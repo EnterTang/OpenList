@@ -260,8 +260,9 @@ type PersonalListResp struct {
 }
 
 type PersonalPartInfo struct {
-	PartNumber int    `json:"partNumber"`
-	UploadUrl  string `json:"uploadUrl"`
+	PartNumber   int    `json:"partNumber"`
+	UploadUrl    string `json:"uploadUrl"`
+	CdnUploadUrl string `json:"cdnUploadUrl"`
 }
 
 type PersonalUploadResp struct {

@@ -59,6 +59,10 @@ const (
 	HandleHookAfterWriting  = "handle_hook_after_writing"
 	HandleHookRateLimit     = "handle_hook_rate_limit"
 	IgnoreSystemFiles       = "ignore_system_files"
+	TMDBApiKey              = "tmdb_api_key"
+	TMDBApiBaseURL          = "tmdb_api_base_url"
+	TMDBLanguage            = "tmdb_language"
+	MediaCategoryRules      = "media_category_rules"
 
 	// index
 	SearchIndex     = "search_index"

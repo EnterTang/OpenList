@@ -492,6 +492,10 @@ func unicode(str string) string {
 }
 
 func (d *Yun139) personalRequest(pathname string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	return d.personalRequestWithHeaders(pathname, method, callback, resp, nil)
+}
+
+func (d *Yun139) personalRequestWithHeaders(pathname string, method string, callback base.ReqCallback, resp interface{}, headers map[string]string) ([]byte, error) {
 	url := d.getPersonalCloudHost() + pathname
 	req := base.RestyClient.R()
 	randStr := random.String(16)
@@ -531,6 +535,9 @@ func (d *Yun139) personalRequest(pathname string, method string, callback base.R
 		"X-Yun-Module-Type":    "100",
 		"X-Yun-Svc-Type":       "1",
 	})
+	if len(headers) > 0 {
+		req.SetHeaders(headers)
+	}
 
 	var e BaseResp
 	req.SetResult(&e)
@@ -557,6 +564,12 @@ func (d *Yun139) personalPost(pathname string, data interface{}, resp interface{
 	return d.personalRequest(pathname, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, resp)
+}
+
+func (d *Yun139) personalUploadPost(pathname string, data interface{}, resp interface{}) ([]byte, error) {
+	return d.personalRequestWithHeaders(pathname, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data)
+	}, resp, d.personalUploadHeaders())
 }
 
 func (d *Yun139) isboPost(pathname string, data interface{}, resp interface{}) ([]byte, error) {
@@ -681,6 +694,36 @@ func (d *Yun139) getPersonalCloudHost() string {
 	return d.PersonalCloudHost
 }
 
+const (
+	personalUploadUserAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Electron/28.2.4 中国移动云盘/12.27.0"
+	personalUploadDefaultDeviceID = "b76e7ddc8f1a4601c4a594fa9f195a0c"
+)
+
+func (d *Yun139) personalUploadDeviceID() string {
+	if d.ref != nil {
+		return d.ref.personalUploadDeviceID()
+	}
+	if deviceID := strings.TrimSpace(d.UserDomainID); deviceID != "" {
+		return deviceID
+	}
+	return personalUploadDefaultDeviceID
+}
+
+func (d *Yun139) personalUploadClientInfo() string {
+	return "||13|12.27.0|PC|QkYtMjAyMDAzMTAxNjQ3|" + d.personalUploadDeviceID() + "||macOS 13.6|1978X1127|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||"
+}
+
+func (d *Yun139) personalUploadHeaders() map[string]string {
+	clientInfo := d.personalUploadClientInfo()
+	return map[string]string{
+		"User-Agent":        personalUploadUserAgent,
+		"X-Yun-App-Channel": "10301000",
+		"x-yun-device-id":   d.personalUploadDeviceID(),
+		"X-Yun-Client-Info": clientInfo,
+		"x-DeviceInfo":      clientInfo,
+	}
+}
+
 func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, uploadPartInfos []PersonalPartInfo, rateLimited *driver.RateLimitReader, p *driver.Progress) error {
 	// 确保数组以 PartNumber 从小到大排序
 	sort.Slice(uploadPartInfos, func(i, j int) bool {
@@ -693,10 +736,17 @@ func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, 
 			return fmt.Errorf("invalid PartNumber %d: index out of bounds (partInfos length: %d)", uploadPartInfo.PartNumber, len(partInfos))
 		}
 		partSize := partInfos[index].PartSize
+		uploadURL := uploadPartInfo.UploadUrl
+		if uploadURL == "" {
+			uploadURL = uploadPartInfo.CdnUploadUrl
+		}
+		if uploadURL == "" {
+			return fmt.Errorf("part %d upload url is empty", uploadPartInfo.PartNumber)
+		}
 		log.Debugf("[139] uploading part %+v/%+v", index, len(partInfos))
 		limitReader := io.LimitReader(rateLimited, partSize)
 		r := io.TeeReader(limitReader, p)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadPartInfo.UploadUrl, r)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, r)
 		if err != nil {
 			return err
 		}
@@ -704,6 +754,7 @@ func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, 
 		req.Header.Set("Content-Length", fmt.Sprint(partSize))
 		req.Header.Set("Origin", "https://yun.139.com")
 		req.Header.Set("Referer", "https://yun.139.com/")
+		req.Header.Set("User-Agent", personalUploadUserAgent)
 		req.ContentLength = partSize
 		err = func() error {
 			res, err := base.HttpClient.Do(req)

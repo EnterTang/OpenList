@@ -3,6 +3,7 @@ package handles
 import (
 	"errors"
 	stdpath "path"
+	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -24,6 +25,26 @@ func Down(c *gin.Context) {
 	if err != nil {
 		common.ErrorPage(c, err, 500)
 		return
+	}
+	if shouldPreviewETFOnDown(c) || shouldRestoreETFOnDownload(storage, filename) {
+		link, file, ok, previewErr := linkETFPreview(c, rawPath, storage, model.LinkArgs{
+			IP:       c.ClientIP(),
+			Header:   c.Request.Header,
+			Type:     c.Query("type"),
+			Redirect: true,
+		})
+		if previewErr != nil {
+			common.ErrorPage(c, previewErr, 500)
+			return
+		}
+		if ok {
+			if common.ShouldProxy(storage, file.GetName()) {
+				proxy(c, link, file, storage.GetStorage().ProxyRange)
+			} else {
+				redirect(c, link)
+			}
+			return
+		}
 	}
 	if common.ShouldProxy(storage, filename) {
 		Proxy(c)
@@ -50,6 +71,20 @@ func Proxy(c *gin.Context) {
 	if err != nil {
 		common.ErrorPage(c, err, 500)
 		return
+	}
+	if shouldPreviewETFOnDown(c) || shouldRestoreETFOnDownload(storage, filename) {
+		link, file, ok, previewErr := linkETFPreview(c, rawPath, storage, model.LinkArgs{
+			Header: c.Request.Header,
+			Type:   c.Query("type"),
+		})
+		if previewErr != nil {
+			common.ErrorPage(c, previewErr, 500)
+			return
+		}
+		if ok {
+			proxy(c, link, file, storage.GetStorage().ProxyRange)
+			return
+		}
 	}
 	if canProxy(storage, filename) {
 		if _, ok := c.GetQuery("d"); !ok {
@@ -123,6 +158,65 @@ func proxy(c *gin.Context, link *model.Link, file model.Obj, proxyRange bool) {
 			common.ErrorPage(c, err, 500, true)
 		}
 	}
+}
+
+func shouldPreviewETFOnDown(c *gin.Context) bool {
+	if c.Query("type") != "" {
+		return true
+	}
+	if c.GetHeader("Range") != "" {
+		return true
+	}
+	switch strings.ToLower(c.GetHeader("Sec-Fetch-Dest")) {
+	case "video", "audio":
+		return true
+	}
+	accept := strings.ToLower(c.GetHeader("Accept"))
+	return strings.Contains(accept, "video/") || strings.Contains(accept, "audio/")
+}
+
+func isETFFile(filename string) bool {
+	return strings.HasSuffix(strings.ToLower(filename), ".etf")
+}
+
+func shouldRestoreETFOnDownload(storage driver.Driver, filename string) bool {
+	if !isETFFile(filename) {
+		return false
+	}
+	controller, ok := storage.(driver.ETFDownloadRestoreController)
+	return ok && controller.ETFDownloadRestoreEnabled()
+}
+
+func linkETFPreview(c *gin.Context, rawPath string, storage driver.Driver, args model.LinkArgs) (*model.Link, model.Obj, bool, error) {
+	namer, ok := storage.(driver.ETFPreviewNamer)
+	if !ok {
+		return nil, nil, false, nil
+	}
+	obj, err := fs.Get(c.Request.Context(), rawPath, &fs.GetArgs{})
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !isETFFile(obj.GetName()) {
+		return nil, nil, false, nil
+	}
+	previewName, err := namer.ETFPreviewName(c.Request.Context(), obj)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if previewName == "" || previewName == obj.GetName() {
+		return nil, nil, false, nil
+	}
+	args.Type = "etf_video"
+	link, file, err := fs.Link(c.Request.Context(), rawPath, args)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if file != nil {
+		file = &model.ObjWrapName{Name: previewName, Obj: file}
+	} else {
+		file = &model.Object{Name: previewName, Size: obj.GetSize(), Modified: obj.ModTime(), Ctime: obj.CreateTime(), HashInfo: obj.GetHash()}
+	}
+	return link, file, true, nil
 }
 
 // TODO need optimize
