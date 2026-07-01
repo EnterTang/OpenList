@@ -1,8 +1,8 @@
 services:
-  openlist-etf:
+  openlist:
     restart: always
     volumes:
-      - '/Volumes/extend Disk/Github/OpenList/data:/opt/openlist/data'
+      - '/etc/openlist:/opt/openlist/data'
     ports:
       - '5244:5244'
       - '5245:5245'
@@ -10,5 +10,5 @@ services:
     environment:
       - UMASK=022
       - TZ=Asia/Shanghai
-    container_name: openlist-etf
-    image: 'openlist:local'
+    container_name: openlist
+    image: 'openlistteam/openlist:latest'

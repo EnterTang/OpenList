@@ -11,8 +11,10 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	driverPkg "github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/go-resty/resty/v2"
 )
@@ -204,7 +206,26 @@ func TestLinkETFVideoCreatesTempDownloadsAndCleans(t *testing.T) {
 			}
 		case "/etf":
 			_, _ = w.Write(data)
+		case "/file/list":
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"items": []any{}}})
 		case "/file/create":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body["type"] == "folder" {
+				parentID, _ := body["parentFileId"].(string)
+				name, _ := body["name"].(string)
+				folderIDs := map[string]string{
+					"root/Temp":           "temp-folder-id",
+					"temp-folder-id/Play": "play-folder-id",
+				}
+				write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": folderIDs[parentID+"/"+name], "fileName": name}})
+				return
+			}
+			if body["parentFileId"] != "play-folder-id" {
+				t.Fatalf("temp file parent = %v, want play-folder-id", body["parentFileId"])
+			}
 			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "temp-id", "fileName": "Movie.mkv", "partInfos": []any{}}})
 		case "/recyclebin/batchTrash", "/recyclebin/clean":
 			write139JSON(t, w, map[string]any{"success": true})
@@ -214,7 +235,11 @@ func TestLinkETFVideoCreatesTempDownloadsAndCleans(t *testing.T) {
 	}))
 	defer server.Close()
 
-	d := &Yun139{PersonalCloudHost: server.URL, Addition: Addition{Type: MetaPersonalNew, ETFVideoPlayback: true, ETFTempFolderID: "temp-folder"}}
+	d := &Yun139{
+		PersonalCloudHost: server.URL,
+		Addition:          Addition{Type: MetaPersonalNew, ETFVideoPlayback: true, ETFTempFolder: "/Temp/Play"},
+	}
+	d.RootFolderID = "root"
 	link, err := d.Link(context.Background(), &model.Object{ID: "etf-id", Name: "Movie.mkv.etf"}, model.LinkArgs{Type: "etf_video"})
 	if err != nil {
 		t.Fatalf("Link returned error: %v", err)
@@ -227,6 +252,20 @@ func TestLinkETFVideoCreatesTempDownloadsAndCleans(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("calls = %s, missing %s", joined, want)
 		}
+	}
+}
+
+func TestETFTempFolderRootPathUsesRootFolder(t *testing.T) {
+	d := &Yun139{
+		Addition: Addition{ETFTempFolder: "/"},
+	}
+	d.RootFolderID = "root"
+	got, err := d.resolveETFTempFolderID(context.Background())
+	if err != nil {
+		t.Fatalf("resolveETFTempFolderID returned error: %v", err)
+	}
+	if got != "root" {
+		t.Fatalf("temp folder id = %q, want root", got)
 	}
 }
 
@@ -386,12 +425,12 @@ func TestAfterPersonalUploadETFUsesTMDBCategoryFolder(t *testing.T) {
 	d := &Yun139{
 		PersonalCloudHost: personalServer.URL,
 		Addition: Addition{
-			Type:            MetaPersonalNew,
-			GenerateETF:     true,
-			ETFRootFolderID: "root",
-			ETFRootPath:     "Managed",
+			Type:          MetaPersonalNew,
+			GenerateETF:   true,
+			ETFRootFolder: "Managed",
 		},
 	}
+	d.RootFolderID = "root"
 	err := d.afterPersonalUploadETF(context.Background(), &model.Object{ID: "parent", Path: "/Movies"}, "Movie.mkv", 2048, strings.Repeat("A", 64), &model.Object{ID: "source", Name: "Movie.mkv"})
 	if err != nil {
 		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
@@ -419,6 +458,46 @@ func TestRemoveETFFileCleansRecycleBin(t *testing.T) {
 	}
 	if strings.Join(calls, ",") != "/recyclebin/batchTrash,/recyclebin/clean" {
 		t.Fatalf("calls = %#v, want trash then clean", calls)
+	}
+}
+
+func Test139ETFConfigMetadataIsChineseAndCollapsed(t *testing.T) {
+	info := op.GetDriverInfoMap()["139Yun"]
+	items := map[string]driverPkg.Item{}
+	for _, item := range info.Additional {
+		items[item.Name] = item
+	}
+	for _, name := range []string{"etf_root_folder_id", "etf_temp_folder_id"} {
+		if _, ok := items[name]; ok {
+			t.Fatalf("%s should be hidden from driver config metadata", name)
+		}
+	}
+	if item, ok := items["auth_mode"]; !ok || item.Label != "授权模式" {
+		t.Fatalf("auth_mode metadata = %+v, want Chinese auth mode label", item)
+	}
+	if item := items["cookie_header"]; item.VisibleWhen != "auth_mode=etf" {
+		t.Fatalf("cookie_header visible_when = %q, want auth_mode=etf", item.VisibleWhen)
+	}
+	if item := items["authorization"]; item.VisibleWhen != "auth_mode=openlist" {
+		t.Fatalf("authorization visible_when = %q, want auth_mode=openlist", item.VisibleWhen)
+	}
+	wantLabels := map[string]string{
+		"generate_etf":    "生成 ETF",
+		"etf_root_folder": "ETF 管理目录",
+		"etf_temp_folder": "ETF 临时播放目录",
+	}
+	for name, wantLabel := range wantLabels {
+		raw, ok := items[name]
+		if !ok {
+			t.Fatalf("missing ETF config item %s", name)
+		}
+		item := raw
+		if item.Group != "ETF" || !item.Collapsed {
+			t.Fatalf("%s group/collapsed = %q/%v, want ETF/true", name, item.Group, item.Collapsed)
+		}
+		if item.Label != wantLabel || item.Help == "" {
+			t.Fatalf("%s label/help should be localized, got label=%q help=%q", name, item.Label, item.Help)
+		}
 	}
 }
 

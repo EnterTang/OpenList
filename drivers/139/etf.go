@@ -52,12 +52,9 @@ func (d *Yun139) linkETFVideo(ctx context.Context, file model.Obj, args model.Li
 	if err != nil {
 		return nil, err
 	}
-	tempParent := strings.TrimSpace(d.Addition.ETFTempFolderID)
-	if tempParent == "" {
-		tempParent = strings.TrimSpace(d.RootFolderID)
-	}
-	if tempParent == "" {
-		tempParent = "/"
+	tempParent, err := d.resolveETFTempFolderID(ctx)
+	if err != nil {
+		return nil, err
 	}
 	tempObj, _, err := d.personalRapidCreate(ctx, tempParent, info.Name, info.Size, info.SHA256)
 	if err != nil {
@@ -145,9 +142,23 @@ func (d *Yun139) shouldCleanAfterPersonalRemove(obj model.Obj) bool {
 }
 
 func (d *Yun139) resolveETFDirectory(ctx context.Context, dstDir model.Obj, sourceName string) (model.Obj, error) {
-	rootID := strings.TrimSpace(d.Addition.ETFRootFolderID)
-	if rootID == "" {
-		rootID = dstDir.GetID()
+	targetDir := dstDir
+	if configuredRoot := strings.TrimSpace(d.Addition.ETFRootFolder); configuredRoot != "" {
+		dir, err := d.ensurePersonalConfiguredFolder(ctx, configuredRoot)
+		if err != nil {
+			return nil, err
+		}
+		targetDir = dir
+	} else if legacyRoot := strings.TrimSpace(d.Addition.ETFRootFolderID); legacyRoot != "" {
+		if looksLikeETFPath(legacyRoot) {
+			dir, err := d.ensurePersonalConfiguredFolder(ctx, legacyRoot)
+			if err != nil {
+				return nil, err
+			}
+			targetDir = dir
+		} else {
+			targetDir = &model.Object{ID: legacyRoot, Name: path.Base(legacyRoot), IsFolder: true}
+		}
 	}
 	parts := splitETFPath(d.Addition.ETFRootPath)
 	if meta := d.resolveETFMediaMetadata(ctx, sourceName, dstDir.GetPath()); meta != nil {
@@ -159,9 +170,9 @@ func (d *Yun139) resolveETFDirectory(ctx context.Context, dstDir model.Obj, sour
 		}
 	}
 	if len(parts) == 0 {
-		return dstDir, nil
+		return targetDir, nil
 	}
-	return d.ensurePersonalFolderPath(ctx, rootID, strings.Join(parts, "/"))
+	return d.ensurePersonalFolderPath(ctx, targetDir.GetID(), strings.Join(parts, "/"))
 }
 
 func (d *Yun139) resolveETFMediaMetadata(ctx context.Context, sourceName, parentPath string) *tmdb.Metadata {

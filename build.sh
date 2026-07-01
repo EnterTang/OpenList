@@ -18,6 +18,20 @@ if [[ "$*" == *"lite"* ]]; then
   useLite=true
 fi
 
+ResolveLatestFrontendTag() {
+  if [ -n "$FRONTEND_VERSION" ]; then
+    echo "$FRONTEND_VERSION"
+    return
+  fi
+  latest_url=$(curl -fsSLI --max-time 10 -o /dev/null -w '%{url_effective}' "https://github.com/$frontendRepo/releases/latest" 2>/dev/null || true)
+  latest_tag="${latest_url##*/}"
+  if [ -n "$latest_tag" ] && [ "$latest_tag" != "latest" ]; then
+    echo "$latest_tag"
+  else
+    echo "latest"
+  fi
+}
+
 if [ "$1" = "dev" ]; then
   version="dev"
   webVersion="rolling"
@@ -25,10 +39,10 @@ elif [ "$1" = "beta" ]; then
   version="beta"
   webVersion="rolling"
 else
-  git tag -d beta || true
+  git tag -d beta >/dev/null 2>&1 || true
   # Always true if there's no tag
   version=$(git describe --abbrev=0 --tags 2>/dev/null || echo "v0.0.0")
-  webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+  webVersion="$(ResolveLatestFrontendTag)"
 fi
 
 echo "backend version: $version"
@@ -97,32 +111,83 @@ AssertStaticBinary() {
 }
 
 FetchWebRolling() {
-  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
-  pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
-  
-  # There is no lite for rolling
-  pre_release_tar_url=$(echo "$pre_release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
-
-  curl -fsSL "$pre_release_tar_url" -o dist.tar.gz
+  # There is no lite for rolling.
+  if ! FetchWebDistForTag "rolling" false; then
+    FetchWebRollingFromAPI
+  fi
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
 }
 
 FetchWebRelease() {
+  if ! FetchWebDistForTag "$webVersion" "$useLite"; then
+    FetchWebReleaseFromAPI
+  fi
+  rm -rf public/dist && mkdir -p public/dist
+  tar -zxvf dist.tar.gz -C public/dist
+  rm -rf dist.tar.gz
+}
+
+FetchWebDistForTag() {
+  tag="$1"
+  lite="$2"
+  if [ -n "$FRONTEND_DIST_URL" ]; then
+    frontend_tar_url="$FRONTEND_DIST_URL"
+  else
+    frontend_tar_url="$(ResolveFrontendAssetURL "$tag" "$lite")"
+  fi
+  [ -n "$frontend_tar_url" ] || return 1
+  curl -fsSL --retry 3 "$frontend_tar_url" -o dist.tar.gz
+}
+
+ResolveFrontendAssetURL() {
+  tag="$1"
+  lite="$2"
+  assets_html=$(curl -fsSL --max-time 20 "https://github.com/$frontendRepo/releases/expanded_assets/$tag" 2>/dev/null || true)
+  if [ -z "$assets_html" ]; then
+    return 1
+  fi
+  if [ "$lite" = true ]; then
+    asset_href=$(echo "$assets_html" | grep -o 'href="[^"]*openlist-frontend-dist-lite[^"]*\.tar\.gz"' | head -n 1 | sed 's/^href="//;s/"$//')
+  else
+    asset_href=$(echo "$assets_html" | grep -o 'href="[^"]*openlist-frontend-dist[^"]*\.tar\.gz"' | grep -v 'lite' | head -n 1 | sed 's/^href="//;s/"$//')
+  fi
+  if [ -z "$asset_href" ]; then
+    return 1
+  fi
+  case "$asset_href" in
+    http*) echo "$asset_href" ;;
+    *) echo "https://github.com$asset_href" ;;
+  esac
+}
+
+FetchWebRollingFromAPI() {
+  if [ -z "$GITHUB_TOKEN" ]; then
+    echo "failed to download rolling frontend without GitHub API; set FRONTEND_DIST_URL to a reachable tar.gz mirror" >&2
+    return 1
+  fi
+  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
+  pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
+  pre_release_tar_url=$(echo "$pre_release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+  curl -fsSL "$pre_release_tar_url" -o dist.tar.gz
+}
+
+FetchWebReleaseFromAPI() {
+  if [ -z "$GITHUB_TOKEN" ]; then
+    echo "failed to download release frontend without GitHub API; set FRONTEND_DIST_URL to a reachable tar.gz mirror" >&2
+    return 1
+  fi
   release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
   release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
-  
+
   if [ "$useLite" = true ]; then
     release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist-lite" | grep "\.tar\.gz$")
   else
     release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
   fi
-  
+
   curl -fsSL "$release_tar_url" -o dist.tar.gz
-  rm -rf public/dist && mkdir -p public/dist
-  tar -zxvf dist.tar.gz -C public/dist
-  rm -rf dist.tar.gz
 }
 
 BuildWinArm64() {

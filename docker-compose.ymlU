@@ -11,4 +11,4 @@ services:
       - UMASK=022
       - TZ=Asia/Shanghai
     container_name: openlist-etf
-    image: 'openlist:local'
+    image: 'openlist-etf:latest'

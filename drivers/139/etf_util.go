@@ -73,6 +73,43 @@ func (d *Yun139) ensurePersonalFolderPath(ctx context.Context, rootID, relPath s
 	return current, nil
 }
 
+func (d *Yun139) ensurePersonalConfiguredFolder(ctx context.Context, folderPath string) (model.Obj, error) {
+	root := d.personalRootFolder()
+	if strings.TrimSpace(folderPath) == "" || isETFRootPath(folderPath) {
+		return root, nil
+	}
+	return d.ensurePersonalFolderPath(ctx, root.GetID(), strings.Join(splitETFPath(folderPath), "/"))
+}
+
+func (d *Yun139) resolveETFTempFolderID(ctx context.Context) (string, error) {
+	if configuredTemp := strings.TrimSpace(d.Addition.ETFTempFolder); configuredTemp != "" {
+		tempDir, err := d.ensurePersonalConfiguredFolder(ctx, configuredTemp)
+		if err != nil {
+			return "", err
+		}
+		return tempDir.GetID(), nil
+	}
+	if legacyTemp := strings.TrimSpace(d.Addition.ETFTempFolderID); legacyTemp != "" {
+		if looksLikeETFPath(legacyTemp) {
+			tempDir, err := d.ensurePersonalConfiguredFolder(ctx, legacyTemp)
+			if err != nil {
+				return "", err
+			}
+			return tempDir.GetID(), nil
+		}
+		return legacyTemp, nil
+	}
+	return d.personalRootFolder().GetID(), nil
+}
+
+func (d *Yun139) personalRootFolder() model.Obj {
+	rootID := strings.TrimSpace(d.RootFolderID)
+	if rootID == "" {
+		rootID = "/"
+	}
+	return &model.Object{ID: rootID, Name: path.Base(rootID), IsFolder: true}
+}
+
 func (d *Yun139) emptyPersonalRecycleBin(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -158,4 +195,14 @@ func splitETFPath(relPath string) []string {
 		}
 	}
 	return segments
+}
+
+func isETFRootPath(relPath string) bool {
+	relPath = strings.TrimSpace(strings.ReplaceAll(relPath, "\\", "/"))
+	return relPath == "/" || relPath == "."
+}
+
+func looksLikeETFPath(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.Contains(value, "/") || strings.Contains(value, "\\") || isETFRootPath(value)
 }

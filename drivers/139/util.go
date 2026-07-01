@@ -73,6 +73,9 @@ func (d *Yun139) refreshToken() error {
 	if d.ref != nil {
 		return d.ref.refreshToken()
 	}
+	if d.useCookieAuthMode() {
+		return d.refreshCookieAuth(context.Background())
+	}
 	decode, err := base64.StdEncoding.DecodeString(d.Authorization)
 	if err != nil {
 		return fmt.Errorf("authorization decode failed: %s", err)

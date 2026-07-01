@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
@@ -42,7 +43,11 @@ func (d *Yun139) GetAddition() driver.Additional {
 
 func (d *Yun139) Init(ctx context.Context) error {
 	if d.ref == nil {
-		if len(d.Authorization) == 0 {
+		if d.useCookieAuthMode() {
+			if strings.TrimSpace(d.CookieHeader) == "" {
+				return fmt.Errorf("cookie_header is empty")
+			}
+		} else if len(d.Authorization) == 0 {
 			if d.Username != "" && d.Password != "" {
 				log.Infof("139yun: authorization is empty, trying to login with password.")
 				newAuth, err := d.loginWithPassword()
