@@ -7,20 +7,21 @@ import (
 
 type Addition struct {
 	//Account       string `json:"account" required:"true"`
-	AuthMode      string `json:"auth_mode" type:"radio" options:"etf,openlist" default:"etf" label:"授权模式" help:"ETF 认证模式只需填写 Cookie Header；OpenList 默认模式沿用 Authorization/用户名/密码/邮箱 Cookie。"`
+	AuthMode      string `json:"auth_mode" type:"select" options:"etf,openlist" default:"etf" label:"授权模式" help:"ETF 认证模式只需填写 Cookie Header；OpenList 默认模式沿用 Authorization/用户名/密码/邮箱 Cookie。"`
 	CookieHeader  string `json:"cookie_header" type:"text" required:"true" visible_when:"auth_mode=etf" label:"Cookie Header" help:"从 yun.139.com 网页端复制完整 Cookie。ETF 认证模式会从其中提取 auth_token、authorization、账号和 ud_id，并自动续期。"`
-	Authorization string `json:"authorization" type:"text" required:"true" visible_when:"auth_mode=openlist"`
-	Username      string `json:"username" required:"true" visible_when:"auth_mode=openlist"`
-	Password      string `json:"password" required:"true" secret:"true" visible_when:"auth_mode=openlist"`
-	MailCookies   string `json:"mail_cookies" required:"true" type:"text" visible_when:"auth_mode=openlist" help:"mail.139.com 的 Cookie，用于密码登录换取移动云盘授权。"`
+	Authorization string `json:"authorization" type:"text" required:"true" visible_when:"auth_mode=openlist" label:"授权"`
+	Username      string `json:"username" required:"true" visible_when:"auth_mode=openlist" label:"用户名"`
+	Password      string `json:"password" required:"true" secret:"true" visible_when:"auth_mode=openlist" label:"密码"`
+	MailCookies   string `json:"mail_cookies" required:"true" type:"text" visible_when:"auth_mode=openlist" label:"邮箱 Cookie" help:"mail.139.com 的 Cookie，用于密码登录换取移动云盘授权。"`
 	driver.RootID
-	Type                  string `json:"type" type:"select" options:"personal_new,family,group,personal" default:"personal_new"`
-	CloudID               string `json:"cloud_id"`
-	UserDomainID          string `json:"user_domain_id" help:"ud_id in Cookie, fill in to show disk usage"`
-	CustomUploadPartSize  int64  `json:"custom_upload_part_size" type:"number" default:"0" help:"0 for auto"`
-	ReportRealSize        bool   `json:"report_real_size" type:"bool" default:"true" help:"Enable to report the real file size during upload"`
-	UseLargeThumbnail     bool   `json:"use_large_thumbnail" type:"bool" default:"false" help:"Enable to use large thumbnail for images"`
+	Type                  string `json:"type" type:"select" options:"personal_new,family,group,personal" default:"personal_new" label:"类型"`
+	CloudID               string `json:"cloud_id" label:"Cloud ID"`
+	UserDomainID          string `json:"user_domain_id" label:"用户域 ID" help:"Cookie 中的 ud_id，填写后可显示容量信息。"`
+	CustomUploadPartSize  int64  `json:"custom_upload_part_size" type:"number" default:"0" label:"自定义分片大小" help:"0 表示自动。"`
+	ReportRealSize        bool   `json:"report_real_size" type:"bool" default:"true" label:"上报真实大小" help:"上传时上报真实文件大小。"`
+	UseLargeThumbnail     bool   `json:"use_large_thumbnail" type:"bool" default:"false" label:"使用大缩略图" help:"为图片使用大缩略图。"`
 	GenerateETF           bool   `json:"generate_etf" type:"bool" default:"false" label:"生成 ETF" group:"ETF" collapsed:"true" help:"上传普通文件后自动生成 .etf 秒传元数据文件。"`
+	ETFArchive            bool   `json:"etf_archive" type:"bool" default:"false" label:"ETF 归档" group:"ETF" collapsed:"true" help:"生成同路径 .etf 后，再复制一份到 ETF 管理目录并按 TMDB 与二级分类规则归档。"`
 	DeleteSourceAfterETF  bool   `json:"delete_source_after_etf" type:"bool" default:"false" label:"生成后删除源文件" group:"ETF" collapsed:"true" help:"生成 .etf 后删除源文件并清空回收站。"`
 	RestoreSourceFromETF  bool   `json:"restore_source_from_etf" type:"bool" default:"false" label:"通过 ETF 恢复源文件" group:"ETF" collapsed:"true" help:"上传 .etf 文件时通过秒传恢复原文件。"`
 	DeleteETFAfterRestore bool   `json:"delete_etf_after_restore" type:"bool" default:"false" label:"恢复后删除 ETF" group:"ETF" collapsed:"true" help:"恢复源文件后删除 .etf 文件并清空回收站。"`

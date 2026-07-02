@@ -15,6 +15,7 @@ Options:
   --base-image-tag <tag>   OpenList base image tag: base, aria2, ffmpeg, aio. Defaults to base.
   --builder <name>         Docker buildx builder name. Defaults to openlist-etf-builder.
   --no-install             Skip pnpm install before frontend build.
+  --skip-i18n              Skip fetching frontend i18n assets before frontend build.
   --no-push                Build locally without pushing. Only supports a single platform.
   --no-cache               Pass --no-cache to docker buildx build.
   -h, --help               Show this help.
@@ -22,12 +23,15 @@ Options:
 Environment:
   DOCKERHUB_USERNAME       Optional username for docker login.
   DOCKERHUB_TOKEN          Optional access token/password for docker login.
-  GO_VERSION               Go Docker image version. Defaults to 1.24.
+  GO_VERSION               Go Docker image version. Defaults to 1.26.4.
   BASE_IMAGE               Runtime base image. Defaults to openlistteam/openlist-base-image.
   INSTALL_ARIA2            Runtime aria2 switch passed to image build. Defaults to false.
   VERSION                  Backend version metadata. Defaults to latest git tag or dev.
   WEB_VERSION              Frontend version metadata. Defaults to frontend package version.
   GIT_COMMIT               Commit metadata. Defaults to current short git commit.
+  FRONTEND_REPO            Frontend release repo. Defaults to OpenListTeam/OpenList-Frontend.
+  FRONTEND_I18N_TAG        Frontend release tag used for i18n.tar.gz. Defaults to latest release.
+  FRONTEND_I18N_URL        Override i18n.tar.gz download URL.
 
 Examples:
   scripts/build-and-push-dockerhub.sh tangente/openlist-etf:latest
@@ -56,9 +60,11 @@ PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-base}"
 BASE_IMAGE="${BASE_IMAGE:-openlistteam/openlist-base-image}"
 BUILDER_NAME="${BUILDER_NAME:-openlist-etf-builder}"
-GO_VERSION="${GO_VERSION:-1.24}"
+GO_VERSION="${GO_VERSION:-1.26.4}"
 INSTALL_ARIA2="${INSTALL_ARIA2:-false}"
+FRONTEND_REPO="${FRONTEND_REPO:-OpenListTeam/OpenList-Frontend}"
 RUN_PNPM_INSTALL="true"
+FETCH_I18N="true"
 PUSH="true"
 NO_CACHE="false"
 
@@ -93,6 +99,10 @@ while [ "$#" -gt 0 ]; do
       RUN_PNPM_INSTALL="false"
       shift
       ;;
+    --skip-i18n)
+      FETCH_I18N="false"
+      shift
+      ;;
     --no-push)
       PUSH="false"
       shift
@@ -117,6 +127,8 @@ done
 require_cmd docker
 require_cmd pnpm
 require_cmd rsync
+require_cmd curl
+require_cmd node
 
 docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 
@@ -128,6 +140,70 @@ WEB_VERSION="${WEB_VERSION:-$(cd "$FRONTEND_DIR" && node -p "require('./package.
 GIT_COMMIT="${GIT_COMMIT:-$(cd "$BACKEND_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 BUILT_AT="${BUILT_AT:-$(date -u +'%Y-%m-%dT%H:%M:%SZ')}"
 
+resolve_frontend_i18n_tag() {
+  if [ -n "${FRONTEND_I18N_TAG:-}" ]; then
+    printf '%s\n' "$FRONTEND_I18N_TAG"
+    return
+  fi
+
+  latest_url="$(curl -fsSLI --max-time 20 -o /dev/null -w '%{url_effective}' \
+    "https://github.com/$FRONTEND_REPO/releases/latest" 2>/dev/null || true)"
+  latest_tag="${latest_url##*/}"
+  if [ -n "$latest_tag" ] && [ "$latest_tag" != "latest" ]; then
+    printf '%s\n' "$latest_tag"
+  else
+    printf '%s\n' "rolling"
+  fi
+}
+
+resolve_frontend_i18n_url() {
+  local tag="$1"
+  local assets_html asset_href
+
+  if [ -n "${FRONTEND_I18N_URL:-}" ]; then
+    printf '%s\n' "$FRONTEND_I18N_URL"
+    return
+  fi
+
+  assets_html="$(curl -fsSL --max-time 20 \
+    "https://github.com/$FRONTEND_REPO/releases/expanded_assets/$tag" 2>/dev/null || true)"
+  [ -n "$assets_html" ] || return 1
+
+  asset_href="$(printf '%s' "$assets_html" |
+    grep -o 'href="[^"]*i18n\.tar\.gz"' |
+    head -n 1 |
+    sed 's/^href="//;s/"$//')"
+  [ -n "$asset_href" ] || return 1
+
+  case "$asset_href" in
+    http*) printf '%s\n' "$asset_href" ;;
+    *) printf '%s\n' "https://github.com$asset_href" ;;
+  esac
+}
+
+prepare_frontend_i18n() {
+  local tag url tmp_i18n
+
+  if [ "$FETCH_I18N" != "true" ]; then
+    echo "==> Skipping frontend i18n fetch"
+    return
+  fi
+
+  [ -f "$FRONTEND_DIR/scripts/i18n.mjs" ] || die "frontend i18n script not found: $FRONTEND_DIR/scripts/i18n.mjs"
+
+  tag="$(resolve_frontend_i18n_tag)"
+  url="$(resolve_frontend_i18n_url "$tag")" || die "failed to resolve frontend i18n.tar.gz for $FRONTEND_REPO@$tag"
+  tmp_i18n="$(mktemp "${TMPDIR:-/tmp}/openlist-i18n.XXXXXX.tar.gz")"
+
+  echo "==> Fetching frontend i18n assets from $FRONTEND_REPO@$tag"
+  curl -fsSL --retry 3 "$url" -o "$tmp_i18n"
+  tar -xzf "$tmp_i18n" -C "$FRONTEND_DIR/src/lang"
+  rm -f "$tmp_i18n"
+
+  echo "==> Preparing frontend i18n entries"
+  (cd "$FRONTEND_DIR" && node scripts/i18n.mjs)
+}
+
 echo "==> Backend:  $BACKEND_DIR"
 echo "==> Frontend: $FRONTEND_DIR"
 echo "==> Image:    $IMAGE"
@@ -138,6 +214,8 @@ if [ "$RUN_PNPM_INSTALL" = "true" ]; then
   echo "==> Installing frontend dependencies"
   (cd "$FRONTEND_DIR" && pnpm install --frozen-lockfile)
 fi
+
+prepare_frontend_i18n
 
 echo "==> Building frontend"
 (cd "$FRONTEND_DIR" && pnpm run build)
@@ -182,7 +260,7 @@ cp -R "$FRONTEND_DIR/dist/." "$BUILD_CONTEXT/public/dist/"
 
 cat > "$TMP_DOCKERFILE" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.7
-ARG GO_VERSION=1.24
+ARG GO_VERSION=1.26.4
 ARG BASE_IMAGE=openlistteam/openlist-base-image
 ARG BASE_IMAGE_TAG=base
 

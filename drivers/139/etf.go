@@ -14,6 +14,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
@@ -23,6 +24,13 @@ import (
 )
 
 const etfVideoLinkType = "etf_video"
+
+type etfArchivePlan struct {
+	targetDir model.Obj
+	meta      *tmdb.Metadata
+	result    recognize.Result
+	pathParts []string
+}
 
 func (d *Yun139) ETFDownloadRestoreEnabled() bool {
 	return d.Addition.Type == MetaPersonalNew && d.Addition.ETFDownloadRestore
@@ -105,12 +113,12 @@ func (d *Yun139) afterPersonalUploadETF(ctx context.Context, dstDir model.Obj, s
 	if err != nil {
 		return err
 	}
-	targetDir := dstDir
-	if dir, err := d.resolveETFDirectory(ctx, dstDir, sourceName); err == nil && dir != nil {
-		targetDir = dir
-	}
-	if err := d.uploadPersonalBytes(ctx, targetDir.GetID(), etfmeta.FileName(sourceName), content); err != nil {
+	etfName := etfmeta.FileName(sourceName)
+	if err := d.uploadPersonalBytes(ctx, dstDir.GetID(), etfName, content); err != nil {
 		return err
+	}
+	if d.Addition.ETFArchive {
+		d.archivePersonalETF(ctx, dstDir, sourceName, etfName, size, sha256, content)
 	}
 	if d.Addition.DeleteSourceAfterETF && uploadedObj != nil {
 		return d.removePersonalAndClean(ctx, uploadedObj)
@@ -142,45 +150,97 @@ func (d *Yun139) shouldCleanAfterPersonalRemove(obj model.Obj) bool {
 }
 
 func (d *Yun139) resolveETFDirectory(ctx context.Context, dstDir model.Obj, sourceName string) (model.Obj, error) {
+	plan, err := d.resolveETFArchivePlan(ctx, dstDir, sourceName)
+	if err != nil {
+		return nil, err
+	}
+	return plan.targetDir, nil
+}
+
+func (d *Yun139) resolveETFArchivePlan(ctx context.Context, dstDir model.Obj, sourceName string) (*etfArchivePlan, error) {
+	targetDir, rootParts, err := d.resolveETFArchiveRoot(ctx, dstDir)
+	if err != nil {
+		return nil, err
+	}
+	result := recognize.Recognize(sourceName, dstDir.GetPath())
+	var resolvedMeta *tmdb.Metadata
+	if meta := d.resolveETFMediaMetadata(ctx, result); meta != nil {
+		resolvedMeta = meta
+	}
+	parts := d.buildETFArchiveParts(result, resolvedMeta)
+	plan := &etfArchivePlan{
+		targetDir: targetDir,
+		meta:      resolvedMeta,
+		result:    result,
+		pathParts: append(rootParts, parts...),
+	}
+	if len(parts) == 0 {
+		return plan, nil
+	}
+	dir, err := d.ensurePersonalFolderPath(ctx, targetDir.GetID(), strings.Join(parts, "/"))
+	if err != nil {
+		return nil, err
+	}
+	plan.targetDir = dir
+	return plan, nil
+}
+
+func (d *Yun139) resolveETFArchiveRoot(ctx context.Context, dstDir model.Obj) (model.Obj, []string, error) {
 	targetDir := dstDir
+	rootParts := []string{}
 	if configuredRoot := strings.TrimSpace(d.Addition.ETFRootFolder); configuredRoot != "" {
 		dir, err := d.ensurePersonalConfiguredFolder(ctx, configuredRoot)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		targetDir = dir
+		if !isETFRootPath(configuredRoot) {
+			rootParts = splitETFPath(configuredRoot)
+		}
 	} else if legacyRoot := strings.TrimSpace(d.Addition.ETFRootFolderID); legacyRoot != "" {
 		if looksLikeETFPath(legacyRoot) {
 			dir, err := d.ensurePersonalConfiguredFolder(ctx, legacyRoot)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			targetDir = dir
+			if !isETFRootPath(legacyRoot) {
+				rootParts = splitETFPath(legacyRoot)
+			}
 		} else {
 			targetDir = &model.Object{ID: legacyRoot, Name: path.Base(legacyRoot), IsFolder: true}
 		}
 	}
-	parts := splitETFPath(d.Addition.ETFRootPath)
-	if meta := d.resolveETFMediaMetadata(ctx, sourceName, dstDir.GetPath()); meta != nil {
-		if meta.MediaType != "" {
-			parts = append(parts, meta.MediaType)
-		}
-		if meta.Category != "" {
-			parts = append(parts, meta.Category)
-		}
-	}
-	if len(parts) == 0 {
-		return targetDir, nil
-	}
-	return d.ensurePersonalFolderPath(ctx, targetDir.GetID(), strings.Join(parts, "/"))
+	return targetDir, rootParts, nil
 }
 
-func (d *Yun139) resolveETFMediaMetadata(ctx context.Context, sourceName, parentPath string) *tmdb.Metadata {
+func (d *Yun139) buildETFArchiveParts(result recognize.Result, meta *tmdb.Metadata) []string {
+	parts := splitETFPath(d.Addition.ETFRootPath)
+	if meta == nil {
+		return parts
+	}
+	if meta.MediaType != "" {
+		parts = append(parts, meta.MediaType)
+	}
+	if meta.Category != "" {
+		parts = append(parts, meta.Category)
+	}
+	if mediaFolder := etfMediaFolderName(meta); mediaFolder != "" {
+		parts = append(parts, mediaFolder)
+	}
+	if meta.MediaType == "tv" {
+		if seasonFolder := etfSeasonFolderName(result.Season); seasonFolder != "" {
+			parts = append(parts, seasonFolder)
+		}
+	}
+	return parts
+}
+
+func (d *Yun139) resolveETFMediaMetadata(ctx context.Context, result recognize.Result) *tmdb.Metadata {
 	apiKey := getSettingValue(conf.TMDBApiKey)
 	if apiKey == "" {
 		return nil
 	}
-	result := recognize.Recognize(sourceName, parentPath)
 	meta, err := tmdb.Resolve(ctx, tmdb.Config{
 		APIKey:        apiKey,
 		BaseURL:       getSettingValue(conf.TMDBApiBaseURL),
@@ -191,6 +251,205 @@ func (d *Yun139) resolveETFMediaMetadata(ctx context.Context, sourceName, parent
 		return nil
 	}
 	return meta
+}
+
+func etfMediaFolderName(meta *tmdb.Metadata) string {
+	if meta == nil || strings.TrimSpace(meta.Name) == "" {
+		return ""
+	}
+	name := sanitizeETFPathSegment(meta.Name)
+	if meta.Year > 0 {
+		name = fmt.Sprintf("%s (%d)", name, meta.Year)
+	}
+	if meta.TMDBID > 0 {
+		name = fmt.Sprintf("%s {tmdb-%d}", name, meta.TMDBID)
+	}
+	return name
+}
+
+func etfSeasonFolderName(season int) string {
+	if season <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("Season %02d", season)
+}
+
+func sanitizeETFPathSegment(segment string) string {
+	segment = strings.NewReplacer("/", " ", "\\", " ").Replace(segment)
+	return strings.Join(strings.Fields(strings.TrimSpace(segment)), " ")
+}
+
+func (d *Yun139) archivePersonalETF(ctx context.Context, dstDir model.Obj, sourceName, etfName string, size int64, sha256 string, content []byte) {
+	record := d.newETFArchiveRecord(dstDir, sourceName, etfName, size, sha256)
+	plan, err := d.resolveETFArchivePlan(ctx, dstDir, sourceName)
+	if err != nil {
+		record.Status = model.ETFArchiveStatusFailed
+		record.Error = err.Error()
+		_ = saveETFArchiveRecord(record)
+		return
+	}
+	d.applyETFArchivePlan(record, plan)
+	if plan.meta == nil {
+		record.Status = model.ETFArchiveStatusFailed
+		record.Error = "tmdb metadata not matched"
+		_ = saveETFArchiveRecord(record)
+		return
+	}
+	if err := d.uploadPersonalBytes(ctx, plan.targetDir.GetID(), etfName, content); err != nil {
+		record.Status = model.ETFArchiveStatusFailed
+		record.Error = err.Error()
+		_ = saveETFArchiveRecord(record)
+		return
+	}
+	record.Status = model.ETFArchiveStatusArchived
+	record.ArchiveETFPath = d.fullETFArchivePath(plan.pathParts, etfName)
+	_ = saveETFArchiveRecord(record)
+}
+
+func saveETFArchiveRecord(record *model.ETFArchiveRecord) error {
+	if db.GetDb() == nil {
+		return nil
+	}
+	return db.CreateETFArchiveRecord(record)
+}
+
+func (d *Yun139) newETFArchiveRecord(dstDir model.Obj, sourceName, etfName string, size int64, sha256 string) *model.ETFArchiveRecord {
+	storage := d.GetStorage()
+	return &model.ETFArchiveRecord{
+		StorageID:        storage.ID,
+		StorageMountPath: storage.MountPath,
+		SourceName:       sourceName,
+		SourcePath:       d.fullETFPath(dstDir.GetPath(), sourceName),
+		LocalETFPath:     d.fullETFPath(dstDir.GetPath(), etfName),
+		ArchiveRoot:      d.etfArchiveRootLabel(),
+		ArchiveEnabled:   true,
+		SourceSize:       size,
+		SourceSHA256:     strings.ToUpper(strings.TrimSpace(sha256)),
+		Status:           model.ETFArchiveStatusFailed,
+	}
+}
+
+func (d *Yun139) etfArchiveRootLabel() string {
+	if root := strings.TrimSpace(d.Addition.ETFRootFolder); root != "" {
+		return root
+	}
+	if legacyRoot := strings.TrimSpace(d.Addition.ETFRootFolderID); legacyRoot != "" {
+		return legacyRoot
+	}
+	return strings.TrimSpace(d.Addition.ETFRootPath)
+}
+
+func (d *Yun139) applyETFArchivePlan(record *model.ETFArchiveRecord, plan *etfArchivePlan) {
+	if record == nil || plan == nil {
+		return
+	}
+	record.Season = plan.result.Season
+	if plan.meta == nil {
+		record.TMDBMatched = false
+		return
+	}
+	record.TMDBMatched = true
+	record.TMDBID = plan.meta.TMDBID
+	record.TMDBName = plan.meta.Name
+	record.TMDBYear = plan.meta.Year
+	record.MediaType = plan.meta.MediaType
+	record.Category = plan.meta.Category
+}
+
+func (d *Yun139) fullETFPath(dirPath, name string) string {
+	storage := d.GetStorage()
+	parts := []string{storage.MountPath}
+	if strings.TrimSpace(dirPath) != "" {
+		parts = append(parts, splitETFPath(dirPath)...)
+	}
+	parts = append(parts, name)
+	return path.Join(parts...)
+}
+
+func (d *Yun139) fullETFArchivePath(pathParts []string, name string) string {
+	storage := d.GetStorage()
+	parts := append([]string{storage.MountPath}, pathParts...)
+	parts = append(parts, name)
+	return path.Join(parts...)
+}
+
+func (d *Yun139) CorrectETFArchive(ctx context.Context, record *model.ETFArchiveRecord, correction model.ETFArchiveCorrection) (*model.ETFArchiveRecord, error) {
+	if record == nil {
+		return nil, fmt.Errorf("archive record is nil")
+	}
+	meta := &tmdb.Metadata{
+		MediaType: strings.TrimSpace(correction.MediaType),
+		TMDBID:    correction.TMDBID,
+		Name:      strings.TrimSpace(correction.TMDBName),
+		Year:      correction.TMDBYear,
+		Category:  strings.TrimSpace(correction.Category),
+	}
+	if meta.Name == "" {
+		return nil, fmt.Errorf("tmdb_name is required")
+	}
+	if meta.MediaType == "" {
+		if correction.Season > 0 {
+			meta.MediaType = "tv"
+		} else {
+			meta.MediaType = "movie"
+		}
+	}
+	result := recognize.Result{Season: correction.Season}
+	root, rootParts, err := d.resolveETFArchiveRoot(ctx, d.personalRootFolder())
+	if err != nil {
+		return nil, err
+	}
+	parts := d.buildETFArchiveParts(result, meta)
+	targetDir := root
+	if len(parts) > 0 {
+		targetDir, err = d.ensurePersonalFolderPath(ctx, root.GetID(), strings.Join(parts, "/"))
+		if err != nil {
+			return nil, err
+		}
+	}
+	info := &etfmeta.Info{
+		Name:       record.SourceName,
+		Size:       record.SourceSize,
+		SHA256:     record.SourceSHA256,
+		CreateTime: time.Now().Format(time.RFC3339),
+	}
+	content, err := etfmeta.Encode(info)
+	if err != nil {
+		return nil, err
+	}
+	etfName := etfmeta.FileName(record.SourceName)
+	if err := d.uploadPersonalBytes(ctx, targetDir.GetID(), etfName, content); err != nil {
+		return nil, err
+	}
+	_ = d.removeArchivedETFByPath(ctx, record.ArchiveETFPath)
+	plan := &etfArchivePlan{
+		targetDir: targetDir,
+		meta:      meta,
+		result:    result,
+		pathParts: append(rootParts, parts...),
+	}
+	d.applyETFArchivePlan(record, plan)
+	record.ArchiveEnabled = true
+	record.ArchiveRoot = d.etfArchiveRootLabel()
+	record.ArchiveETFPath = d.fullETFArchivePath(plan.pathParts, etfName)
+	record.Status = model.ETFArchiveStatusCorrected
+	record.Error = ""
+	return record, db.UpdateETFArchiveRecord(record)
+}
+
+func (d *Yun139) removeArchivedETFByPath(ctx context.Context, fullPath string) error {
+	fullPath = strings.TrimSpace(fullPath)
+	if fullPath == "" {
+		return nil
+	}
+	mountPath := d.GetStorage().MountPath
+	actualPath := strings.TrimPrefix(fullPath, mountPath)
+	actualPath = "/" + strings.TrimLeft(actualPath, "/")
+	obj, err := op.GetUnwrap(ctx, d, actualPath)
+	if err != nil {
+		return nil
+	}
+	return d.Remove(ctx, obj)
 }
 
 func (d *Yun139) uploadPersonalBytes(ctx context.Context, parentID, name string, content []byte) error {

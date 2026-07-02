@@ -182,6 +182,10 @@ func admin(g *gin.RouterGroup) {
 	index.POST("/clear", middlewares.SearchIndex, handles.ClearIndex)
 	index.GET("/progress", middlewares.SearchIndex, handles.GetProgress)
 
+	etfArchive := g.Group("/etf_archive")
+	etfArchive.GET("/list", handles.ListETFArchiveRecords)
+	etfArchive.POST("/correct", handles.CorrectETFArchiveRecord)
+
 	scan := g.Group("/scan")
 	scan.POST("/start", handles.StartManualScan)
 	scan.POST("/stop", handles.StopManualScan)

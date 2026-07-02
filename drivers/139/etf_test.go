@@ -389,9 +389,10 @@ func TestAfterPersonalUploadETFUsesTMDBCategoryFolder(t *testing.T) {
 	})
 
 	folderIDs := map[string]string{
-		"root/Managed":     "managed-id",
-		"managed-id/movie": "movie-id",
-		"movie-id/动画片":     "category-id",
+		"root/Managed":                        "managed-id",
+		"managed-id/movie":                    "movie-id",
+		"movie-id/动画片":                        "category-id",
+		"category-id/Movie (2024) {tmdb-100}": "movie-folder-id",
 	}
 	var finalParent string
 	var createdFolders []string
@@ -427,6 +428,7 @@ func TestAfterPersonalUploadETFUsesTMDBCategoryFolder(t *testing.T) {
 		Addition: Addition{
 			Type:          MetaPersonalNew,
 			GenerateETF:   true,
+			ETFArchive:    true,
 			ETFRootFolder: "Managed",
 		},
 	}
@@ -435,11 +437,147 @@ func TestAfterPersonalUploadETFUsesTMDBCategoryFolder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
 	}
-	if strings.Join(createdFolders, "/") != "Managed/movie/动画片" {
-		t.Fatalf("created folders = %#v, want Managed/movie/动画片", createdFolders)
+	if strings.Join(createdFolders, "/") != "Managed/movie/动画片/Movie (2024) {tmdb-100}" {
+		t.Fatalf("created folders = %#v, want Managed/movie/动画片/Movie (2024) {tmdb-100}", createdFolders)
 	}
-	if finalParent != "category-id" {
-		t.Fatalf("final parent = %q, want category-id", finalParent)
+	if finalParent != "movie-folder-id" {
+		t.Fatalf("final parent = %q, want movie-folder-id", finalParent)
+	}
+}
+
+func TestAfterPersonalUploadETFUsesTVSeasonFolder(t *testing.T) {
+	setup139Resty(t)
+	tmdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tv/260868" {
+			t.Fatalf("tmdb path = %q, want /tv/260868", r.URL.Path)
+		}
+		write139JSON(t, w, map[string]any{
+			"id":                260868,
+			"name":              "婚姻攻略",
+			"first_air_date":    "2024-08-29",
+			"origin_country":    []string{"CN"},
+			"original_language": "zh",
+		})
+	}))
+	defer tmdbServer.Close()
+	oldSettingValue := etfSettingValue
+	etfSettingValue = func(key string) string {
+		switch key {
+		case conf.TMDBApiKey:
+			return "key"
+		case conf.TMDBApiBaseURL:
+			return tmdbServer.URL
+		case conf.TMDBLanguage:
+			return "zh-CN"
+		case conf.MediaCategoryRules:
+			return "tv:\n  国产剧:\n    origin_country: 'CN'\n  未分类:\n"
+		default:
+			return ""
+		}
+	}
+	t.Cleanup(func() {
+		etfSettingValue = oldSettingValue
+	})
+
+	folderIDs := map[string]string{
+		"root/ETF管理":    "managed-id",
+		"managed-id/tv": "tv-id",
+		"tv-id/国产剧":     "category-id",
+		"category-id/婚姻攻略 (2024) {tmdb-260868}": "show-id",
+		"show-id/Season 01":                     "season-id",
+	}
+	var finalParent string
+	var createdFolders []string
+	personalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		switch r.URL.Path {
+		case "/file/list":
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"items": []any{}}})
+		case "/file/create":
+			name, _ := body["name"].(string)
+			parentID, _ := body["parentFileId"].(string)
+			if body["type"] == "folder" {
+				createdFolders = append(createdFolders, name)
+				write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": folderIDs[parentID+"/"+name], "fileName": name}})
+				return
+			}
+			finalParent = parentID
+			if name != "婚姻攻略 (2024) S01E15.苏离王维德终修成正果.2160p.HQ.WEB-DL.H265.AAC.HHWEB.{tmdbid-260868}.mp4.etf" {
+				t.Fatalf("uploaded ETF name = %q", name)
+			}
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "etf-id", "fileName": name, "partInfos": []any{}}})
+		default:
+			t.Fatalf("unexpected personal path: %s", r.URL.Path)
+		}
+	}))
+	defer personalServer.Close()
+
+	d := &Yun139{
+		PersonalCloudHost: personalServer.URL,
+		Addition: Addition{
+			Type:          MetaPersonalNew,
+			GenerateETF:   true,
+			ETFArchive:    true,
+			ETFRootFolder: "ETF管理",
+		},
+	}
+	d.RootFolderID = "root"
+	sourceName := "婚姻攻略 (2024) S01E15.苏离王维德终修成正果.2160p.HQ.WEB-DL.H265.AAC.HHWEB.{tmdbid-260868}.mp4"
+	err := d.afterPersonalUploadETF(context.Background(), &model.Object{ID: "parent", Path: "/转存中转"}, sourceName, 2048, strings.Repeat("A", 64), &model.Object{ID: "source", Name: sourceName})
+	if err != nil {
+		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
+	}
+	wantFolders := "ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}/Season 01"
+	if strings.Join(createdFolders, "/") != wantFolders {
+		t.Fatalf("created folders = %#v, want %s", createdFolders, wantFolders)
+	}
+	if finalParent != "season-id" {
+		t.Fatalf("final parent = %q, want season-id", finalParent)
+	}
+}
+
+func TestAfterPersonalUploadETFKeepsLocalETFWhenArchiveDirectoryFails(t *testing.T) {
+	setup139Resty(t)
+	var uploadedLocal bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/file/create":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body["type"] != "folder" {
+				uploadedLocal = true
+				write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "local-etf-id", "fileName": body["name"], "partInfos": []any{}}})
+				return
+			}
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "managed-id", "fileName": body["name"]}})
+		case "/file/list":
+			write139JSON(t, w, map[string]any{"success": false, "message": "list failed"})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d := &Yun139{
+		PersonalCloudHost: server.URL,
+		Addition: Addition{
+			Type:          MetaPersonalNew,
+			GenerateETF:   true,
+			ETFArchive:    true,
+			ETFRootFolder: "Managed",
+		},
+	}
+	err := d.afterPersonalUploadETF(context.Background(), &model.Object{ID: "parent"}, "Movie.mkv", 2048, strings.Repeat("A", 64), &model.Object{ID: "source", Name: "Movie.mkv"})
+	if err != nil {
+		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
+	}
+	if !uploadedLocal {
+		t.Fatal("local ETF was not uploaded")
 	}
 }
 
@@ -475,6 +613,9 @@ func Test139ETFConfigMetadataIsChineseAndCollapsed(t *testing.T) {
 	if item, ok := items["auth_mode"]; !ok || item.Label != "授权模式" {
 		t.Fatalf("auth_mode metadata = %+v, want Chinese auth mode label", item)
 	}
+	if item := items["auth_mode"]; item.Type != "select" || item.Options != "etf,openlist" {
+		t.Fatalf("auth_mode type/options = %q/%q, want select etf,openlist", item.Type, item.Options)
+	}
 	if item := items["cookie_header"]; item.VisibleWhen != "auth_mode=etf" {
 		t.Fatalf("cookie_header visible_when = %q, want auth_mode=etf", item.VisibleWhen)
 	}
@@ -483,6 +624,7 @@ func Test139ETFConfigMetadataIsChineseAndCollapsed(t *testing.T) {
 	}
 	wantLabels := map[string]string{
 		"generate_etf":    "生成 ETF",
+		"etf_archive":     "ETF 归档",
 		"etf_root_folder": "ETF 管理目录",
 		"etf_temp_folder": "ETF 临时播放目录",
 	}
