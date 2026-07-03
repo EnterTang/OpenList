@@ -18,7 +18,7 @@ type UserClaims struct {
 	jwt.RegisteredClaims
 }
 
-var validTokenCache = cache.NewMemCache[bool]()
+var invalidatedTokenCache = cache.NewMemCache[bool]()
 
 func GenerateToken(user *model.User) (tokenString string, err error) {
 	claim := UserClaims{
@@ -34,7 +34,6 @@ func GenerateToken(user *model.User) (tokenString string, err error) {
 	if err != nil {
 		return "", err
 	}
-	validTokenCache.Set(tokenString, true)
 	return tokenString, err
 }
 
@@ -68,11 +67,11 @@ func InvalidateToken(tokenString string) error {
 	if tokenString == "" {
 		return nil // don't invalidate empty guest token
 	}
-	validTokenCache.Del(tokenString)
+	invalidatedTokenCache.Set(tokenString, true)
 	return nil
 }
 
 func IsTokenInvalidated(tokenString string) bool {
-	_, ok := validTokenCache.Get(tokenString)
-	return !ok
+	_, ok := invalidatedTokenCache.Get(tokenString)
+	return ok
 }

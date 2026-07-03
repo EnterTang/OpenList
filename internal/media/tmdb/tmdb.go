@@ -13,6 +13,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/category"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
 const defaultBaseURL = "https://api.themoviedb.org/3"
@@ -44,6 +45,8 @@ type tmdbItem struct {
 	MediaType        string   `json:"media_type"`
 	Title            string   `json:"title"`
 	Name             string   `json:"name"`
+	OriginalTitle    string   `json:"original_title"`
+	OriginalName     string   `json:"original_name"`
 	ReleaseDate      string   `json:"release_date"`
 	FirstAirDate     string   `json:"first_air_date"`
 	GenreIDs         []int    `json:"genre_ids"`
@@ -107,6 +110,34 @@ func Resolve(ctx context.Context, cfg Config, recognized recognize.Result) (*Met
 	}
 	applyCategory(best, cfg.CategoryRules)
 	return best, nil
+}
+
+func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ETFArchiveTMDBCandidate, error) {
+	cfg = normalizeConfig(cfg)
+	resp, err := search(ctx, cfg, query)
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]model.ETFArchiveTMDBCandidate, 0, len(resp.Results))
+	for _, item := range resp.Results {
+		if item.MediaType != "movie" && item.MediaType != "tv" {
+			continue
+		}
+		meta := item.metadata()
+		applyCategory(meta, cfg.CategoryRules)
+		candidates = append(candidates, model.ETFArchiveTMDBCandidate{
+			TMDBID:           meta.TMDBID,
+			Name:             meta.Name,
+			OriginalName:     item.originalDisplayName(),
+			Year:             meta.Year,
+			MediaType:        meta.MediaType,
+			Category:         meta.Category,
+			GenreIDs:         meta.GenreIDs,
+			OriginCountry:    meta.OriginCountry,
+			OriginalLanguage: meta.OriginalLanguage,
+		})
+	}
+	return candidates, nil
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -199,6 +230,13 @@ func (i tmdbItem) displayName() string {
 	return i.Name
 }
 
+func (i tmdbItem) originalDisplayName() string {
+	if i.OriginalTitle != "" {
+		return i.OriginalTitle
+	}
+	return i.OriginalName
+}
+
 func (i tmdbItem) date() string {
 	if i.ReleaseDate != "" {
 		return i.ReleaseDate
@@ -207,13 +245,23 @@ func (i tmdbItem) date() string {
 }
 
 func scoreCandidate(item tmdbItem, recognized recognize.Result) int {
-	title := normalizeTitle(item.displayName())
+	titles := []string{normalizeTitle(item.displayName()), normalizeTitle(item.originalDisplayName())}
 	target := normalizeTitle(recognized.Title)
 	score := 0
-	if target != "" && title == target {
-		score += 80
-	} else if target != "" && (strings.Contains(title, target) || strings.Contains(target, title)) {
-		score += 55
+	if target != "" {
+		for _, title := range titles {
+			if title == "" {
+				continue
+			}
+			if title == target {
+				score += 80
+				break
+			}
+			if strings.Contains(title, target) || strings.Contains(target, title) {
+				score += 55
+				break
+			}
+		}
 	}
 	if recognized.Year > 0 && yearFromDate(item.date()) == recognized.Year {
 		score += 20

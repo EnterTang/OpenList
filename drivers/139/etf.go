@@ -9,6 +9,10 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +35,16 @@ type etfArchivePlan struct {
 	result    recognize.Result
 	pathParts []string
 }
+
+type manualETFArchiveFile struct {
+	obj      model.Obj
+	dirPath  string
+	fullPath string
+	info     *etfmeta.Info
+	content  []byte
+}
+
+var manualArchiveNumberPattern = regexp.MustCompile(`\d+`)
 
 func (d *Yun139) ETFDownloadRestoreEnabled() bool {
 	return d.Addition.Type == MetaPersonalNew && d.Addition.ETFDownloadRestore
@@ -306,11 +320,302 @@ func (d *Yun139) archivePersonalETF(ctx context.Context, dstDir model.Obj, sourc
 	_ = saveETFArchiveRecord(record)
 }
 
+func (d *Yun139) PreviewManualETFArchive(ctx context.Context, folderPath string, metadata model.ETFManualArchiveMetadata) (*model.ETFManualArchivePreview, error) {
+	meta, err := d.manualArchiveMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	season := manualArchiveSeason(metadata, meta)
+	folderPath = cleanActualPath(folderPath)
+	folderObj, err := op.GetUnwrap(ctx, d, folderPath)
+	if err != nil {
+		return nil, err
+	}
+	if !folderObj.IsDir() {
+		return nil, fmt.Errorf("manual ETF archive target is not a folder")
+	}
+	files, err := d.collectManualETFFiles(ctx, folderObj, folderPath)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return strings.ToLower(files[i].fullPath) < strings.ToLower(files[j].fullPath)
+	})
+	archiveParts := d.manualArchivePathParts(meta, season)
+	targetFolder := etfMediaFolderName(meta)
+	if targetFolder == "" {
+		targetFolder = sanitizeETFPathSegment(meta.Name)
+	}
+	parentPath := path.Dir(folderPath)
+	if parentPath == "." {
+		parentPath = "/"
+	}
+	renamedFolderPath := path.Join(parentPath, targetFolder)
+	items := make([]model.ETFManualArchiveItem, 0, len(files))
+	nextEpisode := metadata.StartEpisode
+	if nextEpisode <= 0 {
+		nextEpisode = 1
+	}
+	for _, file := range files {
+		episode := manualArchiveEpisode(file, nextEpisode)
+		if episode <= 0 {
+			episode = nextEpisode
+		}
+		nextEpisode = episode + 1
+		newName := d.manualArchiveETFName(meta, season, episode, file)
+		relDir := strings.TrimPrefix(file.dirPath, folderPath)
+		relDir = strings.Trim(relDir, "/")
+		newDir := renamedFolderPath
+		if relDir != "" {
+			newDir = path.Join(newDir, relDir)
+		}
+		archivePath := d.fullETFArchivePath(archiveParts, newName)
+		items = append(items, model.ETFManualArchiveItem{
+			OriginalName: file.obj.GetName(),
+			NewName:      newName,
+			OriginalPath: d.fullETFPath(file.dirPath, file.obj.GetName()),
+			NewPath:      d.fullETFPath(newDir, newName),
+			ArchivePath:  archivePath,
+			SourceName:   file.info.Name,
+			SourceSize:   file.info.Size,
+			SourceSHA256: strings.ToUpper(file.info.SHA256),
+			Season:       season,
+			Episode:      episode,
+		})
+	}
+	return &model.ETFManualArchivePreview{
+		SourcePath:       d.fullETFPath(folderPath, ""),
+		TargetFolderName: targetFolder,
+		ArchiveRoot:      d.etfArchiveRootLabel(),
+		ArchiveDirPath:   d.fullETFArchivePath(archiveParts, ""),
+		Items:            items,
+	}, nil
+}
+
+func (d *Yun139) ApplyManualETFArchive(ctx context.Context, folderPath string, metadata model.ETFManualArchiveMetadata, _ []model.ETFManualArchiveItem) (*model.ETFManualArchivePreview, error) {
+	meta, err := d.manualArchiveMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	season := manualArchiveSeason(metadata, meta)
+	preview, err := d.PreviewManualETFArchive(ctx, folderPath, metadata)
+	if err != nil {
+		return nil, err
+	}
+	folderPath = cleanActualPath(folderPath)
+	folderObj, err := op.GetUnwrap(ctx, d, folderPath)
+	if err != nil {
+		return nil, err
+	}
+	files, err := d.collectManualETFFiles(ctx, folderObj, folderPath)
+	if err != nil {
+		return nil, err
+	}
+	filesByPath := make(map[string]manualETFArchiveFile, len(files))
+	for _, file := range files {
+		filesByPath[d.fullETFPath(file.dirPath, file.obj.GetName())] = file
+	}
+	targetDir, _, err := d.manualArchiveTarget(ctx, meta, season)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range preview.Items {
+		file, ok := filesByPath[item.OriginalPath]
+		if !ok {
+			return nil, fmt.Errorf("ETF file not found: %s", item.OriginalPath)
+		}
+		if err := d.Rename(ctx, file.obj, item.NewName); err != nil {
+			return nil, err
+		}
+		if err := d.uploadPersonalBytes(ctx, targetDir.GetID(), item.NewName, file.content); err != nil {
+			return nil, err
+		}
+		_ = saveETFArchiveRecord(&model.ETFArchiveRecord{
+			StorageID:        d.GetStorage().ID,
+			StorageMountPath: d.GetStorage().MountPath,
+			SourceName:       item.SourceName,
+			SourcePath:       item.NewPath,
+			LocalETFPath:     item.NewPath,
+			ArchiveETFPath:   item.ArchivePath,
+			ArchiveRoot:      d.etfArchiveRootLabel(),
+			ArchiveEnabled:   true,
+			TMDBMatched:      true,
+			TMDBID:           meta.TMDBID,
+			TMDBName:         meta.Name,
+			TMDBYear:         meta.Year,
+			MediaType:        meta.MediaType,
+			Category:         meta.Category,
+			Season:           season,
+			SourceSize:       item.SourceSize,
+			SourceSHA256:     item.SourceSHA256,
+			Status:           model.ETFArchiveStatusArchived,
+		})
+	}
+	if folderObj.GetName() != preview.TargetFolderName {
+		if err := d.Rename(ctx, folderObj, preview.TargetFolderName); err != nil {
+			return nil, err
+		}
+	}
+	return preview, nil
+}
+
 func saveETFArchiveRecord(record *model.ETFArchiveRecord) error {
 	if db.GetDb() == nil {
 		return nil
 	}
 	return db.CreateETFArchiveRecord(record)
+}
+
+func (d *Yun139) manualArchiveMetadata(metadata model.ETFManualArchiveMetadata) (*tmdb.Metadata, error) {
+	name := strings.TrimSpace(metadata.Name)
+	if name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	mediaType := strings.TrimSpace(metadata.MediaType)
+	if mediaType == "" {
+		if metadata.Season > 0 {
+			mediaType = "tv"
+		} else {
+			mediaType = "movie"
+		}
+	}
+	return &tmdb.Metadata{
+		MediaType: mediaType,
+		TMDBID:    metadata.TMDBID,
+		Name:      name,
+		Year:      metadata.Year,
+		Category:  strings.TrimSpace(metadata.Category),
+	}, nil
+}
+
+func manualArchiveSeason(metadata model.ETFManualArchiveMetadata, meta *tmdb.Metadata) int {
+	season := metadata.Season
+	if meta != nil && meta.MediaType == "tv" && season <= 0 {
+		return 1
+	}
+	return season
+}
+
+func (d *Yun139) manualArchivePathParts(meta *tmdb.Metadata, season int) []string {
+	rootParts := d.configuredETFRootParts()
+	parts := d.buildETFArchiveParts(recognize.Result{Season: season}, meta)
+	return append(rootParts, parts...)
+}
+
+func (d *Yun139) configuredETFRootParts() []string {
+	if configuredRoot := strings.TrimSpace(d.Addition.ETFRootFolder); configuredRoot != "" && !isETFRootPath(configuredRoot) {
+		return splitETFPath(configuredRoot)
+	}
+	if legacyRoot := strings.TrimSpace(d.Addition.ETFRootFolderID); legacyRoot != "" && looksLikeETFPath(legacyRoot) && !isETFRootPath(legacyRoot) {
+		return splitETFPath(legacyRoot)
+	}
+	return nil
+}
+
+func (d *Yun139) manualArchiveTarget(ctx context.Context, meta *tmdb.Metadata, season int) (model.Obj, []string, error) {
+	root, rootParts, err := d.resolveETFArchiveRoot(ctx, d.personalRootFolder())
+	if err != nil {
+		return nil, nil, err
+	}
+	result := recognize.Result{Season: season}
+	parts := d.buildETFArchiveParts(result, meta)
+	targetDir := root
+	if len(parts) > 0 {
+		targetDir, err = d.ensurePersonalFolderPath(ctx, root.GetID(), strings.Join(parts, "/"))
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return targetDir, append(rootParts, parts...), nil
+}
+
+func (d *Yun139) collectManualETFFiles(ctx context.Context, dir model.Obj, dirPath string) ([]manualETFArchiveFile, error) {
+	objs, err := d.List(ctx, dir, model.ListArgs{Refresh: true})
+	if err != nil {
+		return nil, err
+	}
+	var files []manualETFArchiveFile
+	for _, obj := range objs {
+		childPath := path.Join(dirPath, obj.GetName())
+		if obj.IsDir() {
+			childFiles, err := d.collectManualETFFiles(ctx, obj, childPath)
+			if err != nil {
+				return nil, err
+			}
+			files = append(files, childFiles...)
+			continue
+		}
+		if !etfmeta.IsName(obj.GetName()) {
+			continue
+		}
+		content, info, err := d.readPersonalETFContent(ctx, obj)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, manualETFArchiveFile{
+			obj:      obj,
+			dirPath:  childPathDir(childPath),
+			fullPath: childPath,
+			info:     info,
+			content:  content,
+		})
+	}
+	return files, nil
+}
+
+func childPathDir(p string) string {
+	dir := path.Dir(p)
+	if dir == "." {
+		return "/"
+	}
+	return dir
+}
+
+func manualArchiveEpisode(file manualETFArchiveFile, fallback int) int {
+	if season, episode := recognize.ExtractSeasonEpisode(file.info.Name); season > 0 || episode > 0 {
+		if episode > 0 {
+			return episode
+		}
+	}
+	name := strings.TrimSuffix(file.obj.GetName(), filepath.Ext(file.obj.GetName()))
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	matches := manualArchiveNumberPattern.FindAllString(name, -1)
+	if len(matches) > 0 {
+		if n, err := strconv.Atoi(matches[len(matches)-1]); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func (d *Yun139) manualArchiveETFName(meta *tmdb.Metadata, season int, episode int, file manualETFArchiveFile) string {
+	sourceName := strings.TrimSpace(file.info.Name)
+	if sourceName == "" {
+		sourceName = strings.TrimSuffix(file.obj.GetName(), filepath.Ext(file.obj.GetName()))
+	}
+	mediaExt := filepath.Ext(sourceName)
+	title := sanitizeETFPathSegment(meta.Name)
+	if meta.MediaType == "tv" {
+		if season <= 0 {
+			season = 1
+		}
+		if meta.Year > 0 {
+			return fmt.Sprintf("%s.%d.S%02dE%02d.第%d集%s.etf", title, meta.Year, season, episode, episode, mediaExt)
+		}
+		return fmt.Sprintf("%s.S%02dE%02d.第%d集%s.etf", title, season, episode, episode, mediaExt)
+	}
+	if meta.Year > 0 {
+		return fmt.Sprintf("%s.%d%s.etf", title, meta.Year, mediaExt)
+	}
+	return fmt.Sprintf("%s%s.etf", title, mediaExt)
+}
+
+func cleanActualPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "/"
+	}
+	return path.Clean("/" + strings.TrimLeft(p, "/"))
 }
 
 func (d *Yun139) newETFArchiveRecord(dstDir model.Obj, sourceName, etfName string, size int64, sha256 string) *model.ETFArchiveRecord {
@@ -515,13 +820,18 @@ func (d *Yun139) uploadPersonalBytes(ctx context.Context, parentID, name string,
 }
 
 func (d *Yun139) readPersonalETFInfo(ctx context.Context, file model.Obj) (*etfmeta.Info, error) {
+	_, info, err := d.readPersonalETFContent(ctx, file)
+	return info, err
+}
+
+func (d *Yun139) readPersonalETFContent(ctx context.Context, file model.Obj) ([]byte, *etfmeta.Info, error) {
 	url, err := d.personalGetLink(file.GetID())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	client := base.HttpClient
 	if client == nil {
@@ -529,17 +839,21 @@ func (d *Yun139) readPersonalETFInfo(ctx context.Context, file model.Obj) (*etfm
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected etf status code: %d", res.StatusCode)
+		return nil, nil, fmt.Errorf("unexpected etf status code: %d", res.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(res.Body, 1024*1024))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return etfmeta.Decode(data)
+	info, err := etfmeta.Decode(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, info, nil
 }
 
 func (d *Yun139) etfPreviewEnabled() bool {

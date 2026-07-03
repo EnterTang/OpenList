@@ -42,3 +42,58 @@ type ETFArchiveCorrection struct {
 	Category  string `json:"category"`
 	Season    int    `json:"season"`
 }
+
+type ETFArchiveTMDBCandidate struct {
+	TMDBID           int64    `json:"tmdb_id"`
+	Name             string   `json:"name"`
+	OriginalName     string   `json:"original_name"`
+	Year             int      `json:"year"`
+	MediaType        string   `json:"media_type"`
+	Category         string   `json:"category"`
+	GenreIDs         []int    `json:"genre_ids"`
+	OriginCountry    []string `json:"origin_country"`
+	OriginalLanguage string   `json:"original_language"`
+}
+
+type ETFManualArchiveMetadata struct {
+	TMDBID       int64  `json:"tmdb_id"`
+	Name         string `json:"name"`
+	OriginalName string `json:"original_name"`
+	Year         int    `json:"year"`
+	MediaType    string `json:"media_type"`
+	Category     string `json:"category"`
+	Season       int    `json:"season"`
+	StartEpisode int    `json:"start_episode"`
+}
+
+type ETFManualArchivePreviewReq struct {
+	Path     string                   `json:"path" binding:"required"`
+	Metadata ETFManualArchiveMetadata `json:"metadata" binding:"required"`
+}
+
+type ETFManualArchiveApplyReq struct {
+	Path     string                   `json:"path" binding:"required"`
+	Metadata ETFManualArchiveMetadata `json:"metadata" binding:"required"`
+	Items    []ETFManualArchiveItem   `json:"items"`
+}
+
+type ETFManualArchivePreview struct {
+	SourcePath       string                 `json:"source_path"`
+	TargetFolderName string                 `json:"target_folder_name"`
+	ArchiveRoot      string                 `json:"archive_root"`
+	ArchiveDirPath   string                 `json:"archive_dir_path"`
+	Items            []ETFManualArchiveItem `json:"items"`
+}
+
+type ETFManualArchiveItem struct {
+	OriginalName string `json:"original_name"`
+	NewName      string `json:"new_name"`
+	OriginalPath string `json:"original_path"`
+	NewPath      string `json:"new_path"`
+	ArchivePath  string `json:"archive_path"`
+	SourceName   string `json:"source_name"`
+	SourceSize   int64  `json:"source_size"`
+	SourceSHA256 string `json:"source_sha256"`
+	Season       int    `json:"season"`
+	Episode      int    `json:"episode"`
+}

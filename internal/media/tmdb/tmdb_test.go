@@ -142,6 +142,64 @@ func TestResolveClassifiesWithCategoryRules(t *testing.T) {
 	}
 }
 
+func TestResolveMatchesOriginalNameWhenLocalizedNameDiffers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"results": []map[string]any{{
+			"id":                287009,
+			"media_type":        "tv",
+			"name":              "医到孤岛爱上你",
+			"original_name":     "Doctor on the Edge",
+			"first_air_date":    "2025-01-01",
+			"origin_country":    []string{"KR"},
+			"original_language": "ko",
+		}}})
+	}))
+	defer server.Close()
+
+	got, err := Resolve(context.Background(), Config{APIKey: "key", BaseURL: server.URL}, recognize.Result{
+		Title:     "Doctor on the Edge",
+		QueryList: []string{"Doctor on the Edge"},
+		Year:      2025,
+	})
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if got == nil || got.TMDBID != 287009 {
+		t.Fatalf("metadata = %+v, want original-name match 287009", got)
+	}
+}
+
+func TestSearchCandidatesReturnsOriginalNameAndCategory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"results": []map[string]any{{
+			"id":                287009,
+			"media_type":        "tv",
+			"name":              "医到孤岛爱上你",
+			"original_name":     "Doctor on the Edge",
+			"first_air_date":    "2025-01-01",
+			"genre_ids":         []int{18},
+			"origin_country":    []string{"KR"},
+			"original_language": "ko",
+		}}})
+	}))
+	defer server.Close()
+
+	got, err := SearchCandidates(context.Background(), Config{
+		APIKey:        "key",
+		BaseURL:       server.URL,
+		CategoryRules: "tv:\n  日韩剧:\n    origin_country: 'KR'\n  未分类:\n",
+	}, "Doctor on the Edge")
+	if err != nil {
+		t.Fatalf("SearchCandidates returned error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("candidate count = %d, want 1", len(got))
+	}
+	if got[0].OriginalName != "Doctor on the Edge" || got[0].Category != "日韩剧" {
+		t.Fatalf("candidate = %+v, want original name and category", got[0])
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")

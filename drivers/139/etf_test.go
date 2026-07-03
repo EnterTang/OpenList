@@ -581,6 +581,230 @@ func TestAfterPersonalUploadETFKeepsLocalETFWhenArchiveDirectoryFails(t *testing
 	}
 }
 
+func TestAfterPersonalUploadETFDoesNotArchiveWhenTMDBMetadataMissing(t *testing.T) {
+	setup139Resty(t)
+	var uploadedFiles []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		switch r.URL.Path {
+		case "/file/list":
+			write139JSON(t, w, personalListItems(nil))
+		case "/file/create":
+			name, _ := body["name"].(string)
+			if body["type"] == "folder" {
+				write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "managed-id", "fileName": name}})
+				return
+			}
+			uploadedFiles = append(uploadedFiles, name)
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "etf-id", "fileName": name, "partInfos": []any{}}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d := &Yun139{
+		PersonalCloudHost: server.URL,
+		Addition: Addition{
+			Type:          MetaPersonalNew,
+			GenerateETF:   true,
+			ETFArchive:    true,
+			ETFRootFolder: "ETF管理",
+		},
+	}
+	d.RootFolderID = "root"
+	err := d.afterPersonalUploadETF(context.Background(), &model.Object{ID: "parent", Path: "/Movies"}, "Unknown.mkv", 2048, strings.Repeat("A", 64), &model.Object{ID: "source", Name: "Unknown.mkv"})
+	if err != nil {
+		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
+	}
+	if strings.Join(uploadedFiles, ",") != "Unknown.mkv.etf" {
+		t.Fatalf("uploaded files = %#v, want only local ETF", uploadedFiles)
+	}
+}
+
+func TestPreviewManualETFArchiveKeepsSourceExtensionAndDoesNotCreateArchiveFolders(t *testing.T) {
+	setup139Resty(t)
+	etf01 := mustETFContent(t, "01.iso", 1024, strings.Repeat("A", 64))
+	etf02 := mustETFContent(t, "02.iso", 2048, strings.Repeat("B", 64))
+	var createCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		switch r.URL.Path {
+		case "/file/list":
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			switch body["parentFileId"] {
+			case "root":
+				write139JSON(t, w, personalListItems([]map[string]any{{
+					"fileId": "manual-folder-id", "name": "01", "type": "folder",
+				}}))
+			case "manual-folder-id":
+				write139JSON(t, w, personalListItems([]map[string]any{
+					{"fileId": "etf-01", "name": "01.iso.etf", "type": "file", "size": len(etf01)},
+					{"fileId": "etf-02", "name": "02.iso.etf", "type": "file", "size": len(etf02)},
+				}))
+			default:
+				write139JSON(t, w, personalListItems(nil))
+			}
+		case "/file/getDownloadUrl":
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"url": serverURL(r) + "/etf/" + body["fileId"].(string)}})
+		case "/etf/etf-01":
+			_, _ = w.Write(etf01)
+		case "/etf/etf-02":
+			_, _ = w.Write(etf02)
+		case "/file/create":
+			createCalled = true
+			t.Fatalf("preview should not create archive folders")
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d := &Yun139{
+		Storage:           model.Storage{MountPath: "/"},
+		PersonalCloudHost: server.URL,
+		Addition: Addition{
+			Type:          MetaPersonalNew,
+			ETFRootFolder: "ETF管理",
+		},
+	}
+	d.RootFolderID = "root"
+	preview, err := d.PreviewManualETFArchive(context.Background(), "/01", model.ETFManualArchiveMetadata{
+		TMDBID:    123,
+		Name:      "三国演义",
+		Year:      1994,
+		MediaType: "tv",
+		Category:  "国产剧",
+		Season:    1,
+	})
+	if err != nil {
+		t.Fatalf("PreviewManualETFArchive returned error: %v", err)
+	}
+	if createCalled {
+		t.Fatal("preview created archive folders")
+	}
+	if len(preview.Items) != 2 {
+		t.Fatalf("item count = %d, want 2", len(preview.Items))
+	}
+	wantNames := []string{
+		"三国演义.1994.S01E01.第1集.iso.etf",
+		"三国演义.1994.S01E02.第2集.iso.etf",
+	}
+	for i, want := range wantNames {
+		if preview.Items[i].NewName != want {
+			t.Fatalf("item %d new name = %q, want %q", i, preview.Items[i].NewName, want)
+		}
+	}
+	if preview.ArchiveDirPath != "/ETF管理/tv/国产剧/三国演义 (1994) {tmdb-123}/Season 01" {
+		t.Fatalf("archive dir = %q", preview.ArchiveDirPath)
+	}
+}
+
+func TestApplyManualETFArchiveRenamesFolderAndUploadsArchivedETF(t *testing.T) {
+	setup139Resty(t)
+	etf01 := mustETFContent(t, "01.iso", 1024, strings.Repeat("A", 64))
+	var renamed []string
+	var uploaded []string
+	folderIDs := map[string]string{
+		"root/ETF管理":    "managed-id",
+		"managed-id/tv": "tv-id",
+		"tv-id/国产剧":     "category-id",
+		"category-id/三国演义 (1994) {tmdb-123}": "show-id",
+		"show-id/Season 01":                  "season-id",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		switch r.URL.Path {
+		case "/file/list":
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			switch body["parentFileId"] {
+			case "root":
+				write139JSON(t, w, personalListItems([]map[string]any{{
+					"fileId": "manual-folder-id", "name": "01", "type": "folder",
+				}}))
+			case "manual-folder-id":
+				write139JSON(t, w, personalListItems([]map[string]any{{
+					"fileId": "etf-01", "name": "01.iso.etf", "type": "file", "size": len(etf01),
+				}}))
+			default:
+				write139JSON(t, w, personalListItems(nil))
+			}
+		case "/file/getDownloadUrl":
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"url": serverURL(r) + "/etf/" + body["fileId"].(string)}})
+		case "/etf/etf-01":
+			_, _ = w.Write(etf01)
+		case "/file/update":
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			renamed = append(renamed, fmt.Sprintf("%s:%s", body["fileId"], body["name"]))
+			write139JSON(t, w, map[string]any{"success": true})
+		case "/file/create":
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			name, _ := body["name"].(string)
+			parentID, _ := body["parentFileId"].(string)
+			if body["type"] == "folder" {
+				write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": folderIDs[parentID+"/"+name], "fileName": name}})
+				return
+			}
+			uploaded = append(uploaded, fmt.Sprintf("%s:%s", parentID, name))
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "archived-etf-id", "fileName": name, "partInfos": []any{}}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d := &Yun139{
+		Storage:           model.Storage{MountPath: "/"},
+		PersonalCloudHost: server.URL,
+		Addition: Addition{
+			Type:          MetaPersonalNew,
+			ETFRootFolder: "ETF管理",
+		},
+	}
+	d.RootFolderID = "root"
+	preview, err := d.ApplyManualETFArchive(context.Background(), "/01", model.ETFManualArchiveMetadata{
+		TMDBID:    123,
+		Name:      "三国演义",
+		Year:      1994,
+		MediaType: "tv",
+		Category:  "国产剧",
+		Season:    1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("ApplyManualETFArchive returned error: %v", err)
+	}
+	if len(preview.Items) != 1 {
+		t.Fatalf("item count = %d, want 1", len(preview.Items))
+	}
+	wantFileName := "三国演义.1994.S01E01.第1集.iso.etf"
+	if !containsString(renamed, "etf-01:"+wantFileName) {
+		t.Fatalf("renamed = %#v, missing ETF rename", renamed)
+	}
+	if !containsString(renamed, "manual-folder-id:三国演义 (1994) {tmdb-123}") {
+		t.Fatalf("renamed = %#v, missing folder rename", renamed)
+	}
+	if !containsString(uploaded, "season-id:"+wantFileName) {
+		t.Fatalf("uploaded = %#v, missing archived ETF upload", uploaded)
+	}
+}
+
 func TestRemoveETFFileCleansRecycleBin(t *testing.T) {
 	setup139Resty(t)
 	var calls []string
@@ -662,4 +886,35 @@ func write139JSON(t *testing.T, w http.ResponseWriter, value any) {
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatalf("encode json: %v", err)
 	}
+}
+
+func mustETFContent(t *testing.T, name string, size int64, sha256 string) []byte {
+	t.Helper()
+	data, err := etfmeta.Encode(&etfmeta.Info{Name: name, Size: size, SHA256: sha256})
+	if err != nil {
+		t.Fatalf("Encode ETF: %v", err)
+	}
+	return data
+}
+
+func personalListItems(items []map[string]any) map[string]any {
+	const stamp = "2024-01-01T00:00:00.000+08:00"
+	for _, item := range items {
+		if _, ok := item["createdAt"]; !ok {
+			item["createdAt"] = stamp
+		}
+		if _, ok := item["updatedAt"]; !ok {
+			item["updatedAt"] = stamp
+		}
+	}
+	return map[string]any{"success": true, "data": map[string]any{"items": items}}
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
