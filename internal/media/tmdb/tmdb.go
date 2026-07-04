@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/category"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
@@ -49,10 +51,12 @@ type tmdbItem struct {
 	OriginalName     string   `json:"original_name"`
 	ReleaseDate      string   `json:"release_date"`
 	FirstAirDate     string   `json:"first_air_date"`
+	PosterPath       string   `json:"poster_path"`
 	GenreIDs         []int    `json:"genre_ids"`
 	Genres           []genre  `json:"genres"`
 	OriginCountry    []string `json:"origin_country"`
 	OriginalLanguage string   `json:"original_language"`
+	SearchLanguage   string   `json:"-"`
 }
 
 type genre struct {
@@ -86,17 +90,17 @@ func Resolve(ctx context.Context, cfg Config, recognized recognize.Result) (*Met
 	bestScore := 0
 	var best *Metadata
 	for _, query := range queries {
-		resp, err := search(ctx, cfg, query)
+		items, err := searchAllLanguages(ctx, cfg, query)
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range resp.Results {
+		for _, item := range items {
 			if item.MediaType != "movie" && item.MediaType != "tv" {
 				continue
 			}
 			score := scoreCandidate(item, recognized)
 			if score > bestScore {
-				meta := item.metadata()
+				meta := localizeItem(ctx, cfg, item).metadata()
 				best = meta
 				bestScore = score
 			}
@@ -114,15 +118,44 @@ func Resolve(ctx context.Context, cfg Config, recognized recognize.Result) (*Met
 
 func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ETFArchiveTMDBCandidate, error) {
 	cfg = normalizeConfig(cfg)
-	resp, err := search(ctx, cfg, query)
-	if err != nil {
-		return nil, err
+	queries := recognize.BuildQueryCandidates(query)
+	if len(queries) == 0 {
+		queries = []string{strings.TrimSpace(query)}
 	}
-	candidates := make([]model.ETFArchiveTMDBCandidate, 0, len(resp.Results))
-	for _, item := range resp.Results {
-		if item.MediaType != "movie" && item.MediaType != "tv" {
-			continue
+	items := make([]tmdbItem, 0)
+	seen := map[string]struct{}{}
+	if id, ok := parseNumericID(query); ok {
+		for _, mediaType := range []string{"tv", "movie"} {
+			item, err := requestItem(ctx, cfg, "/"+mediaType+"/"+strconv.FormatInt(id, 10), nil)
+			if err != nil {
+				continue
+			}
+			item.MediaType = mediaType
+			key := mediaType + ":" + strconv.FormatInt(item.ID, 10)
+			seen[key] = struct{}{}
+			items = append(items, *item)
 		}
+	}
+	for _, q := range queries {
+		found, err := searchAllLanguages(ctx, cfg, q)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range found {
+			if item.MediaType != "movie" && item.MediaType != "tv" {
+				continue
+			}
+			key := item.MediaType + ":" + strconv.FormatInt(item.ID, 10)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			items = append(items, item)
+		}
+	}
+	candidates := make([]model.ETFArchiveTMDBCandidate, 0, len(items))
+	for _, item := range items {
+		item = localizeItem(ctx, cfg, item)
 		meta := item.metadata()
 		applyCategory(meta, cfg.CategoryRules)
 		candidates = append(candidates, model.ETFArchiveTMDBCandidate{
@@ -132,6 +165,8 @@ func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ET
 			Year:             meta.Year,
 			MediaType:        meta.MediaType,
 			Category:         meta.Category,
+			PosterPath:       item.PosterPath,
+			PosterURL:        posterURL(item.PosterPath),
 			GenreIDs:         meta.GenreIDs,
 			OriginCountry:    meta.OriginCountry,
 			OriginalLanguage: meta.OriginalLanguage,
@@ -160,6 +195,46 @@ func search(ctx context.Context, cfg Config, query string) (*searchResp, error) 
 		return nil, err
 	}
 	return &resp, nil
+}
+
+func searchAllLanguages(ctx context.Context, cfg Config, query string) ([]tmdbItem, error) {
+	languages := []string{cfg.Language}
+	if isASCII(query) && !strings.EqualFold(cfg.Language, "en-US") {
+		languages = append(languages, "en-US")
+	}
+	seen := map[string]struct{}{}
+	var items []tmdbItem
+	for _, language := range languages {
+		searchCfg := cfg
+		searchCfg.Language = language
+		resp, err := search(ctx, searchCfg, query)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range resp.Results {
+			key := item.MediaType + ":" + strconv.FormatInt(item.ID, 10)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			item.SearchLanguage = language
+			seen[key] = struct{}{}
+			items = append(items, item)
+		}
+	}
+	return items, nil
+}
+
+func localizeItem(ctx context.Context, cfg Config, item tmdbItem) tmdbItem {
+	if item.SearchLanguage == "" || strings.EqualFold(item.SearchLanguage, cfg.Language) {
+		return item
+	}
+	detail, err := requestItem(ctx, cfg, "/"+item.MediaType+"/"+strconv.FormatInt(item.ID, 10), nil)
+	if err != nil {
+		return item
+	}
+	detail.MediaType = item.MediaType
+	detail.SearchLanguage = cfg.Language
+	return *detail
 }
 
 func requestItem(ctx context.Context, cfg Config, endpoint string, params url.Values) (*tmdbItem, error) {
@@ -249,19 +324,22 @@ func scoreCandidate(item tmdbItem, recognized recognize.Result) int {
 	target := normalizeTitle(recognized.Title)
 	score := 0
 	if target != "" {
+		bestTitleScore := 0
 		for _, title := range titles {
 			if title == "" {
 				continue
 			}
 			if title == target {
-				score += 80
-				break
+				bestTitleScore = max(bestTitleScore, 85)
+				continue
 			}
 			if strings.Contains(title, target) || strings.Contains(target, title) {
-				score += 55
-				break
+				bestTitleScore = max(bestTitleScore, 65)
+				continue
 			}
+			bestTitleScore = max(bestTitleScore, titleSimilarityScore(target, title))
 		}
+		score += bestTitleScore
 	}
 	if recognized.Year > 0 && yearFromDate(item.date()) == recognized.Year {
 		score += 20
@@ -274,9 +352,98 @@ func scoreCandidate(item tmdbItem, recognized recognize.Result) int {
 
 func normalizeTitle(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
-	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ")
+	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", ":", " ", "：", " ", "'", " ", "\"", " ", "·", " ")
 	value = replacer.Replace(value)
 	return strings.Join(strings.Fields(value), " ")
+}
+
+func titleSimilarityScore(target, title string) int {
+	targetTerms := termSet(target)
+	titleTerms := termSet(title)
+	if len(targetTerms) == 0 || len(titleTerms) == 0 {
+		return 0
+	}
+	overlap := 0
+	for term := range targetTerms {
+		if _, ok := titleTerms[term]; ok {
+			overlap++
+		}
+	}
+	overlapScore := int(math.Round(float64(overlap) / float64(len(targetTerms)) * 70))
+	lcsScore := 0
+	targetCompact := strings.ReplaceAll(target, " ", "")
+	titleCompact := strings.ReplaceAll(title, " ", "")
+	if len([]rune(targetCompact)) > 0 {
+		lcsScore = int(math.Round(float64(longestCommonSubstringLen(targetCompact, titleCompact)) / float64(len([]rune(targetCompact))) * 65))
+	}
+	return max(overlapScore, lcsScore)
+}
+
+func termSet(value string) map[string]struct{} {
+	terms := map[string]struct{}{}
+	for _, term := range strings.Fields(value) {
+		if len([]rune(term)) < 2 {
+			continue
+		}
+		terms[term] = struct{}{}
+	}
+	return terms
+}
+
+func longestCommonSubstringLen(left, right string) int {
+	a := []rune(left)
+	b := []rune(right)
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	dp := make([]int, len(b)+1)
+	best := 0
+	for i := 1; i <= len(a); i++ {
+		prev := 0
+		for j := 1; j <= len(b); j++ {
+			tmp := dp[j]
+			if a[i-1] == b[j-1] {
+				dp[j] = prev + 1
+				if dp[j] > best {
+					best = dp[j]
+				}
+			} else {
+				dp[j] = 0
+			}
+			prev = tmp
+		}
+	}
+	return best
+}
+
+func parseNumericID(query string) (int64, bool) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return 0, false
+	}
+	for _, r := range query {
+		if !unicode.IsDigit(r) {
+			return 0, false
+		}
+	}
+	id, err := strconv.ParseInt(query, 10, 64)
+	return id, err == nil && id > 0
+}
+
+func isASCII(value string) bool {
+	for _, r := range value {
+		if r > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
+}
+
+func posterURL(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return "https://image.tmdb.org/t/p/w185" + path
 }
 
 func yearFromDate(value string) int {

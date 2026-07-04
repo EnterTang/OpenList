@@ -24,6 +24,20 @@ func TestRecognizeEpisodeFile(t *testing.T) {
 	}
 }
 
+func TestRecognizeEnglishEpisodeReleaseName(t *testing.T) {
+	got := Recognize("Agent.Kim.Reactivated.S01E03.1080p.NF.WEB-DL.AAC2.0.H.264-CXX.mkv", "/139_60t")
+
+	if got.Title != "Agent Kim Reactivated" {
+		t.Fatalf("Title = %q, want Agent Kim Reactivated", got.Title)
+	}
+	if got.Season != 1 || got.Episode != 3 {
+		t.Fatalf("season/episode = %d/%d, want 1/3", got.Season, got.Episode)
+	}
+	if got.MediaTypeHint != "tv" {
+		t.Fatalf("MediaTypeHint = %q, want tv", got.MediaTypeHint)
+	}
+}
+
 func TestRecognizeChineseSeason(t *testing.T) {
 	got := Recognize("嗜血法医 第8季 豆瓣8.8", "/tv")
 
@@ -32,6 +46,13 @@ func TestRecognizeChineseSeason(t *testing.T) {
 	}
 	if got.Title != "嗜血法医" {
 		t.Fatalf("Title = %q, want 嗜血法医", got.Title)
+	}
+}
+
+func TestExtractChineseEpisode(t *testing.T) {
+	season, episode := ExtractSeasonEpisode("凡人修仙传 第十二集.mp4")
+	if season != 1 || episode != 12 {
+		t.Fatalf("season/episode = %d/%d, want 1/12", season, episode)
 	}
 }
 

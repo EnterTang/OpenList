@@ -285,7 +285,7 @@ func etfSeasonFolderName(season int) string {
 	if season <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("Season %02d", season)
+	return fmt.Sprintf("Season %d", season)
 }
 
 func sanitizeETFPathSegment(segment string) string {
@@ -446,6 +446,7 @@ func (d *Yun139) ApplyManualETFArchive(ctx context.Context, folderPath string, m
 			MediaType:        meta.MediaType,
 			Category:         meta.Category,
 			Season:           season,
+			Episode:          item.Episode,
 			SourceSize:       item.SourceSize,
 			SourceSHA256:     item.SourceSHA256,
 			Status:           model.ETFArchiveStatusArchived,
@@ -649,6 +650,7 @@ func (d *Yun139) applyETFArchivePlan(record *model.ETFArchiveRecord, plan *etfAr
 		return
 	}
 	record.Season = plan.result.Season
+	record.Episode = plan.result.Episode
 	if plan.meta == nil {
 		record.TMDBMatched = false
 		return
@@ -692,14 +694,25 @@ func (d *Yun139) CorrectETFArchive(ctx context.Context, record *model.ETFArchive
 	if meta.Name == "" {
 		return nil, fmt.Errorf("tmdb_name is required")
 	}
+	season := correction.Season
+	episode := correction.Episode
+	if season <= 0 || episode <= 0 {
+		recognized := recognize.Recognize(record.SourceName, record.SourcePath)
+		if season <= 0 {
+			season = recognized.Season
+		}
+		if episode <= 0 {
+			episode = recognized.Episode
+		}
+	}
 	if meta.MediaType == "" {
-		if correction.Season > 0 {
+		if season > 0 {
 			meta.MediaType = "tv"
 		} else {
 			meta.MediaType = "movie"
 		}
 	}
-	result := recognize.Result{Season: correction.Season}
+	result := recognize.Result{Season: season, Episode: episode}
 	root, rootParts, err := d.resolveETFArchiveRoot(ctx, d.personalRootFolder())
 	if err != nil {
 		return nil, err

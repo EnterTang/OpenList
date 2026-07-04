@@ -484,7 +484,7 @@ func TestAfterPersonalUploadETFUsesTVSeasonFolder(t *testing.T) {
 		"managed-id/tv": "tv-id",
 		"tv-id/国产剧":     "category-id",
 		"category-id/婚姻攻略 (2024) {tmdb-260868}": "show-id",
-		"show-id/Season 01":                     "season-id",
+		"show-id/Season 1": "season-id",
 	}
 	var finalParent string
 	var createdFolders []string
@@ -530,7 +530,7 @@ func TestAfterPersonalUploadETFUsesTVSeasonFolder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
 	}
-	wantFolders := "ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}/Season 01"
+	wantFolders := "ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}/Season 1"
 	if strings.Join(createdFolders, "/") != wantFolders {
 		t.Fatalf("created folders = %#v, want %s", createdFolders, wantFolders)
 	}
@@ -703,7 +703,7 @@ func TestPreviewManualETFArchiveKeepsSourceExtensionAndDoesNotCreateArchiveFolde
 			t.Fatalf("item %d new name = %q, want %q", i, preview.Items[i].NewName, want)
 		}
 	}
-	if preview.ArchiveDirPath != "/ETF管理/tv/国产剧/三国演义 (1994) {tmdb-123}/Season 01" {
+	if preview.ArchiveDirPath != "/ETF管理/tv/国产剧/三国演义 (1994) {tmdb-123}/Season 1" {
 		t.Fatalf("archive dir = %q", preview.ArchiveDirPath)
 	}
 }
@@ -718,7 +718,7 @@ func TestApplyManualETFArchiveRenamesFolderAndUploadsArchivedETF(t *testing.T) {
 		"managed-id/tv": "tv-id",
 		"tv-id/国产剧":     "category-id",
 		"category-id/三国演义 (1994) {tmdb-123}": "show-id",
-		"show-id/Season 01":                  "season-id",
+		"show-id/Season 1":                   "season-id",
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any

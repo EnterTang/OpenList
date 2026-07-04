@@ -20,12 +20,14 @@ type Result struct {
 
 var (
 	tmdbIDPattern         = regexp.MustCompile(`(?i)(?:tmdb(?:id)?[-_:\s]*|[{\[]tmdb[-_:]?)(\d+)`)
-	seasonEpisodePattern  = regexp.MustCompile(`(?i)\bS(\d{1,2})E(\d{1,3})\b`)
-	chineseSeasonPattern  = regexp.MustCompile(`第\s*(\d{1,2})\s*季`)
+	seasonEpisodePattern  = regexp.MustCompile(`(?i)\bS0*(\d{1,2})\s*E0*(\d{1,4})\b`)
+	seasonPattern         = regexp.MustCompile(`(?i)(?:\bSeason\s*0*([1-9]\d?)\b|(?:^|[\s/._-])S0*([1-9]\d?)(?:$|[\s/._-]))`)
+	episodePattern        = regexp.MustCompile(`(?i)(?:第\s*([一二三四五六七八九十百零〇两\d]{1,4})\s*[集话章回]|\b(?:EP|Episode)\s*0*([1-9]\d{0,3})\b|(?:^|[\s._/-])E0*([1-9]\d{0,3})(?:$|[\s._/-]))`)
+	chineseSeasonPattern  = regexp.MustCompile(`第\s*([一二三四五六七八九十百零〇两\d]{1,4})\s*季`)
 	yearPattern           = regexp.MustCompile(`(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)`)
 	leadingIndexPattern   = regexp.MustCompile(`^\s*\d+\s*[\.\-、_ ]\s*`)
 	doubanPattern         = regexp.MustCompile(`(?i)\s*豆瓣\s*\d+(?:\.\d+)?`)
-	releaseNoisePattern   = regexp.MustCompile(`(?i)(?:^|[\s._\-\[])(?:19|20)\d{2}\b|(?:^|[\s._\-\[])(?:4320p|2160p|1080p|720p|480p|4k|8k|uhd|bluray|blu-ray|remux|web-dl|webrip|hdtv|hdrip|dvdrip|x264|x265|h264|h265|hevc|avc|hdr|dv|dolby|atmos|truehd|dts|ddp|nf|amzn|ma)\b`)
+	releaseNoisePattern   = regexp.MustCompile(`(?i)(?:^|[\s._\-\[])(?:19|20)\d{2}\b|(?:^|[\s._\-\[])(?:4320p|2160p|1440p|1080p|720p|576p|540p|480p|4k|8k|uhd|bluray|blu-ray|bdrip|remux|web-dl|webdl|webrip|hdtv|hdrip|dvdrip|hybrid|x264|x265|h\.?264|h\.?265|hevc|avc|av1|hdr10\+?|hdr|dv|dovi|sdr|dolby|vision|atmos|truehd|dts(?:-?hd)?|eac3|ac3|aac|ddp?|flac|mp3|pcm|nf|netflix|amzn|hmax|hulu|dsnp|ma|proper|repack|imax|10bit|60fps|5\.1|7\.1|2\.0)\b`)
 	genericEpisodePattern = regexp.MustCompile(`(?i)^S\d{1,2}E\d{1,3}$`)
 	spacePattern          = regexp.MustCompile(`\s+`)
 )
@@ -73,6 +75,7 @@ func NormalizeTitle(value string) string {
 	value = strings.ReplaceAll(value, "_", " ")
 	value = strings.ReplaceAll(value, ".", " ")
 	value = strings.ReplaceAll(value, "-", " ")
+	value = strings.NewReplacer("丨", " ", "·", " ", "•", " ").Replace(value)
 	value = leadingIndexPattern.ReplaceAllString(value, "")
 	value = tmdbIDPattern.ReplaceAllString(value, "")
 	value = seasonEpisodePattern.ReplaceAllString(value, "")
@@ -90,7 +93,14 @@ func BuildQueryCandidates(value string) []string {
 	if title == "" {
 		return nil
 	}
-	return []string{title}
+	candidates := []string{}
+	candidates = appendUnique(candidates, title)
+	candidates = appendUnique(candidates, stripCollectionSuffix(title))
+	if prefix := titlePrefixBeforeEpisode(value); prefix != "" {
+		candidates = appendUnique(candidates, prefix)
+		candidates = appendUnique(candidates, stripCollectionSuffix(prefix))
+	}
+	return candidates
 }
 
 func ExtractYearHint(value string) int {
@@ -123,9 +133,20 @@ func ExtractSeasonEpisode(value string) (season int, episode int) {
 		return season, episode
 	}
 	if matches := chineseSeasonPattern.FindStringSubmatch(value); len(matches) == 2 {
-		season, _ = strconv.Atoi(matches[1])
+		season = parseNumberToken(matches[1])
 	}
-	return season, 0
+	if matches := episodePattern.FindStringSubmatch(value); len(matches) == 4 {
+		for _, token := range matches[1:] {
+			if n := parseNumberToken(token); n > 0 {
+				episode = n
+				break
+			}
+		}
+	}
+	if season <= 0 && episode > 0 {
+		season = 1
+	}
+	return season, episode
 }
 
 func parentCandidate(parentPath string) string {
@@ -180,4 +201,57 @@ func appendUnique(values []string, value string) []string {
 		}
 	}
 	return append(values, value)
+}
+
+func titlePrefixBeforeEpisode(value string) string {
+	value = trimMediaExt(strings.TrimSpace(value))
+	index := -1
+	for _, pattern := range []*regexp.Regexp{seasonEpisodePattern, episodePattern, chineseSeasonPattern} {
+		if loc := pattern.FindStringIndex(value); loc != nil && (index < 0 || loc[0] < index) {
+			index = loc[0]
+		}
+	}
+	if index <= 0 {
+		return ""
+	}
+	return NormalizeTitle(value[:index])
+}
+
+func stripCollectionSuffix(value string) string {
+	value = strings.TrimSpace(value)
+	for _, suffix := range []string{"系列", "合集", "全集", "全季", "collection", "complete"} {
+		value = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(value), suffix))
+	}
+	return value
+}
+
+func parseNumberToken(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(value); err == nil {
+		return n
+	}
+	digits := map[rune]int{'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+	units := map[rune]int{'十': 10, '百': 100}
+	total := 0
+	current := 0
+	for _, r := range value {
+		if n, ok := digits[r]; ok {
+			current = n
+			continue
+		}
+		if unit, ok := units[r]; ok {
+			if current == 0 {
+				current = 1
+			}
+			total += current * unit
+			current = 0
+			continue
+		}
+		return 0
+	}
+	total += current
+	return total
 }

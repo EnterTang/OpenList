@@ -32,7 +32,7 @@ func TestListETFArchiveRecordsFilters(t *testing.T) {
 			SourceName:       "婚姻攻略.S01E01.mp4",
 			StorageMountPath: "/139_60t",
 			LocalETFPath:     "/139_60t/转存中转/婚姻攻略.S01E01.mp4.etf",
-			ArchiveETFPath:   "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}/Season 01/婚姻攻略.S01E01.mp4.etf",
+			ArchiveETFPath:   "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}/Season 1/婚姻攻略.S01E01.mp4.etf",
 			TMDBMatched:      true,
 			TMDBID:           260868,
 			TMDBName:         "婚姻攻略",

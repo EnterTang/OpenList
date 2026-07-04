@@ -135,6 +135,21 @@ docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 FRONTEND_DIR="$(cd "$FRONTEND_DIR" && pwd)" || die "frontend dir does not exist: $FRONTEND_DIR"
 [ -f "$FRONTEND_DIR/package.json" ] || die "frontend package.json not found: $FRONTEND_DIR"
 
+FRONTEND_PACKAGE_MANAGER="$(cd "$FRONTEND_DIR" && node -p "require('./package.json').packageManager || ''" 2>/dev/null || true)"
+FRONTEND_PNPM=(pnpm)
+if [[ "$FRONTEND_PACKAGE_MANAGER" == pnpm@* ]]; then
+  REQUIRED_PNPM_VERSION="${FRONTEND_PACKAGE_MANAGER#pnpm@}"
+  CURRENT_PNPM_VERSION="$(pnpm --version 2>/dev/null || true)"
+  if [ "$CURRENT_PNPM_VERSION" != "$REQUIRED_PNPM_VERSION" ]; then
+    echo "==> Using frontend package manager pnpm@$REQUIRED_PNPM_VERSION (current pnpm: ${CURRENT_PNPM_VERSION:-not found})"
+    FRONTEND_PNPM=(pnpm dlx "pnpm@$REQUIRED_PNPM_VERSION")
+  fi
+fi
+
+run_frontend_pnpm() {
+  (cd "$FRONTEND_DIR" && "${FRONTEND_PNPM[@]}" "$@")
+}
+
 VERSION="${VERSION:-$(cd "$BACKEND_DIR" && git describe --abbrev=0 --tags 2>/dev/null || echo dev)}"
 WEB_VERSION="${WEB_VERSION:-$(cd "$FRONTEND_DIR" && node -p "require('./package.json').version" 2>/dev/null || echo custom)}"
 GIT_COMMIT="${GIT_COMMIT:-$(cd "$BACKEND_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
@@ -212,13 +227,13 @@ echo "==> Version:  $VERSION / frontend $WEB_VERSION / commit $GIT_COMMIT"
 
 if [ "$RUN_PNPM_INSTALL" = "true" ]; then
   echo "==> Installing frontend dependencies"
-  (cd "$FRONTEND_DIR" && pnpm install --frozen-lockfile)
+  CI=true run_frontend_pnpm install --frozen-lockfile
 fi
 
 prepare_frontend_i18n
 
 echo "==> Building frontend"
-(cd "$FRONTEND_DIR" && pnpm run build)
+run_frontend_pnpm run build
 
 TMP_DOCKERFILE=""
 BUILD_CONTEXT=""

@@ -28,6 +28,7 @@ type ETFArchiveRecord struct {
 	MediaType        string    `json:"media_type"`
 	Category         string    `json:"category"`
 	Season           int       `json:"season"`
+	Episode          int       `json:"episode"`
 	SourceSize       int64     `json:"source_size"`
 	SourceSHA256     string    `json:"source_sha256"`
 	Status           string    `json:"status" gorm:"index"`
@@ -41,6 +42,7 @@ type ETFArchiveCorrection struct {
 	MediaType string `json:"media_type"`
 	Category  string `json:"category"`
 	Season    int    `json:"season"`
+	Episode   int    `json:"episode"`
 }
 
 type ETFArchiveTMDBCandidate struct {
@@ -50,6 +52,8 @@ type ETFArchiveTMDBCandidate struct {
 	Year             int      `json:"year"`
 	MediaType        string   `json:"media_type"`
 	Category         string   `json:"category"`
+	PosterPath       string   `json:"poster_path"`
+	PosterURL        string   `json:"poster_url"`
 	GenreIDs         []int    `json:"genre_ids"`
 	OriginCountry    []string `json:"origin_country"`
 	OriginalLanguage string   `json:"original_language"`
