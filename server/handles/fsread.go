@@ -109,12 +109,11 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 		return
 	}
 	total, objs := pagination(objs, &req.PageReq)
-	provider := "unknown"
+	storage, storageErr := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
+	provider := storageProviderName(storage)
 	var directUploadTools []string
-	if canWriteContentAtPath {
-		if storage, err := fs.GetStorage(reqPath, &fs.GetStoragesArgs{}); err == nil {
-			directUploadTools = op.GetDirectUploadTools(storage)
-		}
+	if canWriteContentAtPath && storageErr == nil {
+		directUploadTools = op.GetDirectUploadTools(storage)
 	}
 	common.SuccessResp(c, FsListResp{
 		Content:            toObjsResp(objs, reqPath, isEncrypt(meta, reqPath)),
@@ -126,6 +125,17 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 		Provider:           provider,
 		DirectUploadTools:  directUploadTools,
 	})
+}
+
+type storageProvider interface {
+	Config() driver.Config
+}
+
+func storageProviderName(storage storageProvider) string {
+	if storage == nil || storage.Config().Name == "" {
+		return "unknown"
+	}
+	return storage.Config().Name
 }
 
 func FsDirs(c *gin.Context) {

@@ -189,6 +189,10 @@ func admin(g *gin.RouterGroup) {
 	etfArchive.POST("/manual/preview", handles.PreviewManualETFArchive)
 	etfArchive.POST("/manual/apply", handles.ApplyManualETFArchive)
 
+	mobileShare := g.Group("/mobile_share")
+	mobileShare.GET("/list", handles.ListMobileShareRecords)
+	mobileShare.POST("/create", handles.CreateMobileShare)
+
 	scan := g.Group("/scan")
 	scan.POST("/start", handles.StartManualScan)
 	scan.POST("/stop", handles.StopManualScan)
