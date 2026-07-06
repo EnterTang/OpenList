@@ -162,7 +162,19 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	if cfg.SessionFile == "" {
 		cfg.SessionFile = defaults.SessionFile
 	}
-	if len(cfg.Channels) == 0 {
+	if len(cfg.QuarkChannels) == 0 {
+		cfg.QuarkChannels = defaults.QuarkChannels
+	}
+	if len(cfg.AliyunDriveChannels) == 0 {
+		cfg.AliyunDriveChannels = defaults.AliyunDriveChannels
+	}
+	if len(cfg.Pan123Channels) == 0 {
+		cfg.Pan123Channels = defaults.Pan123Channels
+	}
+	if len(cfg.Pan115Channels) == 0 {
+		cfg.Pan115Channels = defaults.Pan115Channels
+	}
+	if len(cfg.Channels) == 0 && !hasTelegramChannelGroups(cfg) {
 		cfg.Channels = defaults.Channels
 	}
 	if len(cfg.SearchCommand) == 0 {
@@ -190,6 +202,13 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 	cfg.APIHash = strings.TrimSpace(cfg.APIHash)
 	cfg.SessionFile = strings.TrimSpace(cfg.SessionFile)
 	cfg.Channels = cleanStringList(cfg.Channels, false)
+	cfg.QuarkChannels = cleanStringList(cfg.QuarkChannels, false)
+	cfg.AliyunDriveChannels = cleanStringList(cfg.AliyunDriveChannels, false)
+	cfg.Pan123Channels = cleanStringList(cfg.Pan123Channels, false)
+	cfg.Pan115Channels = cleanStringList(cfg.Pan115Channels, false)
+	if hasTelegramChannelGroups(cfg) {
+		cfg.Channels = telegramChannelGroups(cfg)
+	}
 	cfg.SearchCommand = cleanCommandList(cfg.SearchCommand)
 	cfg.AuthCommand = cleanCommandList(cfg.AuthCommand)
 	cfg.CommandEnv = cleanStringList(cfg.CommandEnv, false)
@@ -209,12 +228,32 @@ func isZeroTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) bool
 		cfg.APIHash == "" &&
 		cfg.SessionFile == "" &&
 		len(cfg.Channels) == 0 &&
+		len(cfg.QuarkChannels) == 0 &&
+		len(cfg.AliyunDriveChannels) == 0 &&
+		len(cfg.Pan123Channels) == 0 &&
+		len(cfg.Pan115Channels) == 0 &&
 		len(cfg.SearchCommand) == 0 &&
 		len(cfg.AuthCommand) == 0 &&
 		len(cfg.CommandEnv) == 0 &&
 		cfg.CommandTimeoutSeconds == 30 &&
 		cfg.Limit == 40 &&
 		cfg.Query == ""
+}
+
+func hasTelegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) bool {
+	return len(cfg.QuarkChannels) > 0 ||
+		len(cfg.AliyunDriveChannels) > 0 ||
+		len(cfg.Pan123Channels) > 0 ||
+		len(cfg.Pan115Channels) > 0
+}
+
+func telegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) []string {
+	return cleanStringList(append(append(append(append(
+		[]string{},
+		cfg.QuarkChannels...),
+		cfg.AliyunDriveChannels...),
+		cfg.Pan123Channels...),
+		cfg.Pan115Channels...), false)
 }
 
 func mergePanSouSourceConfig(raw string, defaults model.SubscriptionPanSouSourceConfig) (string, error) {

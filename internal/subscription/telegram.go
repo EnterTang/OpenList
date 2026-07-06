@@ -76,7 +76,7 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}
-	rows, err := runTelegramSearchCommand(ctx, sub, cfg)
+	rows, err := runTelegramSearch(ctx, sub, cfg)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}
@@ -115,14 +115,7 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 }
 
 func TelegramAuth(ctx context.Context, subscriptionID uint, action string, req model.SubscriptionTelegramAuthReq) (model.SubscriptionTelegramAuthResp, error) {
-	sub, err := db.GetSubscriptionByID(subscriptionID)
-	if err != nil {
-		return model.SubscriptionTelegramAuthResp{}, err
-	}
-	if err := ApplyDefaults(sub); err != nil {
-		return model.SubscriptionTelegramAuthResp{}, err
-	}
-	cfg, err := parseTelegramConfig(sub.SourceConfig)
+	cfg, err := telegramAuthConfig(subscriptionID)
 	if err != nil {
 		return model.SubscriptionTelegramAuthResp{}, err
 	}
@@ -132,7 +125,7 @@ func TelegramAuth(ctx context.Context, subscriptionID uint, action string, req m
 		PhoneCodeHash:      strings.TrimSpace(req.PhoneCodeHash),
 		PhoneCodeHashCamel: strings.TrimSpace(req.PhoneCodeHash),
 	}
-	result, err := runTelegramAuthCommand(ctx, cfg, action, payload)
+	result, err := runTelegramAuth(ctx, cfg, action, payload)
 	if err != nil {
 		return model.SubscriptionTelegramAuthResp{}, err
 	}
@@ -145,6 +138,24 @@ func TelegramAuth(ctx context.Context, subscriptionID uint, action string, req m
 	}, nil
 }
 
+func telegramAuthConfig(subscriptionID uint) (model.SubscriptionTelegramSourceConfig, error) {
+	if subscriptionID == 0 {
+		cfg, err := GetConfig()
+		if err != nil {
+			return model.SubscriptionTelegramSourceConfig{}, err
+		}
+		return cfg.Telegram, nil
+	}
+	sub, err := db.GetSubscriptionByID(subscriptionID)
+	if err != nil {
+		return model.SubscriptionTelegramSourceConfig{}, err
+	}
+	if err := ApplyDefaults(sub); err != nil {
+		return model.SubscriptionTelegramSourceConfig{}, err
+	}
+	return parseTelegramConfig(sub.SourceConfig)
+}
+
 func parseTelegramConfig(raw string) (model.SubscriptionTelegramSourceConfig, error) {
 	var cfg model.SubscriptionTelegramSourceConfig
 	if strings.TrimSpace(raw) == "" {
@@ -153,17 +164,7 @@ func parseTelegramConfig(raw string) (model.SubscriptionTelegramSourceConfig, er
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		return cfg, errors.WithMessage(err, "invalid telegram source config")
 	}
-	cfg.Channels = cleanStringList(cfg.Channels, false)
-	cfg.CommandEnv = cleanStringList(cfg.CommandEnv, false)
-	if cfg.Limit <= 0 {
-		cfg.Limit = 40
-	}
-	if cfg.CommandTimeoutSeconds <= 0 {
-		cfg.CommandTimeoutSeconds = 30
-	}
-	cfg.SessionFile = strings.TrimSpace(cfg.SessionFile)
-	cfg.Query = strings.TrimSpace(cfg.Query)
-	return cfg, nil
+	return normalizeTelegramSourceConfig(cfg), nil
 }
 
 func runTelegramSearchCommand(ctx context.Context, sub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
@@ -186,13 +187,39 @@ func runTelegramSearchCommand(ctx context.Context, sub *model.Subscription, cfg 
 	return parseTelegramRows(stdout)
 }
 
+func runTelegramSearch(ctx context.Context, sub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
+	if hasTelegramSearchCommand(cfg) {
+		return runTelegramSearchCommand(ctx, sub, cfg)
+	}
+	if hasBuiltinTelegramConfig(cfg) {
+		return builtinTelegramSearch(ctx, sub, cfg)
+	}
+	return nil, errors.New("telegram search backend is not configured")
+}
+
+func runTelegramAuth(ctx context.Context, cfg model.SubscriptionTelegramSourceConfig, action string, payload telegramAuthPayload) (telegramAuthCommandResp, error) {
+	if hasTelegramAuthCommand(cfg) {
+		return runTelegramAuthCommand(ctx, cfg, action, payload)
+	}
+	if hasBuiltinTelegramConfig(cfg) {
+		return builtinTelegramAuth(ctx, cfg, action, payload)
+	}
+	if action == "status" {
+		return telegramAuthCommandResp{Authorized: false}, nil
+	}
+	return telegramAuthCommandResp{}, errors.New("telegram login backend is not configured")
+}
+
 func runTelegramAuthCommand(ctx context.Context, cfg model.SubscriptionTelegramSourceConfig, action string, payload telegramAuthPayload) (telegramAuthCommandResp, error) {
 	command := cfg.AuthCommand
 	if len(command) == 0 {
 		command = telegramAuthCommandFromSearch(cfg.SearchCommand)
 	}
 	if len(command) == 0 || strings.TrimSpace(command[0]) == "" {
-		return telegramAuthCommandResp{}, errors.New("telegram auth_command is not configured")
+		if action == "status" {
+			return telegramAuthCommandResp{Authorized: false}, nil
+		}
+		return telegramAuthCommandResp{}, errors.New("telegram login backend is not configured")
 	}
 	stdout, err := runTelegramCommand(ctx, cfg, command, []string{action}, payload)
 	if err != nil {
@@ -206,6 +233,22 @@ func runTelegramAuthCommand(ctx context.Context, cfg model.SubscriptionTelegramS
 		return telegramAuthCommandResp{}, errors.New(result.Error)
 	}
 	return result, nil
+}
+
+func hasTelegramSearchCommand(cfg model.SubscriptionTelegramSourceConfig) bool {
+	return len(cfg.SearchCommand) > 0 && strings.TrimSpace(cfg.SearchCommand[0]) != ""
+}
+
+func hasTelegramAuthCommand(cfg model.SubscriptionTelegramSourceConfig) bool {
+	command := cfg.AuthCommand
+	if len(command) == 0 {
+		command = telegramAuthCommandFromSearch(cfg.SearchCommand)
+	}
+	return len(command) > 0 && strings.TrimSpace(command[0]) != ""
+}
+
+func hasBuiltinTelegramConfig(cfg model.SubscriptionTelegramSourceConfig) bool {
+	return cfg.APIID > 0 && strings.TrimSpace(cfg.APIHash) != ""
 }
 
 func runTelegramCommand(ctx context.Context, cfg model.SubscriptionTelegramSourceConfig, command []string, extraArgs []string, payload any) ([]byte, error) {

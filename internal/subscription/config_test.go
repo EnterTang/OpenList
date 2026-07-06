@@ -47,3 +47,55 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 		t.Fatalf("subscription limit override = %d, want 5", source.Limit)
 	}
 }
+
+func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
+	sub := &model.Subscription{
+		SourceType:   model.SubscriptionSourceTelegram,
+		SourceConfig: `{"quark_channels":[" @sub-quark ",""],"limit":5}`,
+	}
+	cfg := model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Channels:            []string{"@legacy-default"},
+			QuarkChannels:       []string{"@default-quark"},
+			AliyunDriveChannels: []string{"@default-aliyun"},
+			Pan123Channels:      []string{"@default-123"},
+			Pan115Channels:      []string{"@default-115"},
+		},
+	}
+
+	if err := ApplyConfigDefaults(sub, cfg); err != nil {
+		t.Fatalf("apply defaults: %v", err)
+	}
+
+	var source model.SubscriptionTelegramSourceConfig
+	if err := json.Unmarshal([]byte(sub.SourceConfig), &source); err != nil {
+		t.Fatalf("decode merged source config: %v", err)
+	}
+	if got, want := source.QuarkChannels, []string{"@sub-quark"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("quark channel override = %#v, want %#v", got, want)
+	}
+	if got, want := source.AliyunDriveChannels, []string{"@default-aliyun"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("aliyun channels = %#v, want %#v", got, want)
+	}
+	if got, want := source.Pan123Channels, []string{"@default-123"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("123 channels = %#v, want %#v", got, want)
+	}
+	if got, want := source.Pan115Channels, []string{"@default-115"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("115 channels = %#v, want %#v", got, want)
+	}
+	if got, want := source.Channels, []string{"@sub-quark", "@default-aliyun", "@default-123", "@default-115"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("runtime channels = %#v, want %#v", got, want)
+	}
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}

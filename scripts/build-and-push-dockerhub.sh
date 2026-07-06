@@ -15,7 +15,7 @@ Options:
   --base-image-tag <tag>   OpenList base image tag: base, aria2, ffmpeg, aio. Defaults to base.
   --builder <name>         Docker buildx builder name. Defaults to openlist-etf-builder.
   --no-install             Skip pnpm install before frontend build.
-  --skip-i18n              Skip fetching frontend i18n assets before frontend build.
+  --skip-i18n              Skip fetching/generating frontend i18n assets before frontend build.
   --no-push                Build locally without pushing. Only supports a single platform.
   --no-cache               Pass --no-cache to docker buildx build.
   -h, --help               Show this help.
@@ -32,6 +32,8 @@ Environment:
   FRONTEND_REPO            Frontend release repo. Defaults to OpenListTeam/OpenList-Frontend.
   FRONTEND_I18N_TAG        Frontend release tag used for i18n.tar.gz. Defaults to latest release.
   FRONTEND_I18N_URL        Override i18n.tar.gz download URL.
+  GO_BUILD_PARALLELISM     Go package build parallelism inside Docker. Defaults to 1.
+  GO_MAX_PROCS             GOMAXPROCS for Go compiler processes inside Docker. Defaults to 1.
 
 Examples:
   scripts/build-and-push-dockerhub.sh tangente/openlist-etf:latest
@@ -63,6 +65,8 @@ BUILDER_NAME="${BUILDER_NAME:-openlist-etf-builder}"
 GO_VERSION="${GO_VERSION:-1.26.4}"
 INSTALL_ARIA2="${INSTALL_ARIA2:-false}"
 FRONTEND_REPO="${FRONTEND_REPO:-OpenListTeam/OpenList-Frontend}"
+GO_BUILD_PARALLELISM="${GO_BUILD_PARALLELISM:-1}"
+GO_MAX_PROCS="${GO_MAX_PROCS:-1}"
 RUN_PNPM_INSTALL="true"
 FETCH_I18N="true"
 PUSH="true"
@@ -200,20 +204,27 @@ prepare_frontend_i18n() {
   local tag url tmp_i18n
 
   if [ "$FETCH_I18N" != "true" ]; then
-    echo "==> Skipping frontend i18n fetch"
+    echo "==> Skipping frontend i18n preparation"
     return
   fi
 
   [ -f "$FRONTEND_DIR/scripts/i18n.mjs" ] || die "frontend i18n script not found: $FRONTEND_DIR/scripts/i18n.mjs"
 
   tag="$(resolve_frontend_i18n_tag)"
-  url="$(resolve_frontend_i18n_url "$tag")" || die "failed to resolve frontend i18n.tar.gz for $FRONTEND_REPO@$tag"
-  tmp_i18n="$(mktemp "${TMPDIR:-/tmp}/openlist-i18n.XXXXXX.tar.gz")"
+  url="$(resolve_frontend_i18n_url "$tag")" || true
 
-  echo "==> Fetching frontend i18n assets from $FRONTEND_REPO@$tag"
-  curl -fsSL --retry 3 "$url" -o "$tmp_i18n"
-  tar -xzf "$tmp_i18n" -C "$FRONTEND_DIR/src/lang"
-  rm -f "$tmp_i18n"
+  if [ -n "$url" ]; then
+    tmp_i18n="$(mktemp "${TMPDIR:-/tmp}/openlist-i18n.XXXXXX.tar.gz")"
+    echo "==> Fetching frontend i18n assets from $FRONTEND_REPO@$tag"
+    if curl -fsSL --retry 3 "$url" -o "$tmp_i18n" && tar -xzf "$tmp_i18n" -C "$FRONTEND_DIR/src/lang"; then
+      rm -f "$tmp_i18n"
+    else
+      rm -f "$tmp_i18n"
+      echo "warning: failed to fetch frontend i18n.tar.gz for $FRONTEND_REPO@$tag; using local i18n generation" >&2
+    fi
+  else
+    echo "warning: failed to resolve frontend i18n.tar.gz for $FRONTEND_REPO@$tag; using local i18n generation" >&2
+  fi
 
   echo "==> Preparing frontend i18n entries"
   (cd "$FRONTEND_DIR" && node scripts/i18n.mjs)
@@ -291,8 +302,10 @@ ARG BUILT_AT=unknown
 ARG GIT_COMMIT=unknown
 ARG VERSION=dev
 ARG WEB_VERSION=custom
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -tags=jsoniter \
+ARG GO_BUILD_PARALLELISM=1
+ARG GO_MAX_PROCS=1
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOMAXPROCS=${GO_MAX_PROCS} \
+    go build -p=${GO_BUILD_PARALLELISM} -tags=jsoniter \
     -ldflags="-s -w \
     -X github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=${BUILT_AT} \
     -X github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=${GIT_COMMIT} \
@@ -338,11 +351,23 @@ else
 fi
 docker buildx inspect --bootstrap >/dev/null
 
-BUILD_ARGS=(
+docker_platform_tag() {
+  local image="$1"
+  local platform="$2"
+  local suffix
+  suffix="${platform//\//-}"
+  suffix="${suffix//,/-}"
+
+  if [[ "${image##*/}" == *:* ]]; then
+    printf '%s:%s-%s\n' "${image%:*}" "${image##*:}" "$suffix"
+  else
+    printf '%s:%s\n' "$image" "$suffix"
+  fi
+}
+
+BASE_BUILD_ARGS=(
   buildx build
   --file "$TMP_DOCKERFILE"
-  --tag "$IMAGE"
-  --platform "$PLATFORMS"
   --build-arg "GO_VERSION=$GO_VERSION"
   --build-arg "BASE_IMAGE=$BASE_IMAGE"
   --build-arg "BASE_IMAGE_TAG=$BASE_IMAGE_TAG"
@@ -351,23 +376,50 @@ BUILD_ARGS=(
   --build-arg "GIT_COMMIT=$GIT_COMMIT"
   --build-arg "VERSION=$VERSION"
   --build-arg "WEB_VERSION=$WEB_VERSION"
+  --build-arg "GO_BUILD_PARALLELISM=$GO_BUILD_PARALLELISM"
+  --build-arg "GO_MAX_PROCS=$GO_MAX_PROCS"
 )
 
 if [ "$NO_CACHE" = "true" ]; then
-  BUILD_ARGS+=(--no-cache)
+  BASE_BUILD_ARGS+=(--no-cache)
 fi
 
 if [ "$PUSH" = "true" ]; then
-  BUILD_ARGS+=(--push)
+  if [[ "$PLATFORMS" == *,* ]]; then
+    IFS=',' read -r -a PLATFORM_LIST <<< "$PLATFORMS"
+    PLATFORM_TAGS=()
+    for platform in "${PLATFORM_LIST[@]}"; do
+      platform="${platform//[[:space:]]/}"
+      [ -n "$platform" ] || continue
+      platform_tag="$(docker_platform_tag "$IMAGE" "$platform")"
+      PLATFORM_TAGS+=("$platform_tag")
+      echo "==> Building and pushing Docker image for $platform as $platform_tag"
+      docker "${BASE_BUILD_ARGS[@]}" \
+        --tag "$platform_tag" \
+        --platform "$platform" \
+        --push \
+        "$BUILD_CONTEXT"
+    done
+    [ "${#PLATFORM_TAGS[@]}" -gt 0 ] || die "no valid platform found in --platforms $PLATFORMS"
+    echo "==> Creating multi-platform manifest: $IMAGE"
+    docker buildx imagetools create -t "$IMAGE" "${PLATFORM_TAGS[@]}"
+  else
+    echo "==> Building and pushing Docker image"
+    docker "${BASE_BUILD_ARGS[@]}" \
+      --tag "$IMAGE" \
+      --platform "$PLATFORMS" \
+      --push \
+      "$BUILD_CONTEXT"
+  fi
 else
   [[ "$PLATFORMS" != *,* ]] || die "--no-push can only be used with one platform, for example --platforms linux/amd64"
-  BUILD_ARGS+=(--load)
+  echo "==> Building Docker image"
+  docker "${BASE_BUILD_ARGS[@]}" \
+    --tag "$IMAGE" \
+    --platform "$PLATFORMS" \
+    --load \
+    "$BUILD_CONTEXT"
 fi
-
-BUILD_ARGS+=("$BUILD_CONTEXT")
-
-echo "==> Building Docker image"
-docker "${BUILD_ARGS[@]}"
 
 echo "==> Done"
 if [ "$PUSH" = "true" ]; then

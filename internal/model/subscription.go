@@ -91,6 +91,10 @@ type SubscriptionTelegramSourceConfig struct {
 	APIHash               string   `json:"api_hash"`
 	SessionFile           string   `json:"session_file"`
 	Channels              []string `json:"channels"`
+	QuarkChannels         []string `json:"quark_channels"`
+	AliyunDriveChannels   []string `json:"aliyun_drive_channels"`
+	Pan123Channels        []string `json:"pan123_channels"`
+	Pan115Channels        []string `json:"pan115_channels"`
 	SearchCommand         []string `json:"search_command"`
 	AuthCommand           []string `json:"auth_command"`
 	CommandEnv            []string `json:"command_env"`
@@ -134,7 +138,7 @@ type SubscriptionRunResult struct {
 }
 
 type SubscriptionTelegramAuthReq struct {
-	ID            uint   `json:"id" binding:"required"`
+	ID            uint   `json:"id"`
 	Phone         string `json:"phone"`
 	Code          string `json:"code"`
 	PhoneCodeHash string `json:"phone_code_hash"`
