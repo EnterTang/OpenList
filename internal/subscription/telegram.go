@@ -12,9 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -71,6 +73,11 @@ type telegramAuthCommandResp struct {
 	Error              string         `json:"error,omitempty"`
 }
 
+type telegramPanSubscriptionSource struct {
+	Name   string
+	Config model.SubscriptionTelegramPanConfig
+}
+
 func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
 	cfg, err := parseTelegramConfig(sub.SourceConfig)
 	if err != nil {
@@ -84,7 +91,10 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	nextCursor := lastSeenMsgID
 	now := time.Now()
 	added := 0
+	changed := 0
+	transferred := 0
 	var saved []model.SubscriptionItem
+	triggeredSources := map[string]telegramPanSubscriptionSource{}
 	for _, row := range rows {
 		msgID := rowMessageID(row)
 		if msgID > 0 {
@@ -95,11 +105,14 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 				nextCursor = msgID
 			}
 		}
+		if source, ok := telegramPanSourceForRow(row, cfg); ok {
+			triggeredSources[source.Name] = source
+		}
 		for _, link := range rowLinks(row) {
 			item := telegramLinkItem(sub, row, link, now)
 			stored, isNew, err := db.UpsertSubscriptionItem(item)
 			if err != nil {
-				return saved, sub.LastTreeHash, added, 0, 0, err
+				return saved, sub.LastTreeHash, added, changed, transferred, err
 			}
 			if isNew {
 				added++
@@ -107,11 +120,22 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 			saved = append(saved, *stored)
 		}
 	}
+	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, triggeredSources, transfer, now)
+	if err != nil {
+		return saved, sub.LastTreeHash, added, changed, transferred, err
+	}
+	saved = append(saved, tempItems...)
+	added += tempAdded
+	changed += tempChanged
+	transferred += tempTransferred
 	if nextCursor > lastSeenMsgID {
 		sub.LastCursor = strconv.FormatInt(nextCursor, 10)
 	}
 	hash := telegramRowsHash(rows)
-	return saved, hash, added, 0, 0, nil
+	if tempHash != "" {
+		hash = combinedHash(hash, []string{tempHash})
+	}
+	return saved, hash, added, changed, transferred, nil
 }
 
 func TelegramAuth(ctx context.Context, subscriptionID uint, action string, req model.SubscriptionTelegramAuthReq) (model.SubscriptionTelegramAuthResp, error) {
@@ -171,9 +195,9 @@ func runTelegramSearchCommand(ctx context.Context, sub *model.Subscription, cfg 
 	if len(cfg.SearchCommand) == 0 || strings.TrimSpace(cfg.SearchCommand[0]) == "" {
 		return nil, errors.New("telegram search_command is not configured")
 	}
-	query := cfg.Query
+	query := telegramSearchQuery(sub)
 	if query == "" {
-		query = sub.TMDBName
+		return nil, errors.New("telegram search query is required")
 	}
 	payload := map[string]any{
 		"channels": cfg.Channels,
@@ -185,6 +209,191 @@ func runTelegramSearchCommand(ctx context.Context, sub *model.Subscription, cfg 
 		return nil, err
 	}
 	return parseTelegramRows(stdout)
+}
+
+func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sources map[string]telegramPanSubscriptionSource, transfer bool, seenAt time.Time) ([]model.SubscriptionItem, string, int, int, int, error) {
+	if len(sources) == 0 {
+		return nil, "", 0, 0, 0, nil
+	}
+	var saved []model.SubscriptionItem
+	var snapshotHashes []string
+	seenKeys := map[string]struct{}{}
+	added := 0
+	changed := 0
+	transferred := 0
+	sourceNames := make([]string, 0, len(sources))
+	for name := range sources {
+		sourceNames = append(sourceNames, name)
+	}
+	sort.Strings(sourceNames)
+	for _, name := range sourceNames {
+		source := sources[name]
+		root := strings.TrimSpace(source.Config.TempTransferRoot)
+		if root == "" {
+			continue
+		}
+		snapshot, err := SnapshotPaths(ctx, []string{root})
+		if err != nil {
+			return saved, "", added, changed, transferred, err
+		}
+		snapshotHashes = append(snapshotHashes, source.Name+":"+snapshot.Hash)
+		for _, entry := range MediaFiles(snapshot.Entries) {
+			if !subscriptionEntryMatches(sub, entry) {
+				continue
+			}
+			item := itemFromEntry(sub, entry, seenAt)
+			if _, ok := seenKeys[item.SourceKey]; ok {
+				continue
+			}
+			seenKeys[item.SourceKey] = struct{}{}
+			stored, isNew, err := db.UpsertSubscriptionItem(item)
+			if err != nil {
+				return saved, combinedHash("telegram-temp", snapshotHashes), added, changed, transferred, err
+			}
+			if isNew {
+				added++
+			} else if stored.Status == model.SubscriptionItemStatusPending {
+				changed++
+			}
+			if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
+				if err := transferItem(ctx, stored); err != nil {
+					stored.Status = model.SubscriptionItemStatusFailed
+					stored.LastError = err.Error()
+				} else {
+					stored.Status = model.SubscriptionItemStatusTransferred
+					stored.LastError = ""
+					transferred++
+					if source.Config.DeleteSourceAfter {
+						if err := cleanupSourceAfterTransfer(ctx, stored.SourcePath); err != nil {
+							stored.LastError = "source cleanup failed after transfer: " + err.Error()
+						}
+					}
+				}
+				_, _, err = db.UpsertSubscriptionItem(stored)
+				if err != nil {
+					return saved, combinedHash("telegram-temp", snapshotHashes), added, changed, transferred, err
+				}
+			}
+			saved = append(saved, *stored)
+		}
+	}
+	if len(snapshotHashes) == 0 {
+		return saved, "", added, changed, transferred, nil
+	}
+	return saved, combinedHash("telegram-temp", snapshotHashes), added, changed, transferred, nil
+}
+
+func telegramSearchQuery(sub *model.Subscription) string {
+	if sub == nil {
+		return ""
+	}
+	if query := strings.TrimSpace(sub.TMDBName); query != "" {
+		return query
+	}
+	return strings.TrimSpace(sub.Name)
+}
+
+func telegramPanSources(cfg model.SubscriptionTelegramSourceConfig) []telegramPanSubscriptionSource {
+	candidates := []telegramPanSubscriptionSource{
+		{Name: "quark", Config: cfg.Quark},
+		{Name: "aliyun_drive", Config: cfg.AliyunDrive},
+		{Name: "pan123", Config: cfg.Pan123},
+		{Name: "pan115", Config: cfg.Pan115},
+	}
+	sources := make([]telegramPanSubscriptionSource, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate.Config = normalizeTelegramPanConfig(candidate.Config)
+		if len(candidate.Config.Channels) == 0 && candidate.Config.TempTransferRoot == "" {
+			continue
+		}
+		sources = append(sources, candidate)
+	}
+	return sources
+}
+
+func telegramPanSourceForRow(row telegramCommandRow, cfg model.SubscriptionTelegramSourceConfig) (telegramPanSubscriptionSource, bool) {
+	channel := normalizeTelegramChannel(row.Channel)
+	if channel == "" {
+		return telegramPanSubscriptionSource{}, false
+	}
+	for _, source := range telegramPanSources(cfg) {
+		if channelInList(channel, source.Config.Channels) {
+			return source, true
+		}
+	}
+	return telegramPanSubscriptionSource{}, false
+}
+
+func channelInList(channel string, channels []string) bool {
+	channel = normalizeTelegramChannel(channel)
+	if channel == "" {
+		return false
+	}
+	for _, candidate := range channels {
+		if strings.EqualFold(channel, normalizeTelegramChannel(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
+func subscriptionEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
+	needles := subscriptionMatchNeedles(sub)
+	if len(needles) == 0 {
+		return false
+	}
+	haystacks := []string{
+		normalizeMediaMatchText(entry.Name),
+		normalizeMediaMatchText(entry.Path),
+		normalizeMediaMatchText(fullPath(entry)),
+	}
+	for _, needle := range needles {
+		for _, haystack := range haystacks {
+			if haystack != "" && strings.Contains(haystack, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func subscriptionMatchNeedles(sub *model.Subscription) []string {
+	if sub == nil {
+		return nil
+	}
+	candidates := []string{sub.TMDBName, sub.Name}
+	if sub.TMDBYear > 0 {
+		for _, title := range []string{sub.TMDBName, sub.Name} {
+			if strings.TrimSpace(title) != "" {
+				candidates = append(candidates, fmt.Sprintf("%s %d", title, sub.TMDBYear))
+			}
+		}
+	}
+	seen := map[string]struct{}{}
+	needles := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		needle := normalizeMediaMatchText(candidate)
+		if len([]rune(needle)) < 2 {
+			continue
+		}
+		if _, ok := seen[needle]; ok {
+			continue
+		}
+		seen[needle] = struct{}{}
+		needles = append(needles, needle)
+	}
+	return needles
+}
+
+func normalizeMediaMatchText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	for _, r := range value {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
 }
 
 func runTelegramSearch(ctx context.Context, sub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
@@ -431,7 +640,11 @@ func parseCursor(value string) int64 {
 
 func normalizeTelegramChannel(channel string) string {
 	channel = strings.TrimSpace(channel)
-	return strings.TrimPrefix(channel, "@")
+	channel = strings.TrimPrefix(channel, "https://t.me/")
+	channel = strings.TrimPrefix(channel, "http://t.me/")
+	channel = strings.TrimPrefix(channel, "t.me/")
+	channel = strings.TrimPrefix(channel, "@")
+	return strings.Trim(channel, "/")
 }
 
 func telegramRowsHash(rows []telegramCommandRow) string {

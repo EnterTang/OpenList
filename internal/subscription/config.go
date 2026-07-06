@@ -16,8 +16,6 @@ const ConfigSettingKey = "subscription_config"
 
 func DefaultConfig() model.SubscriptionConfig {
 	return model.SubscriptionConfig{
-		DefaultCheckIntervalMinutes: 60,
-		DefaultMediaType:            "tv",
 		Telegram: model.SubscriptionTelegramSourceConfig{
 			CommandTimeoutSeconds: 30,
 			Limit:                 40,
@@ -76,20 +74,8 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 		return errors.New("subscription is nil")
 	}
 	cfg = normalizeConfig(cfg)
-	if strings.TrimSpace(sub.TargetRoot) == "" && cfg.DefaultTargetRoot != "" {
-		sub.TargetRoot = cfg.DefaultTargetRoot
-	}
 	if sub.CheckIntervalMinutes <= 0 {
-		sub.CheckIntervalMinutes = cfg.DefaultCheckIntervalMinutes
-	}
-	if strings.TrimSpace(sub.MediaType) == "" && cfg.DefaultMediaType != "" {
-		sub.MediaType = cfg.DefaultMediaType
-	}
-	if strings.TrimSpace(sub.Category) == "" && cfg.DefaultCategory != "" {
-		sub.Category = cfg.DefaultCategory
-	}
-	if cfg.DefaultTransferEnabled && !sub.TransferEnabled {
-		sub.TransferEnabled = true
+		sub.CheckIntervalMinutes = 60
 	}
 	sourceType := strings.ToLower(strings.TrimSpace(sub.SourceType))
 	switch sourceType {
@@ -110,15 +96,11 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 }
 
 func normalizeConfig(cfg model.SubscriptionConfig) model.SubscriptionConfig {
-	cfg.DefaultTargetRoot = cleanConfigPath(cfg.DefaultTargetRoot)
-	cfg.DefaultMediaType = strings.ToLower(strings.TrimSpace(cfg.DefaultMediaType))
-	if cfg.DefaultMediaType != "movie" {
-		cfg.DefaultMediaType = "tv"
-	}
-	cfg.DefaultCategory = strings.TrimSpace(cfg.DefaultCategory)
-	if cfg.DefaultCheckIntervalMinutes <= 0 {
-		cfg.DefaultCheckIntervalMinutes = 60
-	}
+	cfg.DefaultTargetRoot = ""
+	cfg.DefaultCheckIntervalMinutes = 0
+	cfg.DefaultMediaType = ""
+	cfg.DefaultCategory = ""
+	cfg.DefaultTransferEnabled = false
 	cfg.Telegram = normalizeTelegramSourceConfig(cfg.Telegram)
 	cfg.PanSou = normalizePanSouSourceConfig(cfg.PanSou)
 	return cfg
@@ -136,6 +118,7 @@ func mergeTelegramSourceConfig(raw string, defaults model.SubscriptionTelegramSo
 	defaults = normalizeTelegramSourceConfig(defaults)
 	cfg := defaults
 	if strings.TrimSpace(raw) != "" {
+		cfg = model.SubscriptionTelegramSourceConfig{}
 		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 			return raw, errors.WithMessage(err, "invalid telegram source config")
 		}
@@ -162,17 +145,41 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	if cfg.SessionFile == "" {
 		cfg.SessionFile = defaults.SessionFile
 	}
-	if len(cfg.QuarkChannels) == 0 {
-		cfg.QuarkChannels = defaults.QuarkChannels
+	if len(cfg.Quark.Channels) == 0 {
+		cfg.Quark.Channels = defaults.Quark.Channels
 	}
-	if len(cfg.AliyunDriveChannels) == 0 {
-		cfg.AliyunDriveChannels = defaults.AliyunDriveChannels
+	if cfg.Quark.TempTransferRoot == "" {
+		cfg.Quark.TempTransferRoot = defaults.Quark.TempTransferRoot
 	}
-	if len(cfg.Pan123Channels) == 0 {
-		cfg.Pan123Channels = defaults.Pan123Channels
+	if !cfg.Quark.DeleteSourceAfter {
+		cfg.Quark.DeleteSourceAfter = defaults.Quark.DeleteSourceAfter
 	}
-	if len(cfg.Pan115Channels) == 0 {
-		cfg.Pan115Channels = defaults.Pan115Channels
+	if len(cfg.AliyunDrive.Channels) == 0 {
+		cfg.AliyunDrive.Channels = defaults.AliyunDrive.Channels
+	}
+	if cfg.AliyunDrive.TempTransferRoot == "" {
+		cfg.AliyunDrive.TempTransferRoot = defaults.AliyunDrive.TempTransferRoot
+	}
+	if !cfg.AliyunDrive.DeleteSourceAfter {
+		cfg.AliyunDrive.DeleteSourceAfter = defaults.AliyunDrive.DeleteSourceAfter
+	}
+	if len(cfg.Pan123.Channels) == 0 {
+		cfg.Pan123.Channels = defaults.Pan123.Channels
+	}
+	if cfg.Pan123.TempTransferRoot == "" {
+		cfg.Pan123.TempTransferRoot = defaults.Pan123.TempTransferRoot
+	}
+	if !cfg.Pan123.DeleteSourceAfter {
+		cfg.Pan123.DeleteSourceAfter = defaults.Pan123.DeleteSourceAfter
+	}
+	if len(cfg.Pan115.Channels) == 0 {
+		cfg.Pan115.Channels = defaults.Pan115.Channels
+	}
+	if cfg.Pan115.TempTransferRoot == "" {
+		cfg.Pan115.TempTransferRoot = defaults.Pan115.TempTransferRoot
+	}
+	if !cfg.Pan115.DeleteSourceAfter {
+		cfg.Pan115.DeleteSourceAfter = defaults.Pan115.DeleteSourceAfter
 	}
 	if len(cfg.Channels) == 0 && !hasTelegramChannelGroups(cfg) {
 		cfg.Channels = defaults.Channels
@@ -192,9 +199,6 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	if cfg.Limit <= 0 {
 		cfg.Limit = defaults.Limit
 	}
-	if cfg.Query == "" {
-		cfg.Query = defaults.Query
-	}
 	return normalizeTelegramSourceConfig(cfg)
 }
 
@@ -202,17 +206,24 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 	cfg.APIHash = strings.TrimSpace(cfg.APIHash)
 	cfg.SessionFile = strings.TrimSpace(cfg.SessionFile)
 	cfg.Channels = cleanStringList(cfg.Channels, false)
-	cfg.QuarkChannels = cleanStringList(cfg.QuarkChannels, false)
-	cfg.AliyunDriveChannels = cleanStringList(cfg.AliyunDriveChannels, false)
-	cfg.Pan123Channels = cleanStringList(cfg.Pan123Channels, false)
-	cfg.Pan115Channels = cleanStringList(cfg.Pan115Channels, false)
+	cfg.Quark.Channels = append(cfg.Quark.Channels, cfg.QuarkChannels...)
+	cfg.AliyunDrive.Channels = append(cfg.AliyunDrive.Channels, cfg.AliyunDriveChannels...)
+	cfg.Pan123.Channels = append(cfg.Pan123.Channels, cfg.Pan123Channels...)
+	cfg.Pan115.Channels = append(cfg.Pan115.Channels, cfg.Pan115Channels...)
+	cfg.Quark = normalizeTelegramPanConfig(cfg.Quark)
+	cfg.AliyunDrive = normalizeTelegramPanConfig(cfg.AliyunDrive)
+	cfg.Pan123 = normalizeTelegramPanConfig(cfg.Pan123)
+	cfg.Pan115 = normalizeTelegramPanConfig(cfg.Pan115)
+	cfg.QuarkChannels = nil
+	cfg.AliyunDriveChannels = nil
+	cfg.Pan123Channels = nil
+	cfg.Pan115Channels = nil
 	if hasTelegramChannelGroups(cfg) {
 		cfg.Channels = telegramChannelGroups(cfg)
 	}
 	cfg.SearchCommand = cleanCommandList(cfg.SearchCommand)
 	cfg.AuthCommand = cleanCommandList(cfg.AuthCommand)
 	cfg.CommandEnv = cleanStringList(cfg.CommandEnv, false)
-	cfg.Query = strings.TrimSpace(cfg.Query)
 	if cfg.CommandTimeoutSeconds <= 0 {
 		cfg.CommandTimeoutSeconds = 30
 	}
@@ -228,32 +239,42 @@ func isZeroTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) bool
 		cfg.APIHash == "" &&
 		cfg.SessionFile == "" &&
 		len(cfg.Channels) == 0 &&
-		len(cfg.QuarkChannels) == 0 &&
-		len(cfg.AliyunDriveChannels) == 0 &&
-		len(cfg.Pan123Channels) == 0 &&
-		len(cfg.Pan115Channels) == 0 &&
+		isZeroTelegramPanConfig(cfg.Quark) &&
+		isZeroTelegramPanConfig(cfg.AliyunDrive) &&
+		isZeroTelegramPanConfig(cfg.Pan123) &&
+		isZeroTelegramPanConfig(cfg.Pan115) &&
 		len(cfg.SearchCommand) == 0 &&
 		len(cfg.AuthCommand) == 0 &&
 		len(cfg.CommandEnv) == 0 &&
 		cfg.CommandTimeoutSeconds == 30 &&
-		cfg.Limit == 40 &&
-		cfg.Query == ""
+		cfg.Limit == 40
 }
 
 func hasTelegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) bool {
-	return len(cfg.QuarkChannels) > 0 ||
-		len(cfg.AliyunDriveChannels) > 0 ||
-		len(cfg.Pan123Channels) > 0 ||
-		len(cfg.Pan115Channels) > 0
+	return len(cfg.Quark.Channels) > 0 ||
+		len(cfg.AliyunDrive.Channels) > 0 ||
+		len(cfg.Pan123.Channels) > 0 ||
+		len(cfg.Pan115.Channels) > 0
 }
 
 func telegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) []string {
 	return cleanStringList(append(append(append(append(
 		[]string{},
-		cfg.QuarkChannels...),
-		cfg.AliyunDriveChannels...),
-		cfg.Pan123Channels...),
-		cfg.Pan115Channels...), false)
+		cfg.Quark.Channels...),
+		cfg.AliyunDrive.Channels...),
+		cfg.Pan123.Channels...),
+		cfg.Pan115.Channels...), false)
+}
+
+func normalizeTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
+	cfg.Channels = cleanStringList(cfg.Channels, false)
+	cfg.TempTransferRoot = cleanConfigPath(cfg.TempTransferRoot)
+	return cfg
+}
+
+func isZeroTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) bool {
+	cfg = normalizeTelegramPanConfig(cfg)
+	return len(cfg.Channels) == 0 && cfg.TempTransferRoot == "" && !cfg.DeleteSourceAfter
 }
 
 func mergePanSouSourceConfig(raw string, defaults model.SubscriptionPanSouSourceConfig) (string, error) {

@@ -153,6 +153,29 @@ func (d *Pan115) Remove(ctx context.Context, obj model.Obj) error {
 	return d.client.Delete(obj.GetID())
 }
 
+func (d *Pan115) ClearRecycleEntry(ctx context.Context, obj model.Obj) error {
+	if obj == nil {
+		return nil
+	}
+	if err := d.WaitLimit(ctx); err != nil {
+		return err
+	}
+	recycled, err := d.client.ListRecycleBin(0, 200)
+	if err != nil {
+		return err
+	}
+	var recycleIDs []string
+	for _, item := range recycled {
+		if item.FileId == obj.GetID() {
+			recycleIDs = append(recycleIDs, item.FileId)
+		}
+	}
+	if len(recycleIDs) == 0 {
+		return nil
+	}
+	return d.client.CleanRecycleBin("", recycleIDs...)
+}
+
 func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err

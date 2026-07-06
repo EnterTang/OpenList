@@ -100,13 +100,7 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 	if len(channels) == 0 {
 		return nil, errors.New("telegram channels are not configured")
 	}
-	query := strings.TrimSpace(cfg.Query)
-	if query == "" && sub != nil {
-		query = strings.TrimSpace(sub.TMDBName)
-	}
-	if query == "" && sub != nil {
-		query = strings.TrimSpace(sub.Name)
-	}
+	query := telegramSearchQuery(sub)
 	if query == "" {
 		return nil, errors.New("telegram search query is required")
 	}

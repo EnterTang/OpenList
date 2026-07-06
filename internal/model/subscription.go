@@ -87,20 +87,29 @@ type SubscriptionManualSourceConfig struct {
 }
 
 type SubscriptionTelegramSourceConfig struct {
-	APIID                 int      `json:"api_id"`
-	APIHash               string   `json:"api_hash"`
-	SessionFile           string   `json:"session_file"`
-	Channels              []string `json:"channels"`
-	QuarkChannels         []string `json:"quark_channels"`
-	AliyunDriveChannels   []string `json:"aliyun_drive_channels"`
-	Pan123Channels        []string `json:"pan123_channels"`
-	Pan115Channels        []string `json:"pan115_channels"`
-	SearchCommand         []string `json:"search_command"`
-	AuthCommand           []string `json:"auth_command"`
-	CommandEnv            []string `json:"command_env"`
-	CommandTimeoutSeconds int64    `json:"command_timeout_seconds"`
-	Limit                 int      `json:"limit"`
-	Query                 string   `json:"query"`
+	APIID                 int                           `json:"api_id"`
+	APIHash               string                        `json:"api_hash"`
+	SessionFile           string                        `json:"session_file"`
+	Channels              []string                      `json:"channels"`
+	QuarkChannels         []string                      `json:"quark_channels,omitempty"`
+	AliyunDriveChannels   []string                      `json:"aliyun_drive_channels,omitempty"`
+	Pan123Channels        []string                      `json:"pan123_channels,omitempty"`
+	Pan115Channels        []string                      `json:"pan115_channels,omitempty"`
+	Quark                 SubscriptionTelegramPanConfig `json:"quark"`
+	AliyunDrive           SubscriptionTelegramPanConfig `json:"aliyun_drive"`
+	Pan123                SubscriptionTelegramPanConfig `json:"pan123"`
+	Pan115                SubscriptionTelegramPanConfig `json:"pan115"`
+	SearchCommand         []string                      `json:"search_command"`
+	AuthCommand           []string                      `json:"auth_command"`
+	CommandEnv            []string                      `json:"command_env"`
+	CommandTimeoutSeconds int64                         `json:"command_timeout_seconds"`
+	Limit                 int                           `json:"limit"`
+}
+
+type SubscriptionTelegramPanConfig struct {
+	Channels          []string `json:"channels"`
+	TempTransferRoot  string   `json:"temp_transfer_root"`
+	DeleteSourceAfter bool     `json:"delete_source_after"`
 }
 
 type SubscriptionPanSouSourceConfig struct {
@@ -113,11 +122,11 @@ type SubscriptionPanSouSourceConfig struct {
 }
 
 type SubscriptionConfig struct {
-	DefaultTargetRoot           string                           `json:"default_target_root"`
-	DefaultCheckIntervalMinutes int                              `json:"default_check_interval_minutes"`
-	DefaultTransferEnabled      bool                             `json:"default_transfer_enabled"`
-	DefaultMediaType            string                           `json:"default_media_type"`
-	DefaultCategory             string                           `json:"default_category"`
+	DefaultTargetRoot           string                           `json:"default_target_root,omitempty"`
+	DefaultCheckIntervalMinutes int                              `json:"default_check_interval_minutes,omitempty"`
+	DefaultTransferEnabled      bool                             `json:"default_transfer_enabled,omitempty"`
+	DefaultMediaType            string                           `json:"default_media_type,omitempty"`
+	DefaultCategory             string                           `json:"default_category,omitempty"`
 	Telegram                    SubscriptionTelegramSourceConfig `json:"telegram"`
 	PanSou                      SubscriptionPanSouSourceConfig   `json:"pansou"`
 }

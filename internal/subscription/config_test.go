@@ -29,8 +29,14 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 	if err := ApplyConfigDefaults(sub, cfg); err != nil {
 		t.Fatalf("apply defaults: %v", err)
 	}
-	if sub.TargetRoot != "/media" || sub.CheckIntervalMinutes != 120 || sub.Category != "欧美剧" {
-		t.Fatalf("subscription defaults were not applied: %#v", sub)
+	if sub.TargetRoot != "" || sub.Category != "" {
+		t.Fatalf("removed default behavior fields were applied: %#v", sub)
+	}
+	if sub.CheckIntervalMinutes != 60 {
+		t.Fatalf("check interval = %d, want internal fallback 60", sub.CheckIntervalMinutes)
+	}
+	if sub.MediaType != "" {
+		t.Fatalf("media type default was applied: %q", sub.MediaType)
 	}
 
 	var source model.SubscriptionTelegramSourceConfig
@@ -55,11 +61,23 @@ func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	}
 	cfg := model.SubscriptionConfig{
 		Telegram: model.SubscriptionTelegramSourceConfig{
-			Channels:            []string{"@legacy-default"},
-			QuarkChannels:       []string{"@default-quark"},
-			AliyunDriveChannels: []string{"@default-aliyun"},
-			Pan123Channels:      []string{"@default-123"},
-			Pan115Channels:      []string{"@default-115"},
+			Channels: []string{"@legacy-default"},
+			Quark: model.SubscriptionTelegramPanConfig{
+				Channels:         []string{"@default-quark"},
+				TempTransferRoot: "/temp/quark",
+			},
+			AliyunDrive: model.SubscriptionTelegramPanConfig{
+				Channels:         []string{"@default-aliyun"},
+				TempTransferRoot: "/temp/aliyun",
+			},
+			Pan123: model.SubscriptionTelegramPanConfig{
+				Channels:          []string{"@default-123"},
+				TempTransferRoot:  "/temp/123",
+				DeleteSourceAfter: true,
+			},
+			Pan115: model.SubscriptionTelegramPanConfig{
+				Channels: []string{"@default-115"},
+			},
 		},
 	}
 
@@ -71,20 +89,45 @@ func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	if err := json.Unmarshal([]byte(sub.SourceConfig), &source); err != nil {
 		t.Fatalf("decode merged source config: %v", err)
 	}
-	if got, want := source.QuarkChannels, []string{"@sub-quark"}; !stringSlicesEqual(got, want) {
+	if got, want := source.Quark.Channels, []string{"@sub-quark"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("quark channel override = %#v, want %#v", got, want)
 	}
-	if got, want := source.AliyunDriveChannels, []string{"@default-aliyun"}; !stringSlicesEqual(got, want) {
+	if source.Quark.TempTransferRoot != "/temp/quark" {
+		t.Fatalf("quark temp root = %q, want /temp/quark", source.Quark.TempTransferRoot)
+	}
+	if got, want := source.AliyunDrive.Channels, []string{"@default-aliyun"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("aliyun channels = %#v, want %#v", got, want)
 	}
-	if got, want := source.Pan123Channels, []string{"@default-123"}; !stringSlicesEqual(got, want) {
+	if source.AliyunDrive.TempTransferRoot != "/temp/aliyun" {
+		t.Fatalf("aliyun temp root = %q, want /temp/aliyun", source.AliyunDrive.TempTransferRoot)
+	}
+	if got, want := source.Pan123.Channels, []string{"@default-123"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("123 channels = %#v, want %#v", got, want)
 	}
-	if got, want := source.Pan115Channels, []string{"@default-115"}; !stringSlicesEqual(got, want) {
+	if source.Pan123.TempTransferRoot != "/temp/123" || !source.Pan123.DeleteSourceAfter {
+		t.Fatalf("123 config = %#v, want temp root and cleanup switch", source.Pan123)
+	}
+	if got, want := source.Pan115.Channels, []string{"@default-115"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("115 channels = %#v, want %#v", got, want)
+	}
+	if len(source.QuarkChannels) != 0 || len(source.AliyunDriveChannels) != 0 || len(source.Pan123Channels) != 0 || len(source.Pan115Channels) != 0 {
+		t.Fatalf("legacy channel fields should not be re-emitted: %#v", source)
 	}
 	if got, want := source.Channels, []string{"@sub-quark", "@default-aliyun", "@default-123", "@default-115"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("runtime channels = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeConfigRemovesDefaultBehaviorFields(t *testing.T) {
+	cfg := normalizeConfig(model.SubscriptionConfig{
+		DefaultTargetRoot:           "/media",
+		DefaultCheckIntervalMinutes: 120,
+		DefaultTransferEnabled:      true,
+		DefaultMediaType:            "movie",
+		DefaultCategory:             "电影",
+	})
+	if cfg.DefaultTargetRoot != "" || cfg.DefaultCheckIntervalMinutes != 0 || cfg.DefaultTransferEnabled || cfg.DefaultMediaType != "" || cfg.DefaultCategory != "" {
+		t.Fatalf("default behavior fields were not removed: %#v", cfg)
 	}
 }
 

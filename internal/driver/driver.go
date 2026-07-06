@@ -76,6 +76,10 @@ type Remove interface {
 	Remove(ctx context.Context, obj model.Obj) error
 }
 
+type RecycleEntryCleaner interface {
+	ClearRecycleEntry(ctx context.Context, obj model.Obj) error
+}
+
 type Put interface {
 	// Put a file (provided as a FileStreamer) into the driver
 	// Besides the most basic upload functionality, the following features also need to be implemented:

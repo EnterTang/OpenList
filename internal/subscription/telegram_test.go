@@ -116,3 +116,76 @@ func TestRunTelegramSearchUsesBuiltinWhenAPIConfigPresentWithoutCommand(t *testi
 		t.Fatalf("rows = %#v", rows)
 	}
 }
+
+func TestTelegramSearchQueryUsesSubscriptionNames(t *testing.T) {
+	if got := telegramSearchQuery(&model.Subscription{TMDBName: " 三体 ", Name: "fallback"}); got != "三体" {
+		t.Fatalf("query = %q, want 三体", got)
+	}
+	if got := telegramSearchQuery(&model.Subscription{Name: " 流浪地球 "}); got != "流浪地球" {
+		t.Fatalf("query = %q, want 流浪地球", got)
+	}
+	if got := telegramSearchQuery(nil); got != "" {
+		t.Fatalf("nil query = %q, want empty", got)
+	}
+}
+
+func TestTelegramPanSourceForRowUsesNestedPanConfig(t *testing.T) {
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Quark: model.SubscriptionTelegramPanConfig{
+			Channels:         []string{"@quark_new"},
+			TempTransferRoot: "/temp/quark",
+		},
+		Pan115: model.SubscriptionTelegramPanConfig{
+			Channels:          []string{"115Channel"},
+			TempTransferRoot:  "/temp/115",
+			DeleteSourceAfter: true,
+		},
+	})
+
+	source, ok := telegramPanSourceForRow(telegramCommandRow{Channel: "https://t.me/quark_new"}, cfg)
+	if !ok {
+		t.Fatal("quark source not matched")
+	}
+	if source.Name != "quark" || source.Config.TempTransferRoot != "/temp/quark" {
+		t.Fatalf("source = %#v, want quark temp config", source)
+	}
+	source, ok = telegramPanSourceForRow(telegramCommandRow{Channel: "@115Channel"}, cfg)
+	if !ok {
+		t.Fatal("115 source not matched")
+	}
+	if source.Name != "pan115" || !source.Config.DeleteSourceAfter {
+		t.Fatalf("source = %#v, want pan115 cleanup config", source)
+	}
+	if _, ok := telegramPanSourceForRow(telegramCommandRow{Channel: "@other"}, cfg); ok {
+		t.Fatal("unexpected source match")
+	}
+}
+
+func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
+	sub := &model.Subscription{
+		Name:     "Fallback Title",
+		TMDBName: "三体",
+		TMDBYear: 2023,
+	}
+	if !subscriptionEntryMatches(sub, TreeEntry{
+		RootPath: "/quark/temp",
+		Path:     "/剧集/三体.2023.S01E01.mkv",
+		Name:     "三体.2023.S01E01.mkv",
+	}) {
+		t.Fatal("expected Chinese title match")
+	}
+	if !subscriptionEntryMatches(&model.Subscription{Name: "The Long Season"}, TreeEntry{
+		RootPath: "/quark/temp",
+		Path:     "/The.Long.Season.S01E01.mkv",
+		Name:     "The.Long.Season.S01E01.mkv",
+	}) {
+		t.Fatal("expected punctuation-normalized title match")
+	}
+	if subscriptionEntryMatches(sub, TreeEntry{
+		RootPath: "/quark/temp",
+		Path:     "/别的剧/S01E01.mkv",
+		Name:     "S01E01.mkv",
+	}) {
+		t.Fatal("unexpected unrelated title match")
+	}
+}

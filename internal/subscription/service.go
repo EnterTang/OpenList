@@ -12,9 +12,11 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/pkg/errors"
 )
@@ -238,6 +240,28 @@ func transferItem(ctx context.Context, item *model.SubscriptionItem) error {
 		if err := fs.Rename(syncCtx, copiedPath, item.TargetName, true); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func cleanupSourceAfterTransfer(ctx context.Context, sourcePath string) error {
+	storage, actualPath, err := op.GetStorageAndActualPath(sourcePath)
+	if err != nil {
+		return errors.WithMessage(err, "failed get source storage")
+	}
+	sourceObj, err := op.Get(ctx, storage, actualPath, true)
+	if err != nil {
+		if errs.IsObjectNotFound(err) {
+			return nil
+		}
+		return errors.WithMessage(err, "failed get source object")
+	}
+	sourceObj = model.UnwrapObjName(sourceObj)
+	if err := op.Remove(ctx, storage, actualPath); err != nil {
+		return err
+	}
+	if cleaner, ok := storage.(driver.RecycleEntryCleaner); ok {
+		return cleaner.ClearRecycleEntry(ctx, sourceObj)
 	}
 	return nil
 }
