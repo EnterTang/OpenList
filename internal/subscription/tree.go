@@ -38,6 +38,8 @@ type TreeSnapshot struct {
 	Hash    string      `json:"hash"`
 }
 
+var snapshotPaths = SnapshotPaths
+
 func SnapshotPaths(ctx context.Context, roots []string) (*TreeSnapshot, error) {
 	var entries []TreeEntry
 	for _, root := range roots {

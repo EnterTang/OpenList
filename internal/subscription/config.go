@@ -145,42 +145,10 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	if cfg.SessionFile == "" {
 		cfg.SessionFile = defaults.SessionFile
 	}
-	if len(cfg.Quark.Channels) == 0 {
-		cfg.Quark.Channels = defaults.Quark.Channels
-	}
-	if cfg.Quark.TempTransferRoot == "" {
-		cfg.Quark.TempTransferRoot = defaults.Quark.TempTransferRoot
-	}
-	if !cfg.Quark.DeleteSourceAfter {
-		cfg.Quark.DeleteSourceAfter = defaults.Quark.DeleteSourceAfter
-	}
-	if len(cfg.AliyunDrive.Channels) == 0 {
-		cfg.AliyunDrive.Channels = defaults.AliyunDrive.Channels
-	}
-	if cfg.AliyunDrive.TempTransferRoot == "" {
-		cfg.AliyunDrive.TempTransferRoot = defaults.AliyunDrive.TempTransferRoot
-	}
-	if !cfg.AliyunDrive.DeleteSourceAfter {
-		cfg.AliyunDrive.DeleteSourceAfter = defaults.AliyunDrive.DeleteSourceAfter
-	}
-	if len(cfg.Pan123.Channels) == 0 {
-		cfg.Pan123.Channels = defaults.Pan123.Channels
-	}
-	if cfg.Pan123.TempTransferRoot == "" {
-		cfg.Pan123.TempTransferRoot = defaults.Pan123.TempTransferRoot
-	}
-	if !cfg.Pan123.DeleteSourceAfter {
-		cfg.Pan123.DeleteSourceAfter = defaults.Pan123.DeleteSourceAfter
-	}
-	if len(cfg.Pan115.Channels) == 0 {
-		cfg.Pan115.Channels = defaults.Pan115.Channels
-	}
-	if cfg.Pan115.TempTransferRoot == "" {
-		cfg.Pan115.TempTransferRoot = defaults.Pan115.TempTransferRoot
-	}
-	if !cfg.Pan115.DeleteSourceAfter {
-		cfg.Pan115.DeleteSourceAfter = defaults.Pan115.DeleteSourceAfter
-	}
+	cfg.Quark = fillTelegramPanConfig(cfg.Quark, defaults.Quark)
+	cfg.AliyunDrive = fillTelegramPanConfig(cfg.AliyunDrive, defaults.AliyunDrive)
+	cfg.Pan123 = fillTelegramPanConfig(cfg.Pan123, defaults.Pan123)
+	cfg.Pan115 = fillTelegramPanConfig(cfg.Pan115, defaults.Pan115)
 	if len(cfg.Channels) == 0 && !hasTelegramChannelGroups(cfg) {
 		cfg.Channels = defaults.Channels
 	}
@@ -269,12 +237,54 @@ func telegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) []string 
 func normalizeTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
 	cfg.Channels = cleanStringList(cfg.Channels, false)
 	cfg.TempTransferRoot = cleanConfigPath(cfg.TempTransferRoot)
+	cfg.Cookie = strings.TrimSpace(cfg.Cookie)
+	cfg.RefreshToken = strings.TrimSpace(cfg.RefreshToken)
+	cfg.AccessToken = strings.TrimSpace(cfg.AccessToken)
+	cfg.DriveID = strings.TrimSpace(cfg.DriveID)
+	cfg.DriveType = strings.ToLower(strings.TrimSpace(cfg.DriveType))
 	return cfg
+}
+
+func fillTelegramPanConfig(cfg, defaults model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
+	cfg = normalizeTelegramPanConfig(cfg)
+	defaults = normalizeTelegramPanConfig(defaults)
+	if len(cfg.Channels) == 0 {
+		cfg.Channels = defaults.Channels
+	}
+	if cfg.TempTransferRoot == "" {
+		cfg.TempTransferRoot = defaults.TempTransferRoot
+	}
+	if !cfg.DeleteSourceAfter {
+		cfg.DeleteSourceAfter = defaults.DeleteSourceAfter
+	}
+	if cfg.Cookie == "" {
+		cfg.Cookie = defaults.Cookie
+	}
+	if cfg.RefreshToken == "" {
+		cfg.RefreshToken = defaults.RefreshToken
+	}
+	if cfg.AccessToken == "" {
+		cfg.AccessToken = defaults.AccessToken
+	}
+	if cfg.DriveID == "" {
+		cfg.DriveID = defaults.DriveID
+	}
+	if cfg.DriveType == "" {
+		cfg.DriveType = defaults.DriveType
+	}
+	return normalizeTelegramPanConfig(cfg)
 }
 
 func isZeroTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) bool {
 	cfg = normalizeTelegramPanConfig(cfg)
-	return len(cfg.Channels) == 0 && cfg.TempTransferRoot == "" && !cfg.DeleteSourceAfter
+	return len(cfg.Channels) == 0 &&
+		cfg.TempTransferRoot == "" &&
+		!cfg.DeleteSourceAfter &&
+		cfg.Cookie == "" &&
+		cfg.RefreshToken == "" &&
+		cfg.AccessToken == "" &&
+		cfg.DriveID == "" &&
+		cfg.DriveType == ""
 }
 
 func mergePanSouSourceConfig(raw string, defaults model.SubscriptionPanSouSourceConfig) (string, error) {

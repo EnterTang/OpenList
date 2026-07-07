@@ -78,6 +78,13 @@ type telegramPanSubscriptionSource struct {
 	Config model.SubscriptionTelegramPanConfig
 }
 
+var telegramPanSourceHosts = map[string][]string{
+	"quark":        {"pan.quark.cn"},
+	"aliyun_drive": {"alipan.com", "aliyundrive.com"},
+	"pan123":       {"123pan.com"},
+	"pan115":       {"115cdn.com", "115.com"},
+}
+
 func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
 	cfg, err := parseTelegramConfig(sub.SourceConfig)
 	if err != nil {
@@ -105,11 +112,28 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 				nextCursor = msgID
 			}
 		}
-		if source, ok := telegramPanSourceForRow(row, cfg); ok {
+		links, sources := rowLinksForTelegramPanSources(row, cfg)
+		for _, source := range sources {
 			triggeredSources[source.Name] = source
 		}
-		for _, link := range rowLinks(row) {
+		accessCode := rowAccessCode(row)
+		for _, link := range links {
+			var saveErr error
+			if len(sources) > 0 {
+				var source telegramPanSubscriptionSource
+				var handled bool
+				source, handled, saveErr = trySaveShareLinkToTemp(ctx, sub, cfg, normalizeTelegramLinkWithAccessCode(link, accessCode))
+				if source.Name != "" {
+					triggeredSources[source.Name] = source
+				}
+				if handled {
+					continue
+				}
+			}
 			item := telegramLinkItem(sub, row, link, now)
+			if saveErr != nil {
+				item.LastError = "telegram share URL transfer failed: " + saveErr.Error()
+			}
 			stored, isNew, err := db.UpsertSubscriptionItem(item)
 			if err != nil {
 				return saved, sub.LastTreeHash, added, changed, transferred, err
@@ -232,7 +256,7 @@ func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sour
 		if root == "" {
 			continue
 		}
-		snapshot, err := SnapshotPaths(ctx, []string{root})
+		snapshot, err := snapshotPaths(ctx, []string{root})
 		if err != nil {
 			return saved, "", added, changed, transferred, err
 		}
@@ -312,16 +336,25 @@ func telegramPanSources(cfg model.SubscriptionTelegramSourceConfig) []telegramPa
 }
 
 func telegramPanSourceForRow(row telegramCommandRow, cfg model.SubscriptionTelegramSourceConfig) (telegramPanSubscriptionSource, bool) {
-	channel := normalizeTelegramChannel(row.Channel)
-	if channel == "" {
+	sources := telegramPanSourcesForRow(row, cfg)
+	if len(sources) == 0 {
 		return telegramPanSubscriptionSource{}, false
 	}
+	return sources[0], true
+}
+
+func telegramPanSourcesForRow(row telegramCommandRow, cfg model.SubscriptionTelegramSourceConfig) []telegramPanSubscriptionSource {
+	channel := normalizeTelegramChannel(row.Channel)
+	if channel == "" {
+		return nil
+	}
+	var matched []telegramPanSubscriptionSource
 	for _, source := range telegramPanSources(cfg) {
 		if channelInList(channel, source.Config.Channels) {
-			return source, true
+			matched = append(matched, source)
 		}
 	}
-	return telegramPanSubscriptionSource{}, false
+	return matched
 }
 
 func channelInList(channel string, channels []string) bool {
@@ -589,6 +622,57 @@ func rowLinks(row telegramCommandRow) []string {
 		appendLink(match)
 	}
 	return links
+}
+
+func rowLinksForTelegramPanSources(row telegramCommandRow, cfg model.SubscriptionTelegramSourceConfig) ([]string, []telegramPanSubscriptionSource) {
+	links := rowLinks(row)
+	sources := telegramPanSourcesForRow(row, cfg)
+	if len(sources) == 0 {
+		return links, nil
+	}
+	var filtered []string
+	triggered := make([]telegramPanSubscriptionSource, 0, len(sources))
+	triggeredNames := map[string]struct{}{}
+	for _, link := range links {
+		for _, source := range sources {
+			if telegramPanSourceAcceptsLink(source.Name, link) {
+				filtered = append(filtered, link)
+				if _, ok := triggeredNames[source.Name]; !ok {
+					triggeredNames[source.Name] = struct{}{}
+					triggered = append(triggered, source)
+				}
+				break
+			}
+		}
+	}
+	return filtered, triggered
+}
+
+func telegramPanSourceAcceptsLink(sourceName, link string) bool {
+	hosts := telegramPanSourceHosts[sourceName]
+	if len(hosts) == 0 {
+		return true
+	}
+	parsed, err := url.Parse(link)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	for _, allowed := range hosts {
+		if hostMatchesDomain(host, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func hostMatchesDomain(host, domain string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if host == "" || domain == "" {
+		return false
+	}
+	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
 func rowText(row telegramCommandRow) string {

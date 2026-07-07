@@ -118,6 +118,70 @@ func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	}
 }
 
+func TestApplyConfigDefaultsMergesTelegramProviderCredentials(t *testing.T) {
+	sub := &model.Subscription{
+		SourceType: model.SubscriptionSourceTelegram,
+		SourceConfig: `{
+			"quark":{"channels":["@sub-quark"],"cookie":" sub-cookie "},
+			"aliyun_drive":{"channels":["@sub-aliyun"]},
+			"pan123":{"channels":["@sub-123"],"access_token":" sub-access "},
+			"pan115":{"channels":["@sub-115"]}
+		}`,
+	}
+	cfg := model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Quark: model.SubscriptionTelegramPanConfig{
+				Channels:     []string{"@default-quark"},
+				Cookie:       " default-quark-cookie ",
+				RefreshToken: " default-quark-refresh ",
+			},
+			AliyunDrive: model.SubscriptionTelegramPanConfig{
+				Channels:     []string{"@default-aliyun"},
+				RefreshToken: " default-aliyun-refresh ",
+				DriveID:      " default-drive ",
+			},
+			Pan123: model.SubscriptionTelegramPanConfig{
+				Channels:    []string{"@default-123"},
+				AccessToken: " default-123-access ",
+			},
+			Pan115: model.SubscriptionTelegramPanConfig{
+				Channels: []string{"@default-115"},
+				Cookie:   " default-115-cookie ",
+			},
+		},
+	}
+
+	if err := ApplyConfigDefaults(sub, cfg); err != nil {
+		t.Fatalf("apply defaults: %v", err)
+	}
+
+	var source model.SubscriptionTelegramSourceConfig
+	if err := json.Unmarshal([]byte(sub.SourceConfig), &source); err != nil {
+		t.Fatalf("decode merged source config: %v", err)
+	}
+	if source.Quark.Cookie != "sub-cookie" {
+		t.Fatalf("quark cookie = %q, want subscription override", source.Quark.Cookie)
+	}
+	if source.Quark.RefreshToken != "default-quark-refresh" {
+		t.Fatalf("quark refresh token = %q, want default", source.Quark.RefreshToken)
+	}
+	if source.AliyunDrive.RefreshToken != "default-aliyun-refresh" {
+		t.Fatalf("aliyun refresh token = %q, want default", source.AliyunDrive.RefreshToken)
+	}
+	if source.AliyunDrive.DriveID != "default-drive" {
+		t.Fatalf("aliyun drive id = %q, want default", source.AliyunDrive.DriveID)
+	}
+	if source.Pan123.AccessToken != "sub-access" {
+		t.Fatalf("123 access token = %q, want subscription override", source.Pan123.AccessToken)
+	}
+	if source.Pan115.Cookie != "default-115-cookie" {
+		t.Fatalf("115 cookie = %q, want default", source.Pan115.Cookie)
+	}
+	if got, want := source.Channels, []string{"@sub-quark", "@sub-aliyun", "@sub-123", "@sub-115"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("runtime channels = %#v, want %#v", got, want)
+	}
+}
+
 func TestNormalizeConfigRemovesDefaultBehaviorFields(t *testing.T) {
 	cfg := normalizeConfig(model.SubscriptionConfig{
 		DefaultTargetRoot:           "/media",

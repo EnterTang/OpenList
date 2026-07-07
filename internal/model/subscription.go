@@ -110,6 +110,11 @@ type SubscriptionTelegramPanConfig struct {
 	Channels          []string `json:"channels"`
 	TempTransferRoot  string   `json:"temp_transfer_root"`
 	DeleteSourceAfter bool     `json:"delete_source_after"`
+	Cookie            string   `json:"cookie,omitempty"`
+	RefreshToken      string   `json:"refresh_token,omitempty"`
+	AccessToken       string   `json:"access_token,omitempty"`
+	DriveID           string   `json:"drive_id,omitempty"`
+	DriveType         string   `json:"drive_type,omitempty"`
 }
 
 type SubscriptionPanSouSourceConfig struct {

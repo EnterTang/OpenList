@@ -100,9 +100,31 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	added := 0
 	changed := 0
 	transferred := 0
+	snapshotRoots := append([]string(nil), cfg.Paths...)
+	tempRootConfigs := map[string]model.SubscriptionTelegramPanConfig{}
+	var shareCfg model.SubscriptionTelegramSourceConfig
+	if len(cfg.Links) > 0 {
+		globalCfg, err := GetConfig()
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		shareCfg = globalCfg.Telegram
+	}
 
 	for _, link := range cfg.Links {
+		source, handled, saveErr := trySaveShareLinkToTemp(ctx, sub, shareCfg, link)
+		if source.Name != "" && handled {
+			root := strings.TrimSpace(source.Config.TempTransferRoot)
+			if root != "" {
+				snapshotRoots = appendPathOnce(snapshotRoots, root)
+				tempRootConfigs[root] = source.Config
+			}
+			continue
+		}
 		item := manualLinkItem(sub, link, now)
+		if saveErr != nil {
+			item.LastError = "share URL transfer failed: " + saveErr.Error()
+		}
 		stored, isNew, err := db.UpsertSubscriptionItem(item)
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, transferred, err
@@ -113,7 +135,7 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		saved = append(saved, *stored)
 	}
 
-	snapshot, err := SnapshotPaths(ctx, cfg.Paths)
+	snapshot, err := snapshotPaths(ctx, snapshotRoots)
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
@@ -136,6 +158,11 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 				stored.Status = model.SubscriptionItemStatusTransferred
 				stored.LastError = ""
 				transferred++
+				if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok && sourceCfg.DeleteSourceAfter {
+					if err := cleanupSourceAfterTransfer(ctx, stored.SourcePath); err != nil {
+						stored.LastError = "source cleanup failed after transfer: " + err.Error()
+					}
+				}
 			}
 			_, _, err = db.UpsertSubscriptionItem(stored)
 			if err != nil {
@@ -182,6 +209,19 @@ func cleanStringList(values []string, fixPath bool) []string {
 		cleaned = append(cleaned, value)
 	}
 	return cleaned
+}
+
+func appendPathOnce(paths []string, path string) []string {
+	path = cleanConfigPath(path)
+	if path == "" {
+		return paths
+	}
+	for _, existing := range paths {
+		if cleanConfigPath(existing) == path {
+			return paths
+		}
+	}
+	return append(paths, path)
 }
 
 func manualLinkItem(sub *model.Subscription, link string, seenAt time.Time) *model.SubscriptionItem {

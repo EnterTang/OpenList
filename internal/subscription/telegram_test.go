@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,6 +162,61 @@ func TestTelegramPanSourceForRowUsesNestedPanConfig(t *testing.T) {
 	}
 }
 
+func TestRowLinksForTelegramPanSourcesFiltersProviderDomains(t *testing.T) {
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Quark: model.SubscriptionTelegramPanConfig{Channels: []string{"@mixed"}},
+	})
+	row := telegramCommandRow{
+		Channel: "@mixed",
+		Text: strings.Join([]string{
+			"https://pan.quark.cn/s/bc18e4ea5fb8",
+			"https://www.alipan.com/s/odeXVKsEKxr",
+			"https://www.123pan.com/s/7Tx1jv-pVu7v?pwd=xoxo#",
+			"https://115cdn.com/s/swssal13zrk?password=t58d",
+		}, " "),
+	}
+
+	links, sources := rowLinksForTelegramPanSources(row, cfg)
+	if got, want := providerSourceNames(sources), []string{"quark"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("sources = %#v, want %#v", got, want)
+	}
+	if got, want := links, []string{"https://pan.quark.cn/s/bc18e4ea5fb8"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("links = %#v, want %#v", got, want)
+	}
+}
+
+func TestRowLinksForTelegramPanSourcesAllowsSharedMixedChannel(t *testing.T) {
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Quark:       model.SubscriptionTelegramPanConfig{Channels: []string{"@mixed"}},
+		AliyunDrive: model.SubscriptionTelegramPanConfig{Channels: []string{"@mixed"}},
+		Pan123:      model.SubscriptionTelegramPanConfig{Channels: []string{"@mixed"}},
+		Pan115:      model.SubscriptionTelegramPanConfig{Channels: []string{"@mixed"}},
+	})
+	row := telegramCommandRow{
+		Channel: "@mixed",
+		Text: strings.Join([]string{
+			"https://pan.quark.cn/s/bc18e4ea5fb8",
+			"https://www.alipan.com/s/odeXVKsEKxr",
+			"https://www.123pan.com/s/7Tx1jv-pVu7v?pwd=xoxo#",
+			"https://115cdn.com/s/swssal13zrk?password=t58d",
+			"https://example.com/not-a-pan-link",
+		}, " "),
+	}
+
+	links, sources := rowLinksForTelegramPanSources(row, cfg)
+	if got, want := providerSourceNames(sources), []string{"quark", "aliyun_drive", "pan123", "pan115"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("sources = %#v, want %#v", got, want)
+	}
+	if got, want := links, []string{
+		"https://pan.quark.cn/s/bc18e4ea5fb8",
+		"https://www.alipan.com/s/odeXVKsEKxr",
+		"https://www.123pan.com/s/7Tx1jv-pVu7v?pwd=xoxo#",
+		"https://115cdn.com/s/swssal13zrk?password=t58d",
+	}; !stringSlicesEqual(got, want) {
+		t.Fatalf("links = %#v, want %#v", got, want)
+	}
+}
+
 func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
 	sub := &model.Subscription{
 		Name:     "Fallback Title",
@@ -188,4 +244,12 @@ func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
 	}) {
 		t.Fatal("unexpected unrelated title match")
 	}
+}
+
+func providerSourceNames(sources []telegramPanSubscriptionSource) []string {
+	names := make([]string, 0, len(sources))
+	for _, source := range sources {
+		names = append(names, source.Name)
+	}
+	return names
 }
