@@ -19,6 +19,12 @@ type listSubscriptionsReq struct {
 	Active     string `form:"active" json:"active"`
 }
 
+type listSubscriptionRunsReq struct {
+	model.PageReq
+	SubscriptionID uint   `form:"subscription_id" json:"subscription_id"`
+	Status         string `form:"status" json:"status"`
+}
+
 func ListSubscriptions(c *gin.Context) {
 	var req listSubscriptionsReq
 	if err := c.ShouldBind(&req); err != nil {
@@ -81,10 +87,6 @@ func CreateSubscription(c *gin.Context) {
 	normalizeSubscription(&req)
 	if req.Name == "" {
 		common.ErrorStrResp(c, "name is required", 400)
-		return
-	}
-	if req.TargetRoot == "" {
-		common.ErrorStrResp(c, "target_root is required", 400)
 		return
 	}
 	if req.TMDBName == "" {
@@ -169,6 +171,40 @@ func CheckSubscription(c *gin.Context) {
 	result, err := subscription.Run(c.Request.Context(), req.ID, req.Transfer)
 	if err != nil {
 		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
+func ListSubscriptionRuns(c *gin.Context) {
+	var req listSubscriptionRunsReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	req.Validate()
+	items, total, err := db.ListSubscriptionRuns(db.SubscriptionRunFilter{
+		SubscriptionID: req.SubscriptionID,
+		Status:         strings.TrimSpace(req.Status),
+		Page:           req.Page,
+		PerPage:        req.PerPage,
+	})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, common.PageResp{Content: items, Total: total})
+}
+
+func SearchSubscriptionResources(c *gin.Context) {
+	var req model.SubscriptionResourceSearchReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	result, err := subscription.SearchResources(c.Request.Context(), req)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
 		return
 	}
 	common.SuccessResp(c, result)

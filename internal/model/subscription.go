@@ -136,6 +136,35 @@ type SubscriptionConfig struct {
 	PanSou                      SubscriptionPanSouSourceConfig   `json:"pansou"`
 }
 
+type SubscriptionResourceSearchReq struct {
+	Query   string   `json:"query" form:"query"`
+	Sources []string `json:"sources" form:"sources"`
+	Limit   int      `json:"limit" form:"limit"`
+}
+
+type SubscriptionResourceSearchResp struct {
+	Query        string                             `json:"query"`
+	Sources      []string                           `json:"sources"`
+	Results      []SubscriptionResourceSearchResult `json:"results"`
+	SourceErrors map[string]string                  `json:"source_errors,omitempty"`
+}
+
+type SubscriptionResourceSearchResult struct {
+	SourceType string                           `json:"source_type"`
+	Provider   string                           `json:"provider,omitempty"`
+	Title      string                           `json:"title"`
+	Content    string                           `json:"content,omitempty"`
+	Channel    string                           `json:"channel,omitempty"`
+	MessageURL string                           `json:"message_url,omitempty"`
+	Date       string                           `json:"date,omitempty"`
+	Links      []SubscriptionResourceSearchLink `json:"links,omitempty"`
+}
+
+type SubscriptionResourceSearchLink struct {
+	URL      string `json:"url"`
+	Provider string `json:"provider,omitempty"`
+}
+
 type SubscriptionPreviewReq struct {
 	ID uint `json:"id" binding:"required"`
 }

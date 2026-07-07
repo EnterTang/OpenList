@@ -29,8 +29,11 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 	if err := ApplyConfigDefaults(sub, cfg); err != nil {
 		t.Fatalf("apply defaults: %v", err)
 	}
-	if sub.TargetRoot != "" || sub.Category != "" {
-		t.Fatalf("removed default behavior fields were applied: %#v", sub)
+	if sub.TargetRoot != "/media" {
+		t.Fatalf("target root = %q, want /media", sub.TargetRoot)
+	}
+	if sub.Category != "" {
+		t.Fatalf("removed default category was applied: %#v", sub)
 	}
 	if sub.CheckIntervalMinutes != 60 {
 		t.Fatalf("check interval = %d, want internal fallback 60", sub.CheckIntervalMinutes)
@@ -182,7 +185,7 @@ func TestApplyConfigDefaultsMergesTelegramProviderCredentials(t *testing.T) {
 	}
 }
 
-func TestNormalizeConfigRemovesDefaultBehaviorFields(t *testing.T) {
+func TestNormalizeConfigPreservesDefaultTargetRootOnly(t *testing.T) {
 	cfg := normalizeConfig(model.SubscriptionConfig{
 		DefaultTargetRoot:           "/media",
 		DefaultCheckIntervalMinutes: 120,
@@ -190,8 +193,11 @@ func TestNormalizeConfigRemovesDefaultBehaviorFields(t *testing.T) {
 		DefaultMediaType:            "movie",
 		DefaultCategory:             "电影",
 	})
-	if cfg.DefaultTargetRoot != "" || cfg.DefaultCheckIntervalMinutes != 0 || cfg.DefaultTransferEnabled || cfg.DefaultMediaType != "" || cfg.DefaultCategory != "" {
-		t.Fatalf("default behavior fields were not removed: %#v", cfg)
+	if cfg.DefaultTargetRoot != "/media" {
+		t.Fatalf("default target root = %q, want /media", cfg.DefaultTargetRoot)
+	}
+	if cfg.DefaultCheckIntervalMinutes != 0 || cfg.DefaultTransferEnabled || cfg.DefaultMediaType != "" || cfg.DefaultCategory != "" {
+		t.Fatalf("unexpected default behavior fields were preserved: %#v", cfg)
 	}
 }
 

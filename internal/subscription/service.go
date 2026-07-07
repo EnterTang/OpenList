@@ -84,7 +84,7 @@ func runBySource(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	case model.SubscriptionSourceTelegram:
 		return runTelegram(ctx, sub, transfer)
 	case model.SubscriptionSourcePanSou:
-		return nil, sub.LastTreeHash, 0, 0, 0, errors.New("pansou subscription provider is not configured in OpenList yet")
+		return runPanSou(ctx, sub, transfer)
 	default:
 		return nil, sub.LastTreeHash, 0, 0, 0, fmt.Errorf("unsupported subscription source type: %s", sub.SourceType)
 	}
@@ -189,6 +189,141 @@ func parseManualConfig(raw string) (model.SubscriptionManualSourceConfig, error)
 	cfg.Paths = cleanStringList(cfg.Paths, true)
 	cfg.Links = cleanStringList(cfg.Links, false)
 	return cfg, nil
+}
+
+func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+	cfg, err := parsePanSouConfig(sub.SourceConfig)
+	if err != nil {
+		return nil, sub.LastTreeHash, 0, 0, 0, err
+	}
+	query := telegramSearchQuery(sub)
+	if query == "" {
+		return nil, sub.LastTreeHash, 0, 0, 0, errors.New("pansou search query is required")
+	}
+	results, err := searchPanSouResources(ctx, query, cfg.Limit, cfg)
+	if err != nil {
+		return nil, sub.LastTreeHash, 0, 0, 0, err
+	}
+	now := time.Now()
+	var saved []model.SubscriptionItem
+	added := 0
+	changed := 0
+	transferred := 0
+	snapshotRoots := []string{}
+	tempRootConfigs := map[string]model.SubscriptionTelegramPanConfig{}
+	globalCfg, err := GetConfig()
+	if err != nil {
+		return saved, sub.LastTreeHash, added, changed, transferred, err
+	}
+	for _, result := range results {
+		for _, link := range result.Links {
+			source, handled, saveErr := trySaveShareLinkToTemp(ctx, sub, globalCfg.Telegram, link.URL)
+			if source.Name != "" && handled {
+				root := strings.TrimSpace(source.Config.TempTransferRoot)
+				if root != "" {
+					snapshotRoots = appendPathOnce(snapshotRoots, root)
+					tempRootConfigs[root] = source.Config
+				}
+				continue
+			}
+			item := panSouLinkItem(sub, result, link, now)
+			if saveErr != nil {
+				item.LastError = "pansou share URL transfer failed: " + saveErr.Error()
+			}
+			stored, isNew, err := db.UpsertSubscriptionItem(item)
+			if err != nil {
+				return saved, sub.LastTreeHash, added, changed, transferred, err
+			}
+			if isNew {
+				added++
+			}
+			saved = append(saved, *stored)
+		}
+	}
+	snapshot, err := snapshotPaths(ctx, snapshotRoots)
+	if err != nil {
+		return saved, sub.LastTreeHash, added, changed, transferred, err
+	}
+	for _, entry := range MediaFiles(snapshot.Entries) {
+		if !subscriptionEntryMatches(sub, entry) {
+			continue
+		}
+		item := itemFromEntry(sub, entry, now)
+		stored, isNew, err := db.UpsertSubscriptionItem(item)
+		if err != nil {
+			return saved, snapshot.Hash, added, changed, transferred, err
+		}
+		if isNew {
+			added++
+		} else if stored.Status == model.SubscriptionItemStatusPending {
+			changed++
+		}
+		if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
+			if err := transferItem(ctx, stored); err != nil {
+				stored.Status = model.SubscriptionItemStatusFailed
+				stored.LastError = err.Error()
+			} else {
+				stored.Status = model.SubscriptionItemStatusTransferred
+				stored.LastError = ""
+				transferred++
+				if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok && sourceCfg.DeleteSourceAfter {
+					if err := cleanupSourceAfterTransfer(ctx, stored.SourcePath); err != nil {
+						stored.LastError = "source cleanup failed after transfer: " + err.Error()
+					}
+				}
+			}
+			_, _, err = db.UpsertSubscriptionItem(stored)
+			if err != nil {
+				return saved, snapshot.Hash, added, changed, transferred, err
+			}
+		}
+		saved = append(saved, *stored)
+	}
+	links := panSouResultLinks(results)
+	return saved, combinedHash(snapshot.Hash, links), added, changed, transferred, nil
+}
+
+func parsePanSouConfig(raw string) (model.SubscriptionPanSouSourceConfig, error) {
+	var cfg model.SubscriptionPanSouSourceConfig
+	if strings.TrimSpace(raw) == "" {
+		return normalizePanSouSourceConfig(cfg), nil
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return cfg, errors.WithMessage(err, "invalid pansou source config")
+	}
+	return normalizePanSouSourceConfig(cfg), nil
+}
+
+func panSouLinkItem(sub *model.Subscription, result model.SubscriptionResourceSearchResult, link model.SubscriptionResourceSearchLink, seenAt time.Time) *model.SubscriptionItem {
+	keyMaterial := fmt.Sprintf("%d:%s:%s", sub.ID, result.Title, link.URL)
+	return &model.SubscriptionItem{
+		SubscriptionID: sub.ID,
+		SourceKey:      "pansou:" + shortHash(keyMaterial),
+		SourceURL:      link.URL,
+		FileHash:       shortHash(link.URL),
+		Status:         model.SubscriptionItemStatusSkipped,
+		LastSeenAt:     seenAt,
+		LastError:      "pansou share URL is discovered; mount or provider transfer is required before file-tree checks",
+	}
+}
+
+func panSouResultLinks(results []model.SubscriptionResourceSearchResult) []string {
+	seen := map[string]struct{}{}
+	var links []string
+	for _, result := range results {
+		for _, link := range result.Links {
+			value := strings.TrimSpace(link.URL)
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			links = append(links, value)
+		}
+	}
+	return links
 }
 
 func cleanStringList(values []string, fixPath bool) []string {

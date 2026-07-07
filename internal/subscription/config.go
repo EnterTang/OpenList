@@ -74,6 +74,9 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 		return errors.New("subscription is nil")
 	}
 	cfg = normalizeConfig(cfg)
+	if sub.TargetRoot == "" && cfg.DefaultTargetRoot != "" {
+		sub.TargetRoot = cfg.DefaultTargetRoot
+	}
 	if sub.CheckIntervalMinutes <= 0 {
 		sub.CheckIntervalMinutes = 60
 	}
@@ -96,7 +99,7 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 }
 
 func normalizeConfig(cfg model.SubscriptionConfig) model.SubscriptionConfig {
-	cfg.DefaultTargetRoot = ""
+	cfg.DefaultTargetRoot = cleanConfigPath(cfg.DefaultTargetRoot)
 	cfg.DefaultCheckIntervalMinutes = 0
 	cfg.DefaultMediaType = ""
 	cfg.DefaultCategory = ""

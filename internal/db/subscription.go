@@ -17,6 +17,13 @@ type SubscriptionFilter struct {
 	PerPage    int
 }
 
+type SubscriptionRunFilter struct {
+	SubscriptionID uint
+	Status         string
+	Page           int
+	PerPage        int
+}
+
 func CreateSubscription(item *model.Subscription) error {
 	if item.LastStatus == "" {
 		item.LastStatus = model.SubscriptionStatusIdle
@@ -163,4 +170,32 @@ func CreateSubscriptionRun(run *model.SubscriptionRun) error {
 
 func UpdateSubscriptionRun(run *model.SubscriptionRun) error {
 	return errors.WithStack(db.Save(run).Error)
+}
+
+func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun, int64, error) {
+	query := db.Model(&model.SubscriptionRun{})
+	if filter.SubscriptionID > 0 {
+		query = query.Where(columnName("subscription_id")+" = ?", filter.SubscriptionID)
+	}
+	if status := strings.TrimSpace(filter.Status); status != "" {
+		query = query.Where(columnName("status")+" = ?", status)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	page := filter.Page
+	if page < 1 {
+		page = 1
+	}
+	perPage := filter.PerPage
+	if perPage < 1 {
+		perPage = 20
+	}
+	var items []model.SubscriptionRun
+	err := query.Order(columnName("started_at") + " DESC").
+		Offset((page - 1) * perPage).
+		Limit(perPage).
+		Find(&items).Error
+	return items, total, errors.WithStack(err)
 }
