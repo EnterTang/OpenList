@@ -30,7 +30,36 @@ type mobileShareOutLinkResp struct {
 	} `json:"data"`
 }
 
+func (d *Yun139) shouldAutoRenameAfterShareRisk(err error) bool {
+	if err == nil || !d.AutoRenameOnShareRisk || d.Addition.Type != MetaPersonalNew {
+		return false
+	}
+	return strings.Contains(err.Error(), "个人云未知异常")
+}
+
 func (d *Yun139) CreateMobileShare(ctx context.Context, obj model.Obj, args model.MobileShareCreateArgs) (*model.MobileShareLink, error) {
+	link, err := d.createMobileShareOnce(ctx, obj, args)
+	if err == nil || !d.shouldAutoRenameAfterShareRisk(err) {
+		return link, err
+	}
+	plan, _, planErr := d.buildShareRiskRenamePlan(ctx, obj, shareRiskActualPath(obj))
+	if planErr != nil {
+		return nil, fmt.Errorf("%w (auto rename planning failed: %v)", err, planErr)
+	}
+	if len(plan) == 0 {
+		return nil, err
+	}
+	if applyErr := d.applyShareRiskRenamePlan(ctx, plan); applyErr != nil {
+		return nil, fmt.Errorf("%w (auto rename apply failed: %v)", err, applyErr)
+	}
+	retried, retryErr := d.createMobileShareOnce(ctx, obj, args)
+	if retryErr != nil {
+		return nil, fmt.Errorf("个人云未知异常，已尝试自动重命名后重新创建分享，但仍失败: %w", retryErr)
+	}
+	return retried, nil
+}
+
+func (d *Yun139) createMobileShareOnce(ctx context.Context, obj model.Obj, args model.MobileShareCreateArgs) (*model.MobileShareLink, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

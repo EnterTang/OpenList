@@ -118,7 +118,7 @@ func searchTelegramResources(ctx context.Context, query string, limit int, cfg m
 			break
 		}
 	}
-	return results, nil
+	return filterResourceSearchResults(results, query, limit), nil
 }
 
 func telegramMessageURL(row telegramCommandRow) string {
@@ -140,7 +140,11 @@ func searchPanSouResources(ctx context.Context, query string, limit int, cfg mod
 		if err != nil {
 			return nil, err
 		}
-		return parseResourceSearchOutput(model.SubscriptionSourcePanSou, stdout, limit)
+		results, err := parseResourceSearchOutput(model.SubscriptionSourcePanSou, stdout, limit)
+		if err != nil {
+			return nil, err
+		}
+		return filterResourceSearchResults(results, query, limit), nil
 	}
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		return nil, errors.New("pansou base_url or search_command is required")
@@ -149,7 +153,11 @@ func searchPanSouResources(ctx context.Context, query string, limit int, cfg mod
 	if err != nil {
 		return nil, err
 	}
-	return parseResourceSearchOutput(model.SubscriptionSourcePanSou, body, limit)
+	results, err := parseResourceSearchOutput(model.SubscriptionSourcePanSou, body, limit)
+	if err != nil {
+		return nil, err
+	}
+	return filterResourceSearchResults(results, query, limit), nil
 }
 
 func runPanSouSearchCommand(ctx context.Context, query string, limit int, cfg model.SubscriptionPanSouSourceConfig) ([]byte, error) {
@@ -481,8 +489,11 @@ func resourceLinksFromText(value, passcode string) []model.SubscriptionResourceS
 		if _, ok := seen[link]; ok {
 			continue
 		}
+		provider, ok := DetectShareProvider(link)
+		if !ok {
+			continue
+		}
 		seen[link] = struct{}{}
-		provider, _ := DetectShareProvider(link)
 		links = append(links, model.SubscriptionResourceSearchLink{
 			URL:      link,
 			Provider: string(provider),
@@ -498,6 +509,25 @@ func firstResultProvider(links []model.SubscriptionResourceSearchLink) string {
 		}
 	}
 	return ""
+}
+
+func filterResourceSearchResults(results []model.SubscriptionResourceSearchResult, query string, limit int) []model.SubscriptionResourceSearchResult {
+	queryNeedle := normalizeMediaMatchText(query)
+	filtered := make([]model.SubscriptionResourceSearchResult, 0, len(results))
+	for _, result := range results {
+		if len(result.Links) == 0 {
+			continue
+		}
+		if queryNeedle != "" && !strings.Contains(normalizeMediaMatchText(result.Title), queryNeedle) {
+			continue
+		}
+		result.Provider = firstResultProvider(result.Links)
+		filtered = append(filtered, result)
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
 }
 
 func resourceTitle(value string) string {

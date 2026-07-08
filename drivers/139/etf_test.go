@@ -847,10 +847,11 @@ func Test139ETFConfigMetadataIsChineseAndCollapsed(t *testing.T) {
 		t.Fatalf("authorization visible_when = %q, want auth_mode=openlist", item.VisibleWhen)
 	}
 	wantLabels := map[string]string{
-		"generate_etf":    "生成 ETF",
-		"etf_archive":     "ETF 归档",
-		"etf_root_folder": "ETF 管理目录",
-		"etf_temp_folder": "ETF 临时播放目录",
+		"generate_etf":              "生成 ETF",
+		"etf_archive":               "ETF 归档",
+		"etf_root_folder":           "ETF 管理目录",
+		"etf_temp_folder":           "ETF 临时播放目录",
+		"auto_rename_on_share_risk": "分享失败后自动重命名",
 	}
 	for name, wantLabel := range wantLabels {
 		raw, ok := items[name]

@@ -63,6 +63,7 @@ BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-base}"
 BASE_IMAGE="${BASE_IMAGE:-openlistteam/openlist-base-image}"
 BUILDER_NAME="${BUILDER_NAME:-openlist-etf-builder}"
 GO_VERSION="${GO_VERSION:-1.26.4}"
+BUILD_TMP_ROOT="${BUILD_TMP_ROOT:-"$BACKEND_DIR/.tmp-build"}"
 INSTALL_ARIA2="${INSTALL_ARIA2:-false}"
 FRONTEND_REPO="${FRONTEND_REPO:-OpenListTeam/OpenList-Frontend}"
 GO_BUILD_PARALLELISM="${GO_BUILD_PARALLELISM:-1}"
@@ -138,6 +139,7 @@ docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 
 FRONTEND_DIR="$(cd "$FRONTEND_DIR" && pwd)" || die "frontend dir does not exist: $FRONTEND_DIR"
 [ -f "$FRONTEND_DIR/package.json" ] || die "frontend package.json not found: $FRONTEND_DIR"
+mkdir -p "$BUILD_TMP_ROOT"
 
 FRONTEND_PACKAGE_MANAGER="$(cd "$FRONTEND_DIR" && node -p "require('./package.json').packageManager || ''" 2>/dev/null || true)"
 FRONTEND_PNPM=(pnpm)
@@ -255,8 +257,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-TMP_DOCKERFILE="$(mktemp "${TMPDIR:-/tmp}/openlist-dockerfile.XXXXXX")"
-BUILD_CONTEXT="$(mktemp -d "${TMPDIR:-/tmp}/openlist-context.XXXXXX")"
+TMP_DOCKERFILE="$(mktemp "$BUILD_TMP_ROOT/openlist-dockerfile.XXXXXX")"
+BUILD_CONTEXT="$(mktemp -d "$BUILD_TMP_ROOT/openlist-context.XXXXXX")"
 
 echo "==> Preparing temporary Docker build context"
 rsync -a --delete \
@@ -264,6 +266,7 @@ rsync -a --delete \
   --exclude='/.github' \
   --exclude='/.idea' \
   --exclude='/.omx' \
+  --exclude='/.tmp-build' \
   --exclude='/.vscode' \
   --exclude='/bin' \
   --exclude='/build' \

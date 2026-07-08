@@ -22,6 +22,7 @@ type Addition struct {
 	UseLargeThumbnail     bool   `json:"use_large_thumbnail" type:"bool" default:"false" label:"使用大缩略图" help:"为图片使用大缩略图。"`
 	GenerateETF           bool   `json:"generate_etf" type:"bool" default:"false" label:"生成 ETF" group:"ETF" collapsed:"true" help:"上传普通文件后自动生成 .etf 秒传元数据文件。"`
 	ETFArchive            bool   `json:"etf_archive" type:"bool" default:"false" label:"ETF 归档" group:"ETF" collapsed:"true" help:"生成同路径 .etf 后，再复制一份到 ETF 管理目录并按 TMDB 与二级分类规则归档。"`
+	AutoRenameOnShareRisk bool   `json:"auto_rename_on_share_risk" type:"bool" default:"false" label:"分享失败后自动重命名" group:"ETF" collapsed:"true" help:"创建移动分享链接返回“个人云未知异常”时，自动将目标文件或目录内含中文标题的名称改为 TMDB 英文名；若无法匹配则改为拼音，并保留季数集数后重试一次分享。改名为永久生效。"`
 	DeleteSourceAfterETF  bool   `json:"delete_source_after_etf" type:"bool" default:"false" label:"生成后删除源文件" group:"ETF" collapsed:"true" help:"生成 .etf 后删除源文件并清空回收站。"`
 	RestoreSourceFromETF  bool   `json:"restore_source_from_etf" type:"bool" default:"false" label:"通过 ETF 恢复源文件" group:"ETF" collapsed:"true" help:"上传 .etf 文件时通过秒传恢复原文件。"`
 	DeleteETFAfterRestore bool   `json:"delete_etf_after_restore" type:"bool" default:"false" label:"恢复后删除 ETF" group:"ETF" collapsed:"true" help:"恢复源文件后删除 .etf 文件并清空回收站。"`

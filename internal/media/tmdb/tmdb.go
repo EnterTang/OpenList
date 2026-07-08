@@ -31,6 +31,7 @@ type Metadata struct {
 	MediaType        string
 	TMDBID           int64
 	Name             string
+	OriginalName     string
 	Year             int
 	GenreIDs         []int
 	OriginCountry    []string
@@ -291,6 +292,7 @@ func (i tmdbItem) metadata() *Metadata {
 		MediaType:        i.MediaType,
 		TMDBID:           i.ID,
 		Name:             i.displayName(),
+		OriginalName:     i.originalDisplayName(),
 		Year:             yearFromDate(i.date()),
 		GenreIDs:         genreIDs,
 		OriginCountry:    i.OriginCountry,
