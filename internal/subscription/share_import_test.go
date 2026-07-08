@@ -76,3 +76,17 @@ func TestParseManualImportTextRejectsTraversalAndCollectsIssues(t *testing.T) {
 		t.Fatalf("issues = %#v, want path issue", issues)
 	}
 }
+
+func TestParseManualImportTextSupportsWholeJSONDocument(t *testing.T) {
+	raw := `{"commonPath":"Season 1/","usesBase62EtagsInExport":true,"files":[{"etag":"69Y8N4KosSpjpcVCReGVzy","size":3531063629,"path":"Episode 02.mkv"}]}`
+	files, issues, err := parseManualImportText(raw)
+	if err != nil {
+		t.Fatalf("parse full JSON import: %v", err)
+	}
+	if len(issues) != 0 || len(files) != 1 {
+		t.Fatalf("files/issues = %#v %#v", files, issues)
+	}
+	if files[0].Path != "Season 1/Episode 02.mkv" {
+		t.Fatalf("path = %q, want Season 1/Episode 02.mkv", files[0].Path)
+	}
+}

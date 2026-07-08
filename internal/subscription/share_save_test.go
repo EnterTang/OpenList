@@ -3,7 +3,6 @@ package subscription
 import (
 	"context"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,13 +44,12 @@ func (p *fakeShareSaver) SaveShareItems(ctx context.Context, ref ShareRef, paren
 	if p.saved == nil {
 		p.saved = map[string][]ShareItem{}
 	}
-	key := parentID
+	p.saved[parentID] = append(p.saved[parentID], items...)
 	if dstDirID != "" {
-		key = dstDirID
+		p.saved[dstDirID] = append(p.saved[dstDirID], items...)
 	}
-	p.saved[key] = append(p.saved[key], items...)
 	p.dstDirID = dstDirID
-	return []string{"task-" + strconv.Itoa(len(p.waitedTasks)+1)}, nil
+	return []string{"task-1"}, nil
 }
 
 func (p *fakeShareSaver) WaitSaveComplete(ctx context.Context, taskIDs []string) error {
