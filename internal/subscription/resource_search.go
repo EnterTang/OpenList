@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
 )
@@ -478,6 +479,7 @@ func resourceLinksFromText(value, passcode string) []model.SubscriptionResourceS
 		passcode = rowAccessCode(telegramCommandRow{Text: value})
 	}
 	matches := telegramCloudLinkPattern.FindAllString(value, -1)
+	matches = append(matches, extractPan123FastLinks(value)...)
 	seen := map[string]struct{}{}
 	links := make([]model.SubscriptionResourceSearchLink, 0, len(matches))
 	for _, match := range matches {
@@ -512,13 +514,12 @@ func firstResultProvider(links []model.SubscriptionResourceSearchLink) string {
 }
 
 func filterResourceSearchResults(results []model.SubscriptionResourceSearchResult, query string, limit int) []model.SubscriptionResourceSearchResult {
-	queryNeedle := normalizeMediaMatchText(query)
 	filtered := make([]model.SubscriptionResourceSearchResult, 0, len(results))
 	for _, result := range results {
 		if len(result.Links) == 0 {
 			continue
 		}
-		if queryNeedle != "" && !strings.Contains(normalizeMediaMatchText(result.Title), queryNeedle) {
+		if !titlematch.TitlesCompatible(query, result.Title) {
 			continue
 		}
 		result.Provider = firstResultProvider(result.Links)

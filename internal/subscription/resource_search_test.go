@@ -95,10 +95,58 @@ func TestParseResourceSearchOutputFiltersByTitleAndSupportedShareLinks(t *testin
 	}
 }
 
+func TestFilterResourceSearchResultsRejectsDocumentaryStyleSuffixTitles(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{{
+		Title: "千与千寻诞生秘话",
+		Links: []model.SubscriptionResourceSearchLink{{
+			URL:      "https://www.123pan.com/s/abc-def",
+			Provider: string(ShareProviderPan123),
+		}},
+	}}
+
+	filtered := filterResourceSearchResults(results, "千与千寻", 10)
+	if len(filtered) != 0 {
+		t.Fatalf("filtered len = %d, want 0: %#v", len(filtered), filtered)
+	}
+}
+
+func TestFilterResourceSearchResultsRejectsContentOnlyKeywordHits(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{{
+		Title:   "完全无关标题",
+		Content: "这里提到了 雨人 和 Rain Man",
+		Links: []model.SubscriptionResourceSearchLink{{
+			URL:      "https://www.123pan.com/s/abc-def",
+			Provider: string(ShareProviderPan123),
+		}},
+	}}
+
+	filtered := filterResourceSearchResults(results, "雨人", 10)
+	if len(filtered) != 0 {
+		t.Fatalf("filtered len = %d, want 0: %#v", len(filtered), filtered)
+	}
+}
+
 func TestResourceLinksFromTextIgnoresUnsupportedURLs(t *testing.T) {
 	links := resourceLinksFromText("论坛页 https://123panfx.com/thread-2993.htm 机器人 https://t.me/share_123pan_bot?start=2993", "")
 	if len(links) != 0 {
 		t.Fatalf("links = %#v, want empty", links)
+	}
+}
+
+func TestResourceLinksFromTextExtractsPan123FastLink(t *testing.T) {
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#食神·百厨大战.2025.S02E05.mp4"
+	links := resourceLinksFromText("分享链接 : \n"+fastLink+"\n", "")
+	if len(links) != 1 {
+		t.Fatalf("links len = %d, want 1: %#v", len(links), links)
+	}
+	if links[0].URL != fastLink || links[0].Provider != string(ShareProviderPan123) {
+		t.Fatalf("link = %#v, want pan123 fastlink", links[0])
+	}
+	if got := filterResourceSearchResults([]model.SubscriptionResourceSearchResult{{
+		Title: "食神·百厨大战 (2025) S02 E05",
+		Links: links,
+	}}, "食神·百厨大战", 10); len(got) != 1 {
+		t.Fatalf("filtered results = %#v, want single match", got)
 	}
 }
 

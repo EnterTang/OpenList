@@ -139,6 +139,60 @@ func TestBuildShareRiskRenamePlanFallsBackToPinyin(t *testing.T) {
 	}
 }
 
+func TestBuildShareRiskRenamePlanUsesBilingualRecognizeCandidates(t *testing.T) {
+	oldSettingValue := shareRiskSettingValue
+	oldTMDBResolve := shareRiskTMDBResolve
+	oldPinyin := shareRiskPinyin
+	t.Cleanup(func() {
+		shareRiskSettingValue = oldSettingValue
+		shareRiskTMDBResolve = oldTMDBResolve
+		shareRiskPinyin = oldPinyin
+	})
+	shareRiskSettingValue = func(key string) string {
+		if key == conf.TMDBApiKey {
+			return "key"
+		}
+		return ""
+	}
+	shareRiskTMDBResolve = func(_ context.Context, _ tmdb.Config, result recognize.Result) (*tmdb.Metadata, error) {
+		if result.Title != "诊疗中 Shrinking" {
+			t.Fatalf("recognized title = %q, want %q", result.Title, "诊疗中 Shrinking")
+		}
+		if len(result.QueryList) == 0 {
+			t.Fatal("recognized query list is empty")
+		}
+		foundEnglish := false
+		for _, candidate := range result.QueryList {
+			if candidate == "Shrinking" {
+				foundEnglish = true
+				break
+			}
+		}
+		if !foundEnglish {
+			t.Fatalf("recognized query list = %#v, want English alias Shrinking", result.QueryList)
+		}
+		return &tmdb.Metadata{Name: "诊疗中", OriginalName: "Shrinking", MediaType: "tv"}, nil
+	}
+	shareRiskPinyin = func(_ string) string {
+		return "Zhen Liao Zhong"
+	}
+
+	d := &Yun139{Addition: Addition{Type: MetaPersonalNew}}
+	plan, canonicalTitle, err := d.buildShareRiskRenamePlan(context.Background(), &model.Object{ID: "file-id", Name: "诊疗中 Shrinking S03E01.mkv", Path: "/"}, "/诊疗中 Shrinking S03E01.mkv")
+	if err != nil {
+		t.Fatalf("buildShareRiskRenamePlan returned error: %v", err)
+	}
+	if canonicalTitle != "Shrinking" {
+		t.Fatalf("canonicalTitle = %q, want %q", canonicalTitle, "Shrinking")
+	}
+	if len(plan) != 1 {
+		t.Fatalf("plan len = %d, want 1", len(plan))
+	}
+	if plan[0].NewName != "Shrinking S03E01.mkv" {
+		t.Fatalf("new name = %q, want %q", plan[0].NewName, "Shrinking S03E01.mkv")
+	}
+}
+
 func TestApplyShareRiskRenamePlanSortsDeepestFirst(t *testing.T) {
 	setup139Resty(t)
 	var renamed []string

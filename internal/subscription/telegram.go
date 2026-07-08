@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
 )
@@ -376,13 +377,13 @@ func subscriptionEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
 		return false
 	}
 	haystacks := []string{
-		normalizeMediaMatchText(entry.Name),
-		normalizeMediaMatchText(entry.Path),
-		normalizeMediaMatchText(fullPath(entry)),
+		strings.TrimSpace(entry.Name),
+		strings.TrimSpace(entry.Path),
+		strings.TrimSpace(fullPath(entry)),
 	}
 	for _, needle := range needles {
 		for _, haystack := range haystacks {
-			if haystack != "" && strings.Contains(haystack, needle) {
+			if haystack != "" && titlematch.TitlesCompatible(needle, haystack) {
 				return true
 			}
 		}
@@ -405,15 +406,16 @@ func subscriptionMatchNeedles(sub *model.Subscription) []string {
 	seen := map[string]struct{}{}
 	needles := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		needle := normalizeMediaMatchText(candidate)
-		if len([]rune(needle)) < 2 {
-			continue
+		for _, needle := range titlematch.BuildMediaQueryCandidates(candidate) {
+			if len([]rune(needle)) < 2 {
+				continue
+			}
+			if _, ok := seen[needle]; ok {
+				continue
+			}
+			seen[needle] = struct{}{}
+			needles = append(needles, needle)
 		}
-		if _, ok := seen[needle]; ok {
-			continue
-		}
-		seen[needle] = struct{}{}
-		needles = append(needles, needle)
 	}
 	return needles
 }
@@ -600,8 +602,10 @@ func rowLinks(row telegramCommandRow) []string {
 			return
 		}
 		value = strings.TrimRight(value, "，,;；)]）>")
-		if _, err := url.ParseRequestURI(value); err != nil {
-			return
+		if !isPan123FastLink(value) {
+			if _, err := url.ParseRequestURI(value); err != nil {
+				return
+			}
 		}
 		if _, ok := seen[value]; ok {
 			return
@@ -619,6 +623,9 @@ func rowLinks(row telegramCommandRow) []string {
 		appendLink(button.URL)
 	}
 	for _, match := range telegramCloudLinkPattern.FindAllString(rowText(row), -1) {
+		appendLink(match)
+	}
+	for _, match := range extractPan123FastLinks(rowText(row)) {
 		appendLink(match)
 	}
 	return links
@@ -649,6 +656,9 @@ func rowLinksForTelegramPanSources(row telegramCommandRow, cfg model.Subscriptio
 }
 
 func telegramPanSourceAcceptsLink(sourceName, link string) bool {
+	if isPan123FastLink(link) {
+		return sourceName == string(ShareProviderPan123)
+	}
 	hosts := telegramPanSourceHosts[sourceName]
 	if len(hosts) == 0 {
 		return true
@@ -693,7 +703,7 @@ func rowAccessCode(row telegramCommandRow) string {
 func normalizeTelegramLinkWithAccessCode(link, accessCode string) string {
 	link = strings.TrimSpace(link)
 	accessCode = strings.TrimSpace(accessCode)
-	if link == "" || accessCode == "" || strings.Contains(link, ",") {
+	if link == "" || accessCode == "" || strings.Contains(link, ",") || isPan123FastLink(link) {
 		return link
 	}
 	return link + "," + accessCode

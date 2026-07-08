@@ -60,6 +60,30 @@ func TestPan123ShareProviderListsChildren(t *testing.T) {
 	}
 }
 
+func TestPan123ShareProviderListsFastLinkAsSingleFile(t *testing.T) {
+	provider := NewPan123ShareProvider(model.SubscriptionTelegramPanConfig{AccessToken: "access-123"})
+	ref := ShareRef{
+		Provider: ShareProviderPan123,
+		RawURL:   "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#食神·百厨大战.2025.S02E05.mp4",
+		ShareID:  "a3531a60736740a152e931a6ecee9bfb",
+		ParentID: "0",
+	}
+
+	items, err := provider.ListShareChildren(context.Background(), ref, "")
+	if err != nil {
+		t.Fatalf("list fastlink children: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %#v, want 1", items)
+	}
+	if items[0].ID != "a3531a60736740a152e931a6ecee9bfb" || items[0].Name != "食神·百厨大战.2025.S02E05.mp4" || items[0].Size != 500797103 || items[0].IsDir {
+		t.Fatalf("item = %#v, want fastlink single file", items[0])
+	}
+	if got := rawString(shareItemRawMap(items[0]), "etag"); got != "a3531a60736740a152e931a6ecee9bfb" {
+		t.Fatalf("etag = %q, want fastlink etag", got)
+	}
+}
+
 func TestPan123ShareProviderSavesItems(t *testing.T) {
 	var saveCalled bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

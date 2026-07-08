@@ -217,6 +217,48 @@ func TestRowLinksForTelegramPanSourcesAllowsSharedMixedChannel(t *testing.T) {
 	}
 }
 
+func TestRowLinksExtractsPan123FastLinkFromMessageText(t *testing.T) {
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#食神·百厨大战.2025.S02E05.mp4"
+	row := telegramCommandRow{
+		Channel: "@pan123",
+		Text:    "🔗分享链接 :\n" + fastLink,
+	}
+	links := rowLinks(row)
+	if got, want := links, []string{fastLink}; !stringSlicesEqual(got, want) {
+		t.Fatalf("links = %#v, want %#v", got, want)
+	}
+	if got := normalizeTelegramLinkWithAccessCode(fastLink, "ABCD"); got != fastLink {
+		t.Fatalf("normalized fastlink = %q, want unchanged", got)
+	}
+}
+
+func TestRowLinksForTelegramPanSourcesKeepsPan123FastLinkOnlyForPan123(t *testing.T) {
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#食神·百厨大战.2025.S02E05.mp4"
+	row := telegramCommandRow{
+		Channel: "@mixed",
+		Text:    fastLink,
+	}
+
+	pan123Cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{Channels: []string{"@mixed"}},
+	})
+	links, sources := rowLinksForTelegramPanSources(row, pan123Cfg)
+	if got, want := providerSourceNames(sources), []string{"pan123"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("sources = %#v, want %#v", got, want)
+	}
+	if got, want := links, []string{fastLink}; !stringSlicesEqual(got, want) {
+		t.Fatalf("links = %#v, want %#v", got, want)
+	}
+
+	quarkCfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Quark: model.SubscriptionTelegramPanConfig{Channels: []string{"@mixed"}},
+	})
+	links, sources = rowLinksForTelegramPanSources(row, quarkCfg)
+	if len(links) != 0 || len(sources) != 0 {
+		t.Fatalf("links/sources = %#v / %#v, want empty links and no triggered source", links, sources)
+	}
+}
+
 func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
 	sub := &model.Subscription{
 		Name:     "Fallback Title",
@@ -243,6 +285,18 @@ func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
 		Name:     "S01E01.mkv",
 	}) {
 		t.Fatal("unexpected unrelated title match")
+	}
+}
+
+func TestSubscriptionEntryMatchesNoisyMixedLanguagePath(t *testing.T) {
+	sub := &model.Subscription{Name: "Rain Man", TMDBName: "雨人"}
+	entry := TreeEntry{
+		RootPath: "/movie",
+		Path:     "/movie/剧情片/雨人 Rain Man 1988 蓝光原盘REMUX",
+		Name:     "雨人 Rain Man 1988 蓝光原盘REMUX",
+	}
+	if !subscriptionEntryMatches(sub, entry) {
+		t.Fatal("expected noisy mixed-language path to match subscription")
 	}
 }
 

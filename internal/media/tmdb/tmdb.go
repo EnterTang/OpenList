@@ -15,6 +15,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/category"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -322,24 +323,32 @@ func (i tmdbItem) date() string {
 }
 
 func scoreCandidate(item tmdbItem, recognized recognize.Result) int {
-	titles := []string{normalizeTitle(item.displayName()), normalizeTitle(item.originalDisplayName())}
-	target := normalizeTitle(recognized.Title)
+	titles := []string{item.displayName(), item.originalDisplayName()}
+	queryCandidates := make([]string, 0, len(recognized.QueryList)+1)
+	if strings.TrimSpace(recognized.Title) != "" {
+		queryCandidates = append(queryCandidates, recognized.Title)
+	}
+	for _, candidate := range recognized.QueryList {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || candidate == recognized.Title {
+			continue
+		}
+		queryCandidates = append(queryCandidates, candidate)
+	}
 	score := 0
-	if target != "" {
+	if len(queryCandidates) > 0 {
 		bestTitleScore := 0
-		for _, title := range titles {
-			if title == "" {
-				continue
+		for _, query := range queryCandidates {
+			for _, title := range titles {
+				if strings.TrimSpace(title) == "" {
+					continue
+				}
+				titleScore := titlematch.ScoreTitleMatch(query, title)
+				if titlematch.TitlesCompatible(query, title) {
+					titleScore += 60
+				}
+				bestTitleScore = max(bestTitleScore, titleScore)
 			}
-			if title == target {
-				bestTitleScore = max(bestTitleScore, 85)
-				continue
-			}
-			if strings.Contains(title, target) || strings.Contains(target, title) {
-				bestTitleScore = max(bestTitleScore, 65)
-				continue
-			}
-			bestTitleScore = max(bestTitleScore, titleSimilarityScore(target, title))
 		}
 		score += bestTitleScore
 	}

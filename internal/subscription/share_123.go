@@ -65,6 +65,12 @@ func (p *pan123ShareProvider) EnsureDir(ctx context.Context, path string) (strin
 }
 
 func (p *pan123ShareProvider) ListShareChildren(ctx context.Context, ref ShareRef, parentID string) ([]ShareItem, error) {
+	if fastLink, err := parsePan123FastLinkFile(ref.RawURL); err == nil {
+		if parentID != "" && parentID != "0" {
+			return nil, nil
+		}
+		return []ShareItem{fastLink.shareItem("0")}, nil
+	}
 	parentID = firstNonEmpty(parentID, "0")
 	var resp pan123ListResp
 	req := p.request(ctx).

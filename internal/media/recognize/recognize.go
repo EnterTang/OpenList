@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 )
 
 type Result struct {
@@ -71,32 +73,29 @@ func NormalizeTitle(value string) string {
 		return ""
 	}
 	value = trimMediaExt(value)
-	value = doubanPattern.ReplaceAllString(value, "")
-	value = strings.ReplaceAll(value, "_", " ")
-	value = strings.ReplaceAll(value, ".", " ")
-	value = strings.ReplaceAll(value, "-", " ")
-	value = strings.NewReplacer("丨", " ", "·", " ", "•", " ").Replace(value)
 	value = leadingIndexPattern.ReplaceAllString(value, "")
-	value = tmdbIDPattern.ReplaceAllString(value, "")
-	value = seasonEpisodePattern.ReplaceAllString(value, "")
-	value = chineseSeasonPattern.ReplaceAllString(value, "")
-	if loc := releaseNoisePattern.FindStringIndex(value); loc != nil {
-		value = value[:loc[0]]
-	}
-	value = strings.Trim(value, " ._-[]()【】")
-	value = spacePattern.ReplaceAllString(value, " ")
-	return strings.TrimSpace(value)
+	value = doubanPattern.ReplaceAllString(value, "")
+	return titlematch.NormalizeMediaTitle(value)
 }
 
 func BuildQueryCandidates(value string) []string {
-	title := NormalizeTitle(value)
-	if title == "" {
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return nil
 	}
+	trimmed := trimMediaExt(value)
+	title := NormalizeTitle(trimmed)
 	candidates := []string{}
+	for _, candidate := range titlematch.BuildMediaQueryCandidates(trimmed) {
+		candidates = appendUnique(candidates, candidate)
+	}
 	candidates = appendUnique(candidates, title)
 	candidates = appendUnique(candidates, stripCollectionSuffix(title))
 	if prefix := titlePrefixBeforeEpisode(value); prefix != "" {
+		for _, candidate := range titlematch.BuildMediaQueryCandidates(prefix) {
+			candidates = appendUnique(candidates, candidate)
+		}
+		prefix = NormalizeTitle(prefix)
 		candidates = appendUnique(candidates, prefix)
 		candidates = appendUnique(candidates, stripCollectionSuffix(prefix))
 	}

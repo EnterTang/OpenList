@@ -70,6 +70,30 @@ func TestBuildQueryCandidatesStripLeadingIndex(t *testing.T) {
 	}
 }
 
+func TestNormalizeTitleRemovesChineseReleaseNoise(t *testing.T) {
+	got := NormalizeTitle("问心 (2023) 蓝光原盘REMUX 国英双音")
+	if got != "问心" {
+		t.Fatalf("NormalizeTitle = %q, want %q", got, "问心")
+	}
+}
+
+func TestBuildQueryCandidatesIncludesBilingualSplit(t *testing.T) {
+	got := BuildQueryCandidates("美剧.诊疗中 第三季 Shrinking Season 3.2026")
+	wants := []string{"诊疗中 Shrinking", "诊疗中", "Shrinking"}
+	for _, want := range wants {
+		found := false
+		for _, item := range got {
+			if item == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("BuildQueryCandidates missing %q in %#v", want, got)
+		}
+	}
+}
+
 func TestPreferParentTitleForGenericEpisode(t *testing.T) {
 	got := Recognize("S01E02.mkv", "/tv/欧美剧/Slow Horses")
 

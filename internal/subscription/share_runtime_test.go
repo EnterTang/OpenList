@@ -267,6 +267,49 @@ func TestTrySaveShareLinkToTempUsesAliyunOpenWebRefreshTokenFallback(t *testing.
 	}
 }
 
+func TestTelegramPanTempRootWithStorageFallbackPrefixesBareProviderRoot(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/123",
+		Driver:    "123Pan",
+	}); err != nil {
+		t.Fatalf("create 123 storage: %v", err)
+	}
+
+	cfg := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferRoot: "转存至移动",
+	})
+	if got, want := cfg.TempTransferRoot, "/123/转存至移动"; got != want {
+		t.Fatalf("temp root = %q, want %q", got, want)
+	}
+
+	cfg = telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferRoot: "/123/转存至移动",
+	})
+	if got, want := cfg.TempTransferRoot, "/123/转存至移动"; got != want {
+		t.Fatalf("mounted temp root = %q, want %q", got, want)
+	}
+}
+
+func TestTelegramPanTempRootWithStorageFallbackSkipsAmbiguousProviderStorage(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	for _, mountPath := range []string{"/123-a", "/123-b"} {
+		if err := db.CreateStorage(&model.Storage{
+			MountPath: mountPath,
+			Driver:    "123Pan",
+		}); err != nil {
+			t.Fatalf("create 123 storage %s: %v", mountPath, err)
+		}
+	}
+
+	cfg := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferRoot: "转存至移动",
+	})
+	if got, want := cfg.TempTransferRoot, "/转存至移动"; got != want {
+		t.Fatalf("ambiguous temp root = %q, want %q", got, want)
+	}
+}
+
 func TestRunManualShareProviderSavesTempRoot(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	if _, err := SaveConfig(model.SubscriptionConfig{

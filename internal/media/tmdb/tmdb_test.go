@@ -347,6 +347,37 @@ func TestSearchCandidatesNumericIDFetchesDetailsWithPoster(t *testing.T) {
 	}
 }
 
+func TestScoreCandidatePrefersExactBilingualEquivalentTitle(t *testing.T) {
+	recognized := recognize.Result{Title: "雨人 Rain Man 1988 蓝光原盘", Year: 1988, MediaTypeHint: "movie"}
+	exact := tmdbItem{Title: "雨人", OriginalTitle: "Rain Man", ReleaseDate: "1988-12-12", MediaType: "movie"}
+	weak := tmdbItem{Title: "雨人诞生秘话", OriginalTitle: "Rain Man Documentary", ReleaseDate: "1988-12-12", MediaType: "movie"}
+	if scoreCandidate(exact, recognized) <= scoreCandidate(weak, recognized) {
+		t.Fatal("exact bilingual match did not outrank weak documentary-style title for noisy local title")
+	}
+}
+
+func TestScoreCandidatePenalizesWeakSubstringMatches(t *testing.T) {
+	recognized := recognize.Result{Title: "Shrinking", MediaTypeHint: "tv"}
+	good := tmdbItem{Name: "Shrinking", OriginalName: "Shrinking", FirstAirDate: "2023-01-01", MediaType: "tv"}
+	bad := tmdbItem{Name: "The Making of Shrinking", OriginalName: "The Making of Shrinking", FirstAirDate: "2023-01-01", MediaType: "tv"}
+	if scoreCandidate(good, recognized) <= scoreCandidate(bad, recognized) {
+		t.Fatal("weak substring candidate outranked exact title")
+	}
+}
+
+func TestScoreCandidateUsesRecognizeQueryListAliases(t *testing.T) {
+	recognized := recognize.Result{
+		Title:         "千与千寻",
+		QueryList:     []string{"千与千寻", "Spirited Away"},
+		MediaTypeHint: "movie",
+	}
+	good := tmdbItem{Title: "Spirited Away", OriginalTitle: "Spirited Away", ReleaseDate: "2001-07-20", MediaType: "movie"}
+	bad := tmdbItem{Title: "千与千寻诞生秘话", OriginalTitle: "Spirited Away Documentary", ReleaseDate: "2001-07-20", MediaType: "movie"}
+	if scoreCandidate(good, recognized) <= scoreCandidate(bad, recognized) {
+		t.Fatal("query-list alias did not help exact candidate outrank documentary-style title")
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
