@@ -165,6 +165,58 @@ func TestTrySaveShareLinkToTempAllowsAliyunAccessTokenWithDriveID(t *testing.T) 
 	}
 }
 
+func TestTrySaveShareLinkToTempHandlesPan123FastLink(t *testing.T) {
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#食神·百厨大战.2025.S02E05.mp4"
+	var factoryProvider ShareProviderName
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		factoryProvider = provider
+		return &fakeShareSaver{}, nil
+	}
+	var savedRef ShareRef
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		savedRef = ref
+		if opts.TempRoot != "/tmp/pan123" {
+			t.Fatalf("temp root = %q, want /tmp/pan123", opts.TempRoot)
+		}
+		if !opts.Match(TreeEntry{
+			RootPath: ref.RawURL,
+			Path:     "/食神·百厨大战.2025.S02E05.mp4",
+			Name:     "食神·百厨大战.2025.S02E05.mp4",
+		}) {
+			t.Fatal("expected fastlink media match to be accepted")
+		}
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:         []string{"@pan123"},
+			TempTransferRoot: "/tmp/pan123",
+			AccessToken:      "access-123",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "食神·百厨大战"}, cfg, fastLink)
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled {
+		t.Fatal("handled = false, want true")
+	}
+	if source.Name != "pan123" || factoryProvider != ShareProviderPan123 {
+		t.Fatalf("source=%#v factoryProvider=%s, want pan123", source, factoryProvider)
+	}
+	if savedRef.RawURL != fastLink || savedRef.ShareID != "a3531a60736740a152e931a6ecee9bfb" {
+		t.Fatalf("saved ref = %#v, want fastlink ref", savedRef)
+	}
+}
+
 func TestTrySaveShareLinkToTempUsesAliyunOpenWebRefreshTokenFallback(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	if err := db.CreateStorage(&model.Storage{
@@ -291,6 +343,103 @@ func TestRunManualShareProviderSavesTempRoot(t *testing.T) {
 	}
 	if items[0].SourceURL != "" {
 		t.Fatalf("source URL = %q, want provider-handled link not recorded as skipped", items[0].SourceURL)
+	}
+}
+
+func TestRunManualImportsTextSavesMatchingPan123Files(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if _, err := SaveConfig(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Pan123: model.SubscriptionTelegramPanConfig{
+				TempTransferRoot: "/tmp/pan123",
+				AccessToken:      "token-1",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	oldFactory := newShareSaverForProvider
+	oldSaveImported := saveImportedFilesToTemp
+	oldSnapshot := snapshotPaths
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveImportedFilesToTemp = oldSaveImported
+		snapshotPaths = oldSnapshot
+	}()
+
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderPan123 {
+			t.Fatalf("provider = %s, want pan123", provider)
+		}
+		if cfg.AccessToken != "token-1" || cfg.TempTransferRoot != "/tmp/pan123" {
+			t.Fatalf("cfg = %#v, want pan123 token and temp root", cfg)
+		}
+		return &fakeShareSaver{}, nil
+	}
+	var importedRoot string
+	var importedFiles []pan123ImportedFile
+	saveImportedFilesToTemp = func(ctx context.Context, provider ShareSaver, rootPath string, files []pan123ImportedFile, opts SaveShareOptions) ([]TreeEntry, error) {
+		importedRoot = rootPath
+		importedFiles = append([]pan123ImportedFile(nil), files...)
+		if opts.TempRoot != "/tmp/pan123" {
+			t.Fatalf("temp root = %q, want /tmp/pan123", opts.TempRoot)
+		}
+		if !opts.Match(TreeEntry{Name: "达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv", Path: "/达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv"}) {
+			t.Fatal("expected match function to accept matching entry")
+		}
+		return []TreeEntry{{
+			RootPath: "/tmp/pan123",
+			Path:     "/达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
+			Name:     "达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
+		}}, nil
+	}
+	snapshotPaths = func(ctx context.Context, roots []string) (*TreeSnapshot, error) {
+		if got, want := roots, []string{"/tmp/pan123"}; !stringSlicesEqual(got, want) {
+			t.Fatalf("snapshot roots = %#v, want %#v", got, want)
+		}
+		return &TreeSnapshot{
+			Hash: "temp-hash-import",
+			Entries: []TreeEntry{{
+				RootPath: "/tmp/pan123",
+				Path:     "/达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
+				Name:     "达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
+			}},
+		}, nil
+	}
+
+	items, _, added, _, _, err := runManual(context.Background(), &model.Subscription{
+		ID:           1,
+		SourceConfig: `{"imports_text":"123FLCPV2$%69Y8N4KosSpjpcVCReGVzy#3531063629#达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv"}`,
+		TMDBName:     "达顿牧场",
+		TargetRoot:   "/target",
+		MediaType:    "tv",
+		Category:     "test",
+	}, false)
+	if err != nil {
+		t.Fatalf("run manual: %v", err)
+	}
+	if importedRoot == "" || len(importedFiles) != 1 {
+		t.Fatalf("root/files = %q %#v", importedRoot, importedFiles)
+	}
+	if added != 1 || len(items) != 1 {
+		t.Fatalf("added/items = %d/%d, want 1/1", added, len(items))
+	}
+}
+
+func TestRunManualImportsTextRequiresPan123Config(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if _, err := SaveConfig(model.SubscriptionConfig{}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	_, _, _, _, _, err := runManual(context.Background(), &model.Subscription{
+		ID:           1,
+		SourceConfig: `{"imports_text":"123FSLinkV2$bc18e4ea5fb89ec5778d1f38c9772f5f#1024#Movie.mkv"}`,
+		TMDBName:     "Movie",
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "pan123") {
+		t.Fatalf("err = %v, want pan123 config error", err)
 	}
 }
 

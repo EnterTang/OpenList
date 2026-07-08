@@ -82,8 +82,9 @@ type SubscriptionRun struct {
 }
 
 type SubscriptionManualSourceConfig struct {
-	Paths []string `json:"paths"`
-	Links []string `json:"links"`
+	Paths       []string `json:"paths"`
+	Links       []string `json:"links"`
+	ImportsText string   `json:"imports_text"`
 }
 
 type SubscriptionTelegramSourceConfig struct {

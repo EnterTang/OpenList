@@ -11,6 +11,7 @@ import (
 var (
 	newShareSaverForProvider = defaultNewShareSaverForProvider
 	saveShareToTemp          = SaveShareToTemp
+	saveImportedFilesToTemp  = SaveImportedFilesToTemp
 )
 
 func trySaveShareLinkToTemp(ctx context.Context, sub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig, rawLink string) (telegramPanSubscriptionSource, bool, error) {

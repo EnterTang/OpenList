@@ -135,6 +135,39 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		saved = append(saved, *stored)
 	}
 
+	if strings.TrimSpace(cfg.ImportsText) != "" {
+		files, _, err := parseManualImportText(cfg.ImportsText)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		globalCfg, err := GetConfig()
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		panCfg := normalizeTelegramPanConfig(globalCfg.Telegram.Pan123)
+		if strings.TrimSpace(panCfg.TempTransferRoot) == "" {
+			return saved, sub.LastTreeHash, added, changed, transferred, fmt.Errorf("pan123 temp_transfer_root is required for manual imports")
+		}
+		if strings.TrimSpace(panCfg.AccessToken) == "" {
+			return saved, sub.LastTreeHash, added, changed, transferred, fmt.Errorf("pan123 access_token is required for manual imports")
+		}
+		provider, err := newShareSaverForProvider(ShareProviderPan123, panCfg)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		_, err = saveImportedFilesToTemp(ctx, provider, "manual_import://pan123", files, SaveShareOptions{
+			TempRoot: panCfg.TempTransferRoot,
+			Match: func(entry TreeEntry) bool {
+				return !entry.IsDir && subscriptionEntryMatches(sub, entry)
+			},
+		})
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		snapshotRoots = appendPathOnce(snapshotRoots, panCfg.TempTransferRoot)
+		tempRootConfigs[panCfg.TempTransferRoot] = panCfg
+	}
+
 	snapshot, err := snapshotPaths(ctx, snapshotRoots)
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
@@ -175,6 +208,9 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	if len(cfg.Links) > 0 {
 		hash = combinedHash(hash, cfg.Links)
 	}
+	if cfg.ImportsText != "" {
+		hash = combinedHash(hash, []string{cfg.ImportsText})
+	}
 	return saved, hash, added, changed, transferred, nil
 }
 
@@ -188,6 +224,7 @@ func parseManualConfig(raw string) (model.SubscriptionManualSourceConfig, error)
 	}
 	cfg.Paths = cleanStringList(cfg.Paths, true)
 	cfg.Links = cleanStringList(cfg.Links, false)
+	cfg.ImportsText = strings.TrimSpace(cfg.ImportsText)
 	return cfg, nil
 }
 
