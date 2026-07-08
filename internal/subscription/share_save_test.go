@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -10,24 +11,47 @@ import (
 
 type fakeShareSaver struct {
 	fakeShareTreeProvider
-	ensuredPath string
-	dstDirID    string
-	saved       map[string][]ShareItem
-	waitedTasks []string
+	ensuredPath    string
+	ensureDirCalls []string
+	ensureDirIDs   map[string]string
+	dstDirID       string
+	saved          map[string][]ShareItem
+	waitedTasks    []string
 }
 
 func (p *fakeShareSaver) EnsureDir(ctx context.Context, path string) (string, error) {
-	p.ensuredPath = path
-	return p.dstDirID, nil
+	if p.ensuredPath == "" {
+		p.ensuredPath = path
+	}
+	p.ensureDirCalls = append(p.ensureDirCalls, path)
+	if p.ensureDirIDs == nil {
+		p.ensureDirIDs = map[string]string{}
+	}
+	if id, ok := p.ensureDirIDs[path]; ok {
+		return id, nil
+	}
+	if p.dstDirID == "" {
+		p.dstDirID = "dir:" + path
+	}
+	id := "dir:" + path
+	if path == p.ensuredPath {
+		id = p.dstDirID
+	}
+	p.ensureDirIDs[path] = id
+	return id, nil
 }
 
 func (p *fakeShareSaver) SaveShareItems(ctx context.Context, ref ShareRef, parentID string, items []ShareItem, dstDirID string) ([]string, error) {
 	if p.saved == nil {
 		p.saved = map[string][]ShareItem{}
 	}
-	p.saved[parentID] = append(p.saved[parentID], items...)
+	key := parentID
+	if dstDirID != "" {
+		key = dstDirID
+	}
+	p.saved[key] = append(p.saved[key], items...)
 	p.dstDirID = dstDirID
-	return []string{"task-1"}, nil
+	return []string{"task-" + strconv.Itoa(len(p.waitedTasks)+1)}, nil
 }
 
 func (p *fakeShareSaver) WaitSaveComplete(ctx context.Context, taskIDs []string) error {
