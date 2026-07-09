@@ -51,8 +51,11 @@ func trySaveShareLinkToTemp(ctx context.Context, sub *model.Subscription, cfg mo
 
 func telegramPanSourceConfigWithStorageFallback(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
 	cfg = normalizeTelegramPanConfig(cfg)
-	if provider == ShareProviderAliyunDrive {
+	switch provider {
+	case ShareProviderAliyunDrive:
 		cfg = aliyunDriveConfigWithStorageFallback(cfg)
+	case ShareProviderPan123:
+		cfg = pan123ConfigWithStorageFallback(cfg)
 	}
 	return telegramPanTempRootWithStorageFallback(provider, cfg)
 }

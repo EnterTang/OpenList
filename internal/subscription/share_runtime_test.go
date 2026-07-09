@@ -165,6 +165,72 @@ func TestTrySaveShareLinkToTempAllowsAliyunAccessTokenWithDriveID(t *testing.T) 
 	}
 }
 
+func TestTrySaveShareLinkToTempUsesPan123StorageAccessTokenFallback(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/123",
+		Driver:    "123Pan",
+		Addition:  `{"AccessToken":" storage-token-123 ","username":"u","password":"p"}`,
+	}); err != nil {
+		t.Fatalf("create 123 storage: %v", err)
+	}
+
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	var factoryConfig model.SubscriptionTelegramPanConfig
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderPan123 {
+			t.Fatalf("provider = %s, want pan123", provider)
+		}
+		factoryConfig = cfg
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:         []string{"@pan123"},
+			TempTransferRoot: "/123/.tmp-share",
+		},
+	})
+
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#SomeShow.2025.S02E05.mp4"
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "SomeShow"}, cfg, fastLink)
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled || source.Name != "pan123" {
+		t.Fatalf("handled/source = %v/%#v, want pan123 handled", handled, source)
+	}
+	if factoryConfig.AccessToken != "storage-token-123" {
+		t.Fatalf("factory access token = %q, want storage-token-123", factoryConfig.AccessToken)
+	}
+}
+
+func TestPan123ConfigWithStorageFallbackPrefersStorageToken(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/123",
+		Driver:    "123Pan",
+		Addition:  `{"AccessToken":"live-storage-token"}`,
+	}); err != nil {
+		t.Fatalf("create 123 storage: %v", err)
+	}
+
+	cfg := pan123ConfigWithStorageFallback(model.SubscriptionTelegramPanConfig{
+		AccessToken: "stale-manual-token",
+	})
+	if got, want := cfg.AccessToken, "live-storage-token"; got != want {
+		t.Fatalf("access token = %q, want %q", got, want)
+	}
+}
+
 func TestTrySaveShareLinkToTempHandlesPan123FastLink(t *testing.T) {
 	oldFactory := newShareSaverForProvider
 	oldSave := saveShareToTemp

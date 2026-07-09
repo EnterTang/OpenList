@@ -144,12 +144,15 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, transferred, err
 		}
-		panCfg := normalizeTelegramPanConfig(globalCfg.Telegram.Pan123)
+		panCfg := telegramPanSourceConfigWithStorageFallback(
+			ShareProviderPan123,
+			normalizeTelegramPanConfig(globalCfg.Telegram.Pan123),
+		)
 		if strings.TrimSpace(panCfg.TempTransferRoot) == "" {
 			return saved, sub.LastTreeHash, added, changed, transferred, fmt.Errorf("pan123 temp_transfer_root is required for manual imports")
 		}
 		if strings.TrimSpace(panCfg.AccessToken) == "" {
-			return saved, sub.LastTreeHash, added, changed, transferred, fmt.Errorf("pan123 access_token is required for manual imports")
+			return saved, sub.LastTreeHash, added, changed, transferred, fmt.Errorf("pan123 access_token is required for manual imports; configure a 123Pan storage so the token can be loaded automatically")
 		}
 		provider, err := newShareSaverForProvider(ShareProviderPan123, panCfg)
 		if err != nil {
