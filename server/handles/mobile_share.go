@@ -8,6 +8,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	mobileshare "github.com/OpenListTeam/OpenList/v4/internal/mobile_share"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -15,10 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
-
-type mobileShareCreator interface {
-	CreateMobileShare(context.Context, model.Obj, model.MobileShareCreateArgs) (*model.MobileShareLink, error)
-}
 
 type mobileShareDeleter interface {
 	DeleteMobileShare(context.Context, model.MobileShareDeleteArgs) error
@@ -60,8 +57,7 @@ func CreateMobileShare(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	creator, ok := storage.(mobileShareCreator)
-	if !ok {
+	if _, ok := storage.(mobileshare.Creator); !ok {
 		common.ErrorStrResp(c, "storage does not support mobile share creation", 400)
 		return
 	}
@@ -70,67 +66,19 @@ func CreateMobileShare(c *gin.Context) {
 		common.ErrorResp(c, err, 404)
 		return
 	}
-	sourceFileID := strings.TrimSpace(obj.GetID())
-	if sourceFileID == "" {
-		common.ErrorStrResp(c, "source object id is empty", 400)
-		return
-	}
-	driveID := mobileShareDriveID(storage.GetStorage().MountPath)
-	existing, err := db.GetMobileShareRecordBySource(driveID, sourceFileID)
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-	if existing != nil && existing.IsValid && !req.Force {
-		common.SuccessResp(c, model.MobileShareCreateResult{
-			Record:          existing,
-			Created:         false,
-			Existing:        true,
-			RequiresConfirm: true,
-		})
-		return
-	}
-	link, err := creator.CreateMobileShare(c.Request.Context(), obj, model.MobileShareCreateArgs{
-		SourcePath: reqPath,
-		PeriodUnit: req.PeriodUnit,
-	})
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-	sourceType := "file"
-	if obj.IsDir() {
-		sourceType = "folder"
-	}
-	periodUnit := req.PeriodUnit
-	if periodUnit <= 0 {
-		periodUnit = 1
-	}
-	record, err := db.UpsertMobileShareRecord(&model.MobileShareRecord{
+	result, err := mobileshare.CreateOrReuseShare(c.Request.Context(), storage.(mobileshare.Creator), mobileshare.ShareRequest{
 		StorageID:        storage.GetStorage().ID,
-		StorageMountPath: utils.FixAndCleanPath(storage.GetStorage().MountPath),
-		DriveID:          driveID,
-		SourceFileID:     sourceFileID,
-		SourcePath:       utils.FixAndCleanPath(reqPath),
-		SourceName:       obj.GetName(),
-		SourceType:       sourceType,
-		PeriodUnit:       periodUnit,
-		LinkID:           link.LinkID,
-		ShareURL:         link.ShareURL,
-		ExtractCode:      link.ExtractCode,
-		IsValid:          true,
-		LastError:        "",
+		StorageMountPath: storage.GetStorage().MountPath,
+		Object:           obj,
+		SourcePath:       reqPath,
+		PeriodUnit:       req.PeriodUnit,
+		Force:            req.Force,
 	})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, model.MobileShareCreateResult{
-		Record:          record,
-		Created:         true,
-		Existing:        existing != nil,
-		RequiresConfirm: false,
-	})
+	common.SuccessResp(c, result)
 }
 
 func ListMobileShareRecords(c *gin.Context) {
@@ -253,7 +201,7 @@ func DeleteMobileShare(c *gin.Context) {
 }
 
 func mobileShareDriveID(mountPath string) string {
-	return utils.FixAndCleanPath(mountPath)
+	return mobileshare.DriveID(mountPath)
 }
 
 func mobileShareDeleteRecordIDs(req deleteMobileShareReq) []uint {

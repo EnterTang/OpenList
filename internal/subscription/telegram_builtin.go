@@ -108,7 +108,7 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 	if limit <= 0 {
 		limit = 40
 	}
-	perChannelLimit := max(1, limit/len(channels))
+	perChannelLimit := telegramBuiltinPerChannelLimit(limit, len(channels))
 	var rows []telegramCommandRow
 	err := runBuiltinTelegramClient(ctx, cfg, func(ctx context.Context, client *telegram.Client) error {
 		status, err := client.Auth().Status(ctx)
@@ -119,9 +119,6 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 			return errors.New("telegram is not logged in")
 		}
 		for _, channel := range channels {
-			if len(rows) >= limit {
-				break
-			}
 			peer, normalized, err := resolveTelegramChannel(ctx, client.API(), channel)
 			if err != nil {
 				return err
@@ -130,7 +127,7 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 				Peer:   peer,
 				Q:      query,
 				Filter: &tg.InputMessagesFilterEmpty{},
-				Limit:  min(perChannelLimit, limit-len(rows)),
+				Limit:  perChannelLimit,
 			})
 			if err != nil {
 				return formatBuiltinTelegramError(err)
@@ -147,6 +144,16 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 		return nil, err
 	}
 	return rows, nil
+}
+
+func telegramBuiltinPerChannelLimit(limit, channelCount int) int {
+	if limit <= 0 {
+		limit = 40
+	}
+	if channelCount <= 0 {
+		return limit
+	}
+	return limit
 }
 
 func runBuiltinTelegramClient(ctx context.Context, cfg model.SubscriptionTelegramSourceConfig, fn func(context.Context, *telegram.Client) error) error {

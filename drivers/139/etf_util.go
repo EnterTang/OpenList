@@ -10,6 +10,12 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
+type personalFolderEnsureStep struct {
+	RelPath string
+	Obj     model.Obj
+	Created bool
+}
+
 func (d *Yun139) personalRapidCreate(ctx context.Context, parentFileID, name string, size int64, sha256 string) (model.Obj, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -45,6 +51,11 @@ func (d *Yun139) personalRapidCreate(ctx context.Context, parentFileID, name str
 }
 
 func (d *Yun139) ensurePersonalFolderPath(ctx context.Context, rootID, relPath string) (model.Obj, error) {
+	obj, _, err := d.ensurePersonalFolderPathWithTrace(ctx, rootID, relPath)
+	return obj, err
+}
+
+func (d *Yun139) ensurePersonalFolderPathWithTrace(ctx context.Context, rootID, relPath string) (model.Obj, []personalFolderEnsureStep, error) {
 	if strings.TrimSpace(rootID) == "" {
 		rootID = d.RootFolderID
 	}
@@ -52,25 +63,31 @@ func (d *Yun139) ensurePersonalFolderPath(ctx context.Context, rootID, relPath s
 		rootID = "/"
 	}
 	current := &model.Object{ID: rootID, Name: path.Base(rootID), IsFolder: true}
+	steps := make([]personalFolderEnsureStep, 0)
+	relParts := make([]string, 0)
 	for _, segment := range splitETFPath(relPath) {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		relParts = append(relParts, segment)
+		currentRelPath := strings.Join(relParts, "/")
 		existing, err := d.findPersonalFolder(ctx, current.GetID(), segment)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if existing != nil {
 			current = existing
+			steps = append(steps, personalFolderEnsureStep{RelPath: currentRelPath, Obj: current, Created: false})
 			continue
 		}
 		created, err := d.createPersonalFolder(ctx, current.GetID(), segment)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		current = created
+		steps = append(steps, personalFolderEnsureStep{RelPath: currentRelPath, Obj: current, Created: true})
 	}
-	return current, nil
+	return current, steps, nil
 }
 
 func (d *Yun139) ensurePersonalConfiguredFolder(ctx context.Context, folderPath string) (model.Obj, error) {

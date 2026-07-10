@@ -14,6 +14,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/bootstrap/data"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -95,6 +96,7 @@ func Start() {
 	InitTaskManager()
 	subscription.RegisterTransferTaskHooks()
 	subscription.StartScheduler()
+	etfauto.StartWorker()
 	if !flags.Debug && !flags.Dev {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -276,6 +278,7 @@ func Start() {
 
 func Shutdown(timeout time.Duration) {
 	utils.Log.Println("Shutdown server...")
+	etfauto.StopWorker()
 	subscription.StopScheduler()
 	fs.ArchiveContentUploadTaskManager.RemoveAll()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)

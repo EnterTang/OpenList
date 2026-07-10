@@ -20,6 +20,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/tmdb"
@@ -30,10 +31,13 @@ import (
 const etfVideoLinkType = "etf_video"
 
 type etfArchivePlan struct {
-	targetDir model.Obj
-	meta      *tmdb.Metadata
-	result    recognize.Result
-	pathParts []string
+	targetDir          model.Obj
+	meta               *tmdb.Metadata
+	result             recognize.Result
+	pathParts          []string
+	mediaRootDir       model.Obj
+	mediaRootPathParts []string
+	mediaRootCreated   bool
 }
 
 type manualETFArchiveFile struct {
@@ -191,11 +195,22 @@ func (d *Yun139) resolveETFArchivePlan(ctx context.Context, dstDir model.Obj, so
 	if len(parts) == 0 {
 		return plan, nil
 	}
-	dir, err := d.ensurePersonalFolderPath(ctx, targetDir.GetID(), strings.Join(parts, "/"))
+	dir, trace, err := d.ensurePersonalFolderPathWithTrace(ctx, targetDir.GetID(), strings.Join(parts, "/"))
 	if err != nil {
 		return nil, err
 	}
 	plan.targetDir = dir
+	if mediaRootRelParts := etfMediaRootRelParts(parts, resolvedMeta); len(mediaRootRelParts) > 0 {
+		plan.mediaRootPathParts = append(rootParts, mediaRootRelParts...)
+		mediaRootRelPath := strings.Join(mediaRootRelParts, "/")
+		for _, step := range trace {
+			if step.RelPath == mediaRootRelPath {
+				plan.mediaRootDir = step.Obj
+				plan.mediaRootCreated = step.Created
+				break
+			}
+		}
+	}
 	return plan, nil
 }
 
@@ -288,6 +303,28 @@ func etfSeasonFolderName(season int) string {
 	return fmt.Sprintf("Season %d", season)
 }
 
+func etfMediaRootRelParts(parts []string, meta *tmdb.Metadata) []string {
+	if meta == nil {
+		return nil
+	}
+	mediaFolder := etfMediaFolderName(meta)
+	if mediaFolder == "" {
+		return nil
+	}
+	index := -1
+	for i, part := range parts {
+		if part == mediaFolder {
+			index = i
+		}
+	}
+	if index < 0 {
+		return nil
+	}
+	rootParts := make([]string, index+1)
+	copy(rootParts, parts[:index+1])
+	return rootParts
+}
+
 func sanitizeETFPathSegment(segment string) string {
 	segment = strings.NewReplacer("/", " ", "\\", " ").Replace(segment)
 	return strings.Join(strings.Fields(strings.TrimSpace(segment)), " ")
@@ -323,6 +360,34 @@ func (d *Yun139) archivePersonalETF(ctx context.Context, dstDir model.Obj, sourc
 	}
 	record.Status = model.ETFArchiveStatusArchived
 	_ = saveETFArchiveRecord(record)
+	d.recordETFAutoSubscriptionEvent(ctx, record, plan)
+}
+
+func (d *Yun139) recordETFAutoSubscriptionEvent(ctx context.Context, record *model.ETFArchiveRecord, plan *etfArchivePlan) {
+	if record == nil || plan == nil || plan.meta == nil || plan.mediaRootDir == nil {
+		return
+	}
+	if !d.Addition.ETFAutoSubscriptionEnabled || strings.TrimSpace(d.Addition.ETFAutoSubscriptionTargetBaseURL) == "" {
+		return
+	}
+	quietSeconds := d.Addition.ETFAutoSubscriptionQuietSeconds
+	if quietSeconds <= 0 {
+		quietSeconds = 30
+	}
+	cfg := etfauto.Config{
+		Enabled:         true,
+		TargetBaseURL:   d.Addition.ETFAutoSubscriptionTargetBaseURL,
+		QuietWindow:     time.Duration(quietSeconds) * time.Second,
+		SharePeriodUnit: d.Addition.ETFAutoSubscriptionSharePeriodUnit,
+		ShareType:       d.Addition.ETFAutoSubscriptionShareType,
+	}
+	_, _ = etfauto.RecordArchiveEvent(ctx, etfauto.ArchiveEvent{
+		Record:           record,
+		MediaRootFileID:  plan.mediaRootDir.GetID(),
+		MediaRootPath:    d.fullETFArchivePath(plan.mediaRootPathParts, ""),
+		MediaRootCreated: plan.mediaRootCreated,
+		OccurredAt:       time.Now(),
+	}, cfg)
 }
 
 func (d *Yun139) PreviewManualETFArchive(ctx context.Context, folderPath string, metadata model.ETFManualArchiveMetadata) (*model.ETFManualArchivePreview, error) {

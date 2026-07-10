@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -60,7 +61,7 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	sub := &model.Subscription{
 		SourceType:   model.SubscriptionSourceTelegram,
-		SourceConfig: `{"quark_channels":[" @sub-quark ",""],"limit":5}`,
+		SourceConfig: `{"quark_channels":[" @sub-quark ",""],"limit":5,"transfer_priority":["quark","123","aliyun"]}`,
 	}
 	cfg := model.SubscriptionConfig{
 		Telegram: model.SubscriptionTelegramSourceConfig{
@@ -119,6 +120,9 @@ func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	if got, want := source.Channels, []string{"@sub-quark", "@default-aliyun", "@default-123", "@default-115"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("runtime channels = %#v, want %#v", got, want)
 	}
+	if got, want := source.TransferPriority, []string{"quark", "pan123", "aliyun_drive", "pan115"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("transfer priority = %#v, want %#v", got, want)
+	}
 }
 
 func TestApplyConfigDefaultsMergesTelegramProviderCredentials(t *testing.T) {
@@ -171,8 +175,8 @@ func TestApplyConfigDefaultsMergesTelegramProviderCredentials(t *testing.T) {
 	if source.AliyunDrive.RefreshToken != "default-aliyun-refresh" {
 		t.Fatalf("aliyun refresh token = %q, want default", source.AliyunDrive.RefreshToken)
 	}
-	if source.AliyunDrive.DriveID != "default-drive" {
-		t.Fatalf("aliyun drive id = %q, want default", source.AliyunDrive.DriveID)
+	if source.AliyunDrive.DriveID != "" || strings.Contains(sub.SourceConfig, "drive_id") {
+		t.Fatalf("aliyun drive id should not be emitted in config: source=%#v raw=%s", source.AliyunDrive, sub.SourceConfig)
 	}
 	if source.Pan123.AccessToken != "sub-access" {
 		t.Fatalf("123 access token = %q, want subscription override", source.Pan123.AccessToken)
@@ -182,6 +186,13 @@ func TestApplyConfigDefaultsMergesTelegramProviderCredentials(t *testing.T) {
 	}
 	if got, want := source.Channels, []string{"@sub-quark", "@sub-aliyun", "@sub-123", "@sub-115"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("runtime channels = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeConfigDefaultsTelegramTransferPriority(t *testing.T) {
+	cfg := normalizeConfig(model.SubscriptionConfig{})
+	if got, want := cfg.Telegram.TransferPriority, []string{"pan123", "pan115", "quark", "aliyun_drive"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("transfer priority = %#v, want %#v", got, want)
 	}
 }
 

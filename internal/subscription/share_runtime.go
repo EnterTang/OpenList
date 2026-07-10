@@ -37,16 +37,91 @@ func trySaveShareLinkToTemp(ctx context.Context, sub *model.Subscription, cfg mo
 	if err != nil {
 		return source, false, err
 	}
-	_, err = saveShareToTemp(ctx, provider, ref, SaveShareOptions{
+	selected, err := saveShareToTemp(ctx, provider, ref, SaveShareOptions{
 		TempRoot: source.Config.TempTransferRoot,
 		Match: func(entry TreeEntry) bool {
-			return !entry.IsDir && subscriptionEntryMatches(sub, entry)
+			return boundShareEntryMatches(sub, entry)
 		},
 	})
 	if err != nil {
 		return source, false, err
 	}
+	source.BoundShareNames, source.BoundSharePaths = boundShareMarkers(selected)
 	return source, true, nil
+}
+
+func boundShareMarkers(entries []TreeEntry) (map[string]struct{}, map[string]struct{}) {
+	names := map[string]struct{}{}
+	paths := map[string]struct{}{}
+	for _, entry := range entries {
+		name := strings.TrimSpace(entry.Name)
+		if name != "" {
+			names[name] = struct{}{}
+		}
+		path := cleanBoundSharePath(entry.Path)
+		if path != "" {
+			paths[path] = struct{}{}
+		}
+	}
+	return names, paths
+}
+
+func mergeStringSet(dst map[string]struct{}, src map[string]struct{}) map[string]struct{} {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = map[string]struct{}{}
+	}
+	for value := range src {
+		dst[value] = struct{}{}
+	}
+	return dst
+}
+
+func mergeBoundShareSource(existing, incoming telegramPanSubscriptionSource) telegramPanSubscriptionSource {
+	if existing.Name == "" {
+		return incoming
+	}
+	if incoming.Name == "" {
+		return existing
+	}
+	incoming.BoundShareNames = mergeStringSet(existing.BoundShareNames, incoming.BoundShareNames)
+	incoming.BoundSharePaths = mergeStringSet(existing.BoundSharePaths, incoming.BoundSharePaths)
+	return incoming
+}
+
+func mergeBoundShareMarkers(names, paths map[string]struct{}, entries []TreeEntry) (map[string]struct{}, map[string]struct{}) {
+	entryNames, entryPaths := boundShareMarkers(entries)
+	return mergeStringSet(names, entryNames), mergeStringSet(paths, entryPaths)
+}
+
+func entryMatchesSubscriptionOrBoundShare(sub *model.Subscription, entry TreeEntry, names, paths map[string]struct{}) bool {
+	if boundShareMarkerMatches(entry, names, paths) && boundShareEntryMatches(sub, entry) {
+		return true
+	}
+	return subscriptionEntryMatches(sub, entry)
+}
+
+func boundShareMarkerMatches(entry TreeEntry, names, paths map[string]struct{}) bool {
+	if len(names) == 0 && len(paths) == 0 {
+		return false
+	}
+	if _, ok := paths[cleanBoundSharePath(entry.Path)]; ok {
+		return true
+	}
+	if _, ok := names[strings.TrimSpace(entry.Name)]; ok {
+		return true
+	}
+	return false
+}
+
+func cleanBoundSharePath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return cleanConfigPath(value)
 }
 
 func telegramPanSourceConfigWithStorageFallback(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
@@ -57,7 +132,11 @@ func telegramPanSourceConfigWithStorageFallback(provider ShareProviderName, cfg 
 	case ShareProviderPan123:
 		cfg = pan123ConfigWithStorageFallback(cfg)
 	}
-	return telegramPanTempRootWithStorageFallback(provider, cfg)
+	cfg = telegramPanTempRootWithStorageFallback(provider, cfg)
+	if provider == ShareProviderAliyunDrive {
+		cfg = aliyunDriveConfigWithTempRootFallback(cfg)
+	}
+	return cfg
 }
 
 func telegramPanTempRootWithStorageFallback(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {

@@ -359,12 +359,11 @@ func TestAfterPersonalUploadETFDeletesSourceAndCleansRecycleBin(t *testing.T) {
 func TestAfterPersonalUploadETFUsesTMDBCategoryFolder(t *testing.T) {
 	setup139Resty(t)
 	tmdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/search/multi" {
-			t.Fatalf("tmdb path = %q, want /search/multi", r.URL.Path)
+		if r.URL.Path != "/search/movie" {
+			t.Fatalf("tmdb path = %q, want /search/movie", r.URL.Path)
 		}
 		write139JSON(t, w, map[string]any{"results": []map[string]any{{
 			"id":                100,
-			"media_type":        "movie",
 			"title":             "Movie",
 			"release_date":      "2024-01-01",
 			"genre_ids":         []int{16},
@@ -435,6 +434,7 @@ func TestAfterPersonalUploadETFUsesTMDBCategoryFolder(t *testing.T) {
 			ETFRootFolder: "Managed",
 		},
 	}
+	d.SetStorage(model.Storage{ID: 1, MountPath: "/139_60t"})
 	d.RootFolderID = "root"
 	err := d.afterPersonalUploadETF(context.Background(), &model.Object{ID: "parent", Path: "/Movies"}, "Movie.mkv", 2048, strings.Repeat("A", 64), &model.Object{ID: "source", Name: "Movie.mkv"})
 	if err != nil {
@@ -539,6 +539,110 @@ func TestAfterPersonalUploadETFUsesTVSeasonFolder(t *testing.T) {
 	}
 	if finalParent != "season-id" {
 		t.Fatalf("final parent = %q, want season-id", finalParent)
+	}
+}
+
+func TestAfterPersonalUploadETFRecordsAutoSubscriptionBatchForCreatedMediaRoot(t *testing.T) {
+	setup139Resty(t)
+	setup139ETFArchiveDB(t)
+	tmdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tv/260868" {
+			t.Fatalf("tmdb path = %q, want /tv/260868", r.URL.Path)
+		}
+		write139JSON(t, w, map[string]any{
+			"id":                260868,
+			"name":              "婚姻攻略",
+			"first_air_date":    "2024-08-29",
+			"origin_country":    []string{"CN"},
+			"original_language": "zh",
+		})
+	}))
+	defer tmdbServer.Close()
+	oldSettingValue := etfSettingValue
+	etfSettingValue = func(key string) string {
+		switch key {
+		case conf.TMDBApiKey:
+			return "key"
+		case conf.TMDBApiBaseURL:
+			return tmdbServer.URL
+		case conf.TMDBLanguage:
+			return "zh-CN"
+		case conf.MediaCategoryRules:
+			return "tv:\n  国产剧:\n    origin_country: 'CN'\n  未分类:\n"
+		default:
+			return ""
+		}
+	}
+	t.Cleanup(func() {
+		etfSettingValue = oldSettingValue
+	})
+
+	folderIDs := map[string]string{
+		"root/ETF管理":    "managed-id",
+		"managed-id/tv": "tv-id",
+		"tv-id/国产剧":     "category-id",
+		"category-id/婚姻攻略 (2024) {tmdb-260868}": "show-id",
+		"show-id/Season 1": "season-id",
+	}
+	personalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		switch r.URL.Path {
+		case "/file/list":
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"items": []any{}}})
+		case "/file/create":
+			name, _ := body["name"].(string)
+			parentID, _ := body["parentFileId"].(string)
+			if body["type"] == "folder" {
+				write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": folderIDs[parentID+"/"+name], "fileName": name}})
+				return
+			}
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "etf-id", "fileName": name, "partInfos": []any{}}})
+		default:
+			t.Fatalf("unexpected personal path: %s", r.URL.Path)
+		}
+	}))
+	defer personalServer.Close()
+
+	d := &Yun139{
+		PersonalCloudHost: personalServer.URL,
+		Addition: Addition{
+			Type:                               MetaPersonalNew,
+			GenerateETF:                        true,
+			ETFArchive:                         true,
+			ETFRootFolder:                      "ETF管理",
+			ETFAutoSubscriptionEnabled:         true,
+			ETFAutoSubscriptionTargetBaseURL:   "http://localhost:8080/api/v1",
+			ETFAutoSubscriptionQuietSeconds:    30,
+			ETFAutoSubscriptionSharePeriodUnit: 1,
+		},
+	}
+	d.SetStorage(model.Storage{ID: 1, MountPath: "/139_60t"})
+	d.RootFolderID = "root"
+	sourceName := "婚姻攻略 (2024) S01E15.2160p.{tmdbid-260868}.mp4"
+	if err := d.afterPersonalUploadETF(context.Background(), &model.Object{ID: "parent", Path: "/转存中转"}, sourceName, 2048, strings.Repeat("A", 64), &model.Object{ID: "source", Name: sourceName}); err != nil {
+		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
+	}
+
+	var roots []model.ETFMediaRoot
+	if err := db.GetDb().Order("id ASC").Find(&roots).Error; err != nil {
+		t.Fatalf("list media roots: %v", err)
+	}
+	if len(roots) != 1 {
+		t.Fatalf("media root count = %d, want 1", len(roots))
+	}
+	wantRoot := "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}"
+	if roots[0].MediaRootPath != wantRoot {
+		t.Fatalf("media root path = %q, want %q", roots[0].MediaRootPath, wantRoot)
+	}
+	var batches []model.ETFMediaRootBatch
+	if err := db.GetDb().Order("id ASC").Find(&batches).Error; err != nil {
+		t.Fatalf("list batches: %v", err)
+	}
+	if len(batches) != 1 || !batches[0].MediaRootCreated || batches[0].Reason != model.ETFMediaRootBatchReasonInitialCreate {
+		t.Fatalf("batches = %#v, want one initial-create batch", batches)
 	}
 }
 

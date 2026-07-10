@@ -146,6 +146,10 @@ func (d *Yun139) DeleteMobileShare(ctx context.Context, args model.MobileShareDe
 		payload := base.Json{
 			"delOutLinkReq": base.Json{
 				"linkIDs": linkIDs[start:end],
+				"commonAccountInfo": base.Json{
+					"account":     d.getAccount(),
+					"accountType": 1,
+				},
 			},
 		}
 		var resp BaseResp

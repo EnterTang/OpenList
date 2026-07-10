@@ -130,6 +130,32 @@ func TestTelegramSearchQueryUsesSubscriptionNames(t *testing.T) {
 	}
 }
 
+func TestTelegramLegacyCursorDoesNotSkipChannelScopedRows(t *testing.T) {
+	cursor := parseTelegramCursor("66656")
+	pan123Row := telegramCommandRow{MsgID: int64(47100), Channel: "Pan123Movie"}
+	if telegramCursorHasSeen(cursor, pan123Row) {
+		t.Fatal("legacy global cursor should not skip a lower channel-scoped message id")
+	}
+
+	next := cursor
+	next.advance(telegramCommandRow{MsgID: int64(66656), Channel: "Aliyun_4K_Movies"})
+	next.advance(pan123Row)
+	formatted := formatTelegramCursor(next)
+	parsed := parseTelegramCursor(formatted)
+	if telegramCursorHasSeen(parsed, telegramCommandRow{MsgID: int64(47101), Channel: "Pan123Movie"}) {
+		t.Fatalf("formatted cursor %q should not skip newer Pan123Movie message", formatted)
+	}
+	if !telegramCursorHasSeen(parsed, pan123Row) {
+		t.Fatalf("formatted cursor %q should remember processed Pan123Movie message", formatted)
+	}
+}
+
+func TestBuiltinTelegramLimitAppliesPerChannel(t *testing.T) {
+	if got := telegramBuiltinPerChannelLimit(40, 7); got != 40 {
+		t.Fatalf("per-channel limit = %d, want 40", got)
+	}
+}
+
 func TestTelegramPanSourceForRowUsesNestedPanConfig(t *testing.T) {
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		Quark: model.SubscriptionTelegramPanConfig{
@@ -348,6 +374,103 @@ func TestTelegramPanSourcesForTransferMergesConfiguredAndTriggered(t *testing.T)
 	}
 	if merged["pan115"].Config.TempTransferRoot != "/115/temp" {
 		t.Fatalf("pan115 = %#v", merged["pan115"])
+	}
+}
+
+func TestSelectTelegramTempTransferCandidatesPrefersConfiguredProviderPriority(t *testing.T) {
+	sub := &model.Subscription{
+		ID:         8,
+		TMDBName:   "飞常日志",
+		TMDBYear:   2024,
+		TMDBID:     243236,
+		MediaType:  "tv",
+		Category:   "港台剧",
+		TargetRoot: "/139_60t/上传中转",
+		Seasons:    []int{2},
+	}
+	seenAt := time.Now()
+	candidates := []telegramTempCandidate{
+		testTelegramTempCandidate(sub, "aliyun_drive", TreeEntry{
+			RootPath: "/ali/转存至移动/F飞常日志2（2026）［港剧］",
+			Path:     "/10粤语.mp4",
+			Name:     "10粤语.mp4",
+			ID:       "ali-e10",
+			Size:     500,
+		}, seenAt),
+		testTelegramTempCandidate(sub, "quark", TreeEntry{
+			RootPath: "/quark/转存至移动",
+			Path:     "/飞常日志.2024.S02E10.第10集.1080p.WEB-DL.mkv",
+			Name:     "飞常日志.2024.S02E10.第10集.1080p.WEB-DL.mkv",
+			ID:       "quark-e10",
+			Size:     800,
+		}, seenAt),
+		testTelegramTempCandidate(sub, "pan123", TreeEntry{
+			RootPath: "/123/转存至移动",
+			Path:     "/飞常日志.2024.S02E10.第10集.1080p.MyTVSuper.WEB-DL.mkv",
+			Name:     "飞常日志.2024.S02E10.第10集.1080p.MyTVSuper.WEB-DL.mkv",
+			ID:       "pan123-e10",
+			Size:     700,
+		}, seenAt),
+	}
+
+	selected := selectTelegramTempTransferCandidates(sub, candidates, []string{"pan123", "pan115", "quark", "aliyun_drive"})
+	if got, want := len(selected), 1; got != want {
+		t.Fatalf("selected count = %d, want %d: %#v", got, want, selected)
+	}
+	if selected[0].Source.Name != "pan123" {
+		t.Fatalf("selected source = %q, want pan123", selected[0].Source.Name)
+	}
+	if selected[0].Item.Season != 2 || selected[0].Item.Episode != 10 {
+		t.Fatalf("selected season/episode = %d/%d, want 2/10", selected[0].Item.Season, selected[0].Item.Episode)
+	}
+}
+
+func TestSelectTelegramTempTransferCandidatesDedupesSameProviderEpisode(t *testing.T) {
+	sub := &model.Subscription{
+		ID:         8,
+		TMDBName:   "飞常日志",
+		TMDBYear:   2024,
+		TMDBID:     243236,
+		MediaType:  "tv",
+		Category:   "港台剧",
+		TargetRoot: "/139_60t/上传中转",
+		Seasons:    []int{2},
+	}
+	seenAt := time.Now()
+	candidates := []telegramTempCandidate{
+		testTelegramTempCandidate(sub, "pan123", TreeEntry{
+			RootPath: "/123/转存至移动",
+			Path:     "/飞常日志.2024.S02E05.第5集.1080p.MyVideo.WEB-DL.SDR.H.264.30fps.AAC 2.0.mkv",
+			Name:     "飞常日志.2024.S02E05.第5集.1080p.MyVideo.WEB-DL.SDR.H.264.30fps.AAC 2.0.mkv",
+			ID:       "pan123-e05-myvideo",
+			Size:     600,
+		}, seenAt),
+		testTelegramTempCandidate(sub, "pan123", TreeEntry{
+			RootPath: "/123/转存至移动",
+			Path:     "/飞常日志.2024.S02E05.第5集.1080p.MyTVSuper.WEB-DL.SDR.H.265.25fps.AAC 2.0.mkv",
+			Name:     "飞常日志.2024.S02E05.第5集.1080p.MyTVSuper.WEB-DL.SDR.H.265.25fps.AAC 2.0.mkv",
+			ID:       "pan123-e05-mytvsuper",
+			Size:     900,
+		}, seenAt),
+	}
+
+	selected := selectTelegramTempTransferCandidates(sub, candidates, []string{"pan123", "pan115", "quark", "aliyun_drive"})
+	if got, want := len(selected), 1; got != want {
+		t.Fatalf("selected count = %d, want %d: %#v", got, want, selected)
+	}
+	if !strings.Contains(selected[0].Entry.Name, "MyTVSuper") {
+		t.Fatalf("selected entry = %q, want larger MyTVSuper candidate", selected[0].Entry.Name)
+	}
+}
+
+func testTelegramTempCandidate(sub *model.Subscription, sourceName string, entry TreeEntry, seenAt time.Time) telegramTempCandidate {
+	item := itemFromEntry(sub, entry, seenAt)
+	return telegramTempCandidate{
+		Source: telegramPanSubscriptionSource{
+			Name: sourceName,
+		},
+		Entry: entry,
+		Item:  item,
 	}
 }
 

@@ -38,6 +38,20 @@ func TestRecognizeEnglishEpisodeReleaseName(t *testing.T) {
 	}
 }
 
+func TestRecognizeNoisyAudioSuffixUsesCleanQueryTitle(t *testing.T) {
+	got := Recognize("成何体统.3Audios.S02E23.1080p.WEB-DL.AAC2.0.mkv", "/anime")
+
+	if got.Title != "成何体统" {
+		t.Fatalf("Title = %q, want 成何体统", got.Title)
+	}
+	if got.Season != 2 || got.Episode != 23 {
+		t.Fatalf("season/episode = %d/%d, want 2/23", got.Season, got.Episode)
+	}
+	if !containsQuery(got.QueryList, "成何体统") {
+		t.Fatalf("QueryList = %#v, want 成何体统 candidate", got.QueryList)
+	}
+}
+
 func TestRecognizeChineseSeason(t *testing.T) {
 	got := Recognize("嗜血法医 第8季 豆瓣8.8", "/tv")
 
@@ -103,4 +117,13 @@ func TestPreferParentTitleForGenericEpisode(t *testing.T) {
 	if got.Season != 1 || got.Episode != 2 {
 		t.Fatalf("season/episode = %d/%d, want 1/2", got.Season, got.Episode)
 	}
+}
+
+func containsQuery(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

@@ -269,9 +269,6 @@ func fillTelegramPanConfig(cfg, defaults model.SubscriptionTelegramPanConfig) mo
 	if cfg.AccessToken == "" {
 		cfg.AccessToken = defaults.AccessToken
 	}
-	if cfg.DriveID == "" {
-		cfg.DriveID = defaults.DriveID
-	}
 	if cfg.DriveType == "" {
 		cfg.DriveType = defaults.DriveType
 	}
@@ -286,7 +283,6 @@ func isZeroTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) bool {
 		cfg.Cookie == "" &&
 		cfg.RefreshToken == "" &&
 		cfg.AccessToken == "" &&
-		cfg.DriveID == "" &&
 		cfg.DriveType == ""
 }
 

@@ -60,6 +60,7 @@ type tmdbItem struct {
 	OriginCountry    []string     `json:"origin_country"`
 	OriginalLanguage string       `json:"original_language"`
 	Seasons          []tmdbSeason `json:"seasons"`
+	Aliases          []string     `json:"-"`
 	SearchLanguage   string       `json:"-"`
 }
 
@@ -71,6 +72,29 @@ type tmdbSeason struct {
 	SeasonNumber int    `json:"season_number"`
 	EpisodeCount int    `json:"episode_count"`
 	Name         string `json:"name"`
+}
+
+type tmdbAlternativeTitlesResp struct {
+	Results []tmdbAliasTitle `json:"results"`
+	Titles  []tmdbAliasTitle `json:"titles"`
+}
+
+type tmdbAliasTitle struct {
+	Title string `json:"title"`
+	Name  string `json:"name"`
+}
+
+type tmdbTranslationsResp struct {
+	Translations []tmdbTranslation `json:"translations"`
+}
+
+type tmdbTranslation struct {
+	Data tmdbTranslationData `json:"data"`
+}
+
+type tmdbTranslationData struct {
+	Title string `json:"title"`
+	Name  string `json:"name"`
 }
 
 func Resolve(ctx context.Context, cfg Config, recognized recognize.Result) (*Metadata, error) {
@@ -100,15 +124,29 @@ func Resolve(ctx context.Context, cfg Config, recognized recognize.Result) (*Met
 	bestScore := 0
 	var best *Metadata
 	for _, query := range queries {
-		items, err := searchAllLanguages(ctx, cfg, query)
+		searchType := recognizedSearchMediaType(recognized)
+		items, err := searchAllLanguagesByType(ctx, cfg, query, searchType)
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range items {
+		if len(items) == 0 && allowsCrossTypeFallback(recognized) {
+			items, err = searchAllLanguagesByType(ctx, cfg, query, "")
+			if err != nil {
+				return nil, err
+			}
+		}
+		for index, item := range items {
 			if item.MediaType != "movie" && item.MediaType != "tv" {
 				continue
 			}
 			score := scoreCandidate(item, recognized)
+			if score < 80 && shouldEnrichCandidateAliases(recognized, item, index) {
+				enriched := enrichCandidateAliases(ctx, cfg, item)
+				if enrichedScore := scoreCandidate(enriched, recognized); enrichedScore > score {
+					item = enriched
+					score = enrichedScore
+				}
+			}
 			if score > bestScore {
 				meta := localizeItem(ctx, cfg, item).metadata()
 				best = meta
@@ -201,16 +239,29 @@ func normalizeConfig(cfg Config) Config {
 	return cfg
 }
 
-func search(ctx context.Context, cfg Config, query string) (*searchResp, error) {
+func search(ctx context.Context, cfg Config, query, mediaType string) (*searchResp, error) {
 	var resp searchResp
 	params := url.Values{"query": []string{query}}
-	if err := request(ctx, cfg, "/search/multi", params, &resp); err != nil {
+	endpoint := "/search/multi"
+	if mediaType == "tv" || mediaType == "movie" {
+		endpoint = "/search/" + mediaType
+	}
+	if err := request(ctx, cfg, endpoint, params, &resp); err != nil {
 		return nil, err
+	}
+	if mediaType == "tv" || mediaType == "movie" {
+		for i := range resp.Results {
+			resp.Results[i].MediaType = mediaType
+		}
 	}
 	return &resp, nil
 }
 
 func searchAllLanguages(ctx context.Context, cfg Config, query string) ([]tmdbItem, error) {
+	return searchAllLanguagesByType(ctx, cfg, query, "")
+}
+
+func searchAllLanguagesByType(ctx context.Context, cfg Config, query, mediaType string) ([]tmdbItem, error) {
 	languages := []string{cfg.Language}
 	if isASCII(query) && !strings.EqualFold(cfg.Language, "en-US") {
 		languages = append(languages, "en-US")
@@ -220,7 +271,7 @@ func searchAllLanguages(ctx context.Context, cfg Config, query string) ([]tmdbIt
 	for _, language := range languages {
 		searchCfg := cfg
 		searchCfg.Language = language
-		resp, err := search(ctx, searchCfg, query)
+		resp, err := search(ctx, searchCfg, query, mediaType)
 		if err != nil {
 			return nil, err
 		}
@@ -265,6 +316,56 @@ func hydrateCandidateItem(ctx context.Context, cfg Config, item tmdbItem) tmdbIt
 	detail.MediaType = item.MediaType
 	detail.SearchLanguage = cfg.Language
 	return *detail
+}
+
+func recognizedSearchMediaType(recognized recognize.Result) string {
+	switch recognized.MediaTypeHint {
+	case "tv", "movie":
+		return recognized.MediaTypeHint
+	default:
+		return ""
+	}
+}
+
+func allowsCrossTypeFallback(recognized recognize.Result) bool {
+	return recognized.MediaTypeHint == "movie" && recognized.Season <= 0 && recognized.Episode <= 0
+}
+
+func shouldEnrichCandidateAliases(recognized recognize.Result, item tmdbItem, index int) bool {
+	if index > 3 {
+		return false
+	}
+	if !containsHan(recognized.Title + " " + strings.Join(recognized.QueryList, " ")) {
+		return false
+	}
+	return !containsHan(item.displayName() + " " + item.originalDisplayName())
+}
+
+func enrichCandidateAliases(ctx context.Context, cfg Config, item tmdbItem) tmdbItem {
+	if item.ID <= 0 || (item.MediaType != "tv" && item.MediaType != "movie") {
+		return item
+	}
+	resource := item.MediaType
+	aliases := append([]string(nil), item.Aliases...)
+	var alt tmdbAlternativeTitlesResp
+	if err := request(ctx, cfg, "/"+resource+"/"+strconv.FormatInt(item.ID, 10)+"/alternative_titles", nil, &alt); err == nil {
+		for _, alias := range append(alt.Results, alt.Titles...) {
+			aliases = appendUniqueAlias(aliases, alias.Title)
+			aliases = appendUniqueAlias(aliases, alias.Name)
+		}
+	}
+	var translations tmdbTranslationsResp
+	if err := request(ctx, cfg, "/"+resource+"/"+strconv.FormatInt(item.ID, 10)+"/translations", nil, &translations); err == nil {
+		for _, translation := range translations.Translations {
+			aliases = appendUniqueAlias(aliases, translation.Data.Title)
+			aliases = appendUniqueAlias(aliases, translation.Data.Name)
+		}
+	}
+	if len(aliases) == len(item.Aliases) {
+		return item
+	}
+	item.Aliases = aliases
+	return item
 }
 
 func requestItem(ctx context.Context, cfg Config, endpoint string, params url.Values) (*tmdbItem, error) {
@@ -383,7 +484,8 @@ func (i tmdbItem) date() string {
 }
 
 func scoreCandidate(item tmdbItem, recognized recognize.Result) int {
-	titles := []string{item.displayName(), item.originalDisplayName()}
+	titles := []string{item.displayName(), item.originalDisplayName(), strings.TrimSpace(item.displayName() + " " + item.originalDisplayName())}
+	titles = append(titles, item.Aliases...)
 	queryCandidates := make([]string, 0, len(recognized.QueryList)+1)
 	if strings.TrimSpace(recognized.Title) != "" {
 		queryCandidates = append(queryCandidates, recognized.Title)
@@ -412,13 +514,38 @@ func scoreCandidate(item tmdbItem, recognized recognize.Result) int {
 		}
 		score += bestTitleScore
 	}
-	if recognized.Year > 0 && yearFromDate(item.date()) == recognized.Year {
-		score += 20
+	score = applyYearAdjustment(score, recognized, item)
+	if recognized.MediaTypeHint != "" {
+		if item.MediaType == recognized.MediaTypeHint {
+			score += 5
+		} else {
+			score -= 40
+		}
 	}
-	if recognized.MediaTypeHint != "" && item.MediaType == recognized.MediaTypeHint {
-		score += 5
+	if score < 0 {
+		return 0
 	}
 	return score
+}
+
+func applyYearAdjustment(score int, recognized recognize.Result, item tmdbItem) int {
+	if recognized.Year <= 0 {
+		return score
+	}
+	releaseYear := yearFromDate(item.date())
+	if releaseYear <= 0 {
+		return score
+	}
+	if releaseYear == recognized.Year {
+		return score + 20
+	}
+	if releaseYear > recognized.Year {
+		return score - 220
+	}
+	if recognized.MediaTypeHint == "tv" && recognized.Season > 0 {
+		return score
+	}
+	return score - min(80, (recognized.Year-releaseYear)*15)
 }
 
 func normalizeTitle(value string) string {
@@ -508,6 +635,28 @@ func isASCII(value string) bool {
 		}
 	}
 	return true
+}
+
+func containsHan(value string) bool {
+	for _, r := range value {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUniqueAlias(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if strings.EqualFold(existing, value) {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func posterURL(path string) string {

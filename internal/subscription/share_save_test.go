@@ -103,6 +103,41 @@ func TestSaveShareToTempSavesMatchedFiles(t *testing.T) {
 	}
 }
 
+func TestSaveShareToTempPreservesMatchedParentDirectories(t *testing.T) {
+	modified := time.Unix(1700000000, 0)
+	provider := &fakeShareSaver{
+		fakeShareTreeProvider: fakeShareTreeProvider{
+			name: ShareProviderAliyunDrive,
+			children: map[string][]ShareItem{
+				"": {
+					{ID: "dir-season-2", Name: "第 2季", IsDir: true, Modified: modified},
+				},
+				"dir-season-2": {
+					{ID: "file-2", ParentID: "dir-season-2", Name: "02 4k.mp4", Size: 2048, Modified: modified},
+				},
+			},
+		},
+		dstDirID: "tmp-dir-id",
+	}
+	ref := ShareRef{Provider: ShareProviderAliyunDrive, RawURL: "https://www.alipan.com/s/odeXVKsEKxr"}
+
+	_, err := SaveShareToTemp(context.Background(), provider, ref, SaveShareOptions{
+		TempRoot: "/tmp/aliyun",
+		Match: func(entry TreeEntry) bool {
+			return entry.Name == "02 4k.mp4"
+		},
+	})
+	if err != nil {
+		t.Fatalf("save share: %v", err)
+	}
+	if got, want := provider.ensureDirCalls, []string{"/tmp/aliyun", "/tmp/aliyun/第 2季"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("ensure dir calls = %#v, want %#v", got, want)
+	}
+	if got := idsFromShareItems(provider.saved["dir:/tmp/aliyun/第 2季"]); !stringSlicesEqual(got, []string{"file-2"}) {
+		t.Fatalf("saved items in season dir = %#v, want file-2", got)
+	}
+}
+
 func TestSaveShareToTempRequiresTempRoot(t *testing.T) {
 	_, err := SaveShareToTemp(context.Background(), &fakeShareSaver{}, ShareRef{}, SaveShareOptions{})
 	if err == nil {

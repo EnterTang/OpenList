@@ -8,6 +8,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/glebarez/sqlite"
@@ -93,18 +94,84 @@ func TestTrySaveShareLinkToTempSkipsIncompleteConfig(t *testing.T) {
 	}
 }
 
-func TestTrySaveShareLinkToTempRequiresAliyunDriveIDWithAccessToken(t *testing.T) {
+type fakeAliyunOpenAddition struct{}
+
+type fakeAliyunOpenStorage struct {
+	model.Storage
+	driveID string
+}
+
+func (d *fakeAliyunOpenStorage) Config() driver.Config {
+	return driver.Config{Name: "AliyundriveOpen"}
+}
+
+func (d *fakeAliyunOpenStorage) GetAddition() driver.Additional {
+	return &fakeAliyunOpenAddition{}
+}
+
+func (d *fakeAliyunOpenStorage) Init(ctx context.Context) error {
+	return nil
+}
+
+func (d *fakeAliyunOpenStorage) Drop(ctx context.Context) error {
+	return nil
+}
+
+func (d *fakeAliyunOpenStorage) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	return nil, nil
+}
+
+func (d *fakeAliyunOpenStorage) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	return nil, nil
+}
+
+func (d *fakeAliyunOpenStorage) AliyunDriveID() string {
+	return d.driveID
+}
+
+func TestTrySaveShareLinkToTempDerivesAliyunDriveIDFromTempRootStorage(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	op.RegisterDriver(func() driver.Driver {
+		return &fakeAliyunOpenStorage{driveID: "storage-drive-1"}
+	})
+	storageID, err := op.CreateStorage(context.Background(), model.Storage{
+		MountPath: "/ali",
+		Driver:    "AliyundriveOpen",
+		Addition:  `{}`,
+	})
+	if err != nil {
+		t.Fatalf("create fake aliyun storage: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = op.DeleteStorageById(context.Background(), storageID)
+	})
+
 	oldFactory := newShareSaverForProvider
-	defer func() { newShareSaverForProvider = oldFactory }()
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+	var factoryConfig model.SubscriptionTelegramPanConfig
 	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
-		t.Fatal("factory should not be called without aliyun drive_id")
+		if provider != ShareProviderAliyunDrive {
+			t.Fatalf("provider = %s, want aliyun", provider)
+		}
+		factoryConfig = cfg
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		if ref.ShareID != "odeXVKsEKxr" || opts.TempRoot != "/ali/.tmp-share" {
+			t.Fatalf("save ref/root = %#v %q", ref, opts.TempRoot)
+		}
 		return nil, nil
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		AliyunDrive: model.SubscriptionTelegramPanConfig{
 			Channels:         []string{"@aliyun"},
-			TempTransferRoot: "/tmp/aliyun",
+			TempTransferRoot: "/ali/.tmp-share",
 			AccessToken:      "access-1",
+			DriveID:          "stale-config-drive",
 		},
 	})
 
@@ -112,11 +179,14 @@ func TestTrySaveShareLinkToTempRequiresAliyunDriveIDWithAccessToken(t *testing.T
 	if err != nil {
 		t.Fatalf("save share link: %v", err)
 	}
-	if handled {
-		t.Fatal("handled = true, want false")
+	if !handled {
+		t.Fatal("handled = false, want true")
 	}
 	if source.Name != "aliyun_drive" {
 		t.Fatalf("source = %#v, want aliyun fallback source", source)
+	}
+	if factoryConfig.AccessToken != "access-1" || factoryConfig.DriveID != "storage-drive-1" {
+		t.Fatalf("factory config = %#v, want access token and storage drive id", factoryConfig)
 	}
 }
 
@@ -162,6 +232,75 @@ func TestTrySaveShareLinkToTempAllowsAliyunAccessTokenWithDriveID(t *testing.T) 
 	}
 	if factoryConfig.AccessToken != "access-1" || factoryConfig.DriveID != "drive-1" {
 		t.Fatalf("factory config = %#v, want access token and drive id", factoryConfig)
+	}
+}
+
+func TestTrySaveShareLinkToTempAcceptsBareEpisodesForBoundShare(t *testing.T) {
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderAliyunDrive {
+			t.Fatalf("provider = %s, want aliyun", provider)
+		}
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		cases := []struct {
+			entry TreeEntry
+			want  bool
+		}{
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/09 4K.mp4", Name: "09 4K.mp4"},
+				want:  true,
+			},
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/第 2季/02 4k.mp4", Name: "02 4k.mp4"},
+				want:  true,
+			},
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/第一季/01 4k.mp4", Name: "01 4k.mp4"},
+				want:  false,
+			},
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/poster.jpg", Name: "poster.jpg"},
+				want:  false,
+			},
+		}
+		for _, tc := range cases {
+			if got := opts.Match(tc.entry); got != tc.want {
+				t.Fatalf("match(%q) = %v, want %v", tc.entry.Path, got, tc.want)
+			}
+		}
+		return []TreeEntry{cases[0].entry, cases[1].entry}, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		AliyunDrive: model.SubscriptionTelegramPanConfig{
+			Channels:         []string{"@aliyun"},
+			TempTransferRoot: "/tmp/aliyun",
+			AccessToken:      "access-1",
+			DriveID:          "drive-1",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{
+		TMDBName:  "非份之罪",
+		TMDBYear:  2026,
+		MediaType: "tv",
+		Seasons:   []int{2},
+	}, cfg, "https://www.alipan.com/s/odeXVKsEKxr")
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled {
+		t.Fatal("handled = false, want true")
+	}
+	if _, ok := source.BoundShareNames["09 4K.mp4"]; !ok {
+		t.Fatalf("bound names = %#v, want 09 4K.mp4", source.BoundShareNames)
 	}
 }
 

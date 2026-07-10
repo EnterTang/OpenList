@@ -76,8 +76,10 @@ type telegramAuthCommandResp struct {
 }
 
 type telegramPanSubscriptionSource struct {
-	Name   string
-	Config model.SubscriptionTelegramPanConfig
+	Name            string
+	Config          model.SubscriptionTelegramPanConfig
+	BoundShareNames map[string]struct{}
+	BoundSharePaths map[string]struct{}
 }
 
 var telegramPanSourceHosts = map[string][]string{
@@ -96,8 +98,8 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}
-	lastSeenMsgID := parseCursor(sub.LastCursor)
-	nextCursor := lastSeenMsgID
+	cursor := parseTelegramCursor(sub.LastCursor)
+	nextCursor := cursor.clone()
 	now := time.Now()
 	added := 0
 	changed := 0
@@ -107,16 +109,14 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	for _, row := range rows {
 		msgID := rowMessageID(row)
 		if msgID > 0 {
-			if msgID <= lastSeenMsgID {
+			if telegramCursorHasSeen(cursor, row) {
 				continue
 			}
-			if msgID > nextCursor {
-				nextCursor = msgID
-			}
+			nextCursor.advance(row)
 		}
 		links, sources := rowLinksForTelegramPanSources(row, cfg)
 		for _, source := range sources {
-			triggeredSources[source.Name] = source
+			triggeredSources[source.Name] = mergeBoundShareSource(triggeredSources[source.Name], source)
 		}
 		accessCode := rowAccessCode(row)
 		for _, link := range links {
@@ -126,7 +126,7 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 				var handled bool
 				source, handled, saveErr = trySaveShareLinkToTemp(ctx, sub, cfg, normalizeTelegramLinkWithAccessCode(link, accessCode))
 				if source.Name != "" {
-					triggeredSources[source.Name] = source
+					triggeredSources[source.Name] = mergeBoundShareSource(triggeredSources[source.Name], source)
 				}
 				if handled {
 					continue
@@ -154,8 +154,8 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	added += tempAdded
 	changed += tempChanged
 	transferred += tempTransferred
-	if nextCursor > lastSeenMsgID {
-		sub.LastCursor = strconv.FormatInt(nextCursor, 10)
+	if formatted := formatTelegramCursor(nextCursor); formatted != strings.TrimSpace(sub.LastCursor) {
+		sub.LastCursor = formatted
 	}
 	hash := telegramRowsHash(rows)
 	if tempHash != "" {
@@ -278,7 +278,7 @@ func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sour
 		}
 		snapshotHashes = append(snapshotHashes, source.Name+":"+snapshot.Hash)
 		for _, entry := range MediaFiles(snapshot.Entries) {
-			if !subscriptionEntryMatches(sub, entry) {
+			if !entryMatchesSubscriptionOrBoundShare(sub, entry, source.BoundShareNames, source.BoundSharePaths) {
 				continue
 			}
 			item := itemFromEntry(sub, entry, seenAt)
@@ -407,6 +407,10 @@ func subscriptionEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
 		}
 	}
 	return false
+}
+
+func boundShareEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
+	return isMediaEntry(entry) && subscriptionSeasonMatches(sub, entry)
 }
 
 func subscriptionSeasonMatches(sub *model.Subscription, entry TreeEntry) bool {
@@ -790,9 +794,92 @@ func rowMessageID(row telegramCommandRow) int64 {
 	return 0
 }
 
-func parseCursor(value string) int64 {
-	cursor, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-	return cursor
+type telegramCursor struct {
+	Legacy   int64
+	Channels map[string]int64
+}
+
+func parseTelegramCursor(value string) telegramCursor {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return telegramCursor{}
+	}
+	if strings.HasPrefix(value, "{") {
+		var channels map[string]int64
+		if err := json.Unmarshal([]byte(value), &channels); err == nil {
+			normalized := make(map[string]int64, len(channels))
+			for channel, cursor := range channels {
+				key := telegramCursorChannelKey(channel)
+				if key == "" || cursor <= 0 {
+					continue
+				}
+				if cursor > normalized[key] {
+					normalized[key] = cursor
+				}
+			}
+			return telegramCursor{Channels: normalized}
+		}
+	}
+	cursor, _ := strconv.ParseInt(value, 10, 64)
+	return telegramCursor{Legacy: cursor}
+}
+
+func telegramCursorHasSeen(cursor telegramCursor, row telegramCommandRow) bool {
+	msgID := rowMessageID(row)
+	if msgID <= 0 {
+		return false
+	}
+	channel := telegramCursorChannelKey(row.Channel)
+	if channel != "" {
+		return cursor.Channels != nil && msgID <= cursor.Channels[channel]
+	}
+	return cursor.Legacy > 0 && msgID <= cursor.Legacy
+}
+
+func (cursor telegramCursor) clone() telegramCursor {
+	next := telegramCursor{Legacy: cursor.Legacy}
+	if len(cursor.Channels) > 0 {
+		next.Channels = make(map[string]int64, len(cursor.Channels))
+		for channel, value := range cursor.Channels {
+			next.Channels[channel] = value
+		}
+	}
+	return next
+}
+
+func (cursor *telegramCursor) advance(row telegramCommandRow) {
+	msgID := rowMessageID(row)
+	if msgID <= 0 {
+		return
+	}
+	channel := telegramCursorChannelKey(row.Channel)
+	if channel == "" {
+		if msgID > cursor.Legacy {
+			cursor.Legacy = msgID
+		}
+		return
+	}
+	if cursor.Channels == nil {
+		cursor.Channels = map[string]int64{}
+	}
+	if msgID > cursor.Channels[channel] {
+		cursor.Channels[channel] = msgID
+	}
+}
+
+func formatTelegramCursor(cursor telegramCursor) string {
+	if len(cursor.Channels) > 0 {
+		body, _ := json.Marshal(cursor.Channels)
+		return string(body)
+	}
+	if cursor.Legacy > 0 {
+		return strconv.FormatInt(cursor.Legacy, 10)
+	}
+	return ""
+}
+
+func telegramCursorChannelKey(channel string) string {
+	return strings.ToLower(normalizeTelegramChannel(channel))
 }
 
 func normalizeTelegramChannel(channel string) string {

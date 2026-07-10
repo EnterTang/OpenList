@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	leadingEpisodePattern = regexp.MustCompile(`^\s*0*([1-9]\d{0,3})(?:[\s._\-、]|$)`)
+	leadingEpisodePattern = regexp.MustCompile(`^\s*0*([1-9]\d{0,2})(?:\D|$)`)
 	seasonDirPattern      = regexp.MustCompile(`(?i)(?:^|[\s._\-/])(?:season|s)\s*0*([1-9]\d?)(?:$|[\s._\-/])`)
 )
 
@@ -26,6 +26,7 @@ type PlanInput struct {
 	MediaType  string
 	Category   string
 	Season     int
+	Seasons    []int
 }
 
 type PlannedName struct {
@@ -42,6 +43,9 @@ func PlanTarget(input PlanInput, fileName, parentPath string) PlannedName {
 	season := recognized.Season
 	if season <= 0 {
 		season = inferSeason(parentPath)
+	}
+	if season <= 0 && mediaType == "tv" {
+		season = inferSelectedSeasonFromParentTitle(input, parentPath)
 	}
 	if season <= 0 {
 		season = input.Season
@@ -98,6 +102,37 @@ func inferSeason(parentPath string) int {
 		return season
 	}
 	return 0
+}
+
+func inferSelectedSeasonFromParentTitle(input PlanInput, parentPath string) int {
+	title := strings.TrimSpace(input.TMDBName)
+	if title == "" || len(input.Seasons) == 0 {
+		return 0
+	}
+	base := strings.TrimSpace(stdpath.Base(utils.FixAndCleanPath(parentPath)))
+	if base == "" || base == "." || base == "/" {
+		return 0
+	}
+	pattern := regexp.MustCompile(regexp.QuoteMeta(title) + `\s*0*([1-9]\d?)(?:\D|$)`)
+	if matches := pattern.FindStringSubmatch(base); len(matches) == 2 {
+		season, _ := strconv.Atoi(matches[1])
+		if seasonIsSelected(season, input.Seasons) {
+			return season
+		}
+	}
+	return 0
+}
+
+func seasonIsSelected(season int, seasons []int) bool {
+	if season <= 0 {
+		return false
+	}
+	for _, selected := range seasons {
+		if selected == season {
+			return true
+		}
+	}
+	return false
 }
 
 func inferLeadingEpisode(fileName string) int {
@@ -176,5 +211,6 @@ func planInputFromSubscription(sub *model.Subscription) PlanInput {
 		MediaType:  sub.MediaType,
 		Category:   sub.Category,
 		Season:     sub.Season,
+		Seasons:    append([]int(nil), sub.Seasons...),
 	}
 }

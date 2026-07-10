@@ -7,6 +7,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
@@ -81,15 +82,14 @@ func verifyAndRemove(ctx context.Context, srcStorage, dstStorage driver.Driver, 
 	dstObjPath := path.Join(dstPath, srcObj.GetName())
 	dstObj, err := op.GetUnwrap(ctx, dstStorage, dstObjPath)
 	if err != nil {
+		if !srcObj.IsDir() && generatedETFExistsForMove(ctx, dstStorage, dstPath, srcObj.GetName()) {
+			return removeVerifiedSource(ctx, srcStorage, srcPath)
+		}
 		return errors.WithMessagef(err, "failed get dst [%s] file", path.Join(dstStorage.GetStorage().MountPath, dstObjPath))
 	}
 
 	if !dstObj.IsDir() {
-		err = op.Remove(ctx, srcStorage, srcPath)
-		if err != nil {
-			return fmt.Errorf("failed remove %s: %+v", path.Join(srcStorage.GetStorage().MountPath, srcPath), err)
-		}
-		return nil
+		return removeVerifiedSource(ctx, srcStorage, srcPath)
 	}
 
 	// Verify directory
@@ -110,7 +110,17 @@ func verifyAndRemove(ctx context.Context, srcStorage, dstStorage driver.Driver, 
 	if hasErr {
 		return errors.Errorf("some subitems of [%s] failed to verify and remove", path.Join(srcStorage.GetStorage().MountPath, srcPath))
 	}
-	err = op.Remove(ctx, srcStorage, srcPath)
+	return removeVerifiedSource(ctx, srcStorage, srcPath)
+}
+
+func generatedETFExistsForMove(ctx context.Context, dstStorage driver.Driver, dstPath, srcName string) bool {
+	etfPath := path.Join(dstPath, etfmeta.FileName(srcName))
+	obj, err := op.GetUnwrap(ctx, dstStorage, etfPath)
+	return err == nil && obj != nil && !obj.IsDir()
+}
+
+func removeVerifiedSource(ctx context.Context, srcStorage driver.Driver, srcPath string) error {
+	err := op.Remove(ctx, srcStorage, srcPath)
 	if err != nil {
 		return fmt.Errorf("failed remove %s: %+v", path.Join(srcStorage.GetStorage().MountPath, srcPath), err)
 	}

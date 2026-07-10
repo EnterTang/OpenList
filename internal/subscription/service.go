@@ -33,7 +33,6 @@ func Run(ctx context.Context, subscriptionID uint, transfer bool) (*model.Subscr
 		Status:           model.SubscriptionStatusRunning,
 		PreviousTreeHash: sub.LastTreeHash,
 	}
-	_ = db.CreateSubscriptionRun(run)
 	sub.LastStatus = model.SubscriptionStatusRunning
 	sub.LastError = ""
 	_ = db.UpdateSubscription(sub)
@@ -57,13 +56,28 @@ func Run(ctx context.Context, subscriptionID uint, transfer bool) (*model.Subscr
 		sub.LastTreeHash = currentHash
 	}
 	sub.LastCheckedAt = &finished
-	_ = db.UpdateSubscriptionRun(run)
+	if shouldPersistSubscriptionRun(run) {
+		_ = db.CreateSubscriptionRun(run)
+	}
 	_ = db.UpdateSubscription(sub)
 	return &model.SubscriptionRunResult{
 		Subscription: sub,
 		Run:          run,
 		Items:        items,
 	}, runErr
+}
+
+func shouldPersistSubscriptionRun(run *model.SubscriptionRun) bool {
+	if run == nil {
+		return false
+	}
+	if run.Status != model.SubscriptionStatusSuccess {
+		return true
+	}
+	if strings.TrimSpace(run.Error) != "" {
+		return true
+	}
+	return run.AddedCount > 0 || run.ChangedCount > 0 || run.TransferredCount > 0
 }
 
 func Preview(ctx context.Context, subscriptionID uint) ([]model.SubscriptionItem, error) {
@@ -99,6 +113,8 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	transferred := 0
 	snapshotRoots := append([]string(nil), cfg.Paths...)
 	tempRootConfigs := map[string]model.SubscriptionTelegramPanConfig{}
+	tempRootBoundNames := map[string]map[string]struct{}{}
+	tempRootBoundPaths := map[string]map[string]struct{}{}
 	var shareCfg model.SubscriptionTelegramSourceConfig
 	if len(cfg.Links) > 0 {
 		globalCfg, err := GetConfig()
@@ -115,6 +131,8 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 			if root != "" {
 				snapshotRoots = appendPathOnce(snapshotRoots, root)
 				tempRootConfigs[root] = source.Config
+				tempRootBoundNames[root] = mergeStringSet(tempRootBoundNames[root], source.BoundShareNames)
+				tempRootBoundPaths[root] = mergeStringSet(tempRootBoundPaths[root], source.BoundSharePaths)
 			}
 			continue
 		}
@@ -155,10 +173,10 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, transferred, err
 		}
-		_, err = saveImportedFilesToTemp(ctx, provider, "manual_import://pan123", files, SaveShareOptions{
+		selected, err := saveImportedFilesToTemp(ctx, provider, "manual_import://pan123", files, SaveShareOptions{
 			TempRoot: panCfg.TempTransferRoot,
 			Match: func(entry TreeEntry) bool {
-				return !entry.IsDir && subscriptionEntryMatches(sub, entry)
+				return boundShareEntryMatches(sub, entry)
 			},
 		})
 		if err != nil {
@@ -166,6 +184,11 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		}
 		snapshotRoots = appendPathOnce(snapshotRoots, panCfg.TempTransferRoot)
 		tempRootConfigs[panCfg.TempTransferRoot] = panCfg
+		tempRootBoundNames[panCfg.TempTransferRoot], tempRootBoundPaths[panCfg.TempTransferRoot] = mergeBoundShareMarkers(
+			tempRootBoundNames[panCfg.TempTransferRoot],
+			tempRootBoundPaths[panCfg.TempTransferRoot],
+			selected,
+		)
 	}
 
 	snapshot, err := snapshotPaths(ctx, snapshotRoots)
@@ -173,6 +196,11 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
 	for _, entry := range MediaFiles(snapshot.Entries) {
+		if names, ok := tempRootBoundNames[entry.RootPath]; ok {
+			if !entryMatchesSubscriptionOrBoundShare(sub, entry, names, tempRootBoundPaths[entry.RootPath]) {
+				continue
+			}
+		}
 		item := itemFromEntry(sub, entry, now)
 		stored, isNew, err := db.UpsertSubscriptionItem(item)
 		if err != nil {
@@ -241,6 +269,8 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	transferred := 0
 	snapshotRoots := []string{}
 	tempRootConfigs := map[string]model.SubscriptionTelegramPanConfig{}
+	tempRootBoundNames := map[string]map[string]struct{}{}
+	tempRootBoundPaths := map[string]map[string]struct{}{}
 	globalCfg, err := GetConfig()
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
@@ -253,6 +283,8 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 				if root != "" {
 					snapshotRoots = appendPathOnce(snapshotRoots, root)
 					tempRootConfigs[root] = source.Config
+					tempRootBoundNames[root] = mergeStringSet(tempRootBoundNames[root], source.BoundShareNames)
+					tempRootBoundPaths[root] = mergeStringSet(tempRootBoundPaths[root], source.BoundSharePaths)
 				}
 				continue
 			}
@@ -275,7 +307,7 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
 	for _, entry := range MediaFiles(snapshot.Entries) {
-		if !subscriptionEntryMatches(sub, entry) {
+		if !entryMatchesSubscriptionOrBoundShare(sub, entry, tempRootBoundNames[entry.RootPath], tempRootBoundPaths[entry.RootPath]) {
 			continue
 		}
 		item := itemFromEntry(sub, entry, now)

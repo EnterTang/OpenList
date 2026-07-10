@@ -116,7 +116,7 @@ type SubscriptionTelegramPanConfig struct {
 	Cookie            string   `json:"cookie,omitempty"`
 	RefreshToken      string   `json:"refresh_token,omitempty"`
 	AccessToken       string   `json:"access_token,omitempty"`
-	DriveID           string   `json:"drive_id,omitempty"`
+	DriveID           string   `json:"-"`
 	DriveType         string   `json:"drive_type,omitempty"`
 }
 

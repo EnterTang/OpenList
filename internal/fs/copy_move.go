@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	stdpath "path"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -244,6 +245,12 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 		return nil
 	}
 
+	releaseSourceSlot, err := t.waitSourceDownloadSlot()
+	if err != nil {
+		return err
+	}
+	defer releaseSourceSlot()
+
 	t.Status = "getting src object link"
 	link, srcObj, err := op.Link(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.LinkArgs{})
 	if err != nil {
@@ -264,6 +271,27 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 }
 
 var (
-	CopyTaskManager *tache.Manager[*FileTransferTask]
-	MoveTaskManager *tache.Manager[*FileTransferTask]
+	CopyTaskManager                 *tache.Manager[*FileTransferTask]
+	MoveTaskManager                 *tache.Manager[*FileTransferTask]
+	aliyunTransferSourceConcurrency = make(chan struct{}, 1)
 )
+
+func isAliyunTransferSourceDriver(driverName string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(driverName)), "aliyundrive")
+}
+
+func (t *FileTransferTask) waitSourceDownloadSlot() (func(), error) {
+	if t == nil || t.SrcStorage == nil || !isAliyunTransferSourceDriver(t.SrcStorage.GetStorage().Driver) {
+		return func() {}, nil
+	}
+	ctx := t.Ctx()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case aliyunTransferSourceConcurrency <- struct{}{}:
+		return func() { <-aliyunTransferSourceConcurrency }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}

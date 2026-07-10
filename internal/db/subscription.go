@@ -113,6 +113,11 @@ func UpsertSubscriptionItem(item *model.SubscriptionItem) (*model.SubscriptionIt
 		}
 	} else if existing.FileHash != "" && existing.FileHash != item.FileHash {
 		item.Status = model.SubscriptionItemStatusPending
+	} else if item.Status == model.SubscriptionItemStatusPending &&
+		existing.TargetPath != "" &&
+		item.TargetPath != "" &&
+		existing.TargetPath != item.TargetPath {
+		item.LastError = ""
 	} else {
 		if item.Status == "" || item.Status == model.SubscriptionItemStatusPending {
 			item.Status = existing.Status
@@ -180,6 +185,7 @@ func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun
 	if status := strings.TrimSpace(filter.Status); status != "" {
 		query = query.Where(columnName("status")+" = ?", status)
 	}
+	query = query.Where(meaningfulSubscriptionRunCondition(), model.SubscriptionStatusSuccess, "")
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, errors.WithStack(err)
@@ -198,4 +204,14 @@ func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun
 		Limit(perPage).
 		Find(&items).Error
 	return items, total, errors.WithStack(err)
+}
+
+func meaningfulSubscriptionRunCondition() string {
+	return "(" +
+		columnName("status") + " <> ? OR " +
+		columnName("added_count") + " > 0 OR " +
+		columnName("changed_count") + " > 0 OR " +
+		columnName("transferred_count") + " > 0 OR " +
+		columnName("error") + " <> ?" +
+		")"
 }

@@ -2,6 +2,7 @@ package _139
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -151,6 +152,7 @@ func TestDeleteMobileShareBuildsPayload(t *testing.T) {
 	mobileShareOutLinkBaseURL = server.URL
 
 	d := &Yun139{
+		Account: "13900000000",
 		Addition: Addition{
 			Type:         MetaPersonalNew,
 			CookieHeader: "auth_token=token; skey=skey",
@@ -169,6 +171,21 @@ func TestDeleteMobileShareBuildsPayload(t *testing.T) {
 	got := req["linkIDs"].([]any)
 	if len(got) != 2 || got[0] != "link-id" || got[1] != "link-2" {
 		t.Fatalf("linkIDs = %#v, want deduplicated link IDs", got)
+	}
+	accountInfo := req["commonAccountInfo"].(map[string]any)
+	if accountInfo["account"] != "13900000000" || accountInfo["accountType"] != float64(1) {
+		t.Fatalf("commonAccountInfo = %#v, want account info", accountInfo)
+	}
+}
+
+func TestMobileShareGetAccountFallsBackToAuthorization(t *testing.T) {
+	d := &Yun139{
+		Addition: Addition{
+			Authorization: base64.StdEncoding.EncodeToString([]byte("pc:13900000000:token")),
+		},
+	}
+	if got := d.getAccount(); got != "13900000000" {
+		t.Fatalf("account = %q, want authorization account", got)
 	}
 }
 

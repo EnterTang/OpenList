@@ -141,10 +141,7 @@ func SnapshotEntriesHash(entries []TreeEntry) string {
 func MediaFiles(entries []TreeEntry) []TreeEntry {
 	files := make([]TreeEntry, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir {
-			continue
-		}
-		if _, ok := mediaExts[strings.ToLower(filepath.Ext(entry.Name))]; ok {
+		if isMediaEntry(entry) {
 			files = append(files, entry)
 		}
 	}
@@ -155,6 +152,14 @@ func MediaFiles(entries []TreeEntry) []TreeEntry {
 		return files[i].Path < files[j].Path
 	})
 	return files
+}
+
+func isMediaEntry(entry TreeEntry) bool {
+	if entry.IsDir {
+		return false
+	}
+	_, ok := mediaExts[strings.ToLower(filepath.Ext(entry.Name))]
+	return ok
 }
 
 func SourceKey(entry TreeEntry) string {

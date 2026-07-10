@@ -86,6 +86,107 @@ func TestSearchUsesConfiguredBaseURLAndLanguage(t *testing.T) {
 	}
 }
 
+func TestResolveSearchesInferredMediaTypeFirst(t *testing.T) {
+	sawTVSearch := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search/tv":
+			sawTVSearch = true
+			writeJSON(t, w, map[string]any{"results": []map[string]any{{
+				"id":             1234,
+				"name":           "Some Show",
+				"first_air_date": "2026-01-01",
+			}}})
+		case "/search/multi", "/search/movie":
+			t.Fatalf("unexpected search path for tv hint: %s", r.URL.Path)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	got, err := Resolve(context.Background(), Config{APIKey: "key", BaseURL: server.URL}, recognize.Result{
+		Title:         "Some Show",
+		QueryList:     []string{"Some Show"},
+		MediaTypeHint: "tv",
+	})
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if !sawTVSearch {
+		t.Fatal("expected /search/tv to be queried")
+	}
+	if got == nil || got.MediaType != "tv" || got.TMDBID != 1234 {
+		t.Fatalf("metadata = %+v, want tv result 1234", got)
+	}
+}
+
+func TestResolveRejectsFutureYearMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search/movie":
+			writeJSON(t, w, map[string]any{"results": []map[string]any{{
+				"id":           4321,
+				"title":        "Some Movie",
+				"release_date": "2026-01-01",
+			}}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	got, err := Resolve(context.Background(), Config{APIKey: "key", BaseURL: server.URL}, recognize.Result{
+		Title:         "Some Movie",
+		QueryList:     []string{"Some Movie"},
+		Year:          2025,
+		MediaTypeHint: "movie",
+	})
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("metadata = %+v, want nil for future year mismatch", got)
+	}
+}
+
+func TestResolveEnrichesEnglishCandidateAliasesForChineseQuery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search/tv":
+			writeJSON(t, w, map[string]any{"results": []map[string]any{{
+				"id":             202411,
+				"name":           "Monarch: Legacy of Monsters",
+				"original_name":  "Monarch: Legacy of Monsters",
+				"first_air_date": "2023-11-17",
+			}}})
+		case "/tv/202411/alternative_titles":
+			writeJSON(t, w, map[string]any{"results": []map[string]any{{
+				"name": "帝王计划：怪兽遗产",
+			}}})
+		case "/tv/202411/translations":
+			writeJSON(t, w, map[string]any{"translations": []map[string]any{{
+				"data": map[string]any{"name": "帝王计划：怪兽遗产"},
+			}}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	got, err := Resolve(context.Background(), Config{APIKey: "key", BaseURL: server.URL}, recognize.Result{
+		Title:         "帝王计划：怪兽遗产",
+		QueryList:     []string{"帝王计划：怪兽遗产"},
+		MediaTypeHint: "tv",
+	})
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if got == nil || got.TMDBID != 202411 {
+		t.Fatalf("metadata = %+v, want alias-enriched result 202411", got)
+	}
+}
+
 func TestLowConfidenceReturnsNoMetadata(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"results": []map[string]any{{
@@ -196,7 +297,7 @@ func TestResolveMatchesEnglishOriginalNameWithPunctuation(t *testing.T) {
 func TestResolveLocalizesEnglishFallbackResult(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/search/multi":
+		case "/search/tv":
 			if r.URL.Query().Get("language") == "zh-CN" {
 				writeJSON(t, w, map[string]any{"results": []map[string]any{}})
 				return

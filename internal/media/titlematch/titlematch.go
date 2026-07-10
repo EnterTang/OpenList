@@ -8,24 +8,29 @@ import (
 )
 
 var (
-	mediaTMDBTagPattern         = regexp.MustCompile(`(?i)\\{tmdbid-\d+\\}|\[tmdb[-_:]?\d+\]`)
-	mediaBracketContentPattern  = regexp.MustCompile(`[\(（\[【\{][^\)）\]】\}]{1,80}[\)）\]】\}]`)
-	mediaLeadingIndexPattern    = regexp.MustCompile(`^\s*\d{1,3}\s*[\.\-、_ ]\s*`)
+	mediaTMDBTagPattern            = regexp.MustCompile(`(?i)\{tmdb(?:id)?-\d+\}|\[tmdb[-_:]?\d+\]`)
+	mediaBracketContentPattern     = regexp.MustCompile(`[\(（\[【\{][^\)）\]】\}]{1,80}[\)）\]】\}]`)
+	mediaInnerBookTitlePattern     = regexp.MustCompile(`《([^》]{2,80})》`)
+	mediaLeadingIndexPattern       = regexp.MustCompile(`^\s*\d{1,3}\s*[\.\-、_ ]\s*`)
 	mediaReleaseGroupSuffixPattern = regexp.MustCompile(`(?i)[-–—]\s*(?:[\p{Han}]{1,6}[A-Za-z]{0,2}|[A-Z][A-Za-z0-9]{1,7})\s*$`)
-	mediaSeasonEpisodePattern   = regexp.MustCompile(`(?i)(?:\bS\d{1,2}E\d{1,3}(?:E\d{1,3})*\b|\bE\d{1,3}\b|\bSeason\s*\d+\b|第\s*[一二三四五六七八九十百零〇两\d]+\s*[季集])`)
-	mediaEnglishNoisePattern    = regexp.MustCompile(`(?i)(?:^|[\s._\-\[])(?:4320p|2160p|1440p|1080p|720p|576p|540p|480p|4k|8k|uhd|bluray|blu-ray|bdrip|remux|web-dl|webdl|webrip|hdtv|hdrip|hybrid|x264|x265|h\.?264|h\.?265|hevc|avc|av1|hdr10\+?|hdr|dv|dovi|sdr|dolby|vision|atmos|truehd|dts(?:-?hd)?|eac3|ac3|aac(?:\d(?:\.\d)?)?|ddp?(?:\d(?:\.\d)?)?|flac|mp3|pcm|nf|netflix|amzn|hmax|hulu|dsnp|imax|ma|10bit|60fps|5\.1|7\.1|2\.0)\b`)
-	mediaEnglishNoiseLoosePattern = regexp.MustCompile(`(?i)\b(?:web\s*dl|web\s*rip|blu\s*ray|aac\s*\d\s+\d|ddp\s*\d\s+\d|ddp\s*\d(?:\s*\.\s*\d)?|dts\s*hd|true\s*hd|h\s*265|h\s*264|x\s*265|x\s*264)\b`)
-	mediaChannelLayoutPattern   = regexp.MustCompile(`\b(?:5\s+1|7\s+1|2\s+0)\b`)
-	mediaChineseNoisePattern    = regexp.MustCompile(`(?i)(蓝光|原盘|国配|中字|双语|内封字幕|特效字幕|修复版|杜比视界|国英双音|粤语|国语|衍生剧)`)
-	mediaCatalogPrefixPattern   = regexp.MustCompile(`^(?i)(美剧|韩剧|日剧|电影|电视剧|动漫|番剧|BBC)\s*`)
-	mediaCollectionSuffixPattern = regexp.MustCompile(`(?i)(系列|合集|三部曲)\s*$`)
-	mediaYearPattern            = regexp.MustCompile(`\b(?:19|20)\d{2}\b`)
-	mediaExportStampPattern     = regexp.MustCompile(`(?:^|[_\s])\d{8}[_\s]\d{6}(?:$|[_\s])`)
-	mediaSizeTailPattern        = regexp.MustCompile(`\b\d+(?:\.\d+)?\s*[GM]B?\b`)
-	mediaSpacePattern           = regexp.MustCompile(`\s+`)
-	mediaTokenPattern           = regexp.MustCompile(`[\p{Han}]+|[A-Za-z0-9]+`)
-	mediaASCIIBoundaryPattern1  = regexp.MustCompile(`([A-Za-z0-9])([\p{Han}])`)
-	mediaASCIIBoundaryPattern2  = regexp.MustCompile(`([\p{Han}])([A-Za-z0-9])`)
+	mediaSeasonEpisodePattern      = regexp.MustCompile(`(?i)(?:\bS\d{1,2}E\d{1,3}(?:E\d{1,3})*\b|\bS\d{1,2}\b|\bE\d{1,3}\b|\bSeason\s*\d+\b|第\s*[一二三四五六七八九十百零〇两\d]+\s*[季集]|(?:更新至|更新到|更至|全)?\s*\d{1,4}\s*集(?:全)?|\d{1,4}\s*集全)`)
+	mediaEnglishNoisePattern       = regexp.MustCompile(`(?i)(?:^|[\s._\-\[])(?:4320p|2160p|1440p|1080p|720p|576p|540p|480p|4k|8k|uhd|bluray|blu-ray|bdrip|remux|web-dl|webdl|webrip|hdtv|hdrip|dvdrip|hybrid|x264|x265|h\.?264|h\.?265|hevc|avc|av1|hdr10\+?|hdr|dv|dovi|sdr|dolby|vision|atmos|truehd|dts(?:-?hd)?|eac3|ac3|aac(?:\d(?:\.\d)?)?|ddp?(?:\d(?:\.\d)?)?|flac|mp3|pcm|nf|netflix|amzn|hmax|hulu|dsnp|disney\+?|prime|amazon|imax|ma|10bit|60fps|(?:\d+\s*)?audios?|5\.1|7\.1|2\.0)\b`)
+	mediaEnglishNoiseLoosePattern  = regexp.MustCompile(`(?i)\b(?:web\s*dl|web\s*rip|blu\s*ray|amazon\s+prime|prime\s+video|aac\s*\d\s+\d|ddp\s*\d\s+\d|ddp\s*\d(?:\s*\.\s*\d)?|dts\s*hd|true\s*hd|h\s*265|h\s*264|x\s*265|x\s*264)\b`)
+	mediaChannelLayoutPattern      = regexp.MustCompile(`\b(?:5\s+1|7\s+1|2\s+0)\b`)
+	mediaChineseNoisePattern       = regexp.MustCompile(`(?i)(蓝光|原盘|国配|中字|双语|内封字幕|特效字幕|修复版|杜比视界|国英双音|粤语|国语|衍生剧|韩剧|韩影|美剧|日剧|英剧|国产剧|短剧|全集|CR源|TX源|优酷修复)`)
+	mediaCatalogPrefixPattern      = regexp.MustCompile(`^(?i)(美剧|韩剧|日剧|电影|电视剧|短剧|动漫|番剧|BBC|HBO)\s*`)
+	mediaCollectionSuffixPattern   = regexp.MustCompile(`(?i)(系列|合集|三部曲)\s*$`)
+	mediaYearPattern               = regexp.MustCompile(`\b(?:19|20)\d{2}\b`)
+	mediaExportStampPattern        = regexp.MustCompile(`(?:^|[_\s])\d{8}[_\s]\d{6}(?:$|[_\s])`)
+	mediaSizeTailPattern           = regexp.MustCompile(`\b\d+(?:\.\d+)?\s*[GM]B?\b`)
+	mediaSequelSubtitlePattern     = regexp.MustCompile(`^([\p{Han}]{2,30})([0-9一二三四五六七八九十]{1,3})\s+[\p{Han}A-Za-z0-9]`)
+	mediaTypoCapitalIPattern       = regexp.MustCompile(`([A-Za-z])I([a-z])`)
+	mediaTypoResurectionPattern    = regexp.MustCompile(`(?i)\bresurection\b`)
+	mediaTypoContinentalPattern    = regexp.MustCompile(`(?i)\bcontinentai\b`)
+	mediaSpacePattern              = regexp.MustCompile(`\s+`)
+	mediaTokenPattern              = regexp.MustCompile(`[\p{Han}]+|[A-Za-z0-9]+`)
+	mediaASCIIBoundaryPattern1     = regexp.MustCompile(`([A-Za-z])([\p{Han}])`)
+	mediaASCIIBoundaryPattern2     = regexp.MustCompile(`([\p{Han}])([A-Za-z])`)
 )
 
 var mediaGenericTerms = map[string]struct{}{
@@ -59,7 +64,7 @@ var mediaDocumentaryKeywords = []string{
 }
 
 func NormalizeMediaTitle(raw string) string {
-	value := strings.TrimSpace(raw)
+	value := fixASCIITitleTypos(strings.TrimSpace(raw))
 	if value == "" {
 		return ""
 	}
@@ -68,7 +73,7 @@ func NormalizeMediaTitle(raw string) string {
 	}
 	value = mediaTMDBTagPattern.ReplaceAllString(value, " ")
 	value = mediaBracketContentPattern.ReplaceAllString(value, " ")
-	value = strings.NewReplacer("丨", " ", "·", " ", "•", " ", "《", " ", "》", " ", "“", " ", "”", " ", "‘", " ", "’", " ", "_", " ", ".", " ", "-", " ", ":", " ", "：", " ", ",", " ", "，", " ", "/", " ", "\\", " ", "&", " ", "!", " ", "！", " ", "?", " ", "？", " ", ";", " ", "；", " ", "'", " ", `"`, " ").Replace(value)
+	value = strings.NewReplacer("丨", " ", "·", " ", "•", " ", "《", " ", "》", " ", "“", " ", "”", " ", "‘", " ", "’", " ", "_", " ", ".", " ", "-", " ", ":", " ", "：", " ", ",", " ", "，", " ", "/", " ", "\\", " ", "&", " ", "+", " ", "!", " ", "！", " ", "?", " ", "？", " ", ";", " ", "；", " ", "'", " ", `"`, " ").Replace(value)
 	value = mediaLeadingIndexPattern.ReplaceAllString(value, "")
 	value = mediaASCIIBoundaryPattern1.ReplaceAllString(value, `${1} ${2}`)
 	value = mediaASCIIBoundaryPattern2.ReplaceAllString(value, `${1} ${2}`)
@@ -81,6 +86,7 @@ func NormalizeMediaTitle(raw string) string {
 	value = mediaChannelLayoutPattern.ReplaceAllString(value, " ")
 	value = mediaChineseNoisePattern.ReplaceAllString(value, " ")
 	value = mediaEnglishNoisePattern.ReplaceAllString(value, " ")
+	value = mediaSeasonEpisodePattern.ReplaceAllString(value, " ")
 	value = mediaSpacePattern.ReplaceAllString(value, " ")
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -104,6 +110,9 @@ func BuildMediaQueryCandidates(raw string) []string {
 		if value == "" {
 			return
 		}
+		if len([]rune(value)) < 2 {
+			return
+		}
 		if _, ok := seen[value]; ok {
 			return
 		}
@@ -113,6 +122,18 @@ func BuildMediaQueryCandidates(raw string) []string {
 	base := NormalizeMediaTitle(raw)
 	add(base)
 	add(stripCollectionSuffix(base))
+	for _, match := range mediaInnerBookTitlePattern.FindAllStringSubmatch(raw, -1) {
+		if len(match) == 2 {
+			add(NormalizeMediaTitle(match[1]))
+		}
+	}
+	if beforeSeparator := titleBeforeMajorSeparator(raw); beforeSeparator != "" {
+		add(beforeSeparator)
+		add(stripCollectionSuffix(beforeSeparator))
+	}
+	if sequel := sequelFranchiseCandidate(base); sequel != "" {
+		add(sequel)
+	}
 	if bracket := bracketAliasCandidate(raw); bracket != "" {
 		add(bracket)
 	}
@@ -123,6 +144,13 @@ func BuildMediaQueryCandidates(raw string) []string {
 		add(ascii)
 	}
 	return candidates
+}
+
+func fixASCIITitleTypos(value string) string {
+	value = mediaTypoCapitalIPattern.ReplaceAllString(value, `${1}l${2}`)
+	value = mediaTypoResurectionPattern.ReplaceAllString(value, "resurrection")
+	value = mediaTypoContinentalPattern.ReplaceAllString(value, "continental")
+	return value
 }
 
 func TokenizeMediaMatchTerms(raw string) []string {
@@ -261,6 +289,35 @@ func bracketAliasCandidate(raw string) string {
 		}
 	}
 	return ""
+}
+
+func titleBeforeMajorSeparator(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	index := -1
+	for _, sep := range []string{"：", ":", " - ", " – ", " — ", "/"} {
+		if i := strings.Index(value, sep); i > 0 && (index < 0 || i < index) {
+			index = i
+		}
+	}
+	if index <= 0 {
+		return ""
+	}
+	candidate := NormalizeMediaTitle(value[:index])
+	if len([]rune(candidate)) < 2 {
+		return ""
+	}
+	return candidate
+}
+
+func sequelFranchiseCandidate(base string) string {
+	match := mediaSequelSubtitlePattern.FindStringSubmatch(strings.TrimSpace(base))
+	if len(match) != 3 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
 }
 
 func cjkCandidate(base string) string {

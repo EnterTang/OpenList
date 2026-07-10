@@ -7,7 +7,7 @@ Date: 2026-07-07
 | Provider | Example URL | Credential required for save | Covered behavior |
 | --- | --- | --- | --- |
 | Quark | `https://pan.quark.cn/s/bc18e4ea5fb8` | `cookie` | URL detection, share token request, detail listing, save request, task polling, subscription runtime save gating |
-| Aliyun Drive | `https://www.alipan.com/s/odeXVKsEKxr` | Web `refresh_token`, or `access_token` plus target `drive_id` | URL detection, access token refresh, share token request, share listing, batch copy, subscription runtime save gating |
+| Aliyun Drive | `https://www.alipan.com/s/odeXVKsEKxr` | Web `refresh_token`, or `access_token` with target `drive_id` derived from the configured `temp_transfer_root` AliyundriveOpen mount | URL detection, access token refresh, share token request, share listing, batch copy, subscription runtime save gating |
 | 123Pan | `https://www.123pan.com/s/7Tx1jv-pVu7v?pwd=xoxo#` | `access_token` | URL detection, `pwd` extraction, share listing, file save through upload request, subscription runtime save gating |
 | 115Pan | `https://115cdn.com/s/swssal13zrk?password=t58d` | `cookie` | URL detection, `password` extraction, share snapshot listing, receive/save request, subscription runtime save gating |
 
@@ -38,7 +38,7 @@ Result: failed on existing repository/environment issues outside this change:
 
 For each provider:
 
-1. Configure global subscription Telegram provider credentials and `temp_transfer_root`. For Aliyun Drive, use the Web refresh token; if only an access token is configured, also provide the target `drive_id`.
+1. Configure global subscription Telegram provider credentials and `temp_transfer_root`. For Aliyun Drive, use the Web refresh token; if only an access token is configured, `temp_transfer_root` must resolve to an initialized AliyundriveOpen mount so the target drive ID can be derived from that storage.
 2. Configure either provider-specific Telegram channels or a manual subscription link.
 3. Run preview/check with transfer disabled.
 4. Confirm matching media files are saved into the temp root and appear as pending subscription items.

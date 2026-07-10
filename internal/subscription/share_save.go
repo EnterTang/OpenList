@@ -21,6 +21,11 @@ type shareTreePair struct {
 	parentID string
 }
 
+type shareSaveGroup struct {
+	parentID string
+	dstDirID string
+}
+
 func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
 	if provider == nil {
 		return nil, fmt.Errorf("share provider is nil")
@@ -38,7 +43,9 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 		return nil, err
 	}
 	selected := make([]TreeEntry, 0, len(pairs))
-	grouped := map[string][]ShareItem{}
+	dirIDs := map[string]string{"": dstDirID}
+	grouped := map[shareSaveGroup][]ShareItem{}
+	groupOrder := make([]shareSaveGroup, 0)
 	for _, pair := range pairs {
 		if pair.entry.IsDir {
 			continue
@@ -46,16 +53,24 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 		if opts.Match != nil && !opts.Match(pair.entry) {
 			continue
 		}
-		selected = append(selected, pair.entry)
-		grouped[pair.parentID] = append(grouped[pair.parentID], pair.item)
-	}
-	for _, pair := range pairs {
-		if _, ok := grouped[pair.parentID]; !ok {
-			continue
+		dirPath := importedParentPath(pair.entry.Path)
+		itemDstDirID := dstDirID
+		if dirPath != "" {
+			itemDstDirID, err = ensureImportedDir(ctx, provider, tempRoot, dirPath, dirIDs)
+			if err != nil {
+				return selected, err
+			}
 		}
-		items := grouped[pair.parentID]
-		delete(grouped, pair.parentID)
-		taskIDs, err := provider.SaveShareItems(ctx, ref, pair.parentID, items, dstDirID)
+		selected = append(selected, pair.entry)
+		key := shareSaveGroup{parentID: pair.parentID, dstDirID: itemDstDirID}
+		if _, ok := grouped[key]; !ok {
+			groupOrder = append(groupOrder, key)
+		}
+		grouped[key] = append(grouped[key], pair.item)
+	}
+	for _, key := range groupOrder {
+		items := grouped[key]
+		taskIDs, err := provider.SaveShareItems(ctx, ref, key.parentID, items, key.dstDirID)
 		if err != nil {
 			return selected, err
 		}

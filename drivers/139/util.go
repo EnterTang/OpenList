@@ -687,7 +687,14 @@ func (d *Yun139) getAccount() string {
 	if d.ref != nil {
 		return d.ref.getAccount()
 	}
-	return d.Account
+	if account := strings.TrimSpace(d.Account); account != "" {
+		return account
+	}
+	_, account, _, err := normalize139Authorization(d.Authorization)
+	if err == nil {
+		return account
+	}
+	return ""
 }
 
 func (d *Yun139) getPersonalCloudHost() string {
