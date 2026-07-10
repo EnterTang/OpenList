@@ -184,6 +184,8 @@ const (
 	_ ContextKey = iota
 
 	NoTaskKey
+	ForceTaskKey
+	TransferTaskPayloadKey
 	ApiUrlKey
 	UserKey
 	MetaKey

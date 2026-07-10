@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -45,24 +46,31 @@ type searchResp struct {
 }
 
 type tmdbItem struct {
-	ID               int64    `json:"id"`
-	MediaType        string   `json:"media_type"`
-	Title            string   `json:"title"`
-	Name             string   `json:"name"`
-	OriginalTitle    string   `json:"original_title"`
-	OriginalName     string   `json:"original_name"`
-	ReleaseDate      string   `json:"release_date"`
-	FirstAirDate     string   `json:"first_air_date"`
-	PosterPath       string   `json:"poster_path"`
-	GenreIDs         []int    `json:"genre_ids"`
-	Genres           []genre  `json:"genres"`
-	OriginCountry    []string `json:"origin_country"`
-	OriginalLanguage string   `json:"original_language"`
-	SearchLanguage   string   `json:"-"`
+	ID               int64        `json:"id"`
+	MediaType        string       `json:"media_type"`
+	Title            string       `json:"title"`
+	Name             string       `json:"name"`
+	OriginalTitle    string       `json:"original_title"`
+	OriginalName     string       `json:"original_name"`
+	ReleaseDate      string       `json:"release_date"`
+	FirstAirDate     string       `json:"first_air_date"`
+	PosterPath       string       `json:"poster_path"`
+	GenreIDs         []int        `json:"genre_ids"`
+	Genres           []genre      `json:"genres"`
+	OriginCountry    []string     `json:"origin_country"`
+	OriginalLanguage string       `json:"original_language"`
+	Seasons          []tmdbSeason `json:"seasons"`
+	SearchLanguage   string       `json:"-"`
 }
 
 type genre struct {
 	ID int `json:"id"`
+}
+
+type tmdbSeason struct {
+	SeasonNumber int    `json:"season_number"`
+	EpisodeCount int    `json:"episode_count"`
+	Name         string `json:"name"`
 }
 
 func Resolve(ctx context.Context, cfg Config, recognized recognize.Result) (*Metadata, error) {
@@ -157,9 +165,10 @@ func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ET
 	}
 	candidates := make([]model.ETFArchiveTMDBCandidate, 0, len(items))
 	for _, item := range items {
-		item = localizeItem(ctx, cfg, item)
+		item = hydrateCandidateItem(ctx, cfg, item)
 		meta := item.metadata()
 		applyCategory(meta, cfg.CategoryRules)
+		seasons := item.seasonInfos()
 		candidates = append(candidates, model.ETFArchiveTMDBCandidate{
 			TMDBID:           meta.TMDBID,
 			Name:             meta.Name,
@@ -172,6 +181,8 @@ func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ET
 			GenreIDs:         meta.GenreIDs,
 			OriginCountry:    meta.OriginCountry,
 			OriginalLanguage: meta.OriginalLanguage,
+			Seasons:          seasons,
+			SeasonMap:        seasonInfoMap(seasons),
 		})
 	}
 	return candidates, nil
@@ -239,6 +250,23 @@ func localizeItem(ctx context.Context, cfg Config, item tmdbItem) tmdbItem {
 	return *detail
 }
 
+func hydrateCandidateItem(ctx context.Context, cfg Config, item tmdbItem) tmdbItem {
+	item = localizeItem(ctx, cfg, item)
+	if item.MediaType != "tv" || len(item.Seasons) > 0 {
+		return item
+	}
+	detail, err := requestItem(ctx, cfg, "/tv/"+strconv.FormatInt(item.ID, 10), nil)
+	if err != nil {
+		return item
+	}
+	if detail.ID == 0 || detail.ID != item.ID {
+		return item
+	}
+	detail.MediaType = item.MediaType
+	detail.SearchLanguage = cfg.Language
+	return *detail
+}
+
 func requestItem(ctx context.Context, cfg Config, endpoint string, params url.Values) (*tmdbItem, error) {
 	var item tmdbItem
 	if err := request(ctx, cfg, endpoint, params, &item); err != nil {
@@ -299,6 +327,38 @@ func (i tmdbItem) metadata() *Metadata {
 		OriginCountry:    i.OriginCountry,
 		OriginalLanguage: i.OriginalLanguage,
 	}
+}
+
+func (i tmdbItem) seasonInfos() []model.TMDBSeasonInfo {
+	if i.MediaType != "tv" || len(i.Seasons) == 0 {
+		return nil
+	}
+	items := make([]model.TMDBSeasonInfo, 0, len(i.Seasons))
+	for _, season := range i.Seasons {
+		if season.SeasonNumber <= 0 {
+			continue
+		}
+		items = append(items, model.TMDBSeasonInfo{
+			SeasonNumber: season.SeasonNumber,
+			EpisodeCount: season.EpisodeCount,
+			Name:         strings.TrimSpace(season.Name),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].SeasonNumber < items[j].SeasonNumber
+	})
+	return items
+}
+
+func seasonInfoMap(seasons []model.TMDBSeasonInfo) map[int]int {
+	if len(seasons) == 0 {
+		return nil
+	}
+	result := make(map[int]int, len(seasons))
+	for _, season := range seasons {
+		result[season.SeasonNumber] = season.EpisodeCount
+	}
+	return result
 }
 
 func (i tmdbItem) displayName() string {

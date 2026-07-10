@@ -309,6 +309,12 @@ func (d *Yun139) archivePersonalETF(ctx context.Context, dstDir model.Obj, sourc
 		_ = saveETFArchiveRecord(record)
 		return
 	}
+	record.ArchiveETFPath = d.fullETFArchivePath(plan.pathParts, etfName)
+	if db.GetDb() != nil {
+		if existing, err := db.FindETFArchiveRecordByFingerprint(record.StorageMountPath, record.SourceSHA256, record.ArchiveETFPath); err == nil && existing.Status == model.ETFArchiveStatusArchived {
+			return
+		}
+	}
 	if err := d.uploadPersonalBytes(ctx, plan.targetDir.GetID(), etfName, content); err != nil {
 		record.Status = model.ETFArchiveStatusFailed
 		record.Error = err.Error()
@@ -316,7 +322,6 @@ func (d *Yun139) archivePersonalETF(ctx context.Context, dstDir model.Obj, sourc
 		return
 	}
 	record.Status = model.ETFArchiveStatusArchived
-	record.ArchiveETFPath = d.fullETFArchivePath(plan.pathParts, etfName)
 	_ = saveETFArchiveRecord(record)
 }
 

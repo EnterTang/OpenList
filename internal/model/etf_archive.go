@@ -46,17 +46,25 @@ type ETFArchiveCorrection struct {
 }
 
 type ETFArchiveTMDBCandidate struct {
-	TMDBID           int64    `json:"tmdb_id"`
-	Name             string   `json:"name"`
-	OriginalName     string   `json:"original_name"`
-	Year             int      `json:"year"`
-	MediaType        string   `json:"media_type"`
-	Category         string   `json:"category"`
-	PosterPath       string   `json:"poster_path"`
-	PosterURL        string   `json:"poster_url"`
-	GenreIDs         []int    `json:"genre_ids"`
-	OriginCountry    []string `json:"origin_country"`
-	OriginalLanguage string   `json:"original_language"`
+	TMDBID           int64            `json:"tmdb_id"`
+	Name             string           `json:"name"`
+	OriginalName     string           `json:"original_name"`
+	Year             int              `json:"year"`
+	MediaType        string           `json:"media_type"`
+	Category         string           `json:"category"`
+	PosterPath       string           `json:"poster_path"`
+	PosterURL        string           `json:"poster_url"`
+	GenreIDs         []int            `json:"genre_ids"`
+	OriginCountry    []string         `json:"origin_country"`
+	OriginalLanguage string           `json:"original_language"`
+	Seasons          []TMDBSeasonInfo `json:"seasons,omitempty"`
+	SeasonMap        map[int]int      `json:"season_map,omitempty"`
+}
+
+type TMDBSeasonInfo struct {
+	SeasonNumber int    `json:"season_number"`
+	EpisodeCount int    `json:"episode_count"`
+	Name         string `json:"name,omitempty"`
 }
 
 type ETFManualArchiveMetadata struct {

@@ -11,12 +11,15 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	driverPkg "github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/glebarez/sqlite"
 	"github.com/go-resty/resty/v2"
+	"gorm.io/gorm"
 )
 
 func TestPersonalRapidCreateUsesSHA256Payload(t *testing.T) {
@@ -539,6 +542,106 @@ func TestAfterPersonalUploadETFUsesTVSeasonFolder(t *testing.T) {
 	}
 }
 
+func TestArchivePersonalETFSkipsExistingArchiveFingerprint(t *testing.T) {
+	setup139Resty(t)
+	setup139ETFArchiveDB(t)
+	tmdbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tv/260868" {
+			t.Fatalf("tmdb path = %q, want /tv/260868", r.URL.Path)
+		}
+		write139JSON(t, w, map[string]any{
+			"id":                260868,
+			"name":              "婚姻攻略",
+			"first_air_date":    "2024-08-29",
+			"origin_country":    []string{"CN"},
+			"original_language": "zh",
+		})
+	}))
+	defer tmdbServer.Close()
+	oldSettingValue := etfSettingValue
+	etfSettingValue = func(key string) string {
+		switch key {
+		case conf.TMDBApiKey:
+			return "key"
+		case conf.TMDBApiBaseURL:
+			return tmdbServer.URL
+		case conf.TMDBLanguage:
+			return "zh-CN"
+		case conf.MediaCategoryRules:
+			return "tv:\n  国产剧:\n    origin_country: 'CN'\n  未分类:\n"
+		default:
+			return ""
+		}
+	}
+	t.Cleanup(func() {
+		etfSettingValue = oldSettingValue
+	})
+
+	sourceName := "婚姻攻略 (2024) S01E15.苏离王维德终修成正果.2160p.HQ.WEB-DL.H265.AAC.HHWEB.{tmdbid-260868}.mp4"
+	archivePath := "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}/Season 1/" + sourceName + ".etf"
+	if err := db.CreateETFArchiveRecord(&model.ETFArchiveRecord{
+		StorageMountPath: "/139_60t",
+		SourceName:       sourceName,
+		SourceSHA256:     strings.Repeat("A", 64),
+		ArchiveETFPath:   archivePath,
+		Status:           model.ETFArchiveStatusArchived,
+	}); err != nil {
+		t.Fatalf("create existing archive record: %v", err)
+	}
+
+	folderIDs := map[string]string{
+		"root/ETF管理":    "managed-id",
+		"managed-id/tv": "tv-id",
+		"tv-id/国产剧":     "category-id",
+		"category-id/婚姻攻略 (2024) {tmdb-260868}": "show-id",
+		"show-id/Season 1": "season-id",
+	}
+	var archivedUploads int
+	personalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		switch r.URL.Path {
+		case "/file/list":
+			write139JSON(t, w, personalListItems(nil))
+		case "/file/create":
+			name, _ := body["name"].(string)
+			parentID, _ := body["parentFileId"].(string)
+			if body["type"] == "folder" {
+				write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": folderIDs[parentID+"/"+name], "fileName": name}})
+				return
+			}
+			if parentID == "season-id" {
+				archivedUploads++
+			}
+			write139JSON(t, w, map[string]any{"success": true, "data": map[string]any{"fileId": "etf-id", "fileName": name, "partInfos": []any{}}})
+		default:
+			t.Fatalf("unexpected personal path: %s", r.URL.Path)
+		}
+	}))
+	defer personalServer.Close()
+
+	d := &Yun139{
+		Storage:           model.Storage{MountPath: "/139_60t"},
+		PersonalCloudHost: personalServer.URL,
+		Addition: Addition{
+			Type:          MetaPersonalNew,
+			GenerateETF:   true,
+			ETFArchive:    true,
+			ETFRootFolder: "ETF管理",
+		},
+	}
+	d.RootFolderID = "root"
+	err := d.afterPersonalUploadETF(context.Background(), &model.Object{ID: "parent", Path: "/转存中转"}, sourceName, 2048, strings.Repeat("A", 64), &model.Object{ID: "source", Name: sourceName})
+	if err != nil {
+		t.Fatalf("afterPersonalUploadETF returned error: %v", err)
+	}
+	if archivedUploads != 0 {
+		t.Fatalf("archived uploads = %d, want 0", archivedUploads)
+	}
+}
+
 func TestAfterPersonalUploadETFKeepsLocalETFWhenArchiveDirectoryFails(t *testing.T) {
 	setup139Resty(t)
 	var uploadedLocal bool
@@ -875,6 +978,17 @@ func setup139Resty(t *testing.T) {
 	t.Cleanup(func() {
 		base.RestyClient = old
 	})
+}
+
+func setup139ETFArchiveDB(t *testing.T) {
+	t.Helper()
+	dsn := "file:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "?mode=memory&cache=shared"
+	database, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig("data")
+	db.Init(database)
 }
 
 func serverURL(r *http.Request) string {

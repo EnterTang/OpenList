@@ -15,7 +15,7 @@ func TestParseTelegramRowsEnvelopeAndLinks(t *testing.T) {
 		"results": [{
 			"msgId": 123,
 			"channel": "@movies",
-			"text": "新剧 https://pan.example/s/abc 提取码 abcd",
+			"text": "新剧 https://pan.example/s/abc 提取码? abcd",
 			"links": ["https://pan.example/s/abc"],
 			"buttons": [{"text": "open", "url": "https://pan.example/s/def"}]
 		}]
@@ -288,6 +288,29 @@ func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
 	}
 }
 
+func TestSubscriptionEntryMatchesSelectedSeasons(t *testing.T) {
+	sub := &model.Subscription{
+		Name:      "Some Show",
+		TMDBName:  "Some Show",
+		MediaType: "tv",
+		Seasons:   []int{2, 4},
+	}
+	if !subscriptionEntryMatches(sub, TreeEntry{
+		RootPath: "/quark/temp",
+		Path:     "/Some Show/Season 2/Some.Show.S02E01.mkv",
+		Name:     "Some.Show.S02E01.mkv",
+	}) {
+		t.Fatal("expected selected season 2 to match")
+	}
+	if subscriptionEntryMatches(sub, TreeEntry{
+		RootPath: "/quark/temp",
+		Path:     "/Some Show/Season 1/Some.Show.S01E01.mkv",
+		Name:     "Some.Show.S01E01.mkv",
+	}) {
+		t.Fatal("did not expect unselected season 1 to match")
+	}
+}
+
 func TestSubscriptionEntryMatchesNoisyMixedLanguagePath(t *testing.T) {
 	sub := &model.Subscription{Name: "Rain Man", TMDBName: "雨人"}
 	entry := TreeEntry{
@@ -297,6 +320,34 @@ func TestSubscriptionEntryMatchesNoisyMixedLanguagePath(t *testing.T) {
 	}
 	if !subscriptionEntryMatches(sub, entry) {
 		t.Fatal("expected noisy mixed-language path to match subscription")
+	}
+}
+
+func TestTelegramPanSourcesForTransferMergesConfiguredAndTriggered(t *testing.T) {
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:         []string{"@mixed"},
+			TempTransferRoot: "/123/temp",
+		},
+		Quark: model.SubscriptionTelegramPanConfig{
+			TempTransferRoot: "/quark/temp",
+		},
+	})
+	triggered := map[string]telegramPanSubscriptionSource{
+		"pan115": {Name: "pan115", Config: model.SubscriptionTelegramPanConfig{TempTransferRoot: "/115/temp"}},
+	}
+	merged := telegramPanSourcesForTransfer(cfg, triggered)
+	if got, want := len(merged), 3; got != want {
+		t.Fatalf("merged count = %d, want %d (%#v)", got, want, merged)
+	}
+	if merged["pan123"].Config.TempTransferRoot != "/123/temp" {
+		t.Fatalf("pan123 = %#v", merged["pan123"])
+	}
+	if merged["quark"].Config.TempTransferRoot != "/quark/temp" {
+		t.Fatalf("quark = %#v", merged["quark"])
+	}
+	if merged["pan115"].Config.TempTransferRoot != "/115/temp" {
+		t.Fatalf("pan115 = %#v", merged["pan115"])
 	}
 }
 

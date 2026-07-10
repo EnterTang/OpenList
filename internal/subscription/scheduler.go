@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	log "github.com/sirupsen/logrus"
 )
@@ -52,6 +53,9 @@ func (s *scheduler) stopLoop() {
 }
 
 func (s *scheduler) loop() {
+	if !s.waitForStoragesLoaded() {
+		return
+	}
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	s.tick()
@@ -62,6 +66,15 @@ func (s *scheduler) loop() {
 		case <-s.stop:
 			return
 		}
+	}
+}
+
+func (s *scheduler) waitForStoragesLoaded() bool {
+	select {
+	case <-conf.StoragesLoadSignal():
+		return true
+	case <-s.stop:
+		return false
 	}
 }
 

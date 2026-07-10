@@ -347,6 +347,51 @@ func TestSearchCandidatesNumericIDFetchesDetailsWithPoster(t *testing.T) {
 	}
 }
 
+func TestSearchCandidatesReturnsTVSeasonInfo(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search/multi":
+			writeJSON(t, w, map[string]any{"results": []map[string]any{{
+				"id":             285205,
+				"media_type":     "tv",
+				"name":           "百万秘宝攻防战",
+				"first_air_date": "2025-01-01",
+			}}})
+		case "/tv/285205":
+			writeJSON(t, w, map[string]any{
+				"id":             285205,
+				"name":           "百万秘宝攻防战",
+				"first_air_date": "2025-01-01",
+				"seasons": []map[string]any{
+					{"season_number": 0, "episode_count": 1, "name": "Specials"},
+					{"season_number": 1, "episode_count": 12, "name": "Season 1"},
+					{"season_number": 2, "episode_count": 8, "name": "Season 2"},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	got, err := SearchCandidates(context.Background(), Config{APIKey: "key", BaseURL: server.URL}, "百万秘宝攻防战")
+	if err != nil {
+		t.Fatalf("SearchCandidates returned error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("candidate count = %d, want 1", len(got))
+	}
+	if len(got[0].Seasons) != 2 {
+		t.Fatalf("seasons = %#v, want regular seasons only", got[0].Seasons)
+	}
+	if got[0].Seasons[0].SeasonNumber != 1 || got[0].Seasons[0].EpisodeCount != 12 {
+		t.Fatalf("first season = %#v, want S1 with 12 episodes", got[0].Seasons[0])
+	}
+	if got[0].SeasonMap[2] != 8 {
+		t.Fatalf("season map = %#v, want season 2 episode count", got[0].SeasonMap)
+	}
+}
+
 func TestScoreCandidatePrefersExactBilingualEquivalentTitle(t *testing.T) {
 	recognized := recognize.Result{Title: "雨人 Rain Man 1988 蓝光原盘", Year: 1988, MediaTypeHint: "movie"}
 	exact := tmdbItem{Title: "雨人", OriginalTitle: "Rain Man", ReleaseDate: "1988-12-12", MediaType: "movie"}

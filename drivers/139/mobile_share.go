@@ -12,7 +12,10 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
-const mobileShareOutLinkPath = "/orchestration/personalCloud-rebuild/outlink/v1.0/getOutLink"
+const (
+	mobileShareOutLinkPath       = "/orchestration/personalCloud-rebuild/outlink/v1.0/getOutLink"
+	mobileShareDeleteOutLinkPath = "/orchestration/personalCloud-rebuild/outlink/v1.0/delOutLink"
+)
 
 var mobileShareOutLinkBaseURL = "https://yun.139.com"
 
@@ -122,6 +125,52 @@ func (d *Yun139) createMobileShareOnce(ctx context.Context, obj model.Obj, args 
 		return nil, fmt.Errorf("mobile share response missing share url")
 	}
 	return link, nil
+}
+
+func (d *Yun139) DeleteMobileShare(ctx context.Context, args model.MobileShareDeleteArgs) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d.Addition.Type != MetaPersonalNew {
+		return errs.NotSupport
+	}
+	linkIDs := normalizeMobileShareLinkIDs(args.LinkIDs)
+	if len(linkIDs) == 0 {
+		return fmt.Errorf("mobile share link ids are empty")
+	}
+	for start := 0; start < len(linkIDs); start += 50 {
+		end := start + 50
+		if end > len(linkIDs) {
+			end = len(linkIDs)
+		}
+		payload := base.Json{
+			"delOutLinkReq": base.Json{
+				"linkIDs": linkIDs[start:end],
+			},
+		}
+		var resp BaseResp
+		if _, err := d.mobileSharePost(mobileShareDeleteOutLinkPath, payload, &resp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeMobileShareLinkIDs(linkIDs []string) []string {
+	seen := make(map[string]struct{}, len(linkIDs))
+	normalized := make([]string, 0, len(linkIDs))
+	for _, linkID := range linkIDs {
+		linkID = strings.TrimSpace(linkID)
+		if linkID == "" {
+			continue
+		}
+		if _, ok := seen[linkID]; ok {
+			continue
+		}
+		seen[linkID] = struct{}{}
+		normalized = append(normalized, linkID)
+	}
+	return normalized
 }
 
 func (d *Yun139) mobileSharePost(pathname string, data interface{}, resp interface{}) ([]byte, error) {

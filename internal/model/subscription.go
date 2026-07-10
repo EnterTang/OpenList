@@ -12,10 +12,11 @@ const (
 	SubscriptionStatusSuccess = "success"
 	SubscriptionStatusFailed  = "failed"
 
-	SubscriptionItemStatusPending     = "pending"
-	SubscriptionItemStatusTransferred = "transferred"
-	SubscriptionItemStatusSkipped     = "skipped"
-	SubscriptionItemStatusFailed      = "failed"
+	SubscriptionItemStatusPending      = "pending"
+	SubscriptionItemStatusTransferring = "transferring"
+	SubscriptionItemStatusTransferred  = "transferred"
+	SubscriptionItemStatusSkipped      = "skipped"
+	SubscriptionItemStatusFailed       = "failed"
 )
 
 type Subscription struct {
@@ -35,6 +36,7 @@ type Subscription struct {
 	MediaType            string     `json:"media_type" gorm:"index"`
 	Category             string     `json:"category"`
 	Season               int        `json:"season"`
+	Seasons              []int      `json:"seasons" gorm:"serializer:json"`
 	LastCheckedAt        *time.Time `json:"last_checked_at"`
 	LastCursor           string     `json:"last_cursor"`
 	LastTreeHash         string     `json:"last_tree_hash"`

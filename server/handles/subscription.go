@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 
@@ -278,7 +279,7 @@ func runTelegramSubscriptionAuth(c *gin.Context, action string) {
 func normalizeSubscription(item *model.Subscription) {
 	item.SourceType = strings.ToLower(strings.TrimSpace(item.SourceType))
 	if item.SourceType == "" {
-		item.SourceType = model.SubscriptionSourceManual
+		item.SourceType = model.SubscriptionSourceTelegram
 	}
 	item.TargetRoot = utils.FixAndCleanPath(item.TargetRoot)
 	item.MediaType = strings.ToLower(strings.TrimSpace(item.MediaType))
@@ -291,7 +292,38 @@ func normalizeSubscription(item *model.Subscription) {
 	if item.CheckIntervalMinutes <= 0 {
 		item.CheckIntervalMinutes = 60
 	}
+	item.Seasons = normalizeSubscriptionSeasons(item.MediaType, item.Seasons, item.Season)
+	if item.MediaType == "movie" {
+		item.Season = 0
+	} else if len(item.Seasons) > 0 {
+		item.Season = item.Seasons[0]
+	} else if item.Season <= 0 {
+		item.Season = 1
+	}
 	if item.LastStatus == "" {
 		item.LastStatus = model.SubscriptionStatusIdle
 	}
+}
+
+func normalizeSubscriptionSeasons(mediaType string, seasons []int, legacySeason int) []int {
+	if strings.EqualFold(strings.TrimSpace(mediaType), "movie") {
+		return nil
+	}
+	if len(seasons) == 0 && legacySeason > 0 {
+		seasons = []int{legacySeason}
+	}
+	seen := map[int]struct{}{}
+	cleaned := make([]int, 0, len(seasons))
+	for _, season := range seasons {
+		if season <= 0 {
+			continue
+		}
+		if _, ok := seen[season]; ok {
+			continue
+		}
+		seen[season] = struct{}{}
+		cleaned = append(cleaned, season)
+	}
+	sort.Ints(cleaned)
+	return cleaned
 }

@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
@@ -26,8 +27,8 @@ import (
 
 var (
 	telegramANSIEscapePattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	telegramCloudLinkPattern  = regexp.MustCompile(`https?://[^\s'"<>，,;；)\]）]+`)
-	telegramAccessCodePattern = regexp.MustCompile(`(?i)(?:访问码|提取码|密码|access(?:\s*code)?|pwd|pass(?:word)?|passcode)[：:\s]*([A-Za-z0-9]{4,8})`)
+	telegramCloudLinkPattern  = regexp.MustCompile(`https?://[^\s'"<>，,;\]）]+`)
+	telegramAccessCodePattern = regexp.MustCompile(`(?i)(?:访问码|提取码|密码|access(?:\s*code)?|pwd|pass(?:word)?|passcode)[？?:：\s]*([A-Za-z0-9]{4,8})`)
 )
 
 type telegramCommandEnvelope struct {
@@ -145,7 +146,7 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 			saved = append(saved, *stored)
 		}
 	}
-	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, triggeredSources, transfer, now)
+	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, telegramPanSourcesForTransfer(cfg, triggeredSources), transfer, now)
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
@@ -236,6 +237,20 @@ func runTelegramSearchCommand(ctx context.Context, sub *model.Subscription, cfg 
 	return parseTelegramRows(stdout)
 }
 
+func telegramPanSourcesForTransfer(cfg model.SubscriptionTelegramSourceConfig, triggered map[string]telegramPanSubscriptionSource) map[string]telegramPanSubscriptionSource {
+	merged := make(map[string]telegramPanSubscriptionSource, len(triggered)+4)
+	for _, source := range telegramPanSources(cfg) {
+		if strings.TrimSpace(source.Config.TempTransferRoot) == "" {
+			continue
+		}
+		merged[source.Name] = source
+	}
+	for name, source := range triggered {
+		merged[name] = source
+	}
+	return merged
+}
+
 func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sources map[string]telegramPanSubscriptionSource, transfer bool, seenAt time.Time) ([]model.SubscriptionItem, string, int, int, int, error) {
 	if len(sources) == 0 {
 		return nil, "", 0, 0, 0, nil
@@ -277,27 +292,27 @@ func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sour
 			}
 			if isNew {
 				added++
-			} else if stored.Status == model.SubscriptionItemStatusPending {
-				changed++
+			}
+			beforePath := stored.TargetPath
+			beforeStatus := stored.Status
+			stored = syncSubscriptionItemPaths(stored, sub, entry, seenAt)
+			if !isNew {
+				switch {
+				case beforeStatus == model.SubscriptionItemStatusFailed:
+					stored.Status = model.SubscriptionItemStatusPending
+					stored.LastError = ""
+					changed++
+				case beforeStatus == model.SubscriptionItemStatusPending && stored.TargetPath != beforePath:
+					changed++
+				}
 			}
 			if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
-				if err := transferItem(ctx, stored); err != nil {
-					stored.Status = model.SubscriptionItemStatusFailed
-					stored.LastError = err.Error()
-				} else {
-					stored.Status = model.SubscriptionItemStatusTransferred
-					stored.LastError = ""
-					transferred++
-					if source.Config.DeleteSourceAfter {
-						if err := cleanupSourceAfterTransfer(ctx, stored.SourcePath); err != nil {
-							stored.LastError = "source cleanup failed after transfer: " + err.Error()
-						}
-					}
-				}
-				_, _, err = db.UpsertSubscriptionItem(stored)
+				var delta int
+				stored, delta, err = applyItemTransfer(ctx, stored, source.Config.DeleteSourceAfter)
 				if err != nil {
 					return saved, combinedHash("telegram-temp", snapshotHashes), added, changed, transferred, err
 				}
+				transferred += delta
 			}
 			saved = append(saved, *stored)
 		}
@@ -376,6 +391,9 @@ func subscriptionEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
 	if len(needles) == 0 {
 		return false
 	}
+	if !subscriptionSeasonMatches(sub, entry) {
+		return false
+	}
 	haystacks := []string{
 		strings.TrimSpace(entry.Name),
 		strings.TrimSpace(entry.Path),
@@ -389,6 +407,51 @@ func subscriptionEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
 		}
 	}
 	return false
+}
+
+func subscriptionSeasonMatches(sub *model.Subscription, entry TreeEntry) bool {
+	seasons := selectedSubscriptionSeasons(sub)
+	if len(seasons) == 0 {
+		return true
+	}
+	season := entrySeason(entry)
+	if season <= 0 {
+		return true
+	}
+	_, ok := seasons[season]
+	return ok
+}
+
+func selectedSubscriptionSeasons(sub *model.Subscription) map[int]struct{} {
+	if sub == nil || strings.EqualFold(strings.TrimSpace(sub.MediaType), "movie") {
+		return nil
+	}
+	values := append([]int(nil), sub.Seasons...)
+	if len(values) == 0 && sub.Season > 0 {
+		values = append(values, sub.Season)
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	seasons := make(map[int]struct{}, len(values))
+	for _, season := range values {
+		if season > 0 {
+			seasons[season] = struct{}{}
+		}
+	}
+	return seasons
+}
+
+func entrySeason(entry TreeEntry) int {
+	recognized := recognize.Recognize(entry.Name, parentPath(entry))
+	if recognized.Season > 0 {
+		return recognized.Season
+	}
+	if season := inferSeason(parentPath(entry)); season > 0 {
+		return season
+	}
+	season, _ := recognize.ExtractSeasonEpisode(entry.Path)
+	return season
 }
 
 func subscriptionMatchNeedles(sub *model.Subscription) []string {
@@ -601,7 +664,7 @@ func rowLinks(row telegramCommandRow) []string {
 		if value == "" {
 			return
 		}
-		value = strings.TrimRight(value, "，,;；)]）>")
+		value = strings.TrimRight(value, "，,;；？?)]）>")
 		if !isPan123FastLink(value) {
 			if _, err := url.ParseRequestURI(value); err != nil {
 				return

@@ -26,6 +26,10 @@ type MobileShareCreateArgs struct {
 	PeriodUnit int    `json:"period_unit"`
 }
 
+type MobileShareDeleteArgs struct {
+	LinkIDs []string `json:"link_ids"`
+}
+
 type MobileShareLink struct {
 	LinkID      string `json:"link_id"`
 	ShareURL    string `json:"share_url"`
@@ -38,4 +42,9 @@ type MobileShareCreateResult struct {
 	Created         bool               `json:"created"`
 	Existing        bool               `json:"existing"`
 	RequiresConfirm bool               `json:"requires_confirm"`
+}
+
+type MobileShareDeleteResult struct {
+	Records []MobileShareRecord `json:"records"`
+	Deleted int                 `json:"deleted"`
 }

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -84,5 +85,38 @@ func TestListETFArchiveRecordsFilters(t *testing.T) {
 	}
 	if total != 1 || len(got) != 1 || got[0].SourceName != "Other.Show.S01E01.mp4" {
 		t.Fatalf("tmdb result = total %d records %#v, want Other.Show.S01E01.mp4", total, got)
+	}
+}
+
+func TestCreateETFArchiveRecordIsIdempotentForSameArchiveFingerprint(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	first := &model.ETFArchiveRecord{
+		SourceName:       "1122好夫妻.S01E01.mkv",
+		StorageMountPath: "/139_60t",
+		ArchiveETFPath:   "/139_60t/ETF转存归档/tv/日韩剧/1122好夫妻/Season 1/1122好夫妻.S01E01.mkv.etf",
+		SourceSHA256:     "12aa4f5552a7b02bfb050742f06e40f31218216a86bd17b79f0b4ed09b17dba7",
+		Status:           model.ETFArchiveStatusArchived,
+	}
+	if err := CreateETFArchiveRecord(first); err != nil {
+		t.Fatalf("create first record: %v", err)
+	}
+
+	second := *first
+	second.ID = 0
+	second.SourceName = "1122好夫妻.S01E01.duplicate.mkv"
+	if err := CreateETFArchiveRecord(&second); err != nil {
+		t.Fatalf("create second record: %v", err)
+	}
+
+	got, total, err := ListETFArchiveRecords(ETFArchiveRecordFilter{Page: 1, PerPage: 20})
+	if err != nil {
+		t.Fatalf("list records: %v", err)
+	}
+	if total != 1 || len(got) != 1 {
+		t.Fatalf("record count = total %d len %d, want 1", total, len(got))
+	}
+	if got[0].SourceSHA256 != strings.ToUpper(first.SourceSHA256) {
+		t.Fatalf("source sha256 = %q, want normalized uppercase", got[0].SourceSHA256)
 	}
 }

@@ -2,6 +2,7 @@ package handles
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 
@@ -12,10 +13,15 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type mobileShareCreator interface {
 	CreateMobileShare(context.Context, model.Obj, model.MobileShareCreateArgs) (*model.MobileShareLink, error)
+}
+
+type mobileShareDeleter interface {
+	DeleteMobileShare(context.Context, model.MobileShareDeleteArgs) error
 }
 
 type createMobileShareReq struct {
@@ -30,6 +36,11 @@ type listMobileShareRecordsReq struct {
 	StorageMountPath string `form:"storage_mount_path" json:"storage_mount_path"`
 	SourceType       string `form:"source_type" json:"source_type"`
 	IsValid          string `form:"is_valid" json:"is_valid"`
+}
+
+type deleteMobileShareReq struct {
+	ID  uint   `json:"id"`
+	IDs []uint `json:"ids"`
 }
 
 func CreateMobileShare(c *gin.Context) {
@@ -70,7 +81,7 @@ func CreateMobileShare(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	if existing != nil && !req.Force {
+	if existing != nil && existing.IsValid && !req.Force {
 		common.SuccessResp(c, model.MobileShareCreateResult{
 			Record:          existing,
 			Created:         false,
@@ -160,6 +171,145 @@ func ListMobileShareRecords(c *gin.Context) {
 	})
 }
 
+func DeleteMobileShare(c *gin.Context) {
+	var req deleteMobileShareReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	ids := mobileShareDeleteRecordIDs(req)
+	if len(ids) == 0 {
+		common.ErrorStrResp(c, "mobile share record id is required", 400)
+		return
+	}
+
+	records := make([]*model.MobileShareRecord, 0, len(ids))
+	recordsByMount := make(map[string][]*model.MobileShareRecord)
+	deleted := 0
+	for _, id := range ids {
+		record, err := db.GetMobileShareRecordByID(id)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				common.ErrorResp(c, err, 404)
+				return
+			}
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		records = append(records, record)
+		if !record.IsValid {
+			continue
+		}
+		if strings.TrimSpace(record.LinkID) == "" {
+			record.IsValid = false
+			record.LastError = ""
+			if err := db.UpdateMobileShareRecord(record); err != nil {
+				common.ErrorResp(c, err, 500)
+				return
+			}
+			deleted++
+			continue
+		}
+		mountPath := utils.FixAndCleanPath(record.StorageMountPath)
+		recordsByMount[mountPath] = append(recordsByMount[mountPath], record)
+	}
+
+	for mountPath, group := range recordsByMount {
+		storage, err := op.GetStorageByMountPath(mountPath)
+		if err != nil {
+			_ = updateMobileShareRecordsError(group, err)
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		deleter, ok := storage.(mobileShareDeleter)
+		if !ok {
+			err := errors.New("storage does not support mobile share deletion")
+			_ = updateMobileShareRecordsError(group, err)
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		if err := deleter.DeleteMobileShare(c.Request.Context(), model.MobileShareDeleteArgs{
+			LinkIDs: mobileShareRecordLinkIDs(group),
+		}); err != nil {
+			_ = updateMobileShareRecordsError(group, err)
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		for _, record := range group {
+			record.IsValid = false
+			record.LastError = ""
+			if err := db.UpdateMobileShareRecord(record); err != nil {
+				common.ErrorResp(c, err, 500)
+				return
+			}
+			deleted++
+		}
+	}
+
+	common.SuccessResp(c, model.MobileShareDeleteResult{
+		Records: mobileShareRecordValues(records),
+		Deleted: deleted,
+	})
+}
+
 func mobileShareDriveID(mountPath string) string {
 	return utils.FixAndCleanPath(mountPath)
+}
+
+func mobileShareDeleteRecordIDs(req deleteMobileShareReq) []uint {
+	seen := make(map[uint]struct{}, len(req.IDs)+1)
+	ids := make([]uint, 0, len(req.IDs)+1)
+	add := func(id uint) {
+		if id == 0 {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	add(req.ID)
+	for _, id := range req.IDs {
+		add(id)
+	}
+	return ids
+}
+
+func mobileShareRecordLinkIDs(records []*model.MobileShareRecord) []string {
+	seen := make(map[string]struct{}, len(records))
+	linkIDs := make([]string, 0, len(records))
+	for _, record := range records {
+		linkID := strings.TrimSpace(record.LinkID)
+		if linkID == "" {
+			continue
+		}
+		if _, ok := seen[linkID]; ok {
+			continue
+		}
+		seen[linkID] = struct{}{}
+		linkIDs = append(linkIDs, linkID)
+	}
+	return linkIDs
+}
+
+func updateMobileShareRecordsError(records []*model.MobileShareRecord, err error) error {
+	if err == nil {
+		return nil
+	}
+	for _, record := range records {
+		record.LastError = err.Error()
+		if updateErr := db.UpdateMobileShareRecord(record); updateErr != nil {
+			return updateErr
+		}
+	}
+	return nil
+}
+
+func mobileShareRecordValues(records []*model.MobileShareRecord) []model.MobileShareRecord {
+	values := make([]model.MobileShareRecord, 0, len(records))
+	for _, record := range records {
+		values = append(values, *record)
+	}
+	return values
 }

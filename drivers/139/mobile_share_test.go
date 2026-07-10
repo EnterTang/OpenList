@@ -128,6 +128,50 @@ func TestCreateMobileShareBuildsFilePayload(t *testing.T) {
 	}
 }
 
+func TestDeleteMobileShareBuildsPayload(t *testing.T) {
+	setup139Resty(t)
+	oldBaseURL := mobileShareOutLinkBaseURL
+	t.Cleanup(func() {
+		mobileShareOutLinkBaseURL = oldBaseURL
+	})
+
+	var body map[string]any
+	var cookieHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != mobileShareDeleteOutLinkPath {
+			t.Fatalf("path = %q, want %s", r.URL.Path, mobileShareDeleteOutLinkPath)
+		}
+		cookieHeader = r.Header.Get("Cookie")
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		write139JSON(t, w, map[string]any{"success": true})
+	}))
+	defer server.Close()
+	mobileShareOutLinkBaseURL = server.URL
+
+	d := &Yun139{
+		Addition: Addition{
+			Type:         MetaPersonalNew,
+			CookieHeader: "auth_token=token; skey=skey",
+		},
+	}
+	err := d.DeleteMobileShare(context.Background(), model.MobileShareDeleteArgs{
+		LinkIDs: []string{" link-id ", "link-id", "link-2"},
+	})
+	if err != nil {
+		t.Fatalf("DeleteMobileShare returned error: %v", err)
+	}
+	if cookieHeader != "auth_token=token; skey=skey" {
+		t.Fatalf("Cookie header = %q, want configured cookie", cookieHeader)
+	}
+	req := body["delOutLinkReq"].(map[string]any)
+	got := req["linkIDs"].([]any)
+	if len(got) != 2 || got[0] != "link-id" || got[1] != "link-2" {
+		t.Fatalf("linkIDs = %#v, want deduplicated link IDs", got)
+	}
+}
+
 func TestCreateMobileShareDoesNotRetryOnNonRiskError(t *testing.T) {
 	setup139Resty(t)
 	oldBaseURL := mobileShareOutLinkBaseURL
@@ -148,7 +192,7 @@ func TestCreateMobileShareDoesNotRetryOnNonRiskError(t *testing.T) {
 
 	d := &Yun139{
 		PersonalCloudHost: server.URL,
-		Addition: Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
+		Addition:          Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
 	}
 	if _, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "file-id", Name: "非分之罪 S01E01.etf", Path: "/"}, model.MobileShareCreateArgs{}); err == nil {
 		t.Fatal("expected error")
@@ -221,7 +265,7 @@ func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
 
 	d := &Yun139{
 		PersonalCloudHost: server.URL,
-		Addition: Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
+		Addition:          Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
 	}
 	link, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "file-id", Name: "非分之罪 S01E01.etf", Path: "/"}, model.MobileShareCreateArgs{})
 	if err != nil {
@@ -280,7 +324,7 @@ func TestCreateMobileShareSkipsRetryWhenRenamePlanEmpty(t *testing.T) {
 
 	d := &Yun139{
 		PersonalCloudHost: server.URL,
-		Addition: Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
+		Addition:          Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
 	}
 	_, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "file-id", Name: "Guilt S01E01.etf", Path: "/"}, model.MobileShareCreateArgs{})
 	if err == nil {

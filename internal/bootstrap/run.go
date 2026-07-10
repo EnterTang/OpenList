@@ -93,6 +93,7 @@ func Start() {
 	InitOfflineDownloadTools()
 	LoadStorages()
 	InitTaskManager()
+	subscription.RegisterTransferTaskHooks()
 	subscription.StartScheduler()
 	if !flags.Debug && !flags.Dev {
 		gin.SetMode(gin.ReleaseMode)

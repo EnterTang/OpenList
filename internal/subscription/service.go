@@ -10,13 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
-	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/pkg/errors"
 )
@@ -187,23 +184,16 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 			changed++
 		}
 		if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
-			if err := transferItem(ctx, stored); err != nil {
-				stored.Status = model.SubscriptionItemStatusFailed
-				stored.LastError = err.Error()
-			} else {
-				stored.Status = model.SubscriptionItemStatusTransferred
-				stored.LastError = ""
-				transferred++
-				if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok && sourceCfg.DeleteSourceAfter {
-					if err := cleanupSourceAfterTransfer(ctx, stored.SourcePath); err != nil {
-						stored.LastError = "source cleanup failed after transfer: " + err.Error()
-					}
-				}
+			deleteSourceAfter := false
+			if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok {
+				deleteSourceAfter = sourceCfg.DeleteSourceAfter
 			}
-			_, _, err = db.UpsertSubscriptionItem(stored)
+			var delta int
+			stored, delta, err = applyItemTransfer(ctx, stored, deleteSourceAfter)
 			if err != nil {
 				return saved, snapshot.Hash, added, changed, transferred, err
 			}
+			transferred += delta
 		}
 		saved = append(saved, *stored)
 	}
@@ -299,23 +289,16 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 			changed++
 		}
 		if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
-			if err := transferItem(ctx, stored); err != nil {
-				stored.Status = model.SubscriptionItemStatusFailed
-				stored.LastError = err.Error()
-			} else {
-				stored.Status = model.SubscriptionItemStatusTransferred
-				stored.LastError = ""
-				transferred++
-				if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok && sourceCfg.DeleteSourceAfter {
-					if err := cleanupSourceAfterTransfer(ctx, stored.SourcePath); err != nil {
-						stored.LastError = "source cleanup failed after transfer: " + err.Error()
-					}
-				}
+			deleteSourceAfter := false
+			if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok {
+				deleteSourceAfter = sourceCfg.DeleteSourceAfter
 			}
-			_, _, err = db.UpsertSubscriptionItem(stored)
+			var delta int
+			stored, delta, err = applyItemTransfer(ctx, stored, deleteSourceAfter)
 			if err != nil {
 				return saved, snapshot.Hash, added, changed, transferred, err
 			}
+			transferred += delta
 		}
 		saved = append(saved, *stored)
 	}
@@ -414,71 +397,35 @@ func manualLinkItem(sub *model.Subscription, link string, seenAt time.Time) *mod
 }
 
 func itemFromEntry(sub *model.Subscription, entry TreeEntry, seenAt time.Time) *model.SubscriptionItem {
-	planned := PlanTarget(planInputFromSubscription(sub), entry.Name, parentPath(entry))
-	sourcePath := fullPath(entry)
-	return &model.SubscriptionItem{
+	item := &model.SubscriptionItem{
 		SubscriptionID: sub.ID,
 		SourceKey:      SourceKey(entry),
-		SourcePath:     sourcePath,
+		SourcePath:     fullPath(entry),
 		FileID:         entry.ID,
 		FilePath:       entry.Path,
 		FileName:       entry.Name,
 		FileSize:       entry.Size,
 		FileHash:       FileHash(entry),
-		Season:         planned.Season,
-		Episode:        planned.Episode,
-		TargetDir:      planned.TargetDir,
-		TargetName:     planned.TargetName,
-		TargetPath:     planned.TargetPath,
 		Status:         model.SubscriptionItemStatusPending,
 		LastSeenAt:     seenAt,
 	}
+	return syncSubscriptionItemPaths(item, sub, entry, seenAt)
 }
 
-func transferItem(ctx context.Context, item *model.SubscriptionItem) error {
+func syncSubscriptionItemPaths(item *model.SubscriptionItem, sub *model.Subscription, entry TreeEntry, seenAt time.Time) *model.SubscriptionItem {
 	if item == nil {
-		return errors.New("subscription item is nil")
+		return nil
 	}
-	targetDir := utils.FixAndCleanPath(item.TargetDir)
-	if targetDir == "" || targetDir == "/" {
-		return errors.New("target dir is empty")
+	planned := PlanTarget(planInputFromSubscription(sub), entry.Name, parentPath(entry))
+	item.Season = planned.Season
+	item.Episode = planned.Episode
+	item.TargetDir = planned.TargetDir
+	item.TargetName = planned.TargetName
+	item.TargetPath = planned.TargetPath
+	if !seenAt.IsZero() {
+		item.LastSeenAt = seenAt
 	}
-	if err := ensureDir(ctx, targetDir); err != nil {
-		return err
-	}
-	syncCtx := context.WithValue(ctx, conf.NoTaskKey, struct{}{})
-	if _, err := fs.Copy(syncCtx, item.SourcePath, targetDir, true); err != nil {
-		return err
-	}
-	copiedPath := utils.FixAndCleanPath(stdpath.Join(targetDir, item.FileName))
-	if item.TargetName != "" && item.TargetName != item.FileName {
-		if err := fs.Rename(syncCtx, copiedPath, item.TargetName, true); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func cleanupSourceAfterTransfer(ctx context.Context, sourcePath string) error {
-	storage, actualPath, err := op.GetStorageAndActualPath(sourcePath)
-	if err != nil {
-		return errors.WithMessage(err, "failed get source storage")
-	}
-	sourceObj, err := op.Get(ctx, storage, actualPath, true)
-	if err != nil {
-		if errs.IsObjectNotFound(err) {
-			return nil
-		}
-		return errors.WithMessage(err, "failed get source object")
-	}
-	sourceObj = model.UnwrapObjName(sourceObj)
-	if err := op.Remove(ctx, storage, actualPath); err != nil {
-		return err
-	}
-	if cleaner, ok := storage.(driver.RecycleEntryCleaner); ok {
-		return cleaner.ClearRecycleEntry(ctx, sourceObj)
-	}
-	return nil
+	return item
 }
 
 func ensureDir(ctx context.Context, path string) error {

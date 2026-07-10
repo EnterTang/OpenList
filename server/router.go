@@ -192,6 +192,7 @@ func admin(g *gin.RouterGroup) {
 	mobileShare := g.Group("/mobile_share")
 	mobileShare.GET("/list", handles.ListMobileShareRecords)
 	mobileShare.POST("/create", handles.CreateMobileShare)
+	mobileShare.POST("/delete", handles.DeleteMobileShare)
 
 	subscription := g.Group("/subscription")
 	subscription.GET("/list", handles.ListSubscriptions)

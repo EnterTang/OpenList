@@ -110,7 +110,7 @@ func transfer(ctx context.Context, taskType taskType, srcObjPath, dstDirPath str
 		return nil, errors.WithMessage(err, "failed get dst storage")
 	}
 
-	if srcStorage.GetStorage() == dstStorage.GetStorage() {
+	if srcStorage.GetStorage() == dstStorage.GetStorage() && ctx.Value(conf.ForceTaskKey) == nil {
 		if utils.IsBool(skipHook...) {
 			ctx = context.WithValue(ctx, conf.SkipHookKey, struct{}{})
 		}
@@ -141,7 +141,7 @@ func transfer(ctx context.Context, taskType taskType, srcObjPath, dstDirPath str
 	}
 
 	t.groupID = stdpath.Join(t.DstStorageMp, t.DstActualPath)
-	task_group.TransferCoordinator.AddTask(t.groupID, nil)
+	task_group.TransferCoordinator.AddTask(t.groupID, ctx.Value(conf.TransferTaskPayloadKey))
 	if ctx.Value(conf.NoTaskKey) != nil {
 		var callback func(nextTask *FileTransferTask) error
 		hasSuccess := false

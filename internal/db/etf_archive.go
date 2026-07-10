@@ -5,6 +5,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
+	"gorm.io/gorm"
 )
 
 type ETFArchiveRecordFilter struct {
@@ -16,6 +17,18 @@ type ETFArchiveRecordFilter struct {
 }
 
 func CreateETFArchiveRecord(record *model.ETFArchiveRecord) error {
+	if record == nil {
+		return errors.New("etf archive record is nil")
+	}
+	record.SourceSHA256 = strings.ToUpper(strings.TrimSpace(record.SourceSHA256))
+	record.ArchiveETFPath = strings.TrimSpace(record.ArchiveETFPath)
+	if existing, err := FindETFArchiveRecordByFingerprint(record.StorageMountPath, record.SourceSHA256, record.ArchiveETFPath); err == nil {
+		record.ID = existing.ID
+		record.CreatedAt = existing.CreatedAt
+		return errors.WithStack(db.Save(record).Error)
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return errors.WithStack(err)
+	}
 	return errors.WithStack(db.Create(record).Error)
 }
 
@@ -26,6 +39,23 @@ func UpdateETFArchiveRecord(record *model.ETFArchiveRecord) error {
 func GetETFArchiveRecordByID(id uint) (*model.ETFArchiveRecord, error) {
 	var record model.ETFArchiveRecord
 	if err := db.First(&record, id).Error; err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &record, nil
+}
+
+func FindETFArchiveRecordByFingerprint(storageMountPath, sourceSHA256, archiveETFPath string) (*model.ETFArchiveRecord, error) {
+	sourceSHA256 = strings.ToUpper(strings.TrimSpace(sourceSHA256))
+	archiveETFPath = strings.TrimSpace(archiveETFPath)
+	if sourceSHA256 == "" || archiveETFPath == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var record model.ETFArchiveRecord
+	err := db.Where(
+		columnName("storage_mount_path")+" = ? AND "+columnName("source_sha256")+" = ? AND "+columnName("archive_etf_path")+" = ?",
+		strings.TrimSpace(storageMountPath), sourceSHA256, archiveETFPath,
+	).First(&record).Error
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return &record, nil
