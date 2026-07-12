@@ -87,6 +87,14 @@ func CreateOrReuseShare(ctx context.Context, creator Creator, req ShareRequest) 
 	if link == nil || strings.TrimSpace(link.ShareURL) == "" {
 		return nil, fmt.Errorf("mobile share response missing share url")
 	}
+	sourcePath := strings.TrimSpace(link.SourcePath)
+	if sourcePath == "" {
+		sourcePath = utils.FixAndCleanPath(req.SourcePath)
+	}
+	sourceName := strings.TrimSpace(link.SourceName)
+	if sourceName == "" {
+		sourceName = req.Object.GetName()
+	}
 	sourceType := "file"
 	if req.Object.IsDir() {
 		sourceType = "folder"
@@ -96,8 +104,8 @@ func CreateOrReuseShare(ctx context.Context, creator Creator, req ShareRequest) 
 		StorageMountPath: utils.FixAndCleanPath(req.StorageMountPath),
 		DriveID:          driveID,
 		SourceFileID:     sourceFileID,
-		SourcePath:       utils.FixAndCleanPath(req.SourcePath),
-		SourceName:       req.Object.GetName(),
+		SourcePath:       sourcePath,
+		SourceName:       sourceName,
 		SourceType:       sourceType,
 		PeriodUnit:       periodUnit,
 		LinkID:           strings.TrimSpace(link.LinkID),

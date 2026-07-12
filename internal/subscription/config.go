@@ -105,6 +105,9 @@ func normalizeConfig(cfg model.SubscriptionConfig) model.SubscriptionConfig {
 	cfg.DefaultCategory = ""
 	cfg.DefaultTransferEnabled = false
 	cfg.Telegram = normalizeTelegramSourceConfig(cfg.Telegram)
+	if len(cfg.Telegram.TransferPriority) == 0 {
+		cfg.Telegram.TransferPriority = append([]string(nil), defaultTransferPriority...)
+	}
 	cfg.PanSou = normalizePanSouSourceConfig(cfg.PanSou)
 	return cfg
 }
@@ -170,7 +173,54 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	if cfg.Limit <= 0 {
 		cfg.Limit = defaults.Limit
 	}
+	if len(cfg.TransferPriority) == 0 {
+		cfg.TransferPriority = append([]string(nil), defaults.TransferPriority...)
+	}
 	return normalizeTelegramSourceConfig(cfg)
+}
+
+var defaultTransferPriority = []string{"pan123", "pan115", "quark", "aliyun_drive"}
+
+func normalizeTransferPriority(values []string) []string {
+	if len(values) == 0 {
+		return append([]string(nil), defaultTransferPriority...)
+	}
+	seen := map[string]struct{}{}
+	normalized := make([]string, 0, len(values)+len(defaultTransferPriority))
+	for _, value := range values {
+		name := normalizeTransferPriorityName(value)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+	for _, name := range defaultTransferPriority {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+	return normalized
+}
+
+func normalizeTransferPriorityName(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "quark":
+		return "quark"
+	case "aliyun", "aliyun_drive", "ali", "alipan":
+		return "aliyun_drive"
+	case "123", "pan123":
+		return "pan123"
+	case "115", "pan115":
+		return "pan115"
+	default:
+		return ""
+	}
 }
 
 func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) model.SubscriptionTelegramSourceConfig {
@@ -201,6 +251,7 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 	if cfg.Limit <= 0 {
 		cfg.Limit = 40
 	}
+	cfg.TransferPriority = normalizeTransferPriority(cfg.TransferPriority)
 	return cfg
 }
 

@@ -13,8 +13,10 @@ import (
 func TestTargetClientCreatesETFSubscriptionAndParsesTask(t *testing.T) {
 	var gotPath string
 	var gotBody map[string]any
+	var gotIdempotencyKey string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotIdempotencyKey = r.Header.Get("Idempotency-Key")
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
@@ -31,7 +33,7 @@ func TestTargetClientCreatesETFSubscriptionAndParsesTask(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewTargetClient(server.URL+"/api/v1", server.Client(), time.Second)
+	client := NewTargetClient(server.URL+"/api/v1", "", server.Client(), time.Second)
 	result, err := client.CreateSubscription(context.Background(), CreateSubscriptionPayload{
 		TMDBID:       260868,
 		MediaType:    "tv",
@@ -40,7 +42,7 @@ func TestTargetClientCreatesETFSubscriptionAndParsesTask(t *testing.T) {
 		ShareType:    "etf",
 		SeasonStart:  1,
 		EpisodeStart: 1,
-	})
+	}, "notification:create:root-1")
 	if err != nil {
 		t.Fatalf("create subscription: %v", err)
 	}
@@ -49,6 +51,9 @@ func TestTargetClientCreatesETFSubscriptionAndParsesTask(t *testing.T) {
 	}
 	if gotBody["share_type"] != "etf" || gotBody["share_url"] != "https://yun.139.com/w/i/abc" {
 		t.Fatalf("request body = %#v, want etf share url", gotBody)
+	}
+	if gotIdempotencyKey != "notification:create:root-1" {
+		t.Fatalf("idempotency key = %q", gotIdempotencyKey)
 	}
 	if result.SubscriptionID != 12 || result.TaskID != "task_create" {
 		t.Fatalf("result = %#v, want subscription 12 task_create", result)
@@ -81,7 +86,7 @@ func TestTargetClientChecksSubscriptionAndParsesTask(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewTargetClient(server.URL+"/api/v1/", server.Client(), time.Second)
+	client := NewTargetClient(server.URL+"/api/v1/", "", server.Client(), time.Second)
 	result, err := client.CheckSubscription(context.Background(), 77)
 	if err != nil {
 		t.Fatalf("check subscription: %v", err)
@@ -92,5 +97,43 @@ func TestTargetClientChecksSubscriptionAndParsesTask(t *testing.T) {
 	}
 	if result.TaskID != "task_check" {
 		t.Fatalf("task id = %q, want task_check", result.TaskID)
+	}
+}
+
+func TestTargetClientUsesPublicAPIRoutesWithToken(t *testing.T) {
+	const token = "test-api-token"
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Fatalf("authorization = %q, want Bearer %s", got, token)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"exists":          true,
+			"subscription_id": 53,
+			"task_id":         "task-public",
+			"task_status":     "pending",
+			"status":          "updating",
+		})
+	}))
+	defer server.Close()
+
+	client := NewTargetClient(server.URL+"/api/v1", token, server.Client(), time.Second)
+	result, err := client.CreateSubscription(context.Background(), CreateSubscriptionPayload{
+		TMDBID:     251600,
+		MediaType:  "tv",
+		ShareURL:   "https://yun.139.com/shareweb/#/w/i/abc",
+		AccessCode: "772g",
+		ShareType:  "etf",
+	})
+	if err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	if gotPath != "/api/v1/subscriptions/manual" {
+		t.Fatalf("path = %q, want /api/v1/subscriptions/manual", gotPath)
+	}
+	if result.SubscriptionID != 53 || result.TaskID != "task-public" || result.Status != "pending" {
+		t.Fatalf("result = %#v, want subscription 53 task-public pending", result)
 	}
 }

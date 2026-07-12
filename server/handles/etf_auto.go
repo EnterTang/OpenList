@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"strconv"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
@@ -17,6 +18,11 @@ type listETFAutoMediaRootsReq struct {
 
 type triggerETFAutoCheckReq struct {
 	ID uint `json:"id" binding:"required"`
+}
+
+type listETFAutoJobsReq struct {
+	Type   string `form:"type"`
+	Status string `form:"status"`
 }
 
 func ListETFAutoMediaRoots(c *gin.Context) {
@@ -60,4 +66,31 @@ func ProcessETFAutoSubscriptionJobs(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, result)
+}
+
+func ListETFAutoJobs(c *gin.Context) {
+	var req listETFAutoJobsReq
+	if err := c.ShouldBindQuery(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	jobs, err := etfauto.ListJobs(c.Request.Context(), etfauto.JobFilter{Type: req.Type, Status: req.Status})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, jobs)
+}
+
+func RetryUnknownETFAutoJob(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		common.ErrorStrResp(c, "invalid ETF notification job id", 400)
+		return
+	}
+	if err := etfauto.RetryUnknownJob(c.Request.Context(), uint(id)); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, gin.H{"queued": true})
 }

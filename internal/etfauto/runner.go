@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -31,7 +32,11 @@ type RunnerOptions struct {
 type defaultShareProvider struct{}
 
 func (defaultShareProvider) CreateOrReuseShare(ctx context.Context, root *model.ETFMediaRoot) (*model.MobileShareRecord, error) {
-	storage, actualPath, err := op.GetStorageAndActualPath(root.MediaRootPath)
+	rootPath := root.MediaRootPath
+	if root != nil && root.ActualMediaRootPath != "" {
+		rootPath = root.ActualMediaRootPath
+	}
+	storage, actualPath, err := op.GetStorageAndActualPath(rootPath)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +101,7 @@ func runCreateSubscriptionJob(ctx context.Context, job *model.ETFSubscriptionJob
 	if err := updateJobShare(ctx, job.ID, root.ID, share); err != nil {
 		return err
 	}
-	client := NewTargetClient(job.TargetBaseURL, opts.HTTPClient, opts.Timeout)
+	client := NewTargetClient(job.TargetBaseURL, job.TargetAPIToken, opts.HTTPClient, opts.Timeout)
 	result, err := client.CreateSubscription(ctx, CreateSubscriptionPayload{
 		TMDBID:       root.TMDBID,
 		MediaType:    root.MediaType,
@@ -105,8 +110,14 @@ func runCreateSubscriptionJob(ctx context.Context, job *model.ETFSubscriptionJob
 		ShareType:    normalizeShareType(job.ShareType),
 		SeasonStart:  defaultSeasonStart(root.MediaType),
 		EpisodeStart: defaultEpisodeStart(root.MediaType),
-	})
+	}, job.JobKey)
 	if err != nil {
+		if IsDeliveryUncertain(err) {
+			if job.TargetSupportsIdempotency {
+				return markJobFailed(ctx, job.ID, err, opts)
+			}
+			return markJobUnknown(ctx, job.ID, err)
+		}
 		return markJobFailed(ctx, job.ID, err, opts)
 	}
 	return MarkCreateSubscriptionSucceeded(ctx, job.ID, CreateSubscriptionResult{
@@ -126,12 +137,38 @@ func runManualCheckJob(ctx context.Context, job *model.ETFSubscriptionJob, opts 
 	if subscriptionID <= 0 {
 		subscriptionID = root.TargetSubscriptionID
 	}
-	client := NewTargetClient(job.TargetBaseURL, opts.HTTPClient, opts.Timeout)
-	result, err := client.CheckSubscription(ctx, subscriptionID)
+	client := NewTargetClient(job.TargetBaseURL, job.TargetAPIToken, opts.HTTPClient, opts.Timeout)
+	result, err := client.CheckSubscription(ctx, subscriptionID, job.JobKey)
 	if err != nil {
+		if IsDeliveryUncertain(err) {
+			if job.TargetSupportsIdempotency {
+				return markJobFailed(ctx, job.ID, err, opts)
+			}
+			return markJobUnknown(ctx, job.ID, err)
+		}
 		return markJobFailed(ctx, job.ID, err, opts)
 	}
 	return markManualCheckSucceeded(ctx, job.ID, result)
+}
+
+func markJobUnknown(ctx context.Context, jobID uint, cause error) error {
+	if cause == nil {
+		cause = errors.New("target delivery outcome is unknown")
+	}
+	return db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job model.ETFSubscriptionJob
+		if err := tx.First(&job, jobID).Error; err != nil {
+			return err
+		}
+		job.Attempts++
+		job.Status = model.ETFSubscriptionJobStatusUnknown
+		job.NextRetryAt = nil
+		job.LastError = cause.Error()
+		if err := tx.Save(&job).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusUnknown)
+	})
 }
 
 func updateJobShare(ctx context.Context, jobID, mediaRootID uint, share *model.MobileShareRecord) error {
@@ -151,6 +188,9 @@ func updateJobShare(ctx context.Context, jobID, mediaRootID uint, share *model.M
 		root.MobileShareRecordID = share.ID
 		root.ShareURL = share.ShareURL
 		root.AccessCode = share.ExtractCode
+		if strings.TrimSpace(share.SourcePath) != "" {
+			root.ActualMediaRootPath = strings.TrimSpace(share.SourcePath)
+		}
 		if err := tx.Save(&job).Error; err != nil {
 			return err
 		}
@@ -183,7 +223,10 @@ func markManualCheckSucceeded(ctx context.Context, jobID uint, result *TargetTas
 		if err := tx.Save(&job).Error; err != nil {
 			return err
 		}
-		return tx.Save(&root).Error
+		if err := tx.Save(&root).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusSucceeded)
 	})
 }
 
@@ -208,7 +251,14 @@ func markJobFailed(ctx context.Context, jobID uint, cause error, opts RunnerOpti
 			next := opts.Now.Add(opts.RetryDelay)
 			job.NextRetryAt = &next
 		}
-		return tx.Save(&job).Error
+		if err := tx.Save(&job).Error; err != nil {
+			return err
+		}
+		clusterStatus := model.ClusterNotificationStatusPending
+		if status == model.ETFSubscriptionJobStatusDeadLetter {
+			clusterStatus = model.ClusterNotificationStatusFailed
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, clusterStatus)
 	})
 }
 

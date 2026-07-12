@@ -14,9 +14,12 @@ fi
 
 # Check for lite parameter
 useLite=false
-if [[ "$*" == *"lite"* ]]; then
-  useLite=true
-fi
+for arg in "$@"; do
+  if [ "$arg" = "lite" ]; then
+    useLite=true
+    break
+  fi
+done
 
 ResolveLatestFrontendTag() {
   if [ -n "$FRONTEND_VERSION" ]; then
@@ -32,6 +35,37 @@ ResolveLatestFrontendTag() {
   fi
 }
 
+ResolveLocalFrontendVersion() {
+  if [ -n "${FRONTEND_VERSION:-}" ]; then
+    echo "$FRONTEND_VERSION"
+    return 0
+  fi
+  local dir="${FRONTEND_DIR:-}"
+  if [ -z "$dir" ] || [ ! -f "$dir/package.json" ]; then
+    return 1
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -p "require('$dir/package.json').version" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
+
+installLocalFrontendDist() {
+  local dir="${FRONTEND_DIR:-}"
+  if [ -z "$dir" ]; then
+    return 1
+  fi
+  if [ ! -d "$dir/dist" ]; then
+    echo "FRONTEND_DIR dist not found: $dir/dist" >&2
+    exit 1
+  fi
+  rm -rf public/dist && mkdir -p public/dist
+  cp -R "$dir/dist/." public/dist/
+  echo "using local frontend from $dir/dist"
+  return 0
+}
+
 if [ "$1" = "dev" ]; then
   version="dev"
   webVersion="rolling"
@@ -43,6 +77,11 @@ else
   # Always true if there's no tag
   version=$(git describe --abbrev=0 --tags 2>/dev/null || echo "v0.0.0")
   webVersion="$(ResolveLatestFrontendTag)"
+fi
+
+localFrontendVersion="$(ResolveLocalFrontendVersion 2>/dev/null || true)"
+if [ -n "$localFrontendVersion" ]; then
+  webVersion="$localFrontendVersion"
 fi
 
 echo "backend version: $version"
@@ -111,6 +150,9 @@ AssertStaticBinary() {
 }
 
 FetchWebRolling() {
+  if installLocalFrontendDist; then
+    return 0
+  fi
   # There is no lite for rolling.
   if ! FetchWebDistForTag "rolling" false; then
     FetchWebRollingFromAPI
@@ -121,6 +163,9 @@ FetchWebRolling() {
 }
 
 FetchWebRelease() {
+  if installLocalFrontendDist; then
+    return 0
+  fi
   if ! FetchWebDistForTag "$webVersion" "$useLite"; then
     FetchWebReleaseFromAPI
   fi
@@ -347,6 +392,98 @@ BuildRelease() {
   # Separate from musl builds to avoid cache conflicts
   BuildLoongGLIBC ./build/$appName-linux-loong64-abi1.0 abi1.0
   BuildLoongGLIBC ./build/$appName-linux-loong64 abi2.0
+}
+
+InstallLinuxAmd64MuslToolchain() {
+  mkdir -p build/musl-libs
+  if [ -x build/musl-libs/bin/x86_64-linux-musl-gcc ]; then
+    export PATH="$PATH:$PWD/build/musl-libs/bin"
+    return 0
+  fi
+  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
+  FILE=x86_64-linux-musl-cross
+  lib_tgz="build/${FILE}.tgz"
+  curl -fsSL -o "${lib_tgz}" "${BASE}${FILE}.tgz"
+  tar xf "${lib_tgz}" --strip-components 1 -C build/musl-libs
+  rm -f "${lib_tgz}"
+  export PATH="$PATH:$PWD/build/musl-libs/bin"
+}
+
+UseZigCrossCompiler() {
+  command -v zig >/dev/null 2>&1
+}
+
+UseXgoDocker() {
+  command -v xgo >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+BuildReleaseLinuxAmd64Musl() {
+  mkdir -p build
+  muslflags="$(GetMuslStaticLdflags)"
+  echo building for linux-musl-amd64
+  export GOOS=linux
+  export GOARCH=amd64
+  export CGO_ENABLED=1
+  if UseZigCrossCompiler; then
+    export CC="zig cc -target x86_64-linux-musl"
+    export CXX="zig c++ -target x86_64-linux-musl"
+  else
+    InstallLinuxAmd64MuslToolchain
+    export CC=x86_64-linux-musl-gcc
+  fi
+  CGO_LDFLAGS="-static" go build -o ./build/$appName-linux-musl-amd64 -ldflags="$muslflags" -tags=jsoniter .
+  AssertStaticBinary "./build/$appName-linux-musl-amd64"
+}
+
+BuildReleaseWindowsAmd64() {
+  mkdir -p build
+  echo building for windows-amd64
+  if UseXgoDocker; then
+    xgo -targets=windows/amd64 -out "$appName" -ldflags="$ldflags" -tags=jsoniter .
+    mv "$appName"-windows-amd64.exe build/
+    return
+  fi
+  if ! UseZigCrossCompiler; then
+    echo "windows-amd64 build requires docker+xgo or zig" >&2
+    exit 1
+  fi
+  chmod +x ./wrapper/zcc-win7 ./wrapper/zcxx-win7
+  export GOOS=windows
+  export GOARCH=amd64
+  export CGO_ENABLED=1
+  export CC="$(pwd)/wrapper/zcc-win7"
+  export CXX="$(pwd)/wrapper/zcxx-win7"
+  go build -o build/$appName-windows-amd64.exe -ldflags="$ldflags" -tags=jsoniter .
+}
+
+BuildReleaseDarwinAmd64() {
+  mkdir -p build
+  echo building for darwin-amd64
+  if UseXgoDocker; then
+    xgo -targets=darwin/amd64 -out "$appName" -ldflags="$ldflags" -tags=jsoniter .
+    mv "$appName"-darwin-amd64 build/
+    return
+  fi
+  if ! UseZigCrossCompiler; then
+    echo "darwin-amd64 build requires docker+xgo or zig" >&2
+    exit 1
+  fi
+  export GOOS=darwin
+  export GOARCH=amd64
+  export CGO_ENABLED=1
+  export CC="zig cc -target x86_64-macos"
+  export CXX="zig c++ -target x86_64-macos"
+  go build -o build/$appName-darwin-amd64 -ldflags="$ldflags" -tags=jsoniter .
+}
+
+BuildReleaseAmd64() {
+  BuildReleaseWindowsAmd64
+  if [ "$(uname -m)" = "x86_64" ]; then
+    BuildReleaseDarwinAmd64
+  else
+    echo "skipping darwin-amd64 on $(uname -m); use docker+xgo or an Intel Mac to build it"
+  fi
+  BuildReleaseLinuxAmd64Musl
 }
 
 BuildLoongGLIBC() {
@@ -685,7 +822,7 @@ for arg in "$@"; do
         buildType="$arg"
       fi
       ;;
-    docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web)
+    docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web|windows_amd64|linux_amd64_musl|darwin_amd64|amd64)
       if [ -z "$dockerType" ]; then
         dockerType="$arg"
       fi
@@ -752,6 +889,34 @@ elif [ "$buildType" = "release" -o "$buildType" = "beta" ]; then
     fi
   elif [ "$dockerType" = "web" ]; then
     echo "web only"
+  elif [ "$dockerType" = "windows_amd64" ]; then
+    BuildReleaseWindowsAmd64
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-windows-amd64-lite.txt"
+    else
+      MakeRelease "md5-windows-amd64.txt"
+    fi
+  elif [ "$dockerType" = "linux_amd64_musl" ]; then
+    BuildReleaseLinuxAmd64Musl
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-linux-amd64-musl-lite.txt"
+    else
+      MakeRelease "md5-linux-amd64-musl.txt"
+    fi
+  elif [ "$dockerType" = "darwin_amd64" ]; then
+    BuildReleaseDarwinAmd64
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-darwin-amd64-lite.txt"
+    else
+      MakeRelease "md5-darwin-amd64.txt"
+    fi
+  elif [ "$dockerType" = "amd64" ]; then
+    BuildReleaseAmd64
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-amd64-lite.txt"
+    else
+      MakeRelease "md5-amd64.txt"
+    fi
   else
     BuildRelease
     if [ "$useLite" = true ]; then
@@ -786,7 +951,7 @@ elif [ "$buildType" = "zip" ]; then
   fi
 else
   echo -e "Parameter error"
-  echo -e "Usage: $0 {dev|beta|release|zip|prepare} [docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web] [lite] [other_params]"
+  echo -e "Usage: $0 {dev|beta|release|zip|prepare} [docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web|windows_amd64|linux_amd64_musl|darwin_amd64|amd64] [lite] [other_params]"
   echo -e "Examples:"
   echo -e "  $0 dev"
   echo -e "  $0 dev lite"

@@ -246,9 +246,16 @@ func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
 
 	shareCalls := 0
 	var renamed []string
+	var dedicatedNames []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case mobileShareOutLinkPath:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			req := body["getOutLinkReq"].(map[string]any)
+			dedicatedNames = append(dedicatedNames, req["dedicatedName"].(string))
 			shareCalls++
 			if shareCalls == 1 {
 				write139JSON(t, w, map[string]any{"success": false, "message": "个人云未知异常"})
@@ -284,7 +291,7 @@ func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
 		PersonalCloudHost: server.URL,
 		Addition:          Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
 	}
-	link, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "file-id", Name: "非分之罪 S01E01.etf", Path: "/"}, model.MobileShareCreateArgs{})
+	link, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "file-id", Name: "非分之罪 S01E01.etf", Path: "/"}, model.MobileShareCreateArgs{SourcePath: "/非分之罪 S01E01.etf"})
 	if err != nil {
 		t.Fatalf("CreateMobileShare returned error: %v", err)
 	}
@@ -296,6 +303,18 @@ func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
 	}
 	if len(renamed) != 1 || renamed[0] != "Guilt S01E01.etf" {
 		t.Fatalf("renamed = %#v, want Guilt S01E01.etf", renamed)
+	}
+	if len(dedicatedNames) != 2 || dedicatedNames[0] != "非分之罪 S01E01.etf" || dedicatedNames[1] != "Guilt S01E01.etf" {
+		t.Fatalf("dedicatedNames = %#v, want original then renamed retry name", dedicatedNames)
+	}
+	if link.SourcePath != "/Guilt S01E01.etf" {
+		t.Fatalf("link.SourcePath = %q, want /Guilt S01E01.etf", link.SourcePath)
+	}
+	if link.SourceName != "Guilt S01E01.etf" {
+		t.Fatalf("link.SourceName = %q, want Guilt S01E01.etf", link.SourceName)
+	}
+	if link.CanonicalTitle != "Guilt" {
+		t.Fatalf("link.CanonicalTitle = %q, want Guilt", link.CanonicalTitle)
 	}
 }
 

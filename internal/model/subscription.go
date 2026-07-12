@@ -20,51 +20,59 @@ const (
 )
 
 type Subscription struct {
-	ID                   uint       `json:"id" gorm:"primarykey"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-	Name                 string     `json:"name" gorm:"index"`
-	SourceType           string     `json:"source_type" gorm:"index"`
-	SourceConfig         string     `json:"source_config" gorm:"type:text"`
-	Active               bool       `json:"active" gorm:"index"`
-	CheckIntervalMinutes int        `json:"check_interval_minutes"`
-	TargetRoot           string     `json:"target_root"`
-	TransferEnabled      bool       `json:"transfer_enabled"`
-	TMDBID               int64      `json:"tmdb_id" gorm:"index"`
-	TMDBName             string     `json:"tmdb_name"`
-	TMDBYear             int        `json:"tmdb_year"`
-	MediaType            string     `json:"media_type" gorm:"index"`
-	Category             string     `json:"category"`
-	Season               int        `json:"season"`
-	Seasons              []int      `json:"seasons" gorm:"serializer:json"`
-	LastCheckedAt        *time.Time `json:"last_checked_at"`
-	LastCursor           string     `json:"last_cursor"`
-	LastTreeHash         string     `json:"last_tree_hash"`
-	LastStatus           string     `json:"last_status" gorm:"index"`
-	LastError            string     `json:"last_error" gorm:"type:text"`
+	ID                       uint       `json:"id" gorm:"primarykey"`
+	CreatedAt                time.Time  `json:"created_at"`
+	UpdatedAt                time.Time  `json:"updated_at"`
+	Name                     string     `json:"name" gorm:"index"`
+	SourceType               string     `json:"source_type" gorm:"index"`
+	SourceConfig             string     `json:"source_config" gorm:"type:text"`
+	Active                   bool       `json:"active" gorm:"index"`
+	CheckIntervalMinutes     int        `json:"check_interval_minutes"`
+	TargetRoot               string     `json:"target_root"`
+	TransferEnabled          bool       `json:"transfer_enabled"`
+	TMDBID                   int64      `json:"tmdb_id" gorm:"index"`
+	TMDBName                 string     `json:"tmdb_name"`
+	TMDBYear                 int        `json:"tmdb_year"`
+	MediaType                string     `json:"media_type" gorm:"index"`
+	Category                 string     `json:"category"`
+	Season                   int        `json:"season"`
+	Seasons                  []int      `json:"seasons" gorm:"serializer:json"`
+	LatestSeasonEpisodeStart int        `json:"latest_season_episode_start"`
+	LatestSeasonEpisodeEnd   int        `json:"latest_season_episode_end"`
+	LastCheckedAt            *time.Time `json:"last_checked_at"`
+	LastCursor               string     `json:"last_cursor"`
+	LastTreeHash             string     `json:"last_tree_hash"`
+	LastStatus               string     `json:"last_status" gorm:"index"`
+	LastError                string     `json:"last_error" gorm:"type:text"`
 }
 
 type SubscriptionItem struct {
-	ID             uint      `json:"id" gorm:"primarykey"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	SubscriptionID uint      `json:"subscription_id" gorm:"uniqueIndex:idx_subscription_item_source;index"`
-	SourceKey      string    `json:"source_key" gorm:"uniqueIndex:idx_subscription_item_source"`
-	SourceURL      string    `json:"source_url" gorm:"type:text"`
-	SourcePath     string    `json:"source_path" gorm:"index"`
-	FileID         string    `json:"file_id" gorm:"index"`
-	FilePath       string    `json:"file_path" gorm:"index"`
-	FileName       string    `json:"file_name"`
-	FileSize       int64     `json:"file_size"`
-	FileHash       string    `json:"file_hash" gorm:"index"`
-	Season         int       `json:"season" gorm:"index"`
-	Episode        int       `json:"episode" gorm:"index"`
-	TargetDir      string    `json:"target_dir"`
-	TargetName     string    `json:"target_name"`
-	TargetPath     string    `json:"target_path"`
-	Status         string    `json:"status" gorm:"index"`
-	LastSeenAt     time.Time `json:"last_seen_at" gorm:"index"`
-	LastError      string    `json:"last_error" gorm:"type:text"`
+	ID                   uint      `json:"id" gorm:"primarykey"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	SubscriptionID       uint      `json:"subscription_id" gorm:"uniqueIndex:idx_subscription_item_source;index"`
+	SourceKey            string    `json:"source_key" gorm:"uniqueIndex:idx_subscription_item_source"`
+	SourceProvider       string    `json:"source_provider" gorm:"index"`
+	SourceURL            string    `json:"source_url" gorm:"type:text"`
+	SourceMessageID      string    `json:"source_message_id" gorm:"index"`
+	SourceMessageChannel string    `json:"source_message_channel" gorm:"index"`
+	SourceMessageURL     string    `json:"source_message_url" gorm:"type:text"`
+	SourceMessageText    string    `json:"source_message_text" gorm:"type:text"`
+	SourcePath           string    `json:"source_path" gorm:"index"`
+	FileID               string    `json:"file_id" gorm:"index"`
+	FilePath             string    `json:"file_path" gorm:"index"`
+	FileName             string    `json:"file_name"`
+	FileSize             int64     `json:"file_size"`
+	FileHash             string    `json:"file_hash" gorm:"index"`
+	Season               int       `json:"season" gorm:"index"`
+	Episode              int       `json:"episode" gorm:"index"`
+	TargetDir            string    `json:"target_dir"`
+	TargetName           string    `json:"target_name"`
+	TargetPath           string    `json:"target_path"`
+	Status               string    `json:"status" gorm:"index"`
+	ClusterJobID         string    `json:"cluster_job_id" gorm:"size:64;index"`
+	LastSeenAt           time.Time `json:"last_seen_at" gorm:"index"`
+	LastError            string    `json:"last_error" gorm:"type:text"`
 }
 
 type SubscriptionRun struct {
@@ -107,6 +115,7 @@ type SubscriptionTelegramSourceConfig struct {
 	CommandEnv            []string                      `json:"command_env"`
 	CommandTimeoutSeconds int64                         `json:"command_timeout_seconds"`
 	Limit                 int                           `json:"limit"`
+	TransferPriority      []string                      `json:"transfer_priority,omitempty"`
 }
 
 type SubscriptionTelegramPanConfig struct {

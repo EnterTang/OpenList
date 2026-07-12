@@ -53,3 +53,14 @@ func TestSchedulerStorageWaitStops(t *testing.T) {
 		t.Fatal("scheduler wait returned true after stop signal")
 	}
 }
+
+func TestClusterCoordinatorSchedulerDoesNotTransferLocally(t *testing.T) {
+	if !schedulerTransfersLocally("standalone") {
+		t.Fatal("standalone scheduler should keep local transfer behavior")
+	}
+	for _, role := range []string{"coordinator", "worker", "hybrid"} {
+		if schedulerTransfersLocally(role) {
+			t.Fatalf("%s scheduler must not bypass cluster dispatch with a local transfer", role)
+		}
+	}
+}

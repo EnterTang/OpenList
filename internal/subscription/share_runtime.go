@@ -38,7 +38,8 @@ func trySaveShareLinkToTemp(ctx context.Context, sub *model.Subscription, cfg mo
 		return source, false, err
 	}
 	selected, err := saveShareToTemp(ctx, provider, ref, SaveShareOptions{
-		TempRoot: source.Config.TempTransferRoot,
+		TempRoot:     source.Config.TempTransferRoot,
+		Subscription: sub,
 		Match: func(entry TreeEntry) bool {
 			return boundShareEntryMatches(sub, entry)
 		},

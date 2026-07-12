@@ -12,7 +12,7 @@ var db *gorm.DB
 
 func Init(d *gorm.DB) {
 	db = d
-	err := AutoMigrate(new(model.Storage), new(model.User), new(model.Meta), new(model.SettingItem), new(model.SearchNode), new(model.TaskItem), new(model.SSHPublicKey), new(model.SharingDB), new(model.ETFArchiveRecord), new(model.MobileShareRecord), new(model.ETFMediaRoot), new(model.ETFMediaRootBatch), new(model.ETFSubscriptionJob), new(model.Subscription), new(model.SubscriptionItem), new(model.SubscriptionRun))
+	err := AutoMigrate(new(model.Storage), new(model.User), new(model.Meta), new(model.SettingItem), new(model.SearchNode), new(model.TaskItem), new(model.SSHPublicKey), new(model.SharingDB), new(model.ETFArchiveRecord), new(model.MobileShareRecord), new(model.ETFMediaRoot), new(model.ETFMediaRootBatch), new(model.ETFSubscriptionJob), new(model.Subscription), new(model.SubscriptionItem), new(model.SubscriptionRun), new(model.ClusterNode), new(model.ClusterNodeSession), new(model.ClusterNodeInventory), new(model.ClusterCoordinatorLease), new(model.ClusterSecret), new(model.ClusterNodeDesiredConfig), new(model.ClusterStorageProfile), new(model.ClusterControlAudit), new(model.ClusterWorkerObservedState), new(model.ClusterJob), new(model.ClusterJobAttempt), new(model.ClusterJobStage), new(model.ClusterUploadManifest), new(model.ClusterShareInspectManifest), new(model.ClusterOutbox), new(model.ClusterInbox))
 	if err != nil {
 		log.Fatalf("failed migrate database: %s", err.Error())
 	}

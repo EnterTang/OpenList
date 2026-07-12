@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -49,6 +50,26 @@ func TestTelegramLinkItemUsesStableMessageSourceKey(t *testing.T) {
 	body, err := json.Marshal(item)
 	if err != nil || len(body) == 0 {
 		t.Fatalf("marshal item: body=%s err=%v", body, err)
+	}
+}
+
+func TestSubscriptionLinkItemsExposeSourceProvider(t *testing.T) {
+	seenAt := time.Now()
+	sub := &model.Subscription{ID: 7}
+	telegramItem := telegramLinkItem(sub, telegramCommandRow{MsgID: float64(1), Channel: "@quark"}, "https://pan.quark.cn/s/bc18e4ea5fb8", seenAt)
+	if telegramItem.SourceProvider != string(ShareProviderQuark) {
+		t.Fatalf("telegram provider = %q, want quark", telegramItem.SourceProvider)
+	}
+	manualItem := manualLinkItem(sub, "https://115cdn.com/s/swssal13zrk?password=t58d", seenAt)
+	if manualItem.SourceProvider != string(ShareProviderPan115) {
+		t.Fatalf("manual provider = %q, want pan115", manualItem.SourceProvider)
+	}
+	panSouItem := panSouLinkItem(sub, model.SubscriptionResourceSearchResult{Title: "demo"}, model.SubscriptionResourceSearchLink{
+		URL:      "https://www.123pan.com/s/7Tx1jv-pVu7v",
+		Provider: "123",
+	}, seenAt)
+	if panSouItem.SourceProvider != string(ShareProviderPan123) {
+		t.Fatalf("pansou provider = %q, want pan123", panSouItem.SourceProvider)
 	}
 }
 
@@ -337,6 +358,61 @@ func TestSubscriptionEntryMatchesSelectedSeasons(t *testing.T) {
 	}
 }
 
+func TestSubscriptionEpisodeRangeAppliesOnlyToLatestSelectedSeason(t *testing.T) {
+	sub := &model.Subscription{
+		MediaType:                "tv",
+		Seasons:                  []int{1, 2},
+		LatestSeasonEpisodeStart: 5,
+		LatestSeasonEpisodeEnd:   8,
+	}
+	for _, tt := range []struct {
+		season  int
+		episode int
+		want    bool
+	}{
+		{season: 1, episode: 2, want: true},
+		{season: 2, episode: 4, want: false},
+		{season: 2, episode: 5, want: true},
+		{season: 2, episode: 8, want: true},
+		{season: 2, episode: 9, want: false},
+		{season: 2, episode: 0, want: false},
+	} {
+		if got := subscriptionEpisodeMatches(sub, tt.season, tt.episode); got != tt.want {
+			t.Fatalf("S%02dE%02d match = %v, want %v", tt.season, tt.episode, got, tt.want)
+		}
+	}
+}
+
+func TestSubscriptionEpisodeRangeSupportsEndOnly(t *testing.T) {
+	sub := &model.Subscription{
+		MediaType:              "tv",
+		Seasons:                []int{3},
+		LatestSeasonEpisodeEnd: 6,
+	}
+	if !subscriptionEpisodeMatches(sub, 3, 6) {
+		t.Fatal("episode at configured end should match")
+	}
+	if subscriptionEpisodeMatches(sub, 3, 7) {
+		t.Fatal("episode after configured end unexpectedly matched")
+	}
+}
+
+func TestSubscriptionEntryMatchesLatestSeasonEpisodeRange(t *testing.T) {
+	sub := &model.Subscription{
+		Name:                     "Some Show",
+		TMDBName:                 "Some Show",
+		MediaType:                "tv",
+		Seasons:                  []int{2},
+		LatestSeasonEpisodeStart: 10,
+	}
+	if subscriptionEntryMatches(sub, TreeEntry{Name: "Some.Show.S02E09.mkv", Path: "/Some.Show.S02E09.mkv"}) {
+		t.Fatal("episode before configured start unexpectedly matched")
+	}
+	if !subscriptionEntryMatches(sub, TreeEntry{Name: "Some.Show.S02E10.mkv", Path: "/Some.Show.S02E10.mkv"}) {
+		t.Fatal("episode at configured start should match")
+	}
+}
+
 func TestSubscriptionEntryMatchesNoisyMixedLanguagePath(t *testing.T) {
 	sub := &model.Subscription{Name: "Rain Man", TMDBName: "雨人"}
 	entry := TreeEntry{
@@ -422,6 +498,49 @@ func TestSelectTelegramTempTransferCandidatesPrefersConfiguredProviderPriority(t
 	}
 	if selected[0].Item.Season != 2 || selected[0].Item.Episode != 10 {
 		t.Fatalf("selected season/episode = %d/%d, want 2/10", selected[0].Item.Season, selected[0].Item.Episode)
+	}
+}
+
+func TestRunTelegramTempTransfersSkipsMissingOptionalRoot(t *testing.T) {
+	oldSnapshot := snapshotPaths
+	defer func() {
+		snapshotPaths = oldSnapshot
+	}()
+
+	var roots []string
+	snapshotPaths = func(ctx context.Context, requested []string) (*TreeSnapshot, error) {
+		root := requested[0]
+		roots = append(roots, root)
+		if root == "/ali/转存至移动" {
+			return nil, errs.ObjectNotFound
+		}
+		return &TreeSnapshot{Hash: "pan123-hash"}, nil
+	}
+
+	_, hash, _, _, _, err := runTelegramTempTransfers(context.Background(), &model.Subscription{}, map[string]telegramPanSubscriptionSource{
+		string(ShareProviderAliyunDrive): {
+			Name: string(ShareProviderAliyunDrive),
+			Config: model.SubscriptionTelegramPanConfig{
+				TempTransferRoot: "/ali/转存至移动",
+			},
+		},
+		string(ShareProviderPan123): {
+			Name: string(ShareProviderPan123),
+			Config: model.SubscriptionTelegramPanConfig{
+				TempTransferRoot: "/123/转存至移动",
+			},
+		},
+	}, model.SubscriptionTelegramSourceConfig{
+		TransferPriority: []string{string(ShareProviderAliyunDrive), string(ShareProviderPan123)},
+	}, false, time.Now())
+	if err != nil {
+		t.Fatalf("run temp transfers: %v", err)
+	}
+	if got, want := strings.Join(roots, ","), "/ali/转存至移动,/123/转存至移动"; got != want {
+		t.Fatalf("snapshot roots = %q, want %q", got, want)
+	}
+	if hash == "" {
+		t.Fatal("expected available provider snapshot to contribute a hash")
 	}
 }
 

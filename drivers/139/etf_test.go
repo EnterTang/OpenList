@@ -13,7 +13,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	driverPkg "github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/tmdb"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
@@ -743,6 +745,41 @@ func TestArchivePersonalETFSkipsExistingArchiveFingerprint(t *testing.T) {
 	}
 	if archivedUploads != 0 {
 		t.Fatalf("archived uploads = %d, want 0", archivedUploads)
+	}
+}
+
+func TestApplyPersistedShareRiskArchivePlanUsesActualRootAndCanonicalTitle(t *testing.T) {
+	setup139ETFArchiveDB(t)
+	d := &Yun139{}
+	d.SetStorage(model.Storage{ID: 1, MountPath: "/139_60t"})
+	meta := &tmdb.Metadata{TMDBID: 276239, Name: "非份之罪", Year: 2026, MediaType: "tv", Category: "国产剧"}
+	rootParts := []string{"ETF转存归档"}
+	parts := []string{"tv", "国产剧", "非份之罪 (2026) {tmdb-276239}", "Season 1"}
+	rootPath := d.fullETFArchivePath([]string{"ETF转存归档", "tv", "国产剧", "非份之罪 (2026) {tmdb-276239}"}, "")
+	rootKey := etfauto.MediaRootKey(d.GetStorage().MountPath, rootPath, meta.MediaType, meta.TMDBID)
+	if err := db.GetDb().Create(&model.ETFMediaRoot{
+		RootKey:                 rootKey,
+		StorageID:               1,
+		StorageMountPath:        "/139_60t",
+		DriveID:                 "/139_60t",
+		MediaRootPath:           rootPath,
+		ActualMediaRootPath:     "/139_60t/ETF转存归档/tv/国产剧/Guilt (2026) {tmdb-276239}",
+		ShareRiskCanonicalTitle: "Guilt",
+		MediaType:               meta.MediaType,
+		TMDBID:                  meta.TMDBID,
+		TMDBName:                meta.Name,
+		TMDBYear:                meta.Year,
+		Category:                meta.Category,
+	}).Error; err != nil {
+		t.Fatalf("create media root: %v", err)
+	}
+
+	gotParts, gotCanonical := d.applyPersistedShareRiskArchivePlan(rootParts, parts, meta)
+	if gotCanonical != "Guilt" {
+		t.Fatalf("gotCanonical = %q, want Guilt", gotCanonical)
+	}
+	if gotParts[2] != "Guilt (2026) {tmdb-276239}" {
+		t.Fatalf("gotParts = %#v, want renamed media root segment", gotParts)
 	}
 }
 

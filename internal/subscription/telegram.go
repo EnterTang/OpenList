@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -80,6 +81,101 @@ type telegramPanSubscriptionSource struct {
 	Config          model.SubscriptionTelegramPanConfig
 	BoundShareNames map[string]struct{}
 	BoundSharePaths map[string]struct{}
+}
+
+type telegramTempCandidate struct {
+	Source telegramPanSubscriptionSource
+	Entry  TreeEntry
+	Item   *model.SubscriptionItem
+}
+
+func selectTelegramTempTransferCandidates(sub *model.Subscription, candidates []telegramTempCandidate, priority []string) []telegramTempCandidate {
+	priority = normalizeTransferPriority(priority)
+	priorityIndex := make(map[string]int, len(priority))
+	for index, name := range priority {
+		priorityIndex[name] = index
+	}
+	bestBySlot := make(map[string]telegramTempCandidate, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Item == nil || !subscriptionEpisodeMatches(sub, candidate.Item.Season, candidate.Item.Episode) {
+			continue
+		}
+		candidate.Item.SourceProvider = normalizeSubscriptionProvider(candidate.Source.Name)
+		slot := mediaSlotKey(sub, candidate.Item)
+		if slot == "" {
+			continue
+		}
+		existing, ok := bestBySlot[slot]
+		if !ok {
+			bestBySlot[slot] = candidate
+			continue
+		}
+		candidateRank := providerPriorityRank(candidate.Source.Name, priorityIndex)
+		existingRank := providerPriorityRank(existing.Source.Name, priorityIndex)
+		switch {
+		case candidateRank < existingRank:
+			bestBySlot[slot] = candidate
+		case candidateRank == existingRank && candidate.Entry.Size > existing.Entry.Size:
+			bestBySlot[slot] = candidate
+		}
+	}
+	selected := make([]telegramTempCandidate, 0, len(bestBySlot))
+	for _, candidate := range bestBySlot {
+		selected = append(selected, candidate)
+	}
+	sort.Slice(selected, func(i, j int) bool {
+		left, right := selected[i].Item, selected[j].Item
+		if left.Season != right.Season {
+			return left.Season < right.Season
+		}
+		if left.Episode != right.Episode {
+			return left.Episode < right.Episode
+		}
+		return providerPriorityRank(selected[i].Source.Name, priorityIndex) < providerPriorityRank(selected[j].Source.Name, priorityIndex)
+	})
+	return selected
+}
+
+func mediaSlotKey(sub *model.Subscription, item *model.SubscriptionItem) string {
+	if item == nil {
+		return ""
+	}
+	if normalizeMediaType(sub.MediaType) == "movie" {
+		return "movie:" + item.TargetPath
+	}
+	if item.Episode > 0 {
+		return fmt.Sprintf("tv:%d:%d", item.Season, item.Episode)
+	}
+	return "path:" + item.TargetPath
+}
+
+func providerPriorityRank(provider string, priorityIndex map[string]int) int {
+	if rank, ok := priorityIndex[strings.TrimSpace(provider)]; ok {
+		return rank
+	}
+	return len(priorityIndex)
+}
+
+func telegramSourceNamesByPriority(sources map[string]telegramPanSubscriptionSource, priority []string) []string {
+	priority = normalizeTransferPriority(priority)
+	seen := map[string]struct{}{}
+	names := make([]string, 0, len(sources))
+	for _, name := range priority {
+		if _, ok := sources[name]; !ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	remaining := make([]string, 0, len(sources))
+	for name := range sources {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		remaining = append(remaining, name)
+	}
+	sort.Strings(remaining)
+	return append(names, remaining...)
 }
 
 var telegramPanSourceHosts = map[string][]string{
@@ -146,7 +242,7 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 			saved = append(saved, *stored)
 		}
 	}
-	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, telegramPanSourcesForTransfer(cfg, triggeredSources), transfer, now)
+	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, telegramPanSourcesForTransfer(cfg, triggeredSources), cfg, transfer, now)
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
@@ -251,22 +347,18 @@ func telegramPanSourcesForTransfer(cfg model.SubscriptionTelegramSourceConfig, t
 	return merged
 }
 
-func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sources map[string]telegramPanSubscriptionSource, transfer bool, seenAt time.Time) ([]model.SubscriptionItem, string, int, int, int, error) {
+func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sources map[string]telegramPanSubscriptionSource, cfg model.SubscriptionTelegramSourceConfig, transfer bool, seenAt time.Time) ([]model.SubscriptionItem, string, int, int, int, error) {
 	if len(sources) == 0 {
 		return nil, "", 0, 0, 0, nil
 	}
 	var saved []model.SubscriptionItem
 	var snapshotHashes []string
-	seenKeys := map[string]struct{}{}
 	added := 0
 	changed := 0
 	transferred := 0
-	sourceNames := make([]string, 0, len(sources))
-	for name := range sources {
-		sourceNames = append(sourceNames, name)
-	}
-	sort.Strings(sourceNames)
-	for _, name := range sourceNames {
+	priority := cfg.TransferPriority
+	var candidates []telegramTempCandidate
+	for _, name := range telegramSourceNamesByPriority(sources, priority) {
 		source := sources[name]
 		root := strings.TrimSpace(source.Config.TempTransferRoot)
 		if root == "" {
@@ -274,6 +366,9 @@ func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sour
 		}
 		snapshot, err := snapshotPaths(ctx, []string{root})
 		if err != nil {
+			if errs.IsObjectNotFound(err) {
+				continue
+			}
 			return saved, "", added, changed, transferred, err
 		}
 		snapshotHashes = append(snapshotHashes, source.Name+":"+snapshot.Hash)
@@ -282,45 +377,66 @@ func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sour
 				continue
 			}
 			item := itemFromEntry(sub, entry, seenAt)
-			if _, ok := seenKeys[item.SourceKey]; ok {
-				continue
-			}
-			seenKeys[item.SourceKey] = struct{}{}
-			stored, isNew, err := db.UpsertSubscriptionItem(item)
-			if err != nil {
-				return saved, combinedHash("telegram-temp", snapshotHashes), added, changed, transferred, err
-			}
-			if isNew {
-				added++
-			}
-			beforePath := stored.TargetPath
-			beforeStatus := stored.Status
-			stored = syncSubscriptionItemPaths(stored, sub, entry, seenAt)
-			if !isNew {
-				switch {
-				case beforeStatus == model.SubscriptionItemStatusFailed:
-					stored.Status = model.SubscriptionItemStatusPending
-					stored.LastError = ""
-					changed++
-				case beforeStatus == model.SubscriptionItemStatusPending && stored.TargetPath != beforePath:
-					changed++
-				}
-			}
-			if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
-				var delta int
-				stored, delta, err = applyItemTransfer(ctx, stored, source.Config.DeleteSourceAfter)
-				if err != nil {
-					return saved, combinedHash("telegram-temp", snapshotHashes), added, changed, transferred, err
-				}
-				transferred += delta
-			}
-			saved = append(saved, *stored)
+			candidates = append(candidates, telegramTempCandidate{
+				Source: source,
+				Entry:  entry,
+				Item:   item,
+			})
 		}
 	}
-	if len(snapshotHashes) == 0 {
+	resultHash := ""
+	if len(snapshotHashes) > 0 {
+		resultHash = combinedHash("telegram-temp", snapshotHashes)
+	}
+	return finalizeTempTransferCandidates(ctx, sub, candidates, priority, transfer, seenAt, resultHash)
+}
+
+func applyTelegramTempTransferCandidates(ctx context.Context, sub *model.Subscription, selected []telegramTempCandidate, transfer bool, seenAt time.Time, resultHash string) ([]model.SubscriptionItem, string, int, int, int, error) {
+	var saved []model.SubscriptionItem
+	added := 0
+	changed := 0
+	transferred := 0
+	seenKeys := map[string]struct{}{}
+	for _, candidate := range selected {
+		item := candidate.Item
+		if _, ok := seenKeys[item.SourceKey]; ok {
+			continue
+		}
+		seenKeys[item.SourceKey] = struct{}{}
+		stored, isNew, err := db.UpsertSubscriptionItem(item)
+		if err != nil {
+			return saved, resultHash, added, changed, transferred, err
+		}
+		if isNew {
+			added++
+		}
+		beforePath := stored.TargetPath
+		beforeStatus := stored.Status
+		stored = syncSubscriptionItemPaths(stored, sub, candidate.Entry, seenAt)
+		if !isNew {
+			switch {
+			case beforeStatus == model.SubscriptionItemStatusFailed:
+				stored.Status = model.SubscriptionItemStatusPending
+				stored.LastError = ""
+				changed++
+			case beforeStatus == model.SubscriptionItemStatusPending && stored.TargetPath != beforePath:
+				changed++
+			}
+		}
+		if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
+			var delta int
+			stored, delta, err = applyItemTransfer(ctx, stored, candidate.Source.Config.DeleteSourceAfter)
+			if err != nil {
+				return saved, resultHash, added, changed, transferred, err
+			}
+			transferred += delta
+		}
+		saved = append(saved, *stored)
+	}
+	if resultHash == "" {
 		return saved, "", added, changed, transferred, nil
 	}
-	return saved, combinedHash("telegram-temp", snapshotHashes), added, changed, transferred, nil
+	return saved, resultHash, added, changed, transferred, nil
 }
 
 func telegramSearchQuery(sub *model.Subscription) string {
@@ -415,15 +531,22 @@ func boundShareEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
 
 func subscriptionSeasonMatches(sub *model.Subscription, entry TreeEntry) bool {
 	seasons := selectedSubscriptionSeasons(sub)
-	if len(seasons) == 0 {
-		return true
+	season, episode := entrySeasonEpisode(entry)
+	if (season <= 0 || episode <= 0) && hasSubscriptionEpisodeRange(sub) {
+		planned := PlanTarget(planInputFromSubscription(sub), entry.Name, parentPath(entry))
+		if season <= 0 {
+			season = planned.Season
+		}
+		if episode <= 0 {
+			episode = planned.Episode
+		}
 	}
-	season := entrySeason(entry)
-	if season <= 0 {
-		return true
+	if len(seasons) > 0 && season > 0 {
+		if _, ok := seasons[season]; !ok {
+			return false
+		}
 	}
-	_, ok := seasons[season]
-	return ok
+	return subscriptionEpisodeMatches(sub, season, episode)
 }
 
 func selectedSubscriptionSeasons(sub *model.Subscription) map[int]struct{} {
@@ -447,15 +570,67 @@ func selectedSubscriptionSeasons(sub *model.Subscription) map[int]struct{} {
 }
 
 func entrySeason(entry TreeEntry) int {
-	recognized := recognize.Recognize(entry.Name, parentPath(entry))
-	if recognized.Season > 0 {
-		return recognized.Season
-	}
-	if season := inferSeason(parentPath(entry)); season > 0 {
-		return season
-	}
-	season, _ := recognize.ExtractSeasonEpisode(entry.Path)
+	season, _ := entrySeasonEpisode(entry)
 	return season
+}
+
+func entrySeasonEpisode(entry TreeEntry) (int, int) {
+	recognized := recognize.Recognize(entry.Name, parentPath(entry))
+	season, episode := recognized.Season, recognized.Episode
+	if season <= 0 {
+		season = inferSeason(parentPath(entry))
+	}
+	if season <= 0 || episode <= 0 {
+		pathSeason, pathEpisode := recognize.ExtractSeasonEpisode(entry.Path)
+		if season <= 0 {
+			season = pathSeason
+		}
+		if episode <= 0 {
+			episode = pathEpisode
+		}
+	}
+	if episode <= 0 {
+		episode = inferLeadingEpisode(entry.Name)
+	}
+	return season, episode
+}
+
+func subscriptionEpisodeMatches(sub *model.Subscription, season, episode int) bool {
+	if sub == nil || strings.EqualFold(strings.TrimSpace(sub.MediaType), "movie") {
+		return true
+	}
+	start, end := sub.LatestSeasonEpisodeStart, sub.LatestSeasonEpisodeEnd
+	if !hasSubscriptionEpisodeRange(sub) {
+		return true
+	}
+	latestSeason := latestSubscriptionSeason(sub)
+	if latestSeason <= 0 || season <= 0 || season != latestSeason {
+		return true
+	}
+	if episode <= 0 {
+		return false
+	}
+	if start > 0 && episode < start {
+		return false
+	}
+	return end <= 0 || episode <= end
+}
+
+func hasSubscriptionEpisodeRange(sub *model.Subscription) bool {
+	return sub != nil && (sub.LatestSeasonEpisodeStart > 0 || sub.LatestSeasonEpisodeEnd > 0)
+}
+
+func latestSubscriptionSeason(sub *model.Subscription) int {
+	if sub == nil {
+		return 0
+	}
+	latest := sub.Season
+	for _, season := range sub.Seasons {
+		if season > latest {
+			latest = season
+		}
+	}
+	return latest
 }
 
 func subscriptionMatchNeedles(sub *model.Subscription) []string {
@@ -652,6 +827,7 @@ func telegramLinkItem(sub *model.Subscription, row telegramCommandRow, link stri
 	return &model.SubscriptionItem{
 		SubscriptionID: sub.ID,
 		SourceKey:      sourceKey,
+		SourceProvider: sourceProviderFromURL(sourceURL),
 		SourceURL:      sourceURL,
 		FileHash:       shortHash(sourceURL),
 		Status:         model.SubscriptionItemStatusSkipped,

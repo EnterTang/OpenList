@@ -36,6 +36,76 @@ func UpdateETFArchiveRecord(record *model.ETFArchiveRecord) error {
 	return errors.WithStack(db.Save(record).Error)
 }
 
+func GetETFMediaRootByRootKey(rootKey string) (*model.ETFMediaRoot, error) {
+	var root model.ETFMediaRoot
+	err := db.Where(columnName("root_key")+" = ?", strings.TrimSpace(rootKey)).First(&root).Error
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &root, nil
+}
+
+func FindETFMediaRootByPath(storageMountPath, mediaRootPath string) (*model.ETFMediaRoot, error) {
+	storageMountPath = strings.TrimSpace(storageMountPath)
+	mediaRootPath = strings.TrimSpace(mediaRootPath)
+	var root model.ETFMediaRoot
+	err := db.Where(
+		columnName("storage_mount_path")+" = ? AND ("+columnName("media_root_path")+" = ? OR "+columnName("actual_media_root_path")+" = ?)",
+		storageMountPath,
+		mediaRootPath,
+		mediaRootPath,
+	).First(&root).Error
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &root, nil
+}
+
+func UpdateETFMediaRoot(root *model.ETFMediaRoot) error {
+	if root == nil {
+		return errors.New("etf media root is nil")
+	}
+	return errors.WithStack(db.Save(root).Error)
+}
+
+func UpdateETFArchivePathsByPrefix(storageMountPath, oldPrefix, newPrefix string) error {
+	storageMountPath = strings.TrimSpace(storageMountPath)
+	oldPrefix = strings.TrimSpace(oldPrefix)
+	newPrefix = strings.TrimSpace(newPrefix)
+	if storageMountPath == "" || oldPrefix == "" || newPrefix == "" || oldPrefix == newPrefix {
+		return nil
+	}
+	var records []model.ETFArchiveRecord
+	if err := db.Where(
+		columnName("storage_mount_path")+" = ? AND "+columnName("archive_etf_path")+" LIKE ?",
+		storageMountPath,
+		oldPrefix+"/%",
+	).Find(&records).Error; err != nil {
+		return errors.WithStack(err)
+	}
+	for i := range records {
+		records[i].ArchiveETFPath = newPrefix + strings.TrimPrefix(records[i].ArchiveETFPath, oldPrefix)
+		if err := db.Save(&records[i]).Error; err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func UpdateETFArchivePath(storageMountPath, oldPath, newPath string) error {
+	storageMountPath = strings.TrimSpace(storageMountPath)
+	oldPath = strings.TrimSpace(oldPath)
+	newPath = strings.TrimSpace(newPath)
+	if storageMountPath == "" || oldPath == "" || newPath == "" || oldPath == newPath {
+		return nil
+	}
+	return errors.WithStack(
+		db.Model(&model.ETFArchiveRecord{}).
+			Where(columnName("storage_mount_path")+" = ? AND "+columnName("archive_etf_path")+" = ?", storageMountPath, oldPath).
+			Update(columnName("archive_etf_path"), newPath).Error,
+	)
+}
+
 func GetETFArchiveRecordByID(id uint) (*model.ETFArchiveRecord, error) {
 	var record model.ETFArchiveRecord
 	if err := db.First(&record, id).Error; err != nil {

@@ -19,6 +19,17 @@ import (
 )
 
 func Run(ctx context.Context, subscriptionID uint, transfer bool) (*model.SubscriptionRunResult, error) {
+	return run(ctx, subscriptionID, transfer, false)
+}
+
+// RunCluster performs discovery and planning on a Coordinator, then hands
+// media children to the registered cluster dispatcher instead of invoking the
+// local OpenList copy/move pipeline.
+func RunCluster(ctx context.Context, subscriptionID uint) (*model.SubscriptionRunResult, error) {
+	return run(ctx, subscriptionID, false, true)
+}
+
+func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch bool) (*model.SubscriptionRunResult, error) {
 	sub, err := db.GetSubscriptionByID(subscriptionID)
 	if err != nil {
 		return nil, err
@@ -37,7 +48,15 @@ func Run(ctx context.Context, subscriptionID uint, transfer bool) (*model.Subscr
 	sub.LastError = ""
 	_ = db.UpdateSubscription(sub)
 
-	items, currentHash, added, changed, transferred, runErr := runBySource(ctx, sub, transfer)
+	var items []model.SubscriptionItem
+	var currentHash string
+	var added, changed, transferred int
+	var runErr error
+	if clusterDispatch {
+		items, currentHash, added, changed, transferred, runErr = runClusterBySource(ctx, sub)
+	} else {
+		items, currentHash, added, changed, transferred, runErr = runBySource(ctx, sub, transfer)
+	}
 	finished := time.Now()
 	run.FinishedAt = &finished
 	run.CurrentTreeHash = currentHash
@@ -112,7 +131,7 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	changed := 0
 	transferred := 0
 	snapshotRoots := append([]string(nil), cfg.Paths...)
-	tempRootConfigs := map[string]model.SubscriptionTelegramPanConfig{}
+	tempRootSources := map[string]telegramPanSubscriptionSource{}
 	tempRootBoundNames := map[string]map[string]struct{}{}
 	tempRootBoundPaths := map[string]map[string]struct{}{}
 	var shareCfg model.SubscriptionTelegramSourceConfig
@@ -130,7 +149,7 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 			root := strings.TrimSpace(source.Config.TempTransferRoot)
 			if root != "" {
 				snapshotRoots = appendPathOnce(snapshotRoots, root)
-				tempRootConfigs[root] = source.Config
+				tempRootSources[root] = source
 				tempRootBoundNames[root] = mergeStringSet(tempRootBoundNames[root], source.BoundShareNames)
 				tempRootBoundPaths[root] = mergeStringSet(tempRootBoundPaths[root], source.BoundSharePaths)
 			}
@@ -174,7 +193,8 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 			return saved, sub.LastTreeHash, added, changed, transferred, err
 		}
 		selected, err := saveImportedFilesToTemp(ctx, provider, "manual_import://pan123", files, SaveShareOptions{
-			TempRoot: panCfg.TempTransferRoot,
+			TempRoot:     panCfg.TempTransferRoot,
+			Subscription: sub,
 			Match: func(entry TreeEntry) bool {
 				return boundShareEntryMatches(sub, entry)
 			},
@@ -183,7 +203,10 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 			return saved, sub.LastTreeHash, added, changed, transferred, err
 		}
 		snapshotRoots = appendPathOnce(snapshotRoots, panCfg.TempTransferRoot)
-		tempRootConfigs[panCfg.TempTransferRoot] = panCfg
+		tempRootSources[panCfg.TempTransferRoot] = telegramPanSubscriptionSource{
+			Name:   string(ShareProviderPan123),
+			Config: panCfg,
+		}
 		tempRootBoundNames[panCfg.TempTransferRoot], tempRootBoundPaths[panCfg.TempTransferRoot] = mergeBoundShareMarkers(
 			tempRootBoundNames[panCfg.TempTransferRoot],
 			tempRootBoundPaths[panCfg.TempTransferRoot],
@@ -195,36 +218,29 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
+	var candidates []telegramTempCandidate
 	for _, entry := range MediaFiles(snapshot.Entries) {
-		if names, ok := tempRootBoundNames[entry.RootPath]; ok {
-			if !entryMatchesSubscriptionOrBoundShare(sub, entry, names, tempRootBoundPaths[entry.RootPath]) {
+		root := cleanConfigPath(entry.RootPath)
+		if names, ok := tempRootBoundNames[root]; ok {
+			if !entryMatchesSubscriptionOrBoundShare(sub, entry, names, tempRootBoundPaths[root]) {
 				continue
 			}
 		}
-		item := itemFromEntry(sub, entry, now)
-		stored, isNew, err := db.UpsertSubscriptionItem(item)
-		if err != nil {
-			return saved, snapshot.Hash, added, changed, transferred, err
-		}
-		if isNew {
-			added++
-		} else if stored.Status == model.SubscriptionItemStatusPending {
-			changed++
-		}
-		if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
-			deleteSourceAfter := false
-			if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok {
-				deleteSourceAfter = sourceCfg.DeleteSourceAfter
-			}
-			var delta int
-			stored, delta, err = applyItemTransfer(ctx, stored, deleteSourceAfter)
-			if err != nil {
-				return saved, snapshot.Hash, added, changed, transferred, err
-			}
-			transferred += delta
-		}
-		saved = append(saved, *stored)
+		source := tempRootSources[root]
+		candidates = append(candidates, telegramTempCandidate{
+			Source: source,
+			Entry:  entry,
+			Item:   itemFromEntry(sub, entry, now),
+		})
 	}
+	tempItems, _, tempAdded, tempChanged, tempTransferred, err := finalizeTempTransferCandidates(ctx, sub, candidates, shareCfg.TransferPriority, transfer, now, snapshot.Hash)
+	if err != nil {
+		return saved, snapshot.Hash, added, changed, transferred, err
+	}
+	saved = append(saved, tempItems...)
+	added += tempAdded
+	changed += tempChanged
+	transferred += tempTransferred
 	hash := snapshot.Hash
 	if len(cfg.Links) > 0 {
 		hash = combinedHash(hash, cfg.Links)
@@ -268,7 +284,7 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	changed := 0
 	transferred := 0
 	snapshotRoots := []string{}
-	tempRootConfigs := map[string]model.SubscriptionTelegramPanConfig{}
+	tempRootSources := map[string]telegramPanSubscriptionSource{}
 	tempRootBoundNames := map[string]map[string]struct{}{}
 	tempRootBoundPaths := map[string]map[string]struct{}{}
 	globalCfg, err := GetConfig()
@@ -282,7 +298,7 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 				root := strings.TrimSpace(source.Config.TempTransferRoot)
 				if root != "" {
 					snapshotRoots = appendPathOnce(snapshotRoots, root)
-					tempRootConfigs[root] = source.Config
+					tempRootSources[root] = source
 					tempRootBoundNames[root] = mergeStringSet(tempRootBoundNames[root], source.BoundShareNames)
 					tempRootBoundPaths[root] = mergeStringSet(tempRootBoundPaths[root], source.BoundSharePaths)
 				}
@@ -306,34 +322,26 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
+	var candidates []telegramTempCandidate
 	for _, entry := range MediaFiles(snapshot.Entries) {
-		if !entryMatchesSubscriptionOrBoundShare(sub, entry, tempRootBoundNames[entry.RootPath], tempRootBoundPaths[entry.RootPath]) {
+		root := cleanConfigPath(entry.RootPath)
+		if !entryMatchesSubscriptionOrBoundShare(sub, entry, tempRootBoundNames[root], tempRootBoundPaths[root]) {
 			continue
 		}
-		item := itemFromEntry(sub, entry, now)
-		stored, isNew, err := db.UpsertSubscriptionItem(item)
-		if err != nil {
-			return saved, snapshot.Hash, added, changed, transferred, err
-		}
-		if isNew {
-			added++
-		} else if stored.Status == model.SubscriptionItemStatusPending {
-			changed++
-		}
-		if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
-			deleteSourceAfter := false
-			if sourceCfg, ok := tempRootConfigs[entry.RootPath]; ok {
-				deleteSourceAfter = sourceCfg.DeleteSourceAfter
-			}
-			var delta int
-			stored, delta, err = applyItemTransfer(ctx, stored, deleteSourceAfter)
-			if err != nil {
-				return saved, snapshot.Hash, added, changed, transferred, err
-			}
-			transferred += delta
-		}
-		saved = append(saved, *stored)
+		candidates = append(candidates, telegramTempCandidate{
+			Source: tempRootSources[root],
+			Entry:  entry,
+			Item:   itemFromEntry(sub, entry, now),
+		})
 	}
+	tempItems, _, tempAdded, tempChanged, tempTransferred, err := finalizeTempTransferCandidates(ctx, sub, candidates, globalCfg.Telegram.TransferPriority, transfer, now, snapshot.Hash)
+	if err != nil {
+		return saved, snapshot.Hash, added, changed, transferred, err
+	}
+	saved = append(saved, tempItems...)
+	added += tempAdded
+	changed += tempChanged
+	transferred += tempTransferred
 	links := panSouResultLinks(results)
 	return saved, combinedHash(snapshot.Hash, links), added, changed, transferred, nil
 }
@@ -351,9 +359,14 @@ func parsePanSouConfig(raw string) (model.SubscriptionPanSouSourceConfig, error)
 
 func panSouLinkItem(sub *model.Subscription, result model.SubscriptionResourceSearchResult, link model.SubscriptionResourceSearchLink, seenAt time.Time) *model.SubscriptionItem {
 	keyMaterial := fmt.Sprintf("%d:%s:%s", sub.ID, result.Title, link.URL)
+	provider := normalizeSubscriptionProvider(link.Provider)
+	if provider == "" {
+		provider = sourceProviderFromURL(link.URL)
+	}
 	return &model.SubscriptionItem{
 		SubscriptionID: sub.ID,
 		SourceKey:      "pansou:" + shortHash(keyMaterial),
+		SourceProvider: provider,
 		SourceURL:      link.URL,
 		FileHash:       shortHash(link.URL),
 		Status:         model.SubscriptionItemStatusSkipped,
@@ -420,12 +433,25 @@ func manualLinkItem(sub *model.Subscription, link string, seenAt time.Time) *mod
 	return &model.SubscriptionItem{
 		SubscriptionID: sub.ID,
 		SourceKey:      key,
+		SourceProvider: sourceProviderFromURL(link),
 		SourceURL:      link,
 		FileHash:       key,
 		Status:         model.SubscriptionItemStatusSkipped,
 		LastSeenAt:     seenAt,
 		LastError:      "share URL is recorded but not mounted as an OpenList path yet",
 	}
+}
+
+func sourceProviderFromURL(raw string) string {
+	provider, ok := DetectShareProvider(strings.TrimSpace(raw))
+	if !ok {
+		return ""
+	}
+	return string(provider)
+}
+
+func normalizeSubscriptionProvider(value string) string {
+	return normalizeTransferPriorityName(value)
 }
 
 func itemFromEntry(sub *model.Subscription, entry TreeEntry, seenAt time.Time) *model.SubscriptionItem {

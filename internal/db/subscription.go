@@ -127,7 +127,12 @@ func UpsertSubscriptionItem(item *model.SubscriptionItem) (*model.SubscriptionIt
 	err = db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "subscription_id"}, {Name: "source_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{
+			"source_provider",
 			"source_url",
+			"source_message_id",
+			"source_message_channel",
+			"source_message_url",
+			"source_message_text",
 			"source_path",
 			"file_id",
 			"file_path",
@@ -140,6 +145,7 @@ func UpsertSubscriptionItem(item *model.SubscriptionItem) (*model.SubscriptionIt
 			"target_name",
 			"target_path",
 			"status",
+			"cluster_job_id",
 			"last_seen_at",
 			"last_error",
 			"updated_at",
@@ -175,6 +181,19 @@ func CreateSubscriptionRun(run *model.SubscriptionRun) error {
 
 func UpdateSubscriptionRun(run *model.SubscriptionRun) error {
 	return errors.WithStack(db.Save(run).Error)
+}
+
+func DeleteSubscriptionRun(id uint) error {
+	return errors.WithStack(db.Delete(&model.SubscriptionRun{}, id).Error)
+}
+
+func ClearFailedSubscriptionRuns() (int64, error) {
+	result := db.Where(
+		columnName("status")+" = ? OR "+columnName("error")+" <> ?",
+		model.SubscriptionStatusFailed,
+		"",
+	).Delete(&model.SubscriptionRun{})
+	return result.RowsAffected, errors.WithStack(result.Error)
 }
 
 func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun, int64, error) {

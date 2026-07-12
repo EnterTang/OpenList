@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
@@ -20,15 +21,18 @@ import (
 )
 
 type Config struct {
-	Enabled         bool
-	TargetBaseURL   string
-	QuietWindow     time.Duration
-	SharePeriodUnit int
-	ShareType       string
+	Enabled                   bool
+	TargetBaseURL             string
+	TargetAPIToken            string
+	TargetSupportsIdempotency bool
+	QuietWindow               time.Duration
+	SharePeriodUnit           int
+	ShareType                 string
 }
 
 type ArchiveEvent struct {
 	Record           *model.ETFArchiveRecord
+	ClusterJobID     string
 	MediaRootFileID  string
 	MediaRootPath    string
 	MediaRootCreated bool
@@ -99,10 +103,11 @@ func RecordArchiveEvent(ctx context.Context, event ArchiveEvent, cfg Config) (*m
 	if err := db.CreateETFArchiveRecord(event.Record); err != nil {
 		return nil, err
 	}
-	root, err := upsertMediaRoot(ctx, event, cfg)
+	root, rootCreated, err := upsertMediaRoot(ctx, event, cfg)
 	if err != nil {
 		return nil, err
 	}
+	event.MediaRootCreated = event.MediaRootCreated || rootCreated
 	return upsertCollectingBatch(ctx, root, event, cfg)
 }
 
@@ -140,7 +145,11 @@ func ComputeMediaRootFingerprint(ctx context.Context, mediaRootID uint) (string,
 	if database == nil {
 		return "", errors.New("database is not initialized")
 	}
-	prefix := strings.TrimRight(root.MediaRootPath, "/") + "/%"
+	rootPath := strings.TrimSpace(root.ActualMediaRootPath)
+	if rootPath == "" {
+		rootPath = root.MediaRootPath
+	}
+	prefix := strings.TrimRight(rootPath, "/") + "/%"
 	var records []model.ETFArchiveRecord
 	if err := database.WithContext(ctx).
 		Where("storage_mount_path = ? AND media_type = ? AND tmdb_id = ? AND archive_etf_path LIKE ? AND status IN ?",
@@ -199,7 +208,10 @@ func MarkCreateSubscriptionSucceeded(ctx context.Context, jobID uint, result Cre
 		if err := tx.Save(&job).Error; err != nil {
 			return err
 		}
-		return tx.Save(&root).Error
+		if err := tx.Save(&root).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusSucceeded)
 	})
 }
 
@@ -242,14 +254,16 @@ func RequestManualCheck(ctx context.Context, mediaRootID uint, now time.Time) (*
 		return nil, errors.WithStack(err)
 	}
 	job := &model.ETFSubscriptionJob{
-		JobKey:               jobKey,
-		MediaRootID:          root.ID,
-		Type:                 model.ETFSubscriptionJobTypeManualCheck,
-		Status:               model.ETFSubscriptionJobStatusPending,
-		TargetBaseURL:        root.TargetBaseURL,
-		ShareType:            normalizeShareType(root.ShareType),
-		TargetSubscriptionID: root.TargetSubscriptionID,
-		Fingerprint:          fingerprint,
+		JobKey:                    jobKey,
+		MediaRootID:               root.ID,
+		Type:                      model.ETFSubscriptionJobTypeManualCheck,
+		Status:                    model.ETFSubscriptionJobStatusPending,
+		TargetBaseURL:             root.TargetBaseURL,
+		TargetAPIToken:            root.TargetAPIToken,
+		TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+		ShareType:                 normalizeShareType(root.ShareType),
+		TargetSubscriptionID:      root.TargetSubscriptionID,
+		Fingerprint:               fingerprint,
 	}
 	if err := database.WithContext(ctx).Create(job).Error; err != nil {
 		return nil, errors.WithStack(err)
@@ -274,6 +288,25 @@ func ListJobs(ctx context.Context, filter JobFilter) ([]model.ETFSubscriptionJob
 		return nil, errors.WithStack(err)
 	}
 	return jobs, nil
+}
+
+func RetryUnknownJob(ctx context.Context, jobID uint) error {
+	if jobID == 0 {
+		return errors.New("ETF notification job id is required")
+	}
+	return db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job model.ETFSubscriptionJob
+		if err := tx.First(&job, "id = ? AND status = ?", jobID, model.ETFSubscriptionJobStatusUnknown).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("ETF notification job is not in unknown state")
+			}
+			return err
+		}
+		if err := tx.Model(&job).Updates(map[string]any{"status": model.ETFSubscriptionJobStatusPending, "next_retry_at": nil, "last_error": ""}).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusPending)
+	})
 }
 
 func ListMediaRoots(ctx context.Context, filter MediaRootFilter) ([]model.ETFMediaRoot, int64, error) {
@@ -327,14 +360,17 @@ func closeBatch(ctx context.Context, batch *model.ETFMediaRootBatch) error {
 		root.CurrentFingerprint = fingerprint
 		if batch.MediaRootCreated {
 			job := &model.ETFSubscriptionJob{
-				JobKey:        "create:" + root.RootKey,
-				MediaRootID:   root.ID,
-				BatchID:       batch.ID,
-				Type:          model.ETFSubscriptionJobTypeCreate,
-				Status:        model.ETFSubscriptionJobStatusPending,
-				TargetBaseURL: root.TargetBaseURL,
-				ShareType:     normalizeShareType(root.ShareType),
-				Fingerprint:   fingerprint,
+				JobKey:                    "create:" + root.RootKey,
+				MediaRootID:               root.ID,
+				BatchID:                   batch.ID,
+				Type:                      model.ETFSubscriptionJobTypeCreate,
+				Status:                    model.ETFSubscriptionJobStatusPending,
+				TargetBaseURL:             root.TargetBaseURL,
+				TargetAPIToken:            root.TargetAPIToken,
+				TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+				ShareType:                 normalizeShareType(root.ShareType),
+				Fingerprint:               fingerprint,
+				ClusterJobIDsJSON:         batch.ClusterJobIDsJSON,
 			}
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(job).Error; err != nil {
 				return err
@@ -344,6 +380,25 @@ func closeBatch(ctx context.Context, batch *model.ETFMediaRootBatch) error {
 			root.DirtySince = &dirtySince
 			root.PendingChangeCount += batch.ETFCount
 			root.Status = model.ETFMediaRootStatusDirty
+			if root.TargetSubscriptionID > 0 && fingerprint != root.LastNotifiedFingerprint {
+				job := &model.ETFSubscriptionJob{
+					JobKey:                    "check:" + root.RootKey + ":" + fingerprint,
+					MediaRootID:               root.ID,
+					BatchID:                   batch.ID,
+					Type:                      model.ETFSubscriptionJobTypeManualCheck,
+					Status:                    model.ETFSubscriptionJobStatusPending,
+					TargetBaseURL:             root.TargetBaseURL,
+					TargetAPIToken:            root.TargetAPIToken,
+					TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+					ShareType:                 normalizeShareType(root.ShareType),
+					TargetSubscriptionID:      root.TargetSubscriptionID,
+					Fingerprint:               fingerprint,
+					ClusterJobIDsJSON:         batch.ClusterJobIDsJSON,
+				}
+				if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(job).Error; err != nil {
+					return err
+				}
+			}
 		}
 		if err := tx.Save(batch).Error; err != nil {
 			return err
@@ -352,53 +407,68 @@ func closeBatch(ctx context.Context, batch *model.ETFMediaRootBatch) error {
 	})
 }
 
-func upsertMediaRoot(ctx context.Context, event ArchiveEvent, cfg Config) (*model.ETFMediaRoot, error) {
+func upsertMediaRoot(ctx context.Context, event ArchiveEvent, cfg Config) (*model.ETFMediaRoot, bool, error) {
 	database := db.GetDb()
 	record := event.Record
 	rootKey := MediaRootKey(record.StorageMountPath, event.MediaRootPath, record.MediaType, record.TMDBID)
+	rootCreated := false
+	var existing model.ETFMediaRoot
+	err := database.WithContext(ctx).Where("root_key = ?", rootKey).Select("id").First(&existing).Error
+	if err == nil {
+		rootCreated = false
+	} else if errors.Is(err, gorm.ErrRecordNotFound) {
+		rootCreated = true
+	} else {
+		return nil, false, errors.WithStack(err)
+	}
 	root := &model.ETFMediaRoot{
-		RootKey:          rootKey,
-		StorageID:        record.StorageID,
-		StorageMountPath: utils.FixAndCleanPath(record.StorageMountPath),
-		DriveID:          utils.FixAndCleanPath(record.StorageMountPath),
-		MediaRootFileID:  strings.TrimSpace(event.MediaRootFileID),
-		MediaRootPath:    normalizeFullPath(event.MediaRootPath),
-		MediaType:        strings.TrimSpace(record.MediaType),
-		TMDBID:           record.TMDBID,
-		TMDBName:         record.TMDBName,
-		TMDBYear:         record.TMDBYear,
-		Category:         record.Category,
-		TargetBaseURL:    strings.TrimRight(strings.TrimSpace(cfg.TargetBaseURL), "/"),
-		ShareType:        normalizeShareType(cfg.ShareType),
-		SharePeriodUnit:  cfg.SharePeriodUnit,
-		Status:           model.ETFMediaRootStatusCollecting,
+		RootKey:                   rootKey,
+		StorageID:                 record.StorageID,
+		StorageMountPath:          utils.FixAndCleanPath(record.StorageMountPath),
+		DriveID:                   utils.FixAndCleanPath(record.StorageMountPath),
+		MediaRootFileID:           strings.TrimSpace(event.MediaRootFileID),
+		MediaRootPath:             normalizeFullPath(event.MediaRootPath),
+		ActualMediaRootPath:       normalizeFullPath(event.MediaRootPath),
+		MediaType:                 strings.TrimSpace(record.MediaType),
+		TMDBID:                    record.TMDBID,
+		TMDBName:                  record.TMDBName,
+		TMDBYear:                  record.TMDBYear,
+		Category:                  record.Category,
+		TargetBaseURL:             strings.TrimRight(strings.TrimSpace(cfg.TargetBaseURL), "/"),
+		TargetAPIToken:            strings.TrimSpace(cfg.TargetAPIToken),
+		TargetSupportsIdempotency: cfg.TargetSupportsIdempotency,
+		ShareType:                 normalizeShareType(cfg.ShareType),
+		SharePeriodUnit:           cfg.SharePeriodUnit,
+		Status:                    model.ETFMediaRootStatusCollecting,
 	}
 	if err := database.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "root_key"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
-			"storage_id":         root.StorageID,
-			"storage_mount_path": root.StorageMountPath,
-			"drive_id":           root.DriveID,
-			"media_root_file_id": root.MediaRootFileID,
-			"media_root_path":    root.MediaRootPath,
-			"media_type":         root.MediaType,
-			"tmdb_id":            root.TMDBID,
-			"tmdb_name":          root.TMDBName,
-			"tmdb_year":          root.TMDBYear,
-			"category":           root.Category,
-			"target_base_url":    root.TargetBaseURL,
-			"share_type":         root.ShareType,
-			"share_period_unit":  root.SharePeriodUnit,
-			"updated_at":         time.Now(),
+			"storage_id":                  root.StorageID,
+			"storage_mount_path":          root.StorageMountPath,
+			"drive_id":                    root.DriveID,
+			"media_root_file_id":          root.MediaRootFileID,
+			"media_root_path":             root.MediaRootPath,
+			"media_type":                  root.MediaType,
+			"tmdb_id":                     root.TMDBID,
+			"tmdb_name":                   root.TMDBName,
+			"tmdb_year":                   root.TMDBYear,
+			"category":                    root.Category,
+			"target_base_url":             root.TargetBaseURL,
+			"target_api_token":            root.TargetAPIToken,
+			"target_supports_idempotency": root.TargetSupportsIdempotency,
+			"share_type":                  root.ShareType,
+			"share_period_unit":           root.SharePeriodUnit,
+			"updated_at":                  time.Now(),
 		}),
 	}).Create(root).Error; err != nil {
-		return nil, errors.WithStack(err)
+		return nil, false, errors.WithStack(err)
 	}
 	var saved model.ETFMediaRoot
 	if err := database.WithContext(ctx).Where("root_key = ?", rootKey).First(&saved).Error; err != nil {
-		return nil, errors.WithStack(err)
+		return nil, false, errors.WithStack(err)
 	}
-	return &saved, nil
+	return &saved, rootCreated, nil
 }
 
 func upsertCollectingBatch(ctx context.Context, root *model.ETFMediaRoot, event ArchiveEvent, cfg Config) (*model.ETFMediaRootBatch, error) {
@@ -424,6 +494,11 @@ func upsertCollectingBatch(ctx context.Context, root *model.ETFMediaRoot, event 
 	batch.LastEventAt = event.OccurredAt
 	batch.QuietUntil = event.OccurredAt.Add(cfg.QuietWindow)
 	batch.MediaRootCreated = batch.MediaRootCreated || event.MediaRootCreated
+	clusterJobIDs, err := mergeClusterJobIDs(batch.ClusterJobIDsJSON, event.ClusterJobID)
+	if err != nil {
+		return nil, err
+	}
+	batch.ClusterJobIDsJSON = clusterJobIDs
 	if batch.MediaRootCreated {
 		batch.Reason = model.ETFMediaRootBatchReasonInitialCreate
 	}
@@ -437,6 +512,62 @@ func upsertCollectingBatch(ctx context.Context, root *model.ETFMediaRoot, event 
 		return nil, errors.WithStack(err)
 	}
 	return &batch, nil
+}
+
+func mergeClusterJobIDs(raw, id string) (string, error) {
+	ids, err := decodeClusterJobIDs(raw)
+	if err != nil {
+		return "", err
+	}
+	id = strings.TrimSpace(id)
+	if id != "" {
+		ids = append(ids, id)
+	}
+	seen := make(map[string]struct{}, len(ids))
+	unique := make([]string, 0, len(ids))
+	for _, candidate := range ids {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		unique = append(unique, candidate)
+	}
+	if len(unique) == 0 {
+		return "", nil
+	}
+	sort.Strings(unique)
+	encoded, err := json.Marshal(unique)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	return string(encoded), nil
+}
+
+func decodeClusterJobIDs(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil, errors.Wrap(err, "decode linked cluster job IDs")
+	}
+	return ids, nil
+}
+
+func updateClusterJobNotificationStatus(tx *gorm.DB, raw, status string) error {
+	ids, err := decodeClusterJobIDs(raw)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return tx.Model(&model.ClusterJob{}).Where("id IN ?", ids).Update("notification_status", status).Error
 }
 
 func getMediaRoot(ctx context.Context, id uint) (*model.ETFMediaRoot, error) {
@@ -475,6 +606,7 @@ func normalizeConfig(cfg Config) Config {
 		cfg.QuietWindow = 30 * time.Second
 	}
 	cfg.TargetBaseURL = strings.TrimRight(strings.TrimSpace(cfg.TargetBaseURL), "/")
+	cfg.TargetAPIToken = strings.TrimSpace(cfg.TargetAPIToken)
 	cfg.ShareType = normalizeShareType(cfg.ShareType)
 	if cfg.SharePeriodUnit <= 0 {
 		cfg.SharePeriodUnit = 1

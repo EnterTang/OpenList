@@ -110,6 +110,38 @@ type MCP struct {
 	Enable bool `json:"enable" env:"ENABLE"`
 }
 
+type ClusterRedis struct {
+	Address          string `json:"address" env:"ADDRESS"`
+	Username         string `json:"username" env:"USERNAME"`
+	Password         string `json:"password" env:"PASSWORD"`
+	DB               int    `json:"db" env:"DB"`
+	ResultStream     string `json:"result_stream" env:"RESULT_STREAM"`
+	CleanupStream    string `json:"cleanup_stream" env:"CLEANUP_STREAM"`
+	DeadLetterStream string `json:"dead_letter_stream" env:"DEAD_LETTER_STREAM"`
+	ConsumerGroup    string `json:"consumer_group" env:"CONSUMER_GROUP"`
+	RequireAOF       bool   `json:"require_aof" env:"REQUIRE_AOF"`
+}
+
+type Cluster struct {
+	Role                      string       `json:"role" env:"ROLE"`
+	NodeID                    string       `json:"node_id" env:"NODE_ID"`
+	CoordinatorURL            string       `json:"coordinator_url" env:"COORDINATOR_URL"`
+	EnrollmentToken           string       `json:"enrollment_token" env:"ENROLLMENT_TOKEN"`
+	SecretMasterKey           string       `json:"-" env:"SECRET_MASTER_KEY"`
+	WorkerKeyFile             string       `json:"worker_key_file" env:"WORKER_KEY_FILE"`
+	WebSocketPath             string       `json:"websocket_path" env:"WEBSOCKET_PATH"`
+	HeartbeatIntervalSecond   int          `json:"heartbeat_interval_seconds" env:"HEARTBEAT_INTERVAL_SECONDS"`
+	ReconnectIntervalSecond   int          `json:"reconnect_interval_seconds" env:"RECONNECT_INTERVAL_SECONDS"`
+	ETFRootPath               string       `json:"etf_root_path" env:"ETF_ROOT_PATH"`
+	TargetBaseURL             string       `json:"target_base_url" env:"TARGET_BASE_URL"`
+	TargetAPIToken            string       `json:"target_api_token" env:"TARGET_API_TOKEN"`
+	TargetSupportsIdempotency bool         `json:"target_supports_idempotency" env:"TARGET_SUPPORTS_IDEMPOTENCY"`
+	QuietWindowSecond         int          `json:"quiet_window_seconds" env:"QUIET_WINDOW_SECONDS"`
+	SharePeriodUnit           int          `json:"share_period_unit" env:"SHARE_PERIOD_UNIT"`
+	ShareType                 string       `json:"share_type" env:"SHARE_TYPE"`
+	Redis                     ClusterRedis `json:"redis" envPrefix:"REDIS_"`
+}
+
 type Config struct {
 	Force                 bool        `json:"force" env:"FORCE"`
 	SiteURL               string      `json:"site_url" env:"SITE_URL"`
@@ -136,6 +168,7 @@ type Config struct {
 	FTP                   FTP         `json:"ftp" envPrefix:"FTP_"`
 	SFTP                  SFTP        `json:"sftp" envPrefix:"SFTP_"`
 	MCP                   MCP         `json:"mcp" envPrefix:"MCP_"`
+	Cluster               Cluster     `json:"cluster" envPrefix:"CLUSTER_"`
 	LastLaunchedVersion   string      `json:"last_launched_version"`
 	ProxyAddress          string      `json:"proxy_address" env:"PROXY_ADDRESS"`
 }
@@ -251,6 +284,23 @@ func DefaultConfig(dataDir string) *Config {
 		},
 		MCP: MCP{
 			Enable: false,
+		},
+		Cluster: Cluster{
+			Role:                    "standalone",
+			WebSocketPath:           "/api/cluster/ws",
+			HeartbeatIntervalSecond: 15,
+			ReconnectIntervalSecond: 5,
+			QuietWindowSecond:       30,
+			SharePeriodUnit:         0,
+			ShareType:               "cloud_drive",
+			Redis: ClusterRedis{
+				Address:          "127.0.0.1:6379",
+				ResultStream:     "cluster:upload-results:v1",
+				CleanupStream:    "cluster:local-cleanup:v1",
+				DeadLetterStream: "cluster:upload-results:dlq:v1",
+				ConsumerGroup:    "openlist-cluster-reporter",
+				RequireAOF:       true,
+			},
 		},
 		LastLaunchedVersion: "",
 		ProxyAddress:        "",

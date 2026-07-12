@@ -2,6 +2,7 @@ package server
 
 import (
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
+	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/message"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
@@ -30,6 +31,9 @@ func Init(e *gin.Engine) {
 	g.Any("/ping", func(c *gin.Context) {
 		c.String(200, "pong")
 	})
+	if cluster.ParseRole(conf.Conf.Cluster.Role).RunsCoordinator() {
+		g.GET(conf.Conf.Cluster.WebSocketPath, gin.WrapH(cluster.WebSocketHandler()))
+	}
 	g.GET("/favicon.ico", handles.Favicon)
 	g.GET("/robots.txt", handles.Robots)
 	g.GET("/manifest.json", static.ManifestJSON)
@@ -116,6 +120,28 @@ func Init(e *gin.Engine) {
 }
 
 func admin(g *gin.RouterGroup) {
+	clusterAdmin := g.Group("/cluster")
+	clusterAdmin.GET("/config", handles.GetClusterConfig)
+	clusterAdmin.POST("/config", handles.SaveClusterConfig)
+	clusterAdmin.GET("/nodes", handles.ListClusterNodes)
+	clusterAdmin.POST("/nodes/:id/inventory/query", handles.QueryClusterNodeInventory)
+	clusterAdmin.POST("/nodes/:id/state", handles.SetClusterNodeState)
+	clusterAdmin.POST("/nodes/:id/config", handles.ApplyClusterNodeConfig)
+	clusterAdmin.GET("/results", handles.ListClusterUploadResults)
+	clusterAdmin.GET("/jobs", handles.ListClusterJobs)
+	clusterAdmin.POST("/jobs/dispatch", handles.DispatchClusterMediaJob)
+	clusterAdmin.POST("/jobs/dispatch_batch", handles.DispatchClusterMediaBatch)
+	clusterAdmin.POST("/jobs/:id/retry", handles.RetryClusterJob)
+	clusterAdmin.POST("/jobs/clear_failed", handles.ArchiveFailedClusterJobs)
+	clusterAdmin.GET("/result_queue/stats", handles.GetClusterResultQueueStats)
+	clusterAdmin.POST("/result_queue/enqueue", handles.EnqueueClusterUploadResult)
+	clusterAdmin.GET("/secrets", handles.ListClusterSecrets)
+	clusterAdmin.POST("/secrets", handles.WriteClusterSecret)
+	clusterAdmin.POST("/secrets/:id/revoke", handles.RevokeClusterSecret)
+	clusterAdmin.GET("/storage-profiles", handles.ListClusterStorageProfiles)
+	clusterAdmin.POST("/storage-profiles", handles.ApplyClusterStorageProfile)
+	clusterAdmin.GET("/audit", handles.ListClusterControlAudit)
+
 	meta := g.Group("/meta")
 	meta.GET("/list", handles.ListMetas)
 	meta.GET("/get", handles.GetMeta)
@@ -191,6 +217,8 @@ func admin(g *gin.RouterGroup) {
 
 	etfAuto := g.Group("/etf_auto")
 	etfAuto.GET("/roots", handles.ListETFAutoMediaRoots)
+	etfAuto.GET("/jobs", handles.ListETFAutoJobs)
+	etfAuto.POST("/jobs/:id/retry_unknown", handles.RetryUnknownETFAutoJob)
 	etfAuto.POST("/check", handles.TriggerETFAutoSubscriptionCheck)
 	etfAuto.POST("/process", handles.ProcessETFAutoSubscriptionJobs)
 
@@ -208,6 +236,8 @@ func admin(g *gin.RouterGroup) {
 	subscription.POST("/preview", handles.PreviewSubscription)
 	subscription.POST("/check", handles.CheckSubscription)
 	subscription.GET("/runs", handles.ListSubscriptionRuns)
+	subscription.POST("/runs/delete", handles.DeleteSubscriptionRun)
+	subscription.POST("/runs/clear_failed", handles.ClearFailedSubscriptionRuns)
 	subscription.POST("/resource/search", handles.SearchSubscriptionResources)
 	subscription.GET("/config", handles.GetSubscriptionConfig)
 	subscription.POST("/config", handles.SaveSubscriptionConfig)

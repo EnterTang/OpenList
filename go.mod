@@ -7,6 +7,7 @@ toolchain go1.26.4
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.2
+	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/KarpelesLab/reflink v1.0.2
 	github.com/KirCute/zip v1.0.1
 	github.com/OpenListTeam/go-cache v0.1.0
@@ -65,6 +66,7 @@ require (
 	github.com/pkg/sftp v1.13.10
 	github.com/pquerna/otp v1.5.0
 	github.com/quic-go/quic-go v0.59.0
+	github.com/redis/go-redis/v9 v9.17.2
 	github.com/rclone/rclone v1.70.3
 	github.com/shirou/gopsutil/v4 v4.25.5
 	github.com/sirupsen/logrus v1.9.4
@@ -112,6 +114,7 @@ require (
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/cronokirby/saferith v0.33.0 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.8.4 // indirect
 	github.com/emersion/go-message v0.18.2 // indirect
@@ -152,6 +155,7 @@ require (
 	github.com/stangelandcl/ppmd v0.1.1 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect

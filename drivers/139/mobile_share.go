@@ -2,14 +2,19 @@ package _139
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"net/http"
+	"path"
+	"sort"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/go-resty/resty/v2"
+	"gorm.io/gorm"
 )
 
 const (
@@ -45,7 +50,11 @@ func (d *Yun139) CreateMobileShare(ctx context.Context, obj model.Obj, args mode
 	if err == nil || !d.shouldAutoRenameAfterShareRisk(err) {
 		return link, err
 	}
-	plan, _, planErr := d.buildShareRiskRenamePlan(ctx, obj, shareRiskActualPath(obj))
+	actualPath := shareRiskActualPath(obj)
+	if strings.TrimSpace(args.SourcePath) != "" {
+		actualPath = args.SourcePath
+	}
+	plan, canonicalTitle, planErr := d.buildShareRiskRenamePlan(ctx, obj, actualPath)
 	if planErr != nil {
 		return nil, fmt.Errorf("%w (auto rename planning failed: %v)", err, planErr)
 	}
@@ -55,9 +64,20 @@ func (d *Yun139) CreateMobileShare(ctx context.Context, obj model.Obj, args mode
 	if applyErr := d.applyShareRiskRenamePlan(ctx, plan); applyErr != nil {
 		return nil, fmt.Errorf("%w (auto rename apply failed: %v)", err, applyErr)
 	}
-	retried, retryErr := d.createMobileShareOnce(ctx, obj, args)
+	retryArgs := args
+	if strings.TrimSpace(retryArgs.SourcePath) != "" {
+		retryArgs.SourcePath = shareRiskApplyRenamePlanPath(retryArgs.SourcePath, plan)
+	}
+	if syncErr := d.syncShareRiskRenamePlan(ctx, obj, args.SourcePath, canonicalTitle, plan); syncErr != nil {
+		return nil, fmt.Errorf("%w (auto rename sync failed: %v)", err, syncErr)
+	}
+	retryObj := shareRiskWrapRenamedObject(obj, plan)
+	retried, retryErr := d.createMobileShareOnce(ctx, retryObj, retryArgs)
 	if retryErr != nil {
 		return nil, fmt.Errorf("个人云未知异常，已尝试自动重命名后重新创建分享，但仍失败: %w", retryErr)
+	}
+	if retried != nil {
+		retried.CanonicalTitle = canonicalTitle
 	}
 	return retried, nil
 }
@@ -120,11 +140,93 @@ func (d *Yun139) createMobileShareOnce(ctx context.Context, obj model.Obj, args 
 		ShareURL:    strings.TrimSpace(item.LinkURL),
 		ExtractCode: strings.TrimSpace(item.Passwd),
 		ObjID:       strings.TrimSpace(item.ObjID),
+		SourcePath:  strings.TrimSpace(args.SourcePath),
+		SourceName:  strings.TrimSpace(obj.GetName()),
 	}
 	if link.ShareURL == "" {
 		return nil, fmt.Errorf("mobile share response missing share url")
 	}
 	return link, nil
+}
+
+func shareRiskWrapRenamedObject(obj model.Obj, plan []shareRiskRenameNode) model.Obj {
+	if obj == nil {
+		return nil
+	}
+	for _, item := range plan {
+		if item.Obj != nil && item.Obj.GetID() == obj.GetID() && strings.TrimSpace(item.NewName) != "" && item.NewName != obj.GetName() {
+			return &model.ObjWrapName{Name: item.NewName, Obj: obj}
+		}
+	}
+	return obj
+}
+
+func shareRiskApplyRenamePlanPath(actualPath string, plan []shareRiskRenameNode) string {
+	actualPath = cleanActualPath(actualPath)
+	if actualPath == "/" {
+		return actualPath
+	}
+	sorted := append([]shareRiskRenameNode(nil), plan...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Depth != sorted[j].Depth {
+			return sorted[i].Depth > sorted[j].Depth
+		}
+		return len(sorted[i].OldName) > len(sorted[j].OldName)
+	})
+	for _, item := range sorted {
+		oldPath := cleanActualPath(path.Join(item.ParentPath, item.OldName))
+		newPath := cleanActualPath(path.Join(item.ParentPath, item.NewName))
+		if actualPath == oldPath {
+			actualPath = newPath
+			continue
+		}
+		prefix := oldPath + "/"
+		if strings.HasPrefix(actualPath, prefix) {
+			actualPath = newPath + strings.TrimPrefix(actualPath, oldPath)
+		}
+	}
+	return cleanActualPath(actualPath)
+}
+
+func (d *Yun139) syncShareRiskRenamePlan(ctx context.Context, obj model.Obj, sourcePath, canonicalTitle string, plan []shareRiskRenameNode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if db.GetDb() == nil || obj == nil {
+		return nil
+	}
+	sourcePath = cleanActualPath(sourcePath)
+	if sourcePath == "/" {
+		return nil
+	}
+	root, err := db.FindETFMediaRootByPath(d.GetStorage().MountPath, sourcePath)
+	if err != nil {
+		if stderrors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return err
+	}
+	if root == nil {
+		return nil
+	}
+	newRootPath := shareRiskApplyRenamePlanPath(sourcePath, plan)
+	if newRootPath != "/" {
+		root.ActualMediaRootPath = newRootPath
+	}
+	if strings.TrimSpace(canonicalTitle) != "" {
+		root.ShareRiskCanonicalTitle = strings.TrimSpace(canonicalTitle)
+	}
+	if err := db.UpdateETFMediaRoot(root); err != nil {
+		return err
+	}
+	for _, item := range plan {
+		oldPath := cleanActualPath(path.Join(item.ParentPath, item.OldName))
+		newPath := shareRiskApplyRenamePlanPath(oldPath, plan)
+		if err := db.UpdateETFArchivePath(d.GetStorage().MountPath, oldPath, newPath); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *Yun139) DeleteMobileShare(ctx context.Context, args model.MobileShareDeleteArgs) error {

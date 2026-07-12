@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,7 +73,7 @@ func GetSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, gin.H{"subscription": item, "items": items})
+	common.SuccessResp(c, gin.H{"subscription": item, "items": filterDisplayedSubscriptionItems(items)})
 }
 
 func CreateSubscription(c *gin.Context) {
@@ -86,6 +87,10 @@ func CreateSubscription(c *gin.Context) {
 		return
 	}
 	normalizeSubscription(&req)
+	if err := validateSubscriptionEpisodeRange(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
 	if req.Name == "" {
 		common.ErrorStrResp(c, "name is required", 400)
 		return
@@ -121,6 +126,10 @@ func UpdateSubscription(c *gin.Context) {
 		return
 	}
 	normalizeSubscription(&req)
+	if err := validateSubscriptionEpisodeRange(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
 	req.CreatedAt = existing.CreatedAt
 	req.LastCheckedAt = existing.LastCheckedAt
 	req.LastCursor = existing.LastCursor
@@ -195,6 +204,30 @@ func ListSubscriptionRuns(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, common.PageResp{Content: items, Total: total})
+}
+
+func DeleteSubscriptionRun(c *gin.Context) {
+	var req struct {
+		ID uint `json:"id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if err := db.DeleteSubscriptionRun(req.ID); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+func ClearFailedSubscriptionRuns(c *gin.Context) {
+	deleted, err := db.ClearFailedSubscriptionRuns()
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, gin.H{"deleted": deleted})
 }
 
 func SearchSubscriptionResources(c *gin.Context) {
@@ -295,6 +328,8 @@ func normalizeSubscription(item *model.Subscription) {
 	item.Seasons = normalizeSubscriptionSeasons(item.MediaType, item.Seasons, item.Season)
 	if item.MediaType == "movie" {
 		item.Season = 0
+		item.LatestSeasonEpisodeStart = 0
+		item.LatestSeasonEpisodeEnd = 0
 	} else if len(item.Seasons) > 0 {
 		item.Season = item.Seasons[0]
 	} else if item.Season <= 0 {
@@ -303,6 +338,33 @@ func normalizeSubscription(item *model.Subscription) {
 	if item.LastStatus == "" {
 		item.LastStatus = model.SubscriptionStatusIdle
 	}
+}
+
+func filterDisplayedSubscriptionItems(items []model.SubscriptionItem) []model.SubscriptionItem {
+	filtered := make([]model.SubscriptionItem, 0, len(items))
+	for _, item := range items {
+		if item.Status != model.SubscriptionItemStatusTransferred {
+			continue
+		}
+		if strings.TrimSpace(item.FileName) == "" && strings.TrimSpace(item.FilePath) == "" && strings.TrimSpace(item.TargetPath) == "" {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func validateSubscriptionEpisodeRange(item *model.Subscription) error {
+	if item == nil || item.MediaType == "movie" {
+		return nil
+	}
+	if item.LatestSeasonEpisodeStart < 0 || item.LatestSeasonEpisodeEnd < 0 {
+		return errors.New("latest season episode range cannot be negative")
+	}
+	if item.LatestSeasonEpisodeStart > 0 && item.LatestSeasonEpisodeEnd > 0 && item.LatestSeasonEpisodeEnd < item.LatestSeasonEpisodeStart {
+		return errors.New("latest_season_episode_end must be greater than or equal to latest_season_episode_start")
+	}
+	return nil
 }
 
 func normalizeSubscriptionSeasons(mediaType string, seasons []int, legacySeason int) []int {

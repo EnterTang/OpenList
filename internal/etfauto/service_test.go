@@ -64,6 +64,7 @@ func TestRecordArchiveEventCoalescesETFUploadsIntoOneDueCreateJob(t *testing.T) 
 
 	first, err := RecordArchiveEvent(ctx, ArchiveEvent{
 		Record:           archivedETFRecord(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		ClusterJobID:     "cluster-job-1",
 		MediaRootFileID:  "folder-media-root",
 		MediaRootPath:    "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
 		MediaRootCreated: true,
@@ -78,6 +79,7 @@ func TestRecordArchiveEventCoalescesETFUploadsIntoOneDueCreateJob(t *testing.T) 
 
 	second, err := RecordArchiveEvent(ctx, ArchiveEvent{
 		Record:           archivedETFRecord(2, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		ClusterJobID:     "cluster-job-2",
 		MediaRootFileID:  "folder-media-root",
 		MediaRootPath:    "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
 		MediaRootCreated: false,
@@ -91,6 +93,13 @@ func TestRecordArchiveEventCoalescesETFUploadsIntoOneDueCreateJob(t *testing.T) 
 	}
 	if second.ETFCount != 2 {
 		t.Fatalf("coalesced batch etf count = %d, want 2", second.ETFCount)
+	}
+	batchClusterJobs, err := decodeClusterJobIDs(second.ClusterJobIDsJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(batchClusterJobs) != "[cluster-job-1 cluster-job-2]" {
+		t.Fatalf("batch cluster jobs = %v", batchClusterJobs)
 	}
 
 	closed, err := CloseDueBatches(ctx, now.Add(39*time.Second))
@@ -118,6 +127,150 @@ func TestRecordArchiveEventCoalescesETFUploadsIntoOneDueCreateJob(t *testing.T) 
 	}
 	if jobs[0].TargetBaseURL != cfg.TargetBaseURL || jobs[0].ShareType != "etf" {
 		t.Fatalf("job target/share type = %q/%q, want configured target and etf", jobs[0].TargetBaseURL, jobs[0].ShareType)
+	}
+	jobClusterJobs, err := decodeClusterJobIDs(jobs[0].ClusterJobIDsJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(jobClusterJobs) != "[cluster-job-1 cluster-job-2]" {
+		t.Fatalf("notification job cluster jobs = %v", jobClusterJobs)
+	}
+}
+
+func TestRecordArchiveEventQueuesCreateJobForFirstTrackedRootEvenWithoutNewDirectory(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	cfg := Config{
+		Enabled:         true,
+		TargetBaseURL:   "http://localhost:8080/api/v1",
+		QuietWindow:     time.Second,
+		SharePeriodUnit: 1,
+		ShareType:       "etf",
+	}
+
+	batch, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record:           archivedETFRecord(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		MediaRootFileID:  "folder-media-root",
+		MediaRootPath:    "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		MediaRootCreated: false,
+		OccurredAt:       now,
+	}, cfg)
+	if err != nil {
+		t.Fatalf("record archive event: %v", err)
+	}
+	if !batch.MediaRootCreated {
+		t.Fatalf("first tracked media root should be treated as created")
+	}
+	if batch.Reason != model.ETFMediaRootBatchReasonInitialCreate {
+		t.Fatalf("batch reason = %q, want %q", batch.Reason, model.ETFMediaRootBatchReasonInitialCreate)
+	}
+
+	if _, err := CloseDueBatches(ctx, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("close due batches: %v", err)
+	}
+	jobs, err := ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeCreate})
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("job count = %d, want 1", len(jobs))
+	}
+}
+
+func TestCloseContentChangedBatchQueuesOneManualCheckJob(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	cfg := Config{
+		Enabled:         true,
+		TargetBaseURL:   "http://localhost:8080/api/v1",
+		TargetAPIToken:  "target-token",
+		QuietWindow:     time.Second,
+		SharePeriodUnit: 1,
+		ShareType:       "etf",
+	}
+
+	initialBatch, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record:           archivedETFRecord(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		MediaRootFileID:  "folder-media-root",
+		MediaRootPath:    "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		MediaRootCreated: true,
+		OccurredAt:       now,
+	}, cfg)
+	if err != nil {
+		t.Fatalf("record initial archive event: %v", err)
+	}
+	if _, err := CloseDueBatches(ctx, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("close initial batch: %v", err)
+	}
+	createJobs, err := ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeCreate})
+	if err != nil {
+		t.Fatalf("list create jobs: %v", err)
+	}
+	if len(createJobs) != 1 {
+		t.Fatalf("create job count = %d, want 1", len(createJobs))
+	}
+	initialFingerprint, err := ComputeMediaRootFingerprint(ctx, initialBatch.MediaRootID)
+	if err != nil {
+		t.Fatalf("compute initial fingerprint: %v", err)
+	}
+	if err := MarkCreateSubscriptionSucceeded(ctx, createJobs[0].ID, CreateSubscriptionResult{
+		SubscriptionID: 77,
+		TaskID:         "task_create",
+		Fingerprint:    initialFingerprint,
+	}); err != nil {
+		t.Fatalf("mark create subscription succeeded: %v", err)
+	}
+
+	changedBatch, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record:           archivedETFRecord(2, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		MediaRootFileID:  "folder-media-root",
+		MediaRootPath:    "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		MediaRootCreated: false,
+		OccurredAt:       now.Add(3 * time.Second),
+	}, cfg)
+	if err != nil {
+		t.Fatalf("record changed archive event: %v", err)
+	}
+	if changedBatch.Reason != model.ETFMediaRootBatchReasonContentChanged {
+		t.Fatalf("changed batch reason = %q, want %q", changedBatch.Reason, model.ETFMediaRootBatchReasonContentChanged)
+	}
+	if _, err := CloseDueBatches(ctx, now.Add(5*time.Second)); err != nil {
+		t.Fatalf("close changed batch: %v", err)
+	}
+
+	changedFingerprint, err := ComputeMediaRootFingerprint(ctx, initialBatch.MediaRootID)
+	if err != nil {
+		t.Fatalf("compute changed fingerprint: %v", err)
+	}
+	if changedFingerprint == initialFingerprint {
+		t.Fatalf("changed fingerprint = initial fingerprint %q", initialFingerprint)
+	}
+	jobs, err := ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeManualCheck})
+	if err != nil {
+		t.Fatalf("list manual check jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("manual check job count = %d, want 1", len(jobs))
+	}
+	if jobs[0].BatchID != changedBatch.ID || jobs[0].TargetSubscriptionID != 77 || jobs[0].Fingerprint != changedFingerprint {
+		t.Fatalf("manual check job = batch %d subscription %d fingerprint %q, want %d/77/%q",
+			jobs[0].BatchID, jobs[0].TargetSubscriptionID, jobs[0].Fingerprint, changedBatch.ID, changedFingerprint)
+	}
+	if jobs[0].TargetAPIToken != cfg.TargetAPIToken {
+		t.Fatalf("manual check token = %q, want configured token", jobs[0].TargetAPIToken)
+	}
+
+	if err := closeBatch(ctx, changedBatch); err != nil {
+		t.Fatalf("close changed batch again: %v", err)
+	}
+	jobs, err = ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeManualCheck})
+	if err != nil {
+		t.Fatalf("list manual check jobs after repeated close: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("manual check job count after repeated close = %d, want 1", len(jobs))
 	}
 }
 
@@ -184,8 +337,8 @@ func TestRequestManualCheckSkipsUnchangedRootAndDeduplicatesChangedFingerprint(t
 	if err != nil {
 		t.Fatalf("request changed manual check: %v", err)
 	}
-	if changed.Status != ManualCheckQueued || changed.Job == nil {
-		t.Fatalf("changed manual check = status %q job %#v, want queued job", changed.Status, changed.Job)
+	if changed.Status != ManualCheckAlreadyQueued || changed.Job == nil {
+		t.Fatalf("changed manual check = status %q job %#v, want automatically queued job", changed.Status, changed.Job)
 	}
 	again, err := RequestManualCheck(ctx, batch.MediaRootID, now.Add(8*time.Second))
 	if err != nil {

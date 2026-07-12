@@ -12,6 +12,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/internal/bootstrap/data"
+	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
@@ -95,8 +96,16 @@ func Start() {
 	LoadStorages()
 	InitTaskManager()
 	subscription.RegisterTransferTaskHooks()
-	subscription.StartScheduler()
-	etfauto.StartWorker()
+	clusterRole := cluster.ParseRole(conf.Conf.Cluster.Role)
+	clusterReady := true
+	if err := cluster.Start(); err != nil {
+		clusterReady = false
+		log.Errorf("failed to start cluster runtime: %v", err)
+	}
+	if clusterReady && (clusterRole.RunsStandaloneSchedulers() || clusterRole.RunsCoordinator()) {
+		subscription.StartScheduler()
+		etfauto.StartWorker()
+	}
 	if !flags.Debug && !flags.Dev {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -278,6 +287,7 @@ func Start() {
 
 func Shutdown(timeout time.Duration) {
 	utils.Log.Println("Shutdown server...")
+	cluster.Stop()
 	etfauto.StopWorker()
 	subscription.StopScheduler()
 	fs.ArchiveContentUploadTaskManager.RemoveAll()

@@ -7,12 +7,14 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
 type SaveShareOptions struct {
-	TempRoot string
-	Match    func(TreeEntry) bool
+	TempRoot     string
+	Match        func(TreeEntry) bool
+	Subscription *model.Subscription
 }
 
 type shareTreePair struct {
@@ -42,10 +44,7 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 	if err != nil {
 		return nil, err
 	}
-	selected := make([]TreeEntry, 0, len(pairs))
-	dirIDs := map[string]string{"": dstDirID}
-	grouped := map[shareSaveGroup][]ShareItem{}
-	groupOrder := make([]shareSaveGroup, 0)
+	matched := make([]shareTreePair, 0, len(pairs))
 	for _, pair := range pairs {
 		if pair.entry.IsDir {
 			continue
@@ -53,6 +52,16 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 		if opts.Match != nil && !opts.Match(pair.entry) {
 			continue
 		}
+		matched = append(matched, pair)
+	}
+	if opts.Subscription != nil {
+		matched = filterLargestSharePairsPerSlot(opts.Subscription, matched)
+	}
+	selected := make([]TreeEntry, 0, len(matched))
+	dirIDs := map[string]string{"": dstDirID}
+	grouped := map[shareSaveGroup][]ShareItem{}
+	groupOrder := make([]shareSaveGroup, 0)
+	for _, pair := range matched {
 		dirPath := importedParentPath(pair.entry.Path)
 		itemDstDirID := dstDirID
 		if dirPath != "" {
@@ -99,11 +108,10 @@ func SaveImportedFilesToTemp(ctx context.Context, provider ShareSaver, rootPath 
 		return nil, err
 	}
 	dirIDs := map[string]string{"": rootDirID}
-	selected := make([]TreeEntry, 0, len(files))
-	grouped := map[string][]ShareItem{}
+	matched := make([]pan123ImportedFile, 0, len(files))
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
-			return selected, err
+			return nil, err
 		}
 		entry := TreeEntry{
 			RootPath: rootPath,
@@ -113,6 +121,20 @@ func SaveImportedFilesToTemp(ctx context.Context, provider ShareSaver, rootPath 
 		}
 		if opts.Match != nil && !opts.Match(entry) {
 			continue
+		}
+		matched = append(matched, file)
+	}
+	if opts.Subscription != nil {
+		matched = filterLargestImportedFilesPerSlot(opts.Subscription, rootPath, matched)
+	}
+	selected := make([]TreeEntry, 0, len(matched))
+	grouped := map[string][]ShareItem{}
+	for _, file := range matched {
+		entry := TreeEntry{
+			RootPath: rootPath,
+			Path:     utils.FixAndCleanPath(stdpath.Join("/", file.Path)),
+			Name:     file.Name,
+			Size:     file.Size,
 		}
 		dirPath := importedParentPath(file.Path)
 		dstDirID, err := ensureImportedDir(ctx, provider, tempRoot, dirPath, dirIDs)

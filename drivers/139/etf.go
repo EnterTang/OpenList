@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	clusterworker "github.com/OpenListTeam/OpenList/v4/internal/cluster/worker"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -31,13 +33,14 @@ import (
 const etfVideoLinkType = "etf_video"
 
 type etfArchivePlan struct {
-	targetDir          model.Obj
-	meta               *tmdb.Metadata
-	result             recognize.Result
-	pathParts          []string
-	mediaRootDir       model.Obj
-	mediaRootPathParts []string
-	mediaRootCreated   bool
+	targetDir               model.Obj
+	meta                    *tmdb.Metadata
+	result                  recognize.Result
+	pathParts               []string
+	mediaRootDir            model.Obj
+	mediaRootPathParts      []string
+	mediaRootCreated        bool
+	shareRiskCanonicalTitle string
 }
 
 type manualETFArchiveFile struct {
@@ -118,6 +121,33 @@ func (d *Yun139) restorePersonalFromETFUpload(ctx context.Context, dstDir model.
 }
 
 func (d *Yun139) afterPersonalUploadETF(ctx context.Context, dstDir model.Obj, sourceName string, size int64, sha256 string, uploadedObj model.Obj) error {
+	if manifest, ok := clusterworker.UploadManifestFromContext(ctx); ok {
+		if !d.Addition.ClusterDedicatedAccount {
+			return fmt.Errorf("cluster ETF upload requires a dedicated 139 account before automatic recycle-bin cleanup")
+		}
+		if uploadedObj == nil {
+			return fmt.Errorf("cluster upload result is missing remote object")
+		}
+		manifest.Name = sourceName
+		manifest.Size = size
+		manifest.SHA256 = strings.ToUpper(strings.TrimSpace(sha256))
+		if manifest.HashSource == "" {
+			manifest.HashSource = "mobile_provider_response"
+		}
+		manifest.RemoteFileID = uploadedObj.GetID()
+		manifest.RemoteParentID = dstDir.GetID()
+		manifest.RemotePath = d.fullETFPath(dstDir.GetPath(), sourceName)
+		if manifest.UploadReceipt == "" {
+			manifest.UploadReceipt = uploadedObj.GetID()
+		}
+		cleanup, err := clusterworker.NewCleanupRequest(manifest, d.GetStorage().MountPath)
+		if err != nil {
+			return fmt.Errorf("build cluster cleanup request: %w", err)
+		}
+		cleanup.AdditionalTargets = append(cleanup.AdditionalTargets, clusterworker.AdditionalCleanupTargetsFromContext(ctx)...)
+		_, err = clusterworker.CompleteClusterUpload(ctx, manifest, cleanup)
+		return err
+	}
 	if !d.shouldGenerateETF(sourceName) {
 		return nil
 	}
@@ -142,6 +172,16 @@ func (d *Yun139) afterPersonalUploadETF(ctx context.Context, dstDir model.Obj, s
 		return d.removePersonalAndClean(ctx, uploadedObj)
 	}
 	return nil
+}
+
+// ClearRecycleEntry is intentionally available only for a dedicated cluster
+// account because China Mobile Cloud exposes account-wide recycle-bin cleanup
+// rather than a reliable single-entry purge endpoint.
+func (d *Yun139) ClearRecycleEntry(ctx context.Context, _ model.Obj) error {
+	if !d.Addition.ClusterDedicatedAccount {
+		return errors.New("cluster recycle-bin cleanup requires a dedicated 139 account")
+	}
+	return d.emptyPersonalRecycleBin(ctx)
 }
 
 func (d *Yun139) shouldGenerateETF(sourceName string) bool {
@@ -185,12 +225,14 @@ func (d *Yun139) resolveETFArchivePlan(ctx context.Context, dstDir model.Obj, so
 	if meta := d.resolveETFMediaMetadata(ctx, result); meta != nil {
 		resolvedMeta = meta
 	}
-	parts := d.buildETFArchiveParts(result, resolvedMeta)
+	logicalParts := d.buildETFArchiveParts(result, resolvedMeta)
+	parts, canonicalTitle := d.applyPersistedShareRiskArchivePlan(rootParts, logicalParts, resolvedMeta)
 	plan := &etfArchivePlan{
-		targetDir: targetDir,
-		meta:      resolvedMeta,
-		result:    result,
-		pathParts: append(rootParts, parts...),
+		targetDir:               targetDir,
+		meta:                    resolvedMeta,
+		result:                  result,
+		pathParts:               append(rootParts, parts...),
+		shareRiskCanonicalTitle: canonicalTitle,
 	}
 	if len(parts) == 0 {
 		return plan, nil
@@ -200,9 +242,11 @@ func (d *Yun139) resolveETFArchivePlan(ctx context.Context, dstDir model.Obj, so
 		return nil, err
 	}
 	plan.targetDir = dir
-	if mediaRootRelParts := etfMediaRootRelParts(parts, resolvedMeta); len(mediaRootRelParts) > 0 {
-		plan.mediaRootPathParts = append(rootParts, mediaRootRelParts...)
-		mediaRootRelPath := strings.Join(mediaRootRelParts, "/")
+	actualMediaRootRelParts := etfMediaRootRelParts(parts, resolvedMeta)
+	logicalMediaRootRelParts := etfMediaRootRelParts(logicalParts, resolvedMeta)
+	if len(actualMediaRootRelParts) > 0 {
+		plan.mediaRootPathParts = append(rootParts, logicalMediaRootRelParts...)
+		mediaRootRelPath := strings.Join(actualMediaRootRelParts, "/")
 		for _, step := range trace {
 			if step.RelPath == mediaRootRelPath {
 				plan.mediaRootDir = step.Obj
@@ -265,6 +309,31 @@ func (d *Yun139) buildETFArchiveParts(result recognize.Result, meta *tmdb.Metada
 	return parts
 }
 
+func (d *Yun139) applyPersistedShareRiskArchivePlan(rootParts, parts []string, meta *tmdb.Metadata) ([]string, string) {
+	copied := append([]string(nil), parts...)
+	if meta == nil || db.GetDb() == nil {
+		return copied, ""
+	}
+	mediaRootParts := etfMediaRootRelParts(copied, meta)
+	if len(mediaRootParts) == 0 {
+		return copied, ""
+	}
+	rootPath := d.fullETFArchivePath(append(rootParts, mediaRootParts...), "")
+	rootKey := etfauto.MediaRootKey(d.GetStorage().MountPath, rootPath, meta.MediaType, meta.TMDBID)
+	root, err := db.GetETFMediaRootByRootKey(rootKey)
+	if err != nil || root == nil {
+		return copied, ""
+	}
+	actualPath := strings.TrimSpace(root.ActualMediaRootPath)
+	if actualPath != "" {
+		actualName := strings.TrimSpace(path.Base(strings.TrimRight(actualPath, "/")))
+		if actualName != "" {
+			copied[len(mediaRootParts)-1] = actualName
+		}
+	}
+	return copied, strings.TrimSpace(root.ShareRiskCanonicalTitle)
+}
+
 func (d *Yun139) resolveETFMediaMetadata(ctx context.Context, result recognize.Result) *tmdb.Metadata {
 	apiKey := getSettingValue(conf.TMDBApiKey)
 	if apiKey == "" {
@@ -294,6 +363,24 @@ func etfMediaFolderName(meta *tmdb.Metadata) string {
 		name = fmt.Sprintf("%s {tmdb-%d}", name, meta.TMDBID)
 	}
 	return name
+}
+
+func applyShareRiskCanonicalETFName(etfName string, result recognize.Result, meta *tmdb.Metadata, canonicalTitle string) string {
+	canonicalTitle = strings.TrimSpace(canonicalTitle)
+	if canonicalTitle == "" {
+		return etfName
+	}
+	oldTitle := strings.TrimSpace(result.Title)
+	if oldTitle == "" && meta != nil {
+		oldTitle = strings.TrimSpace(meta.Name)
+	}
+	if oldTitle == "" {
+		return etfName
+	}
+	if renamed := replaceShareRiskTitle(etfName, oldTitle, canonicalTitle); strings.TrimSpace(renamed) != "" {
+		return renamed
+	}
+	return etfName
 }
 
 func etfSeasonFolderName(season int) string {
@@ -346,13 +433,14 @@ func (d *Yun139) archivePersonalETF(ctx context.Context, dstDir model.Obj, sourc
 		_ = saveETFArchiveRecord(record)
 		return
 	}
-	record.ArchiveETFPath = d.fullETFArchivePath(plan.pathParts, etfName)
+	archiveETFName := applyShareRiskCanonicalETFName(etfName, plan.result, plan.meta, plan.shareRiskCanonicalTitle)
+	record.ArchiveETFPath = d.fullETFArchivePath(plan.pathParts, archiveETFName)
 	if db.GetDb() != nil {
 		if existing, err := db.FindETFArchiveRecordByFingerprint(record.StorageMountPath, record.SourceSHA256, record.ArchiveETFPath); err == nil && existing.Status == model.ETFArchiveStatusArchived {
 			return
 		}
 	}
-	if err := d.uploadPersonalBytes(ctx, plan.targetDir.GetID(), etfName, content); err != nil {
+	if err := d.uploadPersonalBytes(ctx, plan.targetDir.GetID(), archiveETFName, content); err != nil {
 		record.Status = model.ETFArchiveStatusFailed
 		record.Error = err.Error()
 		_ = saveETFArchiveRecord(record)
@@ -375,11 +463,13 @@ func (d *Yun139) recordETFAutoSubscriptionEvent(ctx context.Context, record *mod
 		quietSeconds = 30
 	}
 	cfg := etfauto.Config{
-		Enabled:         true,
-		TargetBaseURL:   d.Addition.ETFAutoSubscriptionTargetBaseURL,
-		QuietWindow:     time.Duration(quietSeconds) * time.Second,
-		SharePeriodUnit: d.Addition.ETFAutoSubscriptionSharePeriodUnit,
-		ShareType:       d.Addition.ETFAutoSubscriptionShareType,
+		Enabled:                   true,
+		TargetBaseURL:             d.Addition.ETFAutoSubscriptionTargetBaseURL,
+		TargetAPIToken:            d.Addition.ETFAutoSubscriptionTargetAPIToken,
+		TargetSupportsIdempotency: d.Addition.ETFAutoSubscriptionTargetSupportsIdempotency,
+		QuietWindow:               time.Duration(quietSeconds) * time.Second,
+		SharePeriodUnit:           d.Addition.ETFAutoSubscriptionSharePeriodUnit,
+		ShareType:                 d.Addition.ETFAutoSubscriptionShareType,
 	}
 	_, _ = etfauto.RecordArchiveEvent(ctx, etfauto.ArchiveEvent{
 		Record:           record,
@@ -788,13 +878,6 @@ func (d *Yun139) CorrectETFArchive(ctx context.Context, record *model.ETFArchive
 		return nil, err
 	}
 	parts := d.buildETFArchiveParts(result, meta)
-	targetDir := root
-	if len(parts) > 0 {
-		targetDir, err = d.ensurePersonalFolderPath(ctx, root.GetID(), strings.Join(parts, "/"))
-		if err != nil {
-			return nil, err
-		}
-	}
 	info := &etfmeta.Info{
 		Name:       record.SourceName,
 		Size:       record.SourceSize,
@@ -805,16 +888,26 @@ func (d *Yun139) CorrectETFArchive(ctx context.Context, record *model.ETFArchive
 	if err != nil {
 		return nil, err
 	}
-	etfName := etfmeta.FileName(record.SourceName)
+	parts, canonicalTitle := d.applyPersistedShareRiskArchivePlan(rootParts, parts, meta)
+	targetDir := root
+	if len(parts) > 0 {
+		targetDir, err = d.ensurePersonalFolderPath(ctx, root.GetID(), strings.Join(parts, "/"))
+		if err != nil {
+			return nil, err
+		}
+	}
+	planCanonicalName := applyShareRiskCanonicalETFName(etfmeta.FileName(record.SourceName), result, meta, canonicalTitle)
+	etfName := planCanonicalName
 	if err := d.uploadPersonalBytes(ctx, targetDir.GetID(), etfName, content); err != nil {
 		return nil, err
 	}
 	_ = d.removeArchivedETFByPath(ctx, record.ArchiveETFPath)
 	plan := &etfArchivePlan{
-		targetDir: targetDir,
-		meta:      meta,
-		result:    result,
-		pathParts: append(rootParts, parts...),
+		targetDir:               targetDir,
+		meta:                    meta,
+		result:                  result,
+		pathParts:               append(rootParts, parts...),
+		shareRiskCanonicalTitle: canonicalTitle,
 	}
 	d.applyETFArchivePlan(record, plan)
 	record.ArchiveEnabled = true

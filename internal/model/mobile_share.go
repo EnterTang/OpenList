@@ -35,6 +35,9 @@ type MobileShareLink struct {
 	ShareURL    string `json:"share_url"`
 	ExtractCode string `json:"extract_code"`
 	ObjID       string `json:"obj_id"`
+	SourcePath  string `json:"source_path,omitempty"`
+	SourceName  string `json:"source_name,omitempty"`
+	CanonicalTitle string `json:"canonical_title,omitempty"`
 }
 
 type MobileShareCreateResult struct {

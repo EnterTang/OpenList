@@ -225,6 +225,18 @@ func TestApplyShareRiskRenamePlanSortsDeepestFirst(t *testing.T) {
 	}
 }
 
+func TestShareRiskApplyRenamePlanPathUsesDeepestRenameFirst(t *testing.T) {
+	plan := []shareRiskRenameNode{
+		{ParentPath: "/139_60t/ETF转存归档/tv/国产剧", Depth: 3, OldName: "非份之罪 (2026) {tmdb-276239}", NewName: "Guilt (2026) {tmdb-276239}"},
+		{ParentPath: "/139_60t/ETF转存归档/tv/国产剧/非份之罪 (2026) {tmdb-276239}/Season 1", Depth: 5, OldName: "非份之罪 S01E01.etf", NewName: "Guilt S01E01.etf"},
+	}
+	got := shareRiskApplyRenamePlanPath("/139_60t/ETF转存归档/tv/国产剧/非份之罪 (2026) {tmdb-276239}/Season 1/非份之罪 S01E01.etf", plan)
+	want := "/139_60t/ETF转存归档/tv/国产剧/Guilt (2026) {tmdb-276239}/Season 1/Guilt S01E01.etf"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func containsRenameNode(nodes []shareRiskRenameNode, id, newName string) bool {
 	for _, node := range nodes {
 		if node.Obj.GetID() == id && node.NewName == newName {
