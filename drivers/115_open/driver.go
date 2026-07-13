@@ -27,9 +27,10 @@ import (
 type Open115 struct {
 	model.Storage
 	Addition
-	client     *sdk.Client
-	limiter    *rate.Limiter
-	parentPath string
+	client                *sdk.Client
+	limiter               *rate.Limiter
+	parentPath            string
+	runtimeMembershipTier string
 }
 
 func (d *Open115) Config() driver.Config {
@@ -51,10 +52,11 @@ func (d *Open115) Init(ctx context.Context) error {
 	if flags.Debug || flags.Dev {
 		d.client.SetDebug(true)
 	}
-	_, err := d.client.UserInfo(ctx)
+	userInfo, err := d.client.UserInfo(ctx)
 	if err != nil {
 		return err
 	}
+	d.runtimeMembershipTier = normalize115OpenMembershipTier(userInfo.VipInfo.LevelName)
 	if d.Addition.LimitRate > 0 {
 		d.limiter = rate.NewLimiter(rate.Limit(d.Addition.LimitRate), 1)
 	}
@@ -87,6 +89,26 @@ func (d *Open115) Init(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (d *Open115) ClusterMembershipTier() string {
+	configured := strings.ToLower(strings.TrimSpace(d.Addition.MembershipTier))
+	if configured != "" && configured != "unknown" {
+		return configured
+	}
+	return d.runtimeMembershipTier
+}
+
+func normalize115OpenMembershipTier(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case strings.Contains(value, "svip"), strings.Contains(value, "super vip"), strings.Contains(value, "超级"):
+		return "svip"
+	case strings.Contains(value, "vip"), strings.Contains(value, "会员"):
+		return "vip"
+	default:
+		return ""
+	}
 }
 
 func (d *Open115) WaitLimit(ctx context.Context) error {

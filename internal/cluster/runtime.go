@@ -52,11 +52,27 @@ type Runtime struct {
 	newWorkerClient      func(transport.WorkerClientOptions) (*transport.WorkerClient, error)
 	closeRedisClient     func(*redis.Client) error
 	stopEmbeddedRedis    func(context.Context, *embeddedredis.Manager) error
+	dispatchTransport    runtimeDispatchTransport
 
 	mu        sync.RWMutex
 	controlMu sync.Mutex
 	outboxMu  sync.Mutex
 	started   bool
+}
+
+type runtimeDispatchTransport interface {
+	ConnectedNodes() []string
+	Session(string) (transport.Peer, bool)
+	Send(context.Context, string, protocol.Envelope) error
+}
+
+func (r *Runtime) mediaDispatchTransport() runtimeDispatchTransport {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.dispatchTransport != nil {
+		return r.dispatchTransport
+	}
+	return r.hub
 }
 
 type DispatchMediaJobRequest struct {
@@ -542,51 +558,8 @@ func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.Cl
 }
 
 func nodeInventorySupports(ctx context.Context, nodeID string, taskContext protocol.TaskContext, required []string, expectedBytes int64) (bool, error) {
-	var inventory model.ClusterNodeInventory
-	if err := db.GetDb().WithContext(ctx).Where("node_id = ?", nodeID).Order("revision DESC").First(&inventory).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return false, nil
-		}
-		return false, err
-	}
-	var capabilities protocol.NodeCapabilities
-	if err := json.Unmarshal([]byte(inventory.CapabilitiesJSON), &capabilities); err != nil {
-		return false, err
-	}
-	if !capabilities.RedisDurabilityReady || !containsFold(capabilities.SupportedProviders, taskContext.Share.Provider) {
-		return false, nil
-	}
-	for _, operation := range required {
-		if !containsFold(capabilities.SupportedOperations, operation) {
-			return false, nil
-		}
-	}
-	// share.inspect is metadata-only: it needs provider credentials and the
-	// operation capability, but no upload-capable target mount or free space.
-	if containsFold(required, model.ClusterJobTypeShareInspect) && strings.TrimSpace(taskContext.TargetProfile) == "" {
-		return true, nil
-	}
-	targetPath, ok := resolveInventoryTargetPath(ctx, nodeID, taskContext.TargetProfile)
-	if !ok {
-		return false, nil
-	}
-	var providerAccounts []protocol.ProviderAccountInventory
-	if strings.TrimSpace(inventory.ProviderAccountsJSON) != "" {
-		if err := json.Unmarshal([]byte(inventory.ProviderAccountsJSON), &providerAccounts); err != nil {
-			return false, err
-		}
-	}
-	if len(providerAccounts) > 0 {
-		if !providerAccountsSupportSource(providerAccounts, taskContext.Share.Provider) {
-			return false, nil
-		}
-		return providerAccountsSupportTarget(providerAccounts, targetPath, taskContext.DeliveryTarget.Provider, expectedBytes), nil
-	}
-	var mounts []protocol.MountInventory
-	if err := json.Unmarshal([]byte(inventory.MountsJSON), &mounts); err != nil {
-		return false, err
-	}
-	return mountsSupportTarget(mounts, targetPath, expectedBytes), nil
+	_, ok, err := nodeInventoryProviderMatch(ctx, nodeID, taskContext, required, expectedBytes)
+	return ok, err
 }
 
 func containsFold(values []string, expected string) bool {
@@ -951,10 +924,8 @@ func (r *Runtime) DispatchShareInspect(ctx context.Context, req DispatchShareIns
 }
 
 func (r *Runtime) DispatchMediaJob(ctx context.Context, req DispatchMediaJobRequest) (*model.ClusterJob, error) {
-	r.mu.RLock()
-	hub := r.hub
-	r.mu.RUnlock()
-	if hub == nil {
+	dispatchTransport := r.mediaDispatchTransport()
+	if dispatchTransport == nil {
 		return nil, errors.New("cluster coordinator is disabled")
 	}
 	if strings.TrimSpace(req.NodeID) == "" {
@@ -987,7 +958,7 @@ func (r *Runtime) DispatchMediaJob(ctx context.Context, req DispatchMediaJobRequ
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
-	if _, ok := hub.Session(req.NodeID); !ok {
+	if _, ok := dispatchTransport.Session(req.NodeID); !ok {
 		return nil, transport.ErrNotConnected
 	}
 	var node model.ClusterNode
@@ -1096,7 +1067,7 @@ func (r *Runtime) DispatchMediaJob(ctx context.Context, req DispatchMediaJobRequ
 	if persistErr != nil {
 		return job, fmt.Errorf("persist cluster job offer: %w", persistErr)
 	}
-	if err := hub.Send(ctx, req.NodeID, *message); err != nil {
+	if err := dispatchTransport.Send(ctx, req.NodeID, *message); err != nil {
 		_ = db.GetDb().Transaction(func(tx *gorm.DB) error {
 			_ = tx.Model(&model.ClusterJobAttempt{}).Where("id = ?", attemptID).Updates(map[string]any{"status": model.ClusterAttemptStatusLost, "finished_at": time.Now().UTC(), "error": err.Error()}).Error
 			_ = tx.Model(&model.ClusterJob{}).Where("id = ?", jobID).Updates(map[string]any{"status": model.ClusterJobStatusQueued, "assigned_node_id": "", "current_attempt_id": "", "last_error": err.Error()}).Error

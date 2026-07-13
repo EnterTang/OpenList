@@ -223,7 +223,10 @@ func TestStagePermitIsRequestedJustInTime(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-func TestResolveStagingTempRootPrefersTaskTargetOverConfiguredProviderRoot(t *testing.T) {
+func TestResolveStagingTempRootDoesNotSubstituteConfiguredProviderRoot(t *testing.T) {
+	oldList := listInventoryStorages
+	listInventoryStorages = func() ([]model.Storage, error) { return nil, nil }
+	t.Cleanup(func() { listInventoryStorages = oldList })
 	service := New(&fakeResultQueue{}, nil)
 	service.desiredConfig.ProviderTempRoots = map[string]string{"aliyundrive": "/ali/cluster-temp"}
 	namespace := ".openlist-cluster/job-1/media-1"
@@ -239,8 +242,8 @@ func TestResolveStagingTempRootPrefersTaskTargetOverConfiguredProviderRoot(t *te
 	}
 
 	got, err := service.resolveStagingTempRoot(context.Background(), task, namespace)
-	require.NoError(t, err)
-	require.Equal(t, "/123/转存至移动/.openlist-cluster/job-1/media-1", got)
+	require.ErrorContains(t, err, "no compatible provider account")
+	require.Empty(t, got)
 }
 
 func validUploadManifest(t *testing.T) protocol.UploadETFManifest {

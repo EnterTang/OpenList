@@ -29,7 +29,17 @@ func trySaveShareLinkToTemp(ctx context.Context, sub *model.Subscription, cfg mo
 	if !ok {
 		return telegramPanSubscriptionSource{}, false, nil
 	}
-	source.Config = telegramPanSourceConfigWithStorageFallback(ref.Provider, source.Config)
+	if sub != nil && sub.TempTarget.Provider != "" {
+		tempTarget := NormalizeSubscriptionStorageTarget(sub.TempTarget)
+		if tempTarget.Provider != providerTargetNameForShareProvider(ref.Provider) {
+			return source, false, nil
+		}
+		source.Config.TempTransferTarget = tempTarget
+	}
+	source.Config, err = telegramPanSourceConfigWithStorageFallback(ref.Provider, source.Config)
+	if err != nil {
+		return source, false, err
+	}
 	if !telegramPanSourceCanSave(ref.Provider, source.Config) {
 		return source, false, nil
 	}
@@ -125,40 +135,48 @@ func cleanBoundSharePath(value string) string {
 	return cleanConfigPath(value)
 }
 
-func telegramPanSourceConfigWithStorageFallback(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
+func telegramPanSourceConfigWithStorageFallback(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (model.SubscriptionTelegramPanConfig, error) {
 	cfg = normalizeTelegramPanConfig(cfg)
+	if cfg.TempTransferTarget.Provider == "" && strings.TrimSpace(cfg.TempTransferRoot) != "" {
+		return cfg, fmt.Errorf("legacy %s temp_transfer_root %q is not a recognized provider mount and requires manual confirmation", provider, cfg.TempTransferRoot)
+	}
 	switch provider {
 	case ShareProviderAliyunDrive:
 		cfg = aliyunDriveConfigWithStorageFallback(cfg)
 	case ShareProviderPan123:
 		cfg = pan123ConfigWithStorageFallback(cfg)
 	}
-	cfg = telegramPanTempTargetWithResolver(provider, cfg)
+	var err error
+	cfg, err = telegramPanTempTargetWithResolver(provider, cfg)
+	if err != nil {
+		return cfg, err
+	}
 	cfg = telegramPanTempRootWithStorageFallback(provider, cfg)
 	if provider == ShareProviderAliyunDrive {
 		cfg = aliyunDriveConfigWithTempRootFallback(cfg)
 	}
-	return cfg
+	return cfg, nil
 }
 
-func telegramPanTempTargetWithResolver(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
+func telegramPanTempTargetWithResolver(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (model.SubscriptionTelegramPanConfig, error) {
 	cfg = normalizeTelegramPanConfig(cfg)
 	target := cfg.TempTransferTarget
 	if target.Provider == "" && target.Folder != "" {
 		target.Provider = providerTargetNameForShareProvider(provider)
 	}
 	if target.Provider == "" || target.Folder == "" {
-		return cfg
+		return cfg, nil
 	}
 	resolved, err := ResolveProviderTarget(context.Background(), ResolveProviderTargetRequest{
-		Provider: target.Provider,
-		Folder:   target.Folder,
+		Provider:      target.Provider,
+		Folder:        target.Folder,
+		NeedShareSave: true,
 	})
 	if err != nil {
-		return cfg
+		return cfg, fmt.Errorf("resolve %s temp transfer target: %w", provider, err)
 	}
 	cfg.TempTransferRoot = resolved.FullPath
-	return normalizeTelegramPanConfig(cfg)
+	return normalizeTelegramPanConfig(cfg), nil
 }
 
 func telegramPanTempRootWithStorageFallback(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {

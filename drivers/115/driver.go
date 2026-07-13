@@ -19,9 +19,10 @@ import (
 type Pan115 struct {
 	model.Storage
 	Addition
-	client     *driver115.Pan115Client
-	limiter    *rate.Limiter
-	appVerOnce sync.Once
+	client                *driver115.Pan115Client
+	limiter               *rate.Limiter
+	appVerOnce            sync.Once
+	runtimeMembershipTier string
 }
 
 func (d *Pan115) Config() driver.Config {
@@ -37,7 +38,25 @@ func (d *Pan115) Init(ctx context.Context) error {
 	if d.LimitRate > 0 {
 		d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate), 1)
 	}
-	return d.login()
+	if err := d.login(); err != nil {
+		return err
+	}
+	if user, err := d.client.GetUser(); err == nil && user != nil {
+		if user.Vip > 0 {
+			d.runtimeMembershipTier = "vip"
+		} else {
+			d.runtimeMembershipTier = "ordinary"
+		}
+	}
+	return nil
+}
+
+func (d *Pan115) ClusterMembershipTier() string {
+	configured := strings.ToLower(strings.TrimSpace(d.Addition.MembershipTier))
+	if configured != "" && configured != "unknown" {
+		return configured
+	}
+	return d.runtimeMembershipTier
 }
 
 func (d *Pan115) WaitLimit(ctx context.Context) error {

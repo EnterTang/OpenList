@@ -52,10 +52,17 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 	var currentHash string
 	var added, changed, transferred int
 	var runErr error
-	if clusterDispatch {
+	runtimeSub := sub
+	if !clusterDispatch {
+		runtimeSub, runErr = resolveSubscriptionDeliveryTarget(ctx, sub, false)
+	}
+	if runErr != nil {
+		// Keep the normal run finalization path so resolution failures are
+		// persisted and surfaced like discovery or transfer failures.
+	} else if clusterDispatch {
 		items, currentHash, added, changed, transferred, runErr = runClusterBySource(ctx, sub)
 	} else {
-		items, currentHash, added, changed, transferred, runErr = runBySource(ctx, sub, transfer)
+		items, currentHash, added, changed, transferred, runErr = runBySource(ctx, runtimeSub, transfer)
 	}
 	finished := time.Now()
 	run.FinishedAt = &finished
@@ -84,6 +91,38 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 		Run:          run,
 		Items:        items,
 	}, runErr
+}
+
+func resolveSubscriptionDeliveryTarget(ctx context.Context, sub *model.Subscription, ensure bool) (*model.Subscription, error) {
+	return resolveSubscriptionDeliveryTargetForFile(ctx, sub, 0, ensure)
+}
+
+func resolveSubscriptionDeliveryTargetForFile(ctx context.Context, sub *model.Subscription, fileSize int64, ensure bool) (*model.Subscription, error) {
+	if sub == nil {
+		return nil, errors.New("subscription is nil")
+	}
+	runtimeSub := *sub
+	target := NormalizeSubscriptionStorageTarget(sub.DeliveryTarget)
+	if target.Provider == "" {
+		return &runtimeSub, nil
+	}
+	resolved, err := ResolveProviderTarget(ctx, ResolveProviderTargetRequest{
+		Provider:   target.Provider,
+		Folder:     target.Folder,
+		NeedUpload: true,
+		FileSize:   fileSize,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve subscription delivery target: %w", err)
+	}
+	if ensure {
+		resolved, err = EnsureResolvedProviderFolder(ctx, resolved)
+		if err != nil {
+			return nil, err
+		}
+	}
+	runtimeSub.TargetRoot = resolved.FullPath
+	return &runtimeSub, nil
 }
 
 func shouldPersistSubscriptionRun(run *model.SubscriptionRun) bool {
@@ -178,10 +217,13 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, transferred, err
 		}
-		panCfg := telegramPanSourceConfigWithStorageFallback(
+		panCfg, err := telegramPanSourceConfigWithStorageFallback(
 			ShareProviderPan123,
 			normalizeTelegramPanConfig(globalCfg.Telegram.Pan123),
 		)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
 		if strings.TrimSpace(panCfg.TempTransferRoot) == "" {
 			return saved, sub.LastTreeHash, added, changed, transferred, fmt.Errorf("pan123 temp_transfer_root is required for manual imports")
 		}

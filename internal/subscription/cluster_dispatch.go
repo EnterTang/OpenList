@@ -50,6 +50,8 @@ type ClusterMediaTask struct {
 	TMDBYear              int
 	Season                int
 	Episode               int
+	TempTarget            model.SubscriptionStorageTarget
+	DeliveryTarget        model.SubscriptionStorageTarget
 	LogicalMediaRoot      string
 	LogicalTargetPath     string
 	TargetProfile         string
@@ -241,7 +243,10 @@ func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref
 		SourceRelativePath: strings.TrimPrefix(item.FilePath, "/"), SourceSize: item.FileSize,
 		SourceHash: item.FileHash, MediaItemID: mediaItemID, MediaType: sub.MediaType,
 		TMDBID: sub.TMDBID, TMDBName: sub.TMDBName, TMDBYear: sub.TMDBYear,
-		Season: item.Season, Episode: item.Episode, LogicalMediaRoot: sub.TargetRoot,
+		Season: item.Season, Episode: item.Episode,
+		TempTarget:        NormalizeSubscriptionStorageTarget(sub.TempTarget),
+		DeliveryTarget:    NormalizeSubscriptionStorageTarget(sub.DeliveryTarget),
+		LogicalMediaRoot:  sub.TargetRoot,
 		LogicalTargetPath: item.TargetPath,
 		WorkflowVersion:   ClusterWorkflowVersion, SealedManifestVersion: ClusterSealedManifestVersion,
 	}
@@ -274,7 +279,10 @@ func inspectClusterShare(ctx context.Context, sub *model.Subscription, cfg model
 	if !ok {
 		return nil, ref, fmt.Errorf("share provider %s is not configured", ref.Provider)
 	}
-	source.Config = telegramPanSourceConfigWithStorageFallback(ref.Provider, source.Config)
+	source.Config, err = telegramPanSourceConfigWithStorageFallback(ref.Provider, source.Config)
+	if err != nil {
+		return nil, ref, err
+	}
 	provider, err := newShareSaverForProvider(ref.Provider, source.Config)
 	if err != nil {
 		return nil, ref, err

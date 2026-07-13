@@ -78,6 +78,53 @@ func TestClusterDispatchPersistsContextAndTransitionsStatus(t *testing.T) {
 	}
 }
 
+func TestClusterDispatchCarriesSubscriptionProviderTargets(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		ID:              44,
+		Name:            "Provider targets",
+		TransferEnabled: true,
+		TMDBName:        "Example",
+		MediaType:       "tv",
+		TempTarget: model.SubscriptionStorageTarget{
+			Provider: " PAN123 ",
+			Folder:   `转存至移动/./`,
+		},
+		DeliveryTarget: model.SubscriptionStorageTarget{
+			Provider: " YIDONG139 ",
+			Folder:   `港台剧\热播`,
+		},
+	}
+	ref := ShareRef{Provider: ShareProviderPan123, RawURL: "https://www.123pan.com/s/example", ShareID: "example"}
+	item := clusterItemFromShareEntry(sub, ref, TreeEntry{
+		Path: "/Example.S01E01.mkv", Name: "Example.S01E01.mkv", ID: "file-1", Size: 1024,
+	}, clusterSourceMessage{}, time.Now())
+	stored, _, _, err := upsertClusterItems([]*model.SubscriptionItem{item})
+	if err != nil {
+		t.Fatalf("upsert cluster item: %v", err)
+	}
+	if _, err := dispatchClusterItems(context.Background(), sub, stored, ref, clusterSourceMessage{}); err != nil {
+		t.Fatalf("dispatch cluster item: %v", err)
+	}
+	if len(dispatcher.tasks) != 1 {
+		t.Fatalf("tasks = %d, want 1", len(dispatcher.tasks))
+	}
+	task := dispatcher.tasks[0]
+	if task.TempTarget.Provider != "pan123" || task.TempTarget.Folder != "转存至移动" {
+		t.Fatalf("temp target = %#v", task.TempTarget)
+	}
+	if task.DeliveryTarget.Provider != "yidong139" || task.DeliveryTarget.Folder != "港台剧/热播" {
+		t.Fatalf("delivery target = %#v", task.DeliveryTarget)
+	}
+	if task.LogicalMediaRoot != "" {
+		t.Fatalf("logical media root = %q, want no legacy path dependency", task.LogicalMediaRoot)
+	}
+}
+
 func TestClusterItemIsIdempotentAcrossMessagesButRedispatchesChangedObject(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	dispatcher := &recordingClusterDispatcher{}

@@ -41,11 +41,14 @@ func TestChooseDispatchTargetRequiresMatchingDeliveryProvider(t *testing.T) {
 	providerAccounts, err := json.Marshal([]protocol.ProviderAccountInventory{{
 		Provider:          "pan123",
 		MountPath:         "/123-a",
+		Status:            "work",
 		SupportsShareSave: true,
 		SupportsDownload:  true,
+		FreeBytes:         100 << 30,
 	}, {
 		Provider:             "yidong139",
 		MountPath:            "/139-a",
+		Status:               "work",
 		SupportsUpload:       true,
 		SupportsETF:          true,
 		MaxSingleUploadBytes: 500 << 30,
@@ -88,6 +91,8 @@ func TestChooseDispatchTargetRequiresMatchingDeliveryProvider(t *testing.T) {
 	target := runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-4", targetProfile: "mobile-primary"}}, subscription.ClusterMediaTask{
 		ShareProvider:    "pan123",
 		SourceSize:       1 << 30,
+		TempTarget:       model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+		DeliveryTarget:   model.SubscriptionStorageTarget{Provider: "pan115", Folder: "剧集"},
 		LogicalMediaRoot: "/115/剧集",
 	})
 	if target != nil {

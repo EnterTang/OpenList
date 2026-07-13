@@ -32,6 +32,30 @@ func TestNormalizeSubscriptionStorageTargetMigratesLegacyFolderPath(t *testing.T
 	}
 }
 
+func TestValidateSubscriptionStorageTargetRejectsUnsafeFolders(t *testing.T) {
+	for _, folder := range []string{"/absolute", "../escape", "series/../../escape", `..\escape`} {
+		t.Run(folder, func(t *testing.T) {
+			err := ValidateSubscriptionStorageTarget(model.SubscriptionStorageTarget{
+				Provider: "pan123",
+				Folder:   folder,
+			})
+			if err == nil {
+				t.Fatalf("expected folder %q to be rejected", folder)
+			}
+		})
+	}
+}
+
+func TestNormalizeSubscriptionStorageTargetCleansRelativeFolder(t *testing.T) {
+	target := NormalizeSubscriptionStorageTarget(model.SubscriptionStorageTarget{
+		Provider: " PAN123 ",
+		Folder:   ` series\Season 1/./ `,
+	})
+	if target.Provider != "pan123" || target.Folder != "series/Season 1" {
+		t.Fatalf("target = %#v", target)
+	}
+}
+
 func TestNormalizeConfigMigratesDefaultTargetRootToProviderTarget(t *testing.T) {
 	cfg := normalizeConfig(model.SubscriptionConfig{
 		DefaultTargetRoot: "/139_60t/剧集",

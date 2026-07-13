@@ -16,6 +16,7 @@ import (
 )
 
 func TestTrySaveShareLinkToTempCallsProviderWhenConfigured(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "Quark", Status: "work"})
 	oldFactory := newShareSaverForProvider
 	oldSave := saveShareToTemp
 	defer func() {
@@ -43,9 +44,9 @@ func TestTrySaveShareLinkToTempCallsProviderWhenConfigured(t *testing.T) {
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		Quark: model.SubscriptionTelegramPanConfig{
-			Channels:         []string{"@quark"},
-			TempTransferRoot: "/tmp/quark",
-			Cookie:           "cookie",
+			Channels:           []string{"@quark"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "quark"},
+			Cookie:             "cookie",
 		},
 	})
 	sub := &model.Subscription{TMDBName: "Some Show"}
@@ -69,6 +70,7 @@ func TestTrySaveShareLinkToTempCallsProviderWhenConfigured(t *testing.T) {
 }
 
 func TestTrySaveShareLinkToTempSkipsIncompleteConfig(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "Quark", Status: "work"})
 	oldFactory := newShareSaverForProvider
 	defer func() { newShareSaverForProvider = oldFactory }()
 	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
@@ -77,8 +79,8 @@ func TestTrySaveShareLinkToTempSkipsIncompleteConfig(t *testing.T) {
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		Quark: model.SubscriptionTelegramPanConfig{
-			Channels:         []string{"@quark"},
-			TempTransferRoot: "/tmp/quark",
+			Channels:           []string{"@quark"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "quark"},
 		},
 	})
 
@@ -138,6 +140,7 @@ func TestTrySaveShareLinkToTempDerivesAliyunDriveIDFromTempRootStorage(t *testin
 		MountPath: "/ali",
 		Driver:    "AliyundriveOpen",
 		Addition:  `{}`,
+		Status:    "work",
 	})
 	if err != nil {
 		t.Fatalf("create fake aliyun storage: %v", err)
@@ -168,10 +171,10 @@ func TestTrySaveShareLinkToTempDerivesAliyunDriveIDFromTempRootStorage(t *testin
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		AliyunDrive: model.SubscriptionTelegramPanConfig{
-			Channels:         []string{"@aliyun"},
-			TempTransferRoot: "/ali/.tmp-share",
-			AccessToken:      "access-1",
-			DriveID:          "stale-config-drive",
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: ".tmp-share"},
+			AccessToken:        "access-1",
+			DriveID:            "stale-config-drive",
 		},
 	})
 
@@ -191,6 +194,7 @@ func TestTrySaveShareLinkToTempDerivesAliyunDriveIDFromTempRootStorage(t *testin
 }
 
 func TestTrySaveShareLinkToTempAllowsAliyunAccessTokenWithDriveID(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "AliyundriveOpen", Status: "work"})
 	oldFactory := newShareSaverForProvider
 	oldSave := saveShareToTemp
 	defer func() {
@@ -213,10 +217,10 @@ func TestTrySaveShareLinkToTempAllowsAliyunAccessTokenWithDriveID(t *testing.T) 
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		AliyunDrive: model.SubscriptionTelegramPanConfig{
-			Channels:         []string{"@aliyun"},
-			TempTransferRoot: "/tmp/aliyun",
-			AccessToken:      "access-1",
-			DriveID:          "drive-1",
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: "aliyun"},
+			AccessToken:        "access-1",
+			DriveID:            "drive-1",
 		},
 	})
 
@@ -236,6 +240,7 @@ func TestTrySaveShareLinkToTempAllowsAliyunAccessTokenWithDriveID(t *testing.T) 
 }
 
 func TestTrySaveShareLinkToTempAcceptsBareEpisodesForBoundShare(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "AliyundriveOpen", Status: "work"})
 	oldFactory := newShareSaverForProvider
 	oldSave := saveShareToTemp
 	defer func() {
@@ -280,10 +285,10 @@ func TestTrySaveShareLinkToTempAcceptsBareEpisodesForBoundShare(t *testing.T) {
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		AliyunDrive: model.SubscriptionTelegramPanConfig{
-			Channels:         []string{"@aliyun"},
-			TempTransferRoot: "/tmp/aliyun",
-			AccessToken:      "access-1",
-			DriveID:          "drive-1",
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: "aliyun"},
+			AccessToken:        "access-1",
+			DriveID:            "drive-1",
 		},
 	})
 
@@ -310,6 +315,7 @@ func TestTrySaveShareLinkToTempUsesPan123StorageAccessTokenFallback(t *testing.T
 		MountPath: "/123",
 		Driver:    "123Pan",
 		Addition:  `{"AccessToken":" storage-token-123 ","username":"u","password":"p"}`,
+		Status:    "work",
 	}); err != nil {
 		t.Fatalf("create 123 storage: %v", err)
 	}
@@ -371,6 +377,7 @@ func TestPan123ConfigWithStorageFallbackPrefersStorageToken(t *testing.T) {
 }
 
 func TestTrySaveShareLinkToTempHandlesPan123FastLink(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "123Pan", Status: "work"})
 	oldFactory := newShareSaverForProvider
 	oldSave := saveShareToTemp
 	defer func() {
@@ -401,9 +408,9 @@ func TestTrySaveShareLinkToTempHandlesPan123FastLink(t *testing.T) {
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		Pan123: model.SubscriptionTelegramPanConfig{
-			Channels:         []string{"@pan123"},
-			TempTransferRoot: "/tmp/pan123",
-			AccessToken:      "access-123",
+			Channels:           []string{"@pan123"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "pan123"},
+			AccessToken:        "access-123",
 		},
 	})
 
@@ -428,6 +435,7 @@ func TestTrySaveShareLinkToTempUsesAliyunOpenWebRefreshTokenFallback(t *testing.
 		MountPath: "/ali",
 		Driver:    "AliyundriveOpen",
 		Addition:  `{"web_refresh_token":" web-refresh-1 ","drive_type":"resource"}`,
+		Status:    "work",
 	}); err != nil {
 		t.Fatalf("create aliyun open storage: %v", err)
 	}
@@ -452,8 +460,8 @@ func TestTrySaveShareLinkToTempUsesAliyunOpenWebRefreshTokenFallback(t *testing.
 	}
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		AliyunDrive: model.SubscriptionTelegramPanConfig{
-			Channels:         []string{"@aliyun"},
-			TempTransferRoot: "/ali/.tmp-share",
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: ".tmp-share"},
 		},
 	})
 
@@ -472,56 +480,51 @@ func TestTrySaveShareLinkToTempUsesAliyunOpenWebRefreshTokenFallback(t *testing.
 	}
 }
 
-func TestTelegramPanTempRootWithStorageFallbackPrefixesBareProviderRoot(t *testing.T) {
+func TestTelegramPanTempRootWithStorageFallbackRejectsBareProviderRoot(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	if err := db.CreateStorage(&model.Storage{
 		MountPath: "/123",
 		Driver:    "123Pan",
+		Status:    "work",
 	}); err != nil {
 		t.Fatalf("create 123 storage: %v", err)
 	}
 
-	cfg := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+	_, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
 		TempTransferRoot: "转存至移动",
 	})
-	if got, want := cfg.TempTransferRoot, "/123/转存至移动"; got != want {
-		t.Fatalf("temp root = %q, want %q", got, want)
+	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
+		t.Fatalf("error = %v, want manual confirmation", err)
 	}
 
-	cfg = telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+	cfg, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
 		TempTransferRoot: "/123/转存至移动",
 	})
+	if err != nil {
+		t.Fatalf("resolve mounted temp config: %v", err)
+	}
 	if got, want := cfg.TempTransferRoot, "/123/转存至移动"; got != want {
 		t.Fatalf("mounted temp root = %q, want %q", got, want)
 	}
 }
 
 func TestTelegramPanTempRootWithStorageFallbackSkipsAmbiguousProviderStorage(t *testing.T) {
-	setupSubscriptionRuntimeDB(t)
-	for _, mountPath := range []string{"/123-a", "/123-b"} {
-		if err := db.CreateStorage(&model.Storage{
-			MountPath: mountPath,
-			Driver:    "123Pan",
-		}); err != nil {
-			t.Fatalf("create 123 storage %s: %v", mountPath, err)
-		}
-	}
-
-	cfg := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+	_, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
 		TempTransferRoot: "转存至移动",
 	})
-	if got, want := cfg.TempTransferRoot, "/转存至移动"; got != want {
-		t.Fatalf("ambiguous temp root = %q, want %q", got, want)
+	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
+		t.Fatalf("error = %v, want manual confirmation", err)
 	}
 }
 
 func TestRunManualShareProviderSavesTempRoot(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "Quark", Status: "work"})
 	if _, err := SaveConfig(model.SubscriptionConfig{
 		Telegram: model.SubscriptionTelegramSourceConfig{
 			Quark: model.SubscriptionTelegramPanConfig{
-				TempTransferRoot: "/tmp/quark",
-				Cookie:           "cookie",
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "quark"},
+				Cookie:             "cookie",
 			},
 		},
 	}); err != nil {
@@ -596,11 +599,12 @@ func TestRunManualShareProviderSavesTempRoot(t *testing.T) {
 
 func TestRunManualImportsTextSavesMatchingPan123Files(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "123Pan", Status: "work"})
 	if _, err := SaveConfig(model.SubscriptionConfig{
 		Telegram: model.SubscriptionTelegramSourceConfig{
 			Pan123: model.SubscriptionTelegramPanConfig{
-				TempTransferRoot: "/tmp/pan123",
-				AccessToken:      "token-1",
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "pan123"},
+				AccessToken:        "token-1",
 			},
 		},
 	}); err != nil {
@@ -707,5 +711,17 @@ func setupSubscriptionRuntimeDB(t *testing.T) {
 		if err == nil {
 			_ = sqlDB.Close()
 		}
+	})
+}
+
+func stubProviderTargetStorage(t *testing.T, storage model.Storage) {
+	t.Helper()
+	oldList := listProviderTargetStorages
+	oldFree := storageFreeBytesForMountPath
+	listProviderTargetStorages = func() ([]model.Storage, error) { return []model.Storage{storage}, nil }
+	storageFreeBytesForMountPath = func(context.Context, string) (int64, bool) { return 1 << 40, true }
+	t.Cleanup(func() {
+		listProviderTargetStorages = oldList
+		storageFreeBytesForMountPath = oldFree
 	})
 }

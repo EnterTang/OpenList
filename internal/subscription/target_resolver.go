@@ -2,95 +2,330 @@ package subscription
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	stdpath "path"
 	"sort"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
 
 var (
-	listProviderTargetStorages   = db.GetEnabledStorages
-	storageFreeBytesForMountPath = defaultStorageFreeBytesForMountPath
+	listProviderTargetStorages    = db.GetEnabledStorages
+	storageFreeBytesForMountPath  = defaultStorageFreeBytesForMountPath
+	storageActiveJobsForMountPath = func(string) int { return 0 }
+	ensureProviderTargetFolder    = fs.MakeDir
+	observeResolvedProviderTarget func(ResolveProviderTargetRequest, ResolvedProviderTarget)
 )
 
 type ResolveProviderTargetRequest struct {
-	Provider string
-	Folder   string
-	FileSize int64
+	Provider      string
+	Folder        string
+	NeedUpload    bool
+	NeedShareSave bool
+	FileSize      int64
+}
+
+// ProviderAccountCandidate is the mode-independent account capability input
+// used by standalone, hybrid, and worker target resolution.
+type ProviderAccountCandidate struct {
+	Provider             string
+	StorageID            uint
+	MountPath            string
+	AccountAlias         string
+	Status               string
+	Disabled             bool
+	MembershipTier       string
+	MembershipWeight     int
+	MaxSingleUploadBytes int64
+	SupportsUpload       bool
+	SupportsDownload     bool
+	SupportsShareSave    bool
+	SupportsETF          bool
+	FreeBytes            int64
+	HasFreeBytes         bool
+	ActiveJobs           int
 }
 
 type ResolvedProviderTarget struct {
-	Provider  string
-	StorageID uint
-	MountPath string
-	Folder    string
-	FullPath  string
-	FreeBytes int64
+	Provider             string
+	StorageID            uint
+	MountPath            string
+	Folder               string
+	FullPath             string
+	AccountAlias         string
+	MembershipTier       string
+	MembershipWeight     int
+	MaxSingleUploadBytes int64
+	FreeBytes            int64
+	ActiveJobs           int
 }
 
 func ResolveProviderTarget(ctx context.Context, req ResolveProviderTargetRequest) (ResolvedProviderTarget, error) {
-	target := NormalizeSubscriptionStorageTarget(model.SubscriptionStorageTarget{
-		Provider: req.Provider,
-		Folder:   req.Folder,
-	})
+	target := model.SubscriptionStorageTarget{Provider: req.Provider, Folder: req.Folder}
+	if err := ValidateSubscriptionStorageTarget(target); err != nil {
+		return ResolvedProviderTarget{}, err
+	}
+	target = NormalizeSubscriptionStorageTarget(target)
+	req.Provider = target.Provider
+	req.Folder = target.Folder
+
+	storages, err := listProviderTargetStorages()
+	if err != nil {
+		return ResolvedProviderTarget{}, fmt.Errorf("list provider target storages: %w", err)
+	}
+	candidates := make([]ProviderAccountCandidate, 0, len(storages))
+	for _, storage := range storages {
+		candidate := providerAccountCandidateFromStorage(ctx, storage)
+		if candidate.Provider == req.Provider {
+			candidates = append(candidates, candidate)
+		}
+	}
+	resolved, err := ResolveProviderTargetFromCandidates(ctx, req, candidates)
+	if err == nil && observeResolvedProviderTarget != nil {
+		observeResolvedProviderTarget(req, resolved)
+	}
+	return resolved, err
+}
+
+func ResolveProviderTargetFromCandidates(_ context.Context, req ResolveProviderTargetRequest, candidates []ProviderAccountCandidate) (ResolvedProviderTarget, error) {
+	target := model.SubscriptionStorageTarget{Provider: req.Provider, Folder: req.Folder}
+	if err := ValidateSubscriptionStorageTarget(target); err != nil {
+		return ResolvedProviderTarget{}, err
+	}
+	target = NormalizeSubscriptionStorageTarget(target)
 	if target.Provider == "" {
 		return ResolvedProviderTarget{}, fmt.Errorf("provider target provider is required")
 	}
-	storages, err := listProviderTargetStorages()
-	if err != nil {
-		return ResolvedProviderTarget{}, err
-	}
-	type candidate struct {
-		storage   model.Storage
-		freeBytes int64
-		hasFree   bool
-	}
-	candidates := make([]candidate, 0, len(storages))
-	for _, storage := range storages {
-		if storageProviderName(storage.Driver) != target.Provider {
+
+	eligible := make([]ProviderAccountCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate.Provider = strings.ToLower(strings.TrimSpace(candidate.Provider))
+		candidate.MountPath = cleanConfigPath(candidate.MountPath)
+		if candidate.Provider != target.Provider || candidate.MountPath == "" {
 			continue
 		}
-		freeBytes, hasFree := storageFreeBytesForMountPath(ctx, storage.MountPath)
-		if req.FileSize > 0 && hasFree && freeBytes < req.FileSize {
+		if candidate.Disabled || !strings.EqualFold(strings.TrimSpace(candidate.Status), op.WORK) {
 			continue
 		}
-		candidates = append(candidates, candidate{storage: storage, freeBytes: freeBytes, hasFree: hasFree})
+		if req.NeedUpload && !candidate.SupportsUpload {
+			continue
+		}
+		if req.NeedUpload && target.Provider == "yidong139" && candidate.MaxSingleUploadBytes <= 0 {
+			continue
+		}
+		if req.NeedShareSave && (!candidate.SupportsShareSave || !candidate.SupportsDownload) {
+			continue
+		}
+		if req.FileSize > 0 && candidate.HasFreeBytes && candidate.FreeBytes < req.FileSize {
+			continue
+		}
+		if req.NeedUpload && req.FileSize > 0 && candidate.MaxSingleUploadBytes > 0 && req.FileSize > candidate.MaxSingleUploadBytes {
+			continue
+		}
+		eligible = append(eligible, candidate)
 	}
-	if len(candidates) == 0 {
-		return ResolvedProviderTarget{}, fmt.Errorf("no enabled storage for provider %s", target.Provider)
+	if len(eligible) == 0 {
+		return ResolvedProviderTarget{}, fmt.Errorf("no compatible provider account for %s", target.Provider)
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].hasFree != candidates[j].hasFree {
-			return candidates[i].hasFree
+
+	sort.SliceStable(eligible, func(i, j int) bool {
+		left, right := eligible[i], eligible[j]
+		if left.MembershipWeight != right.MembershipWeight {
+			return left.MembershipWeight > right.MembershipWeight
 		}
-		if candidates[i].freeBytes != candidates[j].freeBytes {
-			return candidates[i].freeBytes > candidates[j].freeBytes
+		if left.HasFreeBytes != right.HasFreeBytes {
+			return left.HasFreeBytes
 		}
-		left := cleanConfigPath(candidates[i].storage.MountPath)
-		right := cleanConfigPath(candidates[j].storage.MountPath)
-		if left != right {
-			return left < right
+		if left.FreeBytes != right.FreeBytes {
+			return left.FreeBytes > right.FreeBytes
 		}
-		return candidates[i].storage.ID < candidates[j].storage.ID
+		if left.ActiveJobs != right.ActiveJobs {
+			return left.ActiveJobs < right.ActiveJobs
+		}
+		if left.MountPath != right.MountPath {
+			return left.MountPath < right.MountPath
+		}
+		return left.StorageID < right.StorageID
 	})
-	selected := candidates[0]
-	mountPath := cleanConfigPath(selected.storage.MountPath)
-	fullPath := mountPath
+
+	selected := eligible[0]
+	fullPath := selected.MountPath
 	if target.Folder != "" {
-		fullPath = cleanConfigPath(stdpath.Join(mountPath, target.Folder))
+		fullPath = cleanConfigPath(stdpath.Join(selected.MountPath, target.Folder))
 	}
 	return ResolvedProviderTarget{
-		Provider:  target.Provider,
-		StorageID: selected.storage.ID,
-		MountPath: mountPath,
-		Folder:    target.Folder,
-		FullPath:  fullPath,
-		FreeBytes: selected.freeBytes,
+		Provider:             target.Provider,
+		StorageID:            selected.StorageID,
+		MountPath:            selected.MountPath,
+		Folder:               target.Folder,
+		FullPath:             fullPath,
+		AccountAlias:         selected.AccountAlias,
+		MembershipTier:       selected.MembershipTier,
+		MembershipWeight:     selected.MembershipWeight,
+		MaxSingleUploadBytes: selected.MaxSingleUploadBytes,
+		FreeBytes:            selected.FreeBytes,
+		ActiveJobs:           selected.ActiveJobs,
 	}, nil
+}
+
+func EnsureResolvedProviderFolder(ctx context.Context, target ResolvedProviderTarget) (ResolvedProviderTarget, error) {
+	if strings.TrimSpace(target.FullPath) == "" {
+		return ResolvedProviderTarget{}, fmt.Errorf("resolved provider target path is required")
+	}
+	if err := ensureProviderTargetFolder(ctx, target.FullPath); err != nil {
+		return ResolvedProviderTarget{}, fmt.Errorf("ensure provider target folder %s: %w", target.FullPath, err)
+	}
+	return target, nil
+}
+
+func providerAccountCandidateFromStorage(ctx context.Context, storage model.Storage) ProviderAccountCandidate {
+	provider := storageProviderName(storage.Driver)
+	freeBytes, hasFree := storageFreeBytesForMountPath(ctx, storage.MountPath)
+	tier, weight, maxUpload := providerAccountMetadata(storage.Addition)
+	if weight == 0 {
+		weight = membershipWeight(tier)
+	}
+	if provider == "yidong139" && maxUpload == 0 {
+		maxUpload = mobile139MaxSingleUploadBytes(tier)
+	}
+	supportsUpload := !storage.Disabled
+	if driver, err := op.GetStorageByMountPath(storage.MountPath); err == nil {
+		supportsUpload = supportsUpload && !driver.Config().NoUpload
+	}
+	return ProviderAccountCandidate{
+		Provider:             provider,
+		StorageID:            storage.ID,
+		MountPath:            storage.MountPath,
+		AccountAlias:         strings.TrimSpace(storage.Remark),
+		Status:               strings.TrimSpace(storage.Status),
+		Disabled:             storage.Disabled,
+		MembershipTier:       normalizeMembershipTier(tier),
+		MembershipWeight:     weight,
+		MaxSingleUploadBytes: maxUpload,
+		SupportsUpload:       supportsUpload,
+		SupportsDownload:     providerSupportsDownload(provider, storage.Driver),
+		SupportsShareSave:    providerSupportsShareSave(provider),
+		SupportsETF:          provider == "yidong139",
+		FreeBytes:            freeBytes,
+		HasFreeBytes:         hasFree,
+		ActiveJobs:           storageActiveJobsForMountPath(storage.MountPath),
+	}
+}
+
+func providerAccountMetadata(addition string) (tier string, weight int, maxUpload int64) {
+	var values map[string]any
+	if strings.TrimSpace(addition) == "" || json.Unmarshal([]byte(addition), &values) != nil {
+		return "", 0, 0
+	}
+	tier = firstMetadataString(values, "membership_tier", "membershipTier", "member_tier", "vip_level", "vipLevel")
+	weight = int(firstMetadataNumber(values, "membership_weight", "membershipWeight"))
+	maxUpload = int64(firstMetadataNumber(values, "max_single_upload_bytes", "maxSingleUploadBytes"))
+	return tier, weight, maxUpload
+}
+
+func firstMetadataString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func firstMetadataNumber(values map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value, ok := values[key].(float64); ok {
+			return value
+		}
+	}
+	return 0
+}
+
+func normalizeMembershipTier(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "diamond", "钻石":
+		return "diamond"
+	case "gold", "黄金":
+		return "gold"
+	case "silver", "白银":
+		return "silver"
+	case "ordinary", "normal", "普通":
+		return "ordinary"
+	case "vip", "member", "会员":
+		return "vip"
+	case "svip", "super_vip", "supervip", "超级会员":
+		return "svip"
+	case "unknown", "未知", "":
+		return "unknown"
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func membershipWeight(tier string) int {
+	switch normalizeMembershipTier(tier) {
+	case "diamond":
+		return 400
+	case "gold":
+		return 300
+	case "silver":
+		return 200
+	case "ordinary":
+		return 100
+	case "vip":
+		return 200
+	case "svip":
+		return 300
+	default:
+		return 0
+	}
+}
+
+func mobile139MaxSingleUploadBytes(tier string) int64 {
+	switch normalizeMembershipTier(tier) {
+	case "diamond":
+		return 500 << 30
+	case "gold":
+		return 20 << 30
+	case "silver":
+		return 8 << 30
+	case "ordinary":
+		return 5 << 30
+	default:
+		return 0
+	}
+}
+
+func providerSupportsShareSave(provider string) bool {
+	switch provider {
+	case "quark", "aliyun_drive", "pan123", "pan115":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerSupportsDownload(provider, driverName string) bool {
+	driverName = strings.ToLower(strings.TrimSpace(driverName))
+	switch provider {
+	case "pan123":
+		return driverName == "123pan" || driverName == "123 open"
+	case "pan115":
+		return driverName == "115 cloud" || driverName == "115 open"
+	case "aliyun_drive":
+		return driverName == "aliyundrive" || driverName == "aliyundriveopen"
+	case "quark":
+		return driverName == "quark" || driverName == "quarkopen" || driverName == "quarktv"
+	case "yidong139":
+		return driverName == "139yun" || driverName == "139 cloud" || driverName == "139"
+	default:
+		return false
+	}
 }
 
 func defaultStorageFreeBytesForMountPath(ctx context.Context, mountPath string) (int64, bool) {

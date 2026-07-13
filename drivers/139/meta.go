@@ -7,12 +7,13 @@ import (
 
 type Addition struct {
 	//Account       string `json:"account" required:"true"`
-	AuthMode      string `json:"auth_mode" type:"select" options:"etf,openlist" default:"etf" label:"授权模式" help:"ETF 认证模式只需填写 Cookie Header；OpenList 默认模式沿用 Authorization/用户名/密码/邮箱 Cookie。"`
-	CookieHeader  string `json:"cookie_header" type:"text" required:"true" visible_when:"auth_mode=etf" label:"Cookie Header" help:"从 yun.139.com 网页端复制完整 Cookie。ETF 认证模式会从其中提取 auth_token、authorization、账号和 ud_id，并自动续期。"`
-	Authorization string `json:"authorization" type:"text" required:"true" visible_when:"auth_mode=openlist" label:"授权"`
-	Username      string `json:"username" required:"true" visible_when:"auth_mode=openlist" label:"用户名"`
-	Password      string `json:"password" required:"true" secret:"true" visible_when:"auth_mode=openlist" label:"密码"`
-	MailCookies   string `json:"mail_cookies" required:"true" type:"text" visible_when:"auth_mode=openlist" label:"邮箱 Cookie" help:"mail.139.com 的 Cookie，用于密码登录换取移动云盘授权。"`
+	AuthMode       string `json:"auth_mode" type:"select" options:"etf,openlist" default:"etf" label:"授权模式" help:"ETF 认证模式只需填写 Cookie Header；OpenList 默认模式沿用 Authorization/用户名/密码/邮箱 Cookie。"`
+	CookieHeader   string `json:"cookie_header" type:"text" required:"true" visible_when:"auth_mode=etf" label:"Cookie Header" help:"从 yun.139.com 网页端复制完整 Cookie。ETF 认证模式会从其中提取 auth_token、authorization、账号和 ud_id，并自动续期。"`
+	Authorization  string `json:"authorization" type:"text" required:"true" visible_when:"auth_mode=openlist" label:"授权"`
+	Username       string `json:"username" required:"true" visible_when:"auth_mode=openlist" label:"用户名"`
+	Password       string `json:"password" required:"true" secret:"true" visible_when:"auth_mode=openlist" label:"密码"`
+	MailCookies    string `json:"mail_cookies" required:"true" type:"text" visible_when:"auth_mode=openlist" label:"邮箱 Cookie" help:"mail.139.com 的 Cookie，用于密码登录换取移动云盘授权。"`
+	MembershipTier string `json:"membership_tier" type:"select" options:"unknown,ordinary,silver,gold,diamond" default:"unknown" label:"会员等级" help:"用于集群能力调度；未知等级禁止集群上传，普通/白银/黄金/钻石分别限制单文件上传为 5/8/20/500 GiB。"`
 	driver.RootID
 	Type                                         string `json:"type" type:"select" options:"personal_new,family,group,personal" default:"personal_new" label:"类型"`
 	CloudID                                      string `json:"cloud_id" label:"Cloud ID"`

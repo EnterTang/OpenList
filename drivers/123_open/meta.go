@@ -14,7 +14,8 @@ type Addition struct {
 	AccessToken string `json:"AccessToken" required:"false"`
 
 	//  refresh_token方式的AccessToken  【对个人开发者暂未开放】
-	RefreshToken string `json:"RefreshToken" required:"false"`
+	RefreshToken   string `json:"RefreshToken" required:"false"`
+	MembershipTier string `json:"membership_tier" type:"select" options:"unknown,ordinary,vip,svip" default:"unknown" label:"会员等级" help:"用于多账号集群调度权重；无法确认时保留 unknown。"`
 
 	// 使用在线API
 	UseOnlineAPI bool   `json:"use_online_api" default:"true"`

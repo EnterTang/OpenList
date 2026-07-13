@@ -27,9 +27,10 @@ import (
 )
 
 var (
-	telegramANSIEscapePattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	telegramCloudLinkPattern  = regexp.MustCompile(`https?://[^\s'"<>，,;\]）]+`)
-	telegramAccessCodePattern = regexp.MustCompile(`(?i)(?:访问码|提取码|密码|access(?:\s*code)?|pwd|pass(?:word)?|passcode)[？?:：\s]*([A-Za-z0-9]{4,8})`)
+	telegramANSIEscapePattern     = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	telegramCloudLinkPattern      = regexp.MustCompile(`https?://[^\s'"<>，,;\]）]+`)
+	telegramAccessCodePattern     = regexp.MustCompile(`(?i)(?:访问码|提取码|密码|access(?:\s*code)?|pwd|pass(?:word)?|passcode)[？?:：\s]*([A-Za-z0-9]{4,8})`)
+	applySubscriptionItemTransfer = applyItemTransfer
 )
 
 type telegramCommandEnvelope struct {
@@ -424,8 +425,13 @@ func applyTelegramTempTransferCandidates(ctx context.Context, sub *model.Subscri
 			}
 		}
 		if transfer && sub.TransferEnabled && stored.SourcePath != "" && stored.TargetPath != "" && stored.Status == model.SubscriptionItemStatusPending {
+			runtimeSub, resolveErr := resolveSubscriptionDeliveryTargetForFile(ctx, sub, stored.FileSize, true)
+			if resolveErr != nil {
+				return saved, resultHash, added, changed, transferred, resolveErr
+			}
+			stored = syncSubscriptionItemPaths(stored, runtimeSub, candidate.Entry, seenAt)
 			var delta int
-			stored, delta, err = applyItemTransfer(ctx, stored, candidate.Source.Config.DeleteSourceAfter)
+			stored, delta, err = applySubscriptionItemTransfer(ctx, stored, candidate.Source.Config.DeleteSourceAfter)
 			if err != nil {
 				return saved, resultHash, added, changed, transferred, err
 			}

@@ -28,7 +28,10 @@ func SaveClusterShareSelection(ctx context.Context, rawURL, passcode, tempRoot s
 	if !ok {
 		return nil, errors.New("share provider is not configured on this worker")
 	}
-	source.Config = telegramPanSourceConfigWithStorageFallback(ref.Provider, source.Config)
+	source.Config, err = telegramPanSourceConfigWithStorageFallback(ref.Provider, source.Config)
+	if err != nil {
+		return nil, err
+	}
 	resolvedTempRoot, err := resolveClusterShareTempRoot(source.Config.TempTransferRoot, tempRoot)
 	if err != nil {
 		return nil, err

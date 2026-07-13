@@ -20,30 +20,32 @@ const (
 )
 
 type Subscription struct {
-	ID                       uint       `json:"id" gorm:"primarykey"`
-	CreatedAt                time.Time  `json:"created_at"`
-	UpdatedAt                time.Time  `json:"updated_at"`
-	Name                     string     `json:"name" gorm:"index"`
-	SourceType               string     `json:"source_type" gorm:"index"`
-	SourceConfig             string     `json:"source_config" gorm:"type:text"`
-	Active                   bool       `json:"active" gorm:"index"`
-	CheckIntervalMinutes     int        `json:"check_interval_minutes"`
-	TargetRoot               string     `json:"target_root"`
-	TransferEnabled          bool       `json:"transfer_enabled"`
-	TMDBID                   int64      `json:"tmdb_id" gorm:"index"`
-	TMDBName                 string     `json:"tmdb_name"`
-	TMDBYear                 int        `json:"tmdb_year"`
-	MediaType                string     `json:"media_type" gorm:"index"`
-	Category                 string     `json:"category"`
-	Season                   int        `json:"season"`
-	Seasons                  []int      `json:"seasons" gorm:"serializer:json"`
-	LatestSeasonEpisodeStart int        `json:"latest_season_episode_start"`
-	LatestSeasonEpisodeEnd   int        `json:"latest_season_episode_end"`
-	LastCheckedAt            *time.Time `json:"last_checked_at"`
-	LastCursor               string     `json:"last_cursor"`
-	LastTreeHash             string     `json:"last_tree_hash"`
-	LastStatus               string     `json:"last_status" gorm:"index"`
-	LastError                string     `json:"last_error" gorm:"type:text"`
+	ID                       uint                      `json:"id" gorm:"primarykey"`
+	CreatedAt                time.Time                 `json:"created_at"`
+	UpdatedAt                time.Time                 `json:"updated_at"`
+	Name                     string                    `json:"name" gorm:"index"`
+	SourceType               string                    `json:"source_type" gorm:"index"`
+	SourceConfig             string                    `json:"source_config" gorm:"type:text"`
+	Active                   bool                      `json:"active" gorm:"index"`
+	CheckIntervalMinutes     int                       `json:"check_interval_minutes"`
+	TargetRoot               string                    `json:"target_root,omitempty"`
+	TempTarget               SubscriptionStorageTarget `json:"temp_target,omitempty" gorm:"serializer:json"`
+	DeliveryTarget           SubscriptionStorageTarget `json:"delivery_target,omitempty" gorm:"serializer:json"`
+	TransferEnabled          bool                      `json:"transfer_enabled"`
+	TMDBID                   int64                     `json:"tmdb_id" gorm:"index"`
+	TMDBName                 string                    `json:"tmdb_name"`
+	TMDBYear                 int                       `json:"tmdb_year"`
+	MediaType                string                    `json:"media_type" gorm:"index"`
+	Category                 string                    `json:"category"`
+	Season                   int                       `json:"season"`
+	Seasons                  []int                     `json:"seasons" gorm:"serializer:json"`
+	LatestSeasonEpisodeStart int                       `json:"latest_season_episode_start"`
+	LatestSeasonEpisodeEnd   int                       `json:"latest_season_episode_end"`
+	LastCheckedAt            *time.Time                `json:"last_checked_at"`
+	LastCursor               string                    `json:"last_cursor"`
+	LastTreeHash             string                    `json:"last_tree_hash"`
+	LastStatus               string                    `json:"last_status" gorm:"index"`
+	LastError                string                    `json:"last_error" gorm:"type:text"`
 }
 
 type SubscriptionItem struct {

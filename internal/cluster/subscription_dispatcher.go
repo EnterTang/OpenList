@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 
@@ -24,9 +25,10 @@ const (
 )
 
 type dispatchTarget struct {
-	nodeID        string
-	targetProfile string
-	assignedBytes int64
+	nodeID             string
+	targetProfile      string
+	pendingAssignments int
+	match              nodeProviderAccountMatch
 }
 
 func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context, task subscription.ClusterInspectTask) (string, error) {
@@ -80,10 +82,6 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	if d.runtime == nil || len(tasks) == 0 {
 		return nil, errors.New("cluster subscription dispatcher is unavailable")
 	}
-	config, err := subscription.GetConfig()
-	if err != nil {
-		return nil, err
-	}
 	targets, err := d.runtime.subscriptionDispatchTargets(ctx)
 	if err != nil {
 		return nil, err
@@ -98,7 +96,9 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			results[i].Error = errors.New("no connected cluster worker has a compatible writable ETF target")
 			continue
 		}
-		target.assignedBytes += max64(task.SourceSize, 0)
+		target.pendingAssignments++
+		taskContext := subscriptionMediaTaskContext(task, target.targetProfile)
+		bindTaskContextProviderAccounts(&taskContext, target.match)
 		requests = append(requests, DispatchMediaJobRequest{
 			NodeID:         target.nodeID,
 			IdempotencyKey: task.IdempotencyKey,
@@ -106,7 +106,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			RequiredCapabilities: []string{
 				"share.save", "mobile.upload", "result.report",
 			},
-			TaskContext: subscriptionMediaTaskContext(config, task, target.targetProfile),
+			TaskContext: taskContext,
 		})
 		requestTaskIndexes = append(requestTaskIndexes, i)
 	}
@@ -139,27 +139,23 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	return results, dispatchErr
 }
 
-func subscriptionMediaTaskContext(cfg model.SubscriptionConfig, task subscription.ClusterMediaTask, targetProfile string) protocol.TaskContext {
+func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProfile string) protocol.TaskContext {
+	tempTarget := subscription.NormalizeSubscriptionStorageTarget(task.TempTarget)
 	staging := protocol.ProviderTargetRequirement{
-		Provider:      strings.TrimSpace(task.ShareProvider),
+		Provider:      tempTarget.Provider,
+		Folder:        tempTarget.Folder,
 		NeedShareSave: true,
 		RequiredBytes: max64(task.SourceSize, 0),
 	}
-	source, ok := subscriptionTelegramPanConfigForProvider(cfg.Telegram, task.ShareProvider)
-	if ok {
-		stagingTarget := source.TempTransferTarget
-		if stagingTarget.Provider != "" {
-			staging.Provider = stagingTarget.Provider
-		}
-		staging.Folder = stagingTarget.Folder
+	if staging.Provider == "" {
+		staging.Provider = strings.TrimSpace(task.ShareProvider)
 	}
+	deliveryTarget := subscription.NormalizeSubscriptionStorageTarget(task.DeliveryTarget)
 	delivery := protocol.ProviderTargetRequirement{
+		Provider:      deliveryTarget.Provider,
+		Folder:        deliveryTarget.Folder,
 		NeedUpload:    true,
 		RequiredBytes: max64(task.SourceSize, 0),
-	}
-	if migrated, ok := subscription.MigrateLegacyPathTarget(task.LogicalMediaRoot); ok {
-		delivery.Provider = migrated.Provider
-		delivery.Folder = migrated.Folder
 	}
 	return protocol.TaskContext{
 		MediaItemID: task.MediaItemID, WorkflowVersion: task.WorkflowVersion,
@@ -183,29 +179,12 @@ func subscriptionMediaTaskContext(cfg model.SubscriptionConfig, task subscriptio
 	}
 }
 
-func subscriptionTelegramPanConfigForProvider(cfg model.SubscriptionTelegramSourceConfig, provider string) (model.SubscriptionTelegramPanConfig, bool) {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "quark":
-		return cfg.Quark, true
-	case "aliyun_drive", "aliyundrive", "aliyun":
-		return cfg.AliyunDrive, true
-	case "pan123", "123":
-		return cfg.Pan123, true
-	case "pan115", "115":
-		return cfg.Pan115, true
-	default:
-		return model.SubscriptionTelegramPanConfig{}, false
-	}
-}
-
 func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchTarget, error) {
-	r.mu.RLock()
-	hub := r.hub
-	r.mu.RUnlock()
-	if hub == nil {
+	dispatchTransport := r.mediaDispatchTransport()
+	if dispatchTransport == nil {
 		return nil, errors.New("cluster coordinator is disabled")
 	}
-	connected := hub.ConnectedNodes()
+	connected := dispatchTransport.ConnectedNodes()
 	if len(connected) == 0 {
 		return nil, errors.New("no cluster worker is connected")
 	}
@@ -217,13 +196,45 @@ func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchT
 	for i := range nodes {
 		allowed[nodes[i].ID] = struct{}{}
 	}
+	var inventories []model.ClusterNodeInventory
+	if err := db.GetDb().WithContext(ctx).Where("node_id IN ?", connected).Order("node_id ASC, revision DESC").Find(&inventories).Error; err != nil {
+		return nil, err
+	}
+	latest := make(map[string]model.ClusterNodeInventory, len(inventories))
+	for _, inventory := range inventories {
+		if _, exists := latest[inventory.NodeID]; !exists {
+			latest[inventory.NodeID] = inventory
+		}
+	}
+	targets := make([]*dispatchTarget, 0, len(connected))
+	for nodeID, inventory := range latest {
+		if _, ok := allowed[nodeID]; !ok {
+			continue
+		}
+		var accounts []protocol.ProviderAccountInventory
+		if json.Unmarshal([]byte(inventory.ProviderAccountsJSON), &accounts) != nil {
+			continue
+		}
+		for _, account := range accounts {
+			if !providerAccountHealthy(account) || !account.SupportsUpload || !account.SupportsETF {
+				continue
+			}
+			targets = append(targets, &dispatchTarget{nodeID: nodeID, targetProfile: path.Clean(account.MountPath)})
+		}
+	}
+	if len(targets) > 0 {
+		return targets, nil
+	}
+	// Compatibility fallback for workers that have not yet reported provider
+	// account inventories. New workers are scheduled directly from the
+	// capability pool above, not from user-visible mount-path configuration.
 	var desiredConfigs []model.ClusterNodeDesiredConfig
 	if err := db.GetDb().WithContext(ctx).
 		Where("node_id IN ? AND status = ? AND observed_revision >= revision", connected, model.ClusterDesiredStatusApplied).
 		Find(&desiredConfigs).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
-	targets := make([]*dispatchTarget, 0, len(desiredConfigs))
+	targets = make([]*dispatchTarget, 0, len(desiredConfigs))
 	for i := range desiredConfigs {
 		state := &desiredConfigs[i]
 		if _, ok := allowed[state.NodeID]; !ok {
@@ -246,29 +257,51 @@ func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchT
 func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchTarget, task subscription.ClusterMediaTask) *dispatchTarget {
 	eligible := make([]*dispatchTarget, 0, len(targets))
 	for _, target := range targets {
-		context := protocol.TaskContext{
-			Share:         protocol.ShareTaskContext{Provider: task.ShareProvider},
-			TargetProfile: target.targetProfile,
-			DeliveryTarget: protocol.ProviderTargetRequirement{
-				Provider: subscriptionMediaTaskContext(model.SubscriptionConfig{}, task, target.targetProfile).DeliveryTarget.Provider,
-			},
-		}
-		ok, err := nodeInventorySupports(ctx, target.nodeID, context, []string{"share.save", "mobile.upload", "result.report"}, task.SourceSize+target.assignedBytes)
+		taskContext := subscriptionMediaTaskContext(task, target.targetProfile)
+		match, ok, err := nodeInventoryProviderMatch(ctx, target.nodeID, taskContext, []string{"share.save", "mobile.upload", "result.report"}, task.SourceSize)
 		if err != nil || !ok {
 			continue
 		}
+		match.ActiveJobs += target.pendingAssignments
+		match.NodeActiveJobs += int64(target.pendingAssignments)
+		target.match = match
 		eligible = append(eligible, target)
 	}
 	if len(eligible) == 0 {
 		return nil
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
-		if eligible[i].assignedBytes == eligible[j].assignedBytes {
+		left, right := eligible[i].match, eligible[j].match
+		if left.MembershipWeight != right.MembershipWeight {
+			return left.MembershipWeight > right.MembershipWeight
+		}
+		if left.FreeBytes != right.FreeBytes {
+			return left.FreeBytes > right.FreeBytes
+		}
+		if left.ActiveJobs != right.ActiveJobs {
+			return left.ActiveJobs < right.ActiveJobs
+		}
+		if left.NodeActiveJobs != right.NodeActiveJobs {
+			return left.NodeActiveJobs < right.NodeActiveJobs
+		}
+		if eligible[i].nodeID != eligible[j].nodeID {
 			return eligible[i].nodeID < eligible[j].nodeID
 		}
-		return eligible[i].assignedBytes < eligible[j].assignedBytes
+		return eligible[i].targetProfile < eligible[j].targetProfile
 	})
 	return eligible[0]
+}
+
+func bindTaskContextProviderAccounts(taskContext *protocol.TaskContext, match nodeProviderAccountMatch) {
+	if taskContext == nil {
+		return
+	}
+	taskContext.StagingTarget.StorageID = match.Staging.StorageID
+	taskContext.StagingTarget.NodeMountID = match.Staging.NodeMountID
+	taskContext.StagingTarget.AccountFingerprint = match.Staging.AccountFingerprint
+	taskContext.DeliveryTarget.StorageID = match.Delivery.StorageID
+	taskContext.DeliveryTarget.NodeMountID = match.Delivery.NodeMountID
+	taskContext.DeliveryTarget.AccountFingerprint = match.Delivery.AccountFingerprint
 }
 
 func subscriptionBatchID(tasks []subscription.ClusterMediaTask) string {

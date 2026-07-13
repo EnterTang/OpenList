@@ -138,6 +138,21 @@ func (s *Service) DecorateInventory(report *protocol.InventoryReport) {
 		return
 	}
 	report.KeyAgreement, report.ObservedRevision = s.ControlIdentity()
+	s.mu.Lock()
+	activeMounts := make([][2]string, 0, len(s.active))
+	for _, task := range s.active {
+		activeMounts = append(activeMounts, [2]string{task.stagingMount, task.deliveryMount})
+	}
+	s.mu.Unlock()
+	for i := range report.ProviderAccounts {
+		mountPath := path.Clean(report.ProviderAccounts[i].MountPath)
+		report.ProviderAccounts[i].ActiveJobs = 0
+		for _, mounts := range activeMounts {
+			if mountPath == mounts[0] || mountPath == mounts[1] {
+				report.ProviderAccounts[i].ActiveJobs++
+			}
+		}
+	}
 }
 
 func (s *Service) handleConfigApply(ctx context.Context, message protocol.Envelope) error {

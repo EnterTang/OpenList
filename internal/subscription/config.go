@@ -46,6 +46,9 @@ func GetConfig() (model.SubscriptionConfig, error) {
 }
 
 func SaveConfig(cfg model.SubscriptionConfig) (model.SubscriptionConfig, error) {
+	if err := validateSubscriptionConfigTargets(cfg); err != nil {
+		return cfg, err
+	}
 	cfg = normalizeConfig(cfg)
 	body, err := json.Marshal(cfg)
 	if err != nil {
@@ -74,8 +77,26 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 		return errors.New("subscription is nil")
 	}
 	cfg = normalizeConfig(cfg)
-	if sub.TargetRoot == "" && cfg.DefaultTargetRoot != "" {
-		sub.TargetRoot = cfg.DefaultTargetRoot
+	if err := validateSubscriptionConfigTargets(cfg); err != nil {
+		return err
+	}
+	if err := ValidateSubscriptionStorageTarget(sub.TempTarget); err != nil {
+		return errors.WithMessage(err, "invalid temp target")
+	}
+	if err := ValidateSubscriptionStorageTarget(sub.DeliveryTarget); err != nil {
+		return errors.WithMessage(err, "invalid delivery target")
+	}
+	sub.TempTarget = NormalizeSubscriptionStorageTarget(sub.TempTarget)
+	sub.DeliveryTarget = NormalizeSubscriptionStorageTarget(sub.DeliveryTarget)
+	if sub.DeliveryTarget.Provider == "" && strings.TrimSpace(sub.TargetRoot) != "" {
+		if migrated, ok := MigrateLegacyPathTarget(sub.TargetRoot); ok {
+			sub.DeliveryTarget = migrated
+		} else {
+			return errors.Errorf("legacy target_root %q is not a recognized provider mount and requires manual confirmation", sub.TargetRoot)
+		}
+	}
+	if sub.DeliveryTarget.Provider == "" && cfg.DefaultTarget.Provider != "" {
+		sub.DeliveryTarget = cfg.DefaultTarget
 	}
 	if sub.CheckIntervalMinutes <= 0 {
 		sub.CheckIntervalMinutes = 60
@@ -94,6 +115,45 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 			return err
 		}
 		sub.SourceConfig = merged
+	}
+	return nil
+}
+
+func validateSubscriptionConfigTargets(cfg model.SubscriptionConfig) error {
+	if err := ValidateSubscriptionStorageTarget(cfg.DefaultTarget); err != nil {
+		return errors.WithMessage(err, "invalid default target")
+	}
+	if cfg.DefaultTarget.Provider == "" && strings.TrimSpace(cfg.DefaultTargetRoot) != "" {
+		return errors.Errorf("legacy default_target_root %q is not a recognized provider mount and requires manual confirmation", cfg.DefaultTargetRoot)
+	}
+	panTargets := []struct {
+		name   string
+		target model.SubscriptionStorageTarget
+	}{
+		{"quark", cfg.Telegram.Quark.TempTransferTarget},
+		{"aliyun_drive", cfg.Telegram.AliyunDrive.TempTransferTarget},
+		{"pan123", cfg.Telegram.Pan123.TempTransferTarget},
+		{"pan115", cfg.Telegram.Pan115.TempTransferTarget},
+	}
+	for _, item := range panTargets {
+		if err := ValidateSubscriptionStorageTarget(item.target); err != nil {
+			return errors.WithMessagef(err, "invalid %s temp transfer target", item.name)
+		}
+	}
+	panRoots := []struct {
+		name   string
+		target model.SubscriptionStorageTarget
+		root   string
+	}{
+		{"quark", cfg.Telegram.Quark.TempTransferTarget, cfg.Telegram.Quark.TempTransferRoot},
+		{"aliyun_drive", cfg.Telegram.AliyunDrive.TempTransferTarget, cfg.Telegram.AliyunDrive.TempTransferRoot},
+		{"pan123", cfg.Telegram.Pan123.TempTransferTarget, cfg.Telegram.Pan123.TempTransferRoot},
+		{"pan115", cfg.Telegram.Pan115.TempTransferTarget, cfg.Telegram.Pan115.TempTransferRoot},
+	}
+	for _, item := range panRoots {
+		if item.target.Provider == "" && strings.TrimSpace(item.root) != "" {
+			return errors.Errorf("legacy %s temp_transfer_root %q is not a recognized provider mount and requires manual confirmation", item.name, item.root)
+		}
 	}
 	return nil
 }
@@ -320,6 +380,9 @@ func fillTelegramPanConfig(cfg, defaults model.SubscriptionTelegramPanConfig) mo
 	if cfg.TempTransferRoot == "" {
 		cfg.TempTransferRoot = defaults.TempTransferRoot
 	}
+	if cfg.TempTransferTarget.Provider == "" {
+		cfg.TempTransferTarget = defaults.TempTransferTarget
+	}
 	if !cfg.DeleteSourceAfter {
 		cfg.DeleteSourceAfter = defaults.DeleteSourceAfter
 	}
@@ -342,6 +405,7 @@ func isZeroTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) bool {
 	cfg = normalizeTelegramPanConfig(cfg)
 	return len(cfg.Channels) == 0 &&
 		cfg.TempTransferRoot == "" &&
+		cfg.TempTransferTarget.Provider == "" &&
 		!cfg.DeleteSourceAfter &&
 		cfg.Cookie == "" &&
 		cfg.RefreshToken == "" &&

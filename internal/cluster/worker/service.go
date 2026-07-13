@@ -52,9 +52,11 @@ type resultQueue interface {
 }
 
 type activeTask struct {
-	attempt protocol.AttemptRef
-	ctx     context.Context
-	cancel  context.CancelCauseFunc
+	attempt       protocol.AttemptRef
+	ctx           context.Context
+	cancel        context.CancelCauseFunc
+	stagingMount  string
+	deliveryMount string
 }
 
 type Service struct {
@@ -67,16 +69,23 @@ type Service struct {
 	control map[string]chan error
 	permits map[string]chan protocol.StagePermit
 
-	controlNodeID    string
-	controlKeys      *secure.KeyPair
-	storageOperator  StorageOperator
-	desiredConfig    protocol.WorkerDesiredConfig
-	configObserved   observedState
-	storageObserved  map[string]observedState
-	observedRevision uint64
-	downloadGate     *limitGate
-	uploadGate       *limitGate
-	targetGates      map[string]*limitGate
+	controlNodeID         string
+	controlKeys           *secure.KeyPair
+	storageOperator       StorageOperator
+	desiredConfig         protocol.WorkerDesiredConfig
+	configObserved        observedState
+	storageObserved       map[string]observedState
+	observedRevision      uint64
+	downloadGate          *limitGate
+	uploadGate            *limitGate
+	targetGates           map[string]*limitGate
+	mediaTransferBoundary func(context.Context, protocol.JobOffer, resolvedMediaTransferTargets) error
+}
+
+type resolvedMediaTransferTargets struct {
+	StagingRoot   string
+	DeliveryRoot  string
+	DeliveryMount string
 }
 
 func New(queue resultQueue, sender Sender) *Service {
@@ -589,6 +598,15 @@ func (s *Service) finishActive(jobID string, task *activeTask) {
 	s.mu.Unlock()
 }
 
+func (s *Service) recordActiveAccountBindings(jobID, stagingMount, deliveryMount string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if task := s.active[jobID]; task != nil {
+		task.stagingMount = path.Clean(strings.TrimSpace(stagingMount))
+		task.deliveryMount = path.Clean(strings.TrimSpace(deliveryMount))
+	}
+}
+
 func sameAttempt(left, right protocol.AttemptRef) bool {
 	return left.JobID == right.JobID &&
 		left.AttemptID == right.AttemptID &&
@@ -688,12 +706,15 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err != nil {
 		return fmt.Errorf("resolve cluster delivery target root: %w", err)
 	}
-	targetStorage, _, err := op.GetStorageAndActualPath(targetBindingMount)
-	if err != nil {
-		return fmt.Errorf("resolve cluster target profile: %w", err)
-	}
-	if !strings.Contains(strings.ToLower(targetStorage.GetStorage().Driver), "139") {
-		return errors.New("cluster media target must use a 139 driver with ETF upload support")
+	var targetStorage driver.Driver
+	if s.mediaTransferBoundary == nil {
+		targetStorage, _, err = op.GetStorageAndActualPath(targetBindingMount)
+		if err != nil {
+			return fmt.Errorf("resolve cluster target profile: %w", err)
+		}
+		if !strings.Contains(strings.ToLower(targetStorage.GetStorage().Driver), "139") {
+			return errors.New("cluster media target must use a 139 driver with ETF upload support")
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -710,6 +731,16 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err != nil {
 		return fmt.Errorf("resolve cluster staging temp root: %w", err)
 	}
+	if s.mediaTransferBoundary != nil {
+		return s.mediaTransferBoundary(ctx, offer, resolvedMediaTransferTargets{
+			StagingRoot: requestedTempRoot, DeliveryRoot: targetRootBase, DeliveryMount: targetBindingMount,
+		})
+	}
+	stagingStorage, _, err := op.GetStorageAndActualPath(requestedTempRoot)
+	if err != nil {
+		return fmt.Errorf("resolve cluster staging account: %w", err)
+	}
+	s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
 	releaseDownload, err := s.acquireDownloadCapacity(ctx)
 	if err != nil {
 		return err

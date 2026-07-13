@@ -103,6 +103,7 @@ type MountInventory struct {
 }
 
 type ProviderAccountInventory struct {
+	StorageID            uint   `json:"storage_id"`
 	NodeMountID          string `json:"node_mount_id"`
 	Provider             string `json:"provider"`
 	MountPath            string `json:"mount_path"`
@@ -242,11 +243,14 @@ type StagePermitRequest struct {
 }
 
 type ProviderTargetRequirement struct {
-	Provider      string `json:"provider,omitempty"`
-	Folder        string `json:"folder,omitempty"`
-	NeedShareSave bool   `json:"need_share_save,omitempty"`
-	NeedUpload    bool   `json:"need_upload,omitempty"`
-	RequiredBytes int64  `json:"required_bytes,omitempty"`
+	Provider           string `json:"provider,omitempty"`
+	Folder             string `json:"folder,omitempty"`
+	StorageID          uint   `json:"storage_id,omitempty"`
+	NodeMountID        string `json:"node_mount_id,omitempty"`
+	AccountFingerprint string `json:"account_fingerprint,omitempty"`
+	NeedShareSave      bool   `json:"need_share_save,omitempty"`
+	NeedUpload         bool   `json:"need_upload,omitempty"`
+	RequiredBytes      int64  `json:"required_bytes,omitempty"`
 }
 
 type TaskContext struct {

@@ -7,9 +7,12 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 )
+
+var ensureResolvedProviderFolder = subscription.EnsureResolvedProviderFolder
 
 func (s *Service) resolveStagingTempRoot(ctx context.Context, task protocol.TaskContext, namespace string) (string, error) {
 	namespace = path.Clean(strings.TrimSpace(namespace))
@@ -21,20 +24,14 @@ func (s *Service) resolveStagingTempRoot(ctx context.Context, task protocol.Task
 		Folder:   task.StagingTarget.Folder,
 	})
 	if target.Provider != "" {
-		resolved, err := subscription.ResolveProviderTarget(ctx, subscription.ResolveProviderTargetRequest{
-			Provider: target.Provider,
-			Folder:   target.Folder,
-			FileSize: stagingRequiredBytes(task),
-		})
+		requirement := task.StagingTarget
+		requirement.Provider = target.Provider
+		requirement.Folder = target.Folder
+		requirement.NeedShareSave = true
+		requirement.RequiredBytes = stagingRequiredBytes(task)
+		resolved, err := s.resolveProviderTargetRequirement(ctx, requirement)
 		if err == nil {
 			return path.Join(resolved.FullPath, namespace), nil
-		}
-		if legacyRoot, ok := legacyProviderMountPath(target.Provider); ok {
-			base := legacyRoot
-			if target.Folder != "" {
-				base = path.Join(base, target.Folder)
-			}
-			return path.Join(base, namespace), nil
 		}
 		return "", err
 	}
@@ -44,7 +41,19 @@ func (s *Service) resolveStagingTempRoot(ctx context.Context, task protocol.Task
 	return namespace, nil
 }
 
-func (s *Service) resolveDeliveryTargetRoot(_ context.Context, task protocol.TaskContext) (string, string, error) {
+func (s *Service) resolveDeliveryTargetRoot(ctx context.Context, task protocol.TaskContext) (string, string, error) {
+	if strings.TrimSpace(task.DeliveryTarget.Provider) != "" {
+		requirement := task.DeliveryTarget
+		requirement.NeedUpload = true
+		if requirement.RequiredBytes <= 0 {
+			requirement.RequiredBytes = primarySourceObject(task.SourceObjects).Size
+		}
+		resolved, err := s.resolveProviderTargetRequirement(ctx, requirement)
+		if err != nil {
+			return "", "", err
+		}
+		return resolved.FullPath, resolved.MountPath, nil
+	}
 	targetProfileRef := strings.TrimSpace(task.TargetProfile)
 	if targetProfileRef == "" || targetProfileRef == "/" {
 		return "", "", fmt.Errorf("cluster target profile must be a mounted destination path")
@@ -58,6 +67,27 @@ func (s *Service) resolveDeliveryTargetRoot(_ context.Context, task protocol.Tas
 		Provider: task.DeliveryTarget.Provider,
 		Folder:   task.DeliveryTarget.Folder,
 	})
+	storageModel, err := db.GetStorageByMountPath(bindingMount)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve cluster target binding storage: %w", err)
+	}
+	if target.Provider != "" && !strings.EqualFold(providerName(storageModel.Driver), target.Provider) {
+		return "", "", fmt.Errorf("cluster delivery provider %q does not match bound account provider %q", target.Provider, providerName(storageModel.Driver))
+	}
+	if task.DeliveryTarget.StorageID != 0 && task.DeliveryTarget.StorageID != storageModel.ID {
+		return "", "", fmt.Errorf("cluster delivery storage id does not match the bound account")
+	}
+	if task.DeliveryTarget.AccountFingerprint != "" && task.DeliveryTarget.AccountFingerprint != accountFingerprint(*storageModel, providerName(storageModel.Driver)) {
+		return "", "", fmt.Errorf("cluster delivery account fingerprint does not match the bound account")
+	}
+	if task.DeliveryTarget.NodeMountID != "" {
+		s.mu.Lock()
+		nodeID := s.controlNodeID
+		s.mu.Unlock()
+		if nodeID == "" || task.DeliveryTarget.NodeMountID != stableMountID(nodeID, storageModel.ID, storageModel.MountPath) {
+			return "", "", fmt.Errorf("cluster delivery mount identity does not match the bound account")
+		}
+	}
 	root := bindingMount
 	if target.Folder != "" {
 		root = path.Join(bindingMount, target.Folder)
@@ -65,22 +95,58 @@ func (s *Service) resolveDeliveryTargetRoot(_ context.Context, task protocol.Tas
 	return root, bindingMount, nil
 }
 
+func (s *Service) resolveProviderTargetRequirement(ctx context.Context, requirement protocol.ProviderTargetRequirement) (subscription.ResolvedProviderTarget, error) {
+	storages, err := listInventoryStorages()
+	if err != nil {
+		return subscription.ResolvedProviderTarget{}, fmt.Errorf("list worker provider accounts: %w", err)
+	}
+	s.mu.Lock()
+	nodeID := s.controlNodeID
+	s.mu.Unlock()
+	candidates := make([]subscription.ProviderAccountCandidate, 0, len(storages))
+	for _, storage := range storages {
+		snapshot, hydrateErr := hydrateInventoryStorage(ctx, nodeID, storage)
+		if hydrateErr != nil {
+			continue
+		}
+		account := snapshot.Account
+		if requirement.StorageID != 0 && account.StorageID != requirement.StorageID {
+			continue
+		}
+		if requirement.NodeMountID != "" && account.NodeMountID != requirement.NodeMountID {
+			continue
+		}
+		if requirement.AccountFingerprint != "" && account.AccountFingerprint != requirement.AccountFingerprint {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(account.Status), "work") {
+			continue
+		}
+		candidates = append(candidates, subscription.ProviderAccountCandidate{
+			Provider: account.Provider, StorageID: account.StorageID, MountPath: account.MountPath,
+			AccountAlias: account.AccountAlias, Status: account.Status, Disabled: storage.Disabled,
+			MembershipTier:   account.MembershipTier,
+			MembershipWeight: account.MembershipWeight, MaxSingleUploadBytes: account.MaxSingleUploadBytes,
+			SupportsUpload: account.SupportsUpload, SupportsDownload: account.SupportsDownload,
+			SupportsShareSave: account.SupportsShareSave, SupportsETF: account.SupportsETF,
+			FreeBytes: account.FreeBytes, HasFreeBytes: account.TotalBytes > 0 || account.FreeBytes > 0,
+			ActiveJobs: account.ActiveJobs,
+		})
+	}
+	resolved, err := subscription.ResolveProviderTargetFromCandidates(ctx, subscription.ResolveProviderTargetRequest{
+		Provider: requirement.Provider, Folder: requirement.Folder,
+		NeedUpload: requirement.NeedUpload, NeedShareSave: requirement.NeedShareSave,
+		FileSize: requirement.RequiredBytes,
+	}, candidates)
+	if err != nil {
+		return subscription.ResolvedProviderTarget{}, err
+	}
+	return ensureResolvedProviderFolder(ctx, resolved)
+}
+
 func stagingRequiredBytes(task protocol.TaskContext) int64 {
 	if task.StagingTarget.RequiredBytes > 0 {
 		return task.StagingTarget.RequiredBytes
 	}
 	return primarySourceObject(task.SourceObjects).Size
-}
-
-func legacyProviderMountPath(provider string) (string, bool) {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "pan123":
-		return "/123", true
-	case "pan115":
-		return "/115", true
-	case "yidong139":
-		return "/139_60t", true
-	default:
-		return "", false
-	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,6 +34,7 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 	for provider := range providers {
 		providerList = append(providerList, provider)
 	}
+	sort.Strings(providerList)
 	report := protocol.InventoryReport{
 		Revision:    uint64(time.Now().UTC().UnixNano()),
 		CollectedAt: time.Now().UTC(),

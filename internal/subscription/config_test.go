@@ -14,7 +14,7 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 		SourceConfig: `{"channels":["@custom"],"limit":5}`,
 	}
 	cfg := model.SubscriptionConfig{
-		DefaultTargetRoot:           "/media",
+		DefaultTarget:               model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "media"},
 		DefaultCheckIntervalMinutes: 120,
 		DefaultMediaType:            "tv",
 		DefaultCategory:             "欧美剧",
@@ -30,8 +30,8 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 	if err := ApplyConfigDefaults(sub, cfg); err != nil {
 		t.Fatalf("apply defaults: %v", err)
 	}
-	if sub.TargetRoot != "/media" {
-		t.Fatalf("target root = %q, want /media", sub.TargetRoot)
+	if sub.DeliveryTarget != cfg.DefaultTarget {
+		t.Fatalf("delivery target = %#v, want %#v", sub.DeliveryTarget, cfg.DefaultTarget)
 	}
 	if sub.Category != "" {
 		t.Fatalf("removed default category was applied: %#v", sub)
@@ -67,17 +67,17 @@ func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 		Telegram: model.SubscriptionTelegramSourceConfig{
 			Channels: []string{"@legacy-default"},
 			Quark: model.SubscriptionTelegramPanConfig{
-				Channels:         []string{"@default-quark"},
-				TempTransferRoot: "/temp/quark",
+				Channels:           []string{"@default-quark"},
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "temp"},
 			},
 			AliyunDrive: model.SubscriptionTelegramPanConfig{
-				Channels:         []string{"@default-aliyun"},
-				TempTransferRoot: "/temp/aliyun",
+				Channels:           []string{"@default-aliyun"},
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: "temp"},
 			},
 			Pan123: model.SubscriptionTelegramPanConfig{
-				Channels:          []string{"@default-123"},
-				TempTransferRoot:  "/temp/123",
-				DeleteSourceAfter: true,
+				Channels:           []string{"@default-123"},
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+				DeleteSourceAfter:  true,
 			},
 			Pan115: model.SubscriptionTelegramPanConfig{
 				Channels: []string{"@default-115"},
@@ -96,19 +96,19 @@ func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	if got, want := source.Quark.Channels, []string{"@sub-quark"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("quark channel override = %#v, want %#v", got, want)
 	}
-	if source.Quark.TempTransferRoot != "/temp/quark" {
-		t.Fatalf("quark temp root = %q, want /temp/quark", source.Quark.TempTransferRoot)
+	if source.Quark.TempTransferTarget != cfg.Telegram.Quark.TempTransferTarget {
+		t.Fatalf("quark temp target = %#v", source.Quark.TempTransferTarget)
 	}
 	if got, want := source.AliyunDrive.Channels, []string{"@default-aliyun"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("aliyun channels = %#v, want %#v", got, want)
 	}
-	if source.AliyunDrive.TempTransferRoot != "/temp/aliyun" {
-		t.Fatalf("aliyun temp root = %q, want /temp/aliyun", source.AliyunDrive.TempTransferRoot)
+	if source.AliyunDrive.TempTransferTarget != cfg.Telegram.AliyunDrive.TempTransferTarget {
+		t.Fatalf("aliyun temp target = %#v", source.AliyunDrive.TempTransferTarget)
 	}
 	if got, want := source.Pan123.Channels, []string{"@default-123"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("123 channels = %#v, want %#v", got, want)
 	}
-	if source.Pan123.TempTransferRoot != "/temp/123" || !source.Pan123.DeleteSourceAfter {
+	if source.Pan123.TempTransferTarget != cfg.Telegram.Pan123.TempTransferTarget || !source.Pan123.DeleteSourceAfter {
 		t.Fatalf("123 config = %#v, want temp root and cleanup switch", source.Pan123)
 	}
 	if got, want := source.Pan115.Channels, []string{"@default-115"}; !stringSlicesEqual(got, want) {
@@ -186,6 +186,64 @@ func TestApplyConfigDefaultsMergesTelegramProviderCredentials(t *testing.T) {
 	}
 	if got, want := source.Channels, []string{"@sub-quark", "@sub-aliyun", "@sub-123", "@sub-115"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("runtime channels = %#v, want %#v", got, want)
+	}
+}
+
+func TestApplyConfigDefaultsMergesTelegramProviderTarget(t *testing.T) {
+	sub := &model.Subscription{
+		SourceType:   model.SubscriptionSourceTelegram,
+		SourceConfig: `{"pan123":{"channels":["@sub"]}}`,
+	}
+	cfg := model.SubscriptionConfig{
+		DefaultTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "剧集"},
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Pan123: model.SubscriptionTelegramPanConfig{
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "转存至移动"},
+			},
+		},
+	}
+
+	if err := ApplyConfigDefaults(sub, cfg); err != nil {
+		t.Fatalf("apply defaults: %v", err)
+	}
+	if sub.DeliveryTarget != cfg.DefaultTarget {
+		t.Fatalf("delivery target = %#v, want %#v", sub.DeliveryTarget, cfg.DefaultTarget)
+	}
+	var source model.SubscriptionTelegramSourceConfig
+	if err := json.Unmarshal([]byte(sub.SourceConfig), &source); err != nil {
+		t.Fatalf("decode merged source config: %v", err)
+	}
+	if source.Pan123.TempTransferTarget != cfg.Telegram.Pan123.TempTransferTarget {
+		t.Fatalf("temp target = %#v, want %#v", source.Pan123.TempTransferTarget, cfg.Telegram.Pan123.TempTransferTarget)
+	}
+}
+
+func TestApplyConfigDefaultsMigratesLegacySubscriptionTarget(t *testing.T) {
+	sub := &model.Subscription{TargetRoot: "/139_60t/港台剧"}
+	if err := ApplyConfigDefaults(sub, model.SubscriptionConfig{}); err != nil {
+		t.Fatalf("apply defaults: %v", err)
+	}
+	if sub.DeliveryTarget.Provider != "yidong139" || sub.DeliveryTarget.Folder != "港台剧" {
+		t.Fatalf("delivery target = %#v", sub.DeliveryTarget)
+	}
+}
+
+func TestApplyConfigDefaultsRejectsUnknownLegacySubscriptionTarget(t *testing.T) {
+	sub := &model.Subscription{TargetRoot: "/custom-mount/media"}
+	err := ApplyConfigDefaults(sub, model.SubscriptionConfig{})
+	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
+		t.Fatalf("error = %v, want manual confirmation error", err)
+	}
+}
+
+func TestApplyConfigDefaultsRejectsUnknownLegacyTempTransferRoot(t *testing.T) {
+	sub := &model.Subscription{SourceType: model.SubscriptionSourceTelegram}
+	cfg := model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{TempTransferRoot: "/custom-mount/temp"},
+	}}
+	err := ApplyConfigDefaults(sub, cfg)
+	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
+		t.Fatalf("error = %v, want manual confirmation error", err)
 	}
 }
 
