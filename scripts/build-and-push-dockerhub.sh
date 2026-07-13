@@ -53,6 +53,46 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found in PATH"
 }
 
+install_pnpm() {
+  local version="${1:-}"
+
+  if command -v pnpm >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "==> pnpm not found, installing"
+
+  if command -v corepack >/dev/null 2>&1; then
+    corepack enable >/dev/null 2>&1 || true
+    if [ -n "$version" ]; then
+      corepack prepare "pnpm@$version" --activate
+    else
+      corepack prepare pnpm@latest --activate
+    fi
+    command -v pnpm >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    if [ -n "$version" ]; then
+      npm install -g "pnpm@$version"
+    else
+      npm install -g pnpm
+    fi
+    command -v pnpm >/dev/null 2>&1 && return 0
+  fi
+
+  echo "==> Falling back to standalone pnpm installer"
+  if ! (ldconfig -p 2>/dev/null | grep -q 'libatomic\.so\.1') \
+    && ! ls /usr/lib/*/libatomic.so.1 >/dev/null 2>&1 \
+    && ! ls /lib/*/libatomic.so.1 >/dev/null 2>&1; then
+    die "libatomic.so.1 is required for standalone pnpm; install it with: apt install -y libatomic1 (or use: npm install -g pnpm@${version:-latest})"
+  fi
+
+  curl -fsSL https://get.pnpm.io/install.sh | sh -
+  export PATH="$HOME/.local/share/pnpm:$PATH"
+  command -v pnpm >/dev/null 2>&1 || die "failed to install pnpm; try: npm install -g pnpm@${version:-latest}"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -130,7 +170,6 @@ done
 [[ "$IMAGE" == */* ]] || die "DockerHub image should include a namespace, for example tangente/openlist-etf:latest"
 
 require_cmd docker
-require_cmd pnpm
 require_cmd rsync
 require_cmd curl
 require_cmd node
@@ -142,7 +181,18 @@ FRONTEND_DIR="$(cd "$FRONTEND_DIR" && pwd)" || die "frontend dir does not exist:
 mkdir -p "$BUILD_TMP_ROOT"
 
 FRONTEND_PACKAGE_MANAGER="$(cd "$FRONTEND_DIR" && node -p "require('./package.json').packageManager || ''" 2>/dev/null || true)"
-FRONTEND_PNPM=(pnpm)
+REQUIRED_PNPM_VERSION=""
+if [[ "$FRONTEND_PACKAGE_MANAGER" == pnpm@* ]]; then
+  REQUIRED_PNPM_VERSION="${FRONTEND_PACKAGE_MANAGER#pnpm@}"
+fi
+install_pnpm "$REQUIRED_PNPM_VERSION"
+
+# Determine pnpm command - try PATH first, then use full path if just installed
+if command -v pnpm >/dev/null 2>&1; then
+  FRONTEND_PNPM=(pnpm)
+else
+  FRONTEND_PNPM=("$HOME/.local/share/pnpm/pnpm")
+fi
 if [[ "$FRONTEND_PACKAGE_MANAGER" == pnpm@* ]]; then
   REQUIRED_PNPM_VERSION="${FRONTEND_PACKAGE_MANAGER#pnpm@}"
   CURRENT_PNPM_VERSION="$(pnpm --version 2>/dev/null || true)"
