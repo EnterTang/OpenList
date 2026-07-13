@@ -84,14 +84,16 @@ func (d managerDependencies) withDefaults() managerDependencies {
 var currentManagerDeps = (managerDependencies{}).withDefaults()
 
 type Manager struct {
-	owned     bool
-	process   managedProcess
-	effective EffectiveOptions
-	shutdown  func(context.Context, EffectiveOptions) error
-	exit      chan error
-	stopDone  chan struct{}
-	stopOnce  sync.Once
-	stopErr   error
+	owned             bool
+	process           managedProcess
+	effective         EffectiveOptions
+	shutdown          func(context.Context, EffectiveOptions) error
+	lifecycleLockPath string
+	acquireLock       func(context.Context, string) (*installLock, error)
+	exit              chan error
+	stopDone          chan struct{}
+	stopOnce          sync.Once
+	stopErr           error
 }
 
 func (m *Manager) Owned() bool { return m != nil && m.owned }
@@ -106,15 +108,16 @@ func Prepare(ctx context.Context, opts Options) (manager *Manager, effective Eff
 	if err := os.MkdirAll(lifecycleDir, 0700); err != nil {
 		return nil, effective, fmt.Errorf("create Redis lifecycle directory: %w", err)
 	}
-	lifecycleLock, err := acquireInstallLock(filepath.Join(lifecycleDir, ".lifecycle.lock"))
+	lifecycleLockPath := filepath.Join(lifecycleDir, ".lifecycle.lock")
+	lifecycleLock, err := acquireInstallLockContext(ctx, lifecycleLockPath)
 	if err != nil {
 		return nil, effective, fmt.Errorf("acquire Redis lifecycle lock: %w", err)
 	}
 	defer func() { err = errors.Join(err, lifecycleLock.release()) }()
-	return prepareLocked(ctx, opts, deps)
+	return prepareLocked(ctx, opts, deps, lifecycleLockPath)
 }
 
-func prepareLocked(ctx context.Context, opts Options, deps managerDependencies) (*Manager, EffectiveOptions, error) {
+func prepareLocked(ctx context.Context, opts Options, deps managerDependencies, lifecycleLockPath string) (*Manager, EffectiveOptions, error) {
 	effective := effectiveFromOptions(opts)
 	managedAddress := managedEndpointAddress(opts.Address)
 	redisDir := filepath.Join(opts.DataDir, "redis")
@@ -195,6 +198,9 @@ func prepareLocked(ctx context.Context, opts Options, deps managerDependencies) 
 	if err != nil {
 		return nil, effectiveFromOptions(opts), fmt.Errorf("extract embedded Redis payload: %w", err)
 	}
+	if err := secureDirectory(extracted.Dir); err != nil {
+		return nil, effectiveFromOptions(opts), fmt.Errorf("secure extracted Redis runtime directory: %w", err)
+	}
 	_, portString, err := net.SplitHostPort(opts.Address)
 	if err != nil {
 		return nil, effectiveFromOptions(opts), fmt.Errorf("parse Redis address: %w", err)
@@ -231,7 +237,16 @@ func prepareLocked(ctx context.Context, opts Options, deps managerDependencies) 
 		_ = logFile.Close()
 		return nil, effectiveFromOptions(opts), fmt.Errorf("start embedded Redis: %w", err)
 	}
-	m := &Manager{owned: true, process: process, effective: effective, shutdown: deps.shutdown, exit: make(chan error, 1), stopDone: make(chan struct{})}
+	m := &Manager{
+		owned:             true,
+		process:           process,
+		effective:         effective,
+		shutdown:          deps.shutdown,
+		lifecycleLockPath: lifecycleLockPath,
+		acquireLock:       acquireInstallLockContext,
+		exit:              make(chan error, 1),
+		stopDone:          make(chan struct{}),
+	}
 	go func() { m.exit <- process.Wait(); close(m.exit); _ = logFile.Close() }()
 
 	timeout := opts.StartupTimeout
@@ -258,45 +273,84 @@ func (m *Manager) Stop(ctx context.Context) error {
 	if m == nil || !m.owned {
 		return nil
 	}
+	select {
+	case <-m.stopDone:
+		return m.stopErr
+	default:
+	}
+	select {
+	case <-m.exit:
+		return nil
+	default:
+	}
+	var lifecycleLock *installLock
+	if m.lifecycleLockPath != "" {
+		acquireLock := m.acquireLock
+		if acquireLock == nil {
+			acquireLock = acquireInstallLockContext
+		}
+		var err error
+		lifecycleLock, err = acquireLock(ctx, m.lifecycleLockPath)
+		if err != nil {
+			return fmt.Errorf("acquire Redis lifecycle lock: %w", err)
+		}
+	}
+	started := false
 	m.stopOnce.Do(func() {
+		started = true
 		go func() {
 			defer close(m.stopDone)
-			select {
-			case <-m.exit:
-				return
-			default:
-			}
-			shutdownErr := m.shutdown(ctx, m.effective)
-			if isExpectedShutdownError(shutdownErr) {
-				shutdownErr = nil
-			}
-			select {
-			case <-m.exit:
-				if shutdownErr != nil {
-					m.stopErr = fmt.Errorf("shutdown embedded Redis: %w", shutdownErr)
-				}
-			case <-ctx.Done():
-				killErr := m.process.Kill()
-				if killErr != nil {
-					killErr = fmt.Errorf("kill embedded Redis child: %w", killErr)
-				}
-				select {
-				case <-m.exit:
-				default:
-				}
-				if shutdownErr != nil {
-					m.stopErr = errors.Join(fmt.Errorf("shutdown embedded Redis: %w", shutdownErr), ctx.Err(), killErr)
-				} else {
-					m.stopErr = errors.Join(ctx.Err(), killErr)
+			m.stopErr = m.stopOwned(ctx)
+			if lifecycleLock != nil {
+				if err := lifecycleLock.release(); err != nil {
+					m.stopErr = errors.Join(m.stopErr, fmt.Errorf("release Redis lifecycle lock: %w", err))
 				}
 			}
 		}()
 	})
+	var releaseErr error
+	if !started && lifecycleLock != nil {
+		if err := lifecycleLock.release(); err != nil {
+			releaseErr = fmt.Errorf("release Redis lifecycle lock: %w", err)
+		}
+	}
 	select {
 	case <-m.stopDone:
-		return m.stopErr
+		return errors.Join(m.stopErr, releaseErr)
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Join(ctx.Err(), releaseErr)
+	}
+}
+
+func (m *Manager) stopOwned(ctx context.Context) error {
+	select {
+	case <-m.exit:
+		return nil
+	default:
+	}
+	shutdownErr := m.shutdown(ctx, m.effective)
+	if isExpectedShutdownError(shutdownErr) {
+		shutdownErr = nil
+	}
+	select {
+	case <-m.exit:
+		if shutdownErr != nil {
+			return fmt.Errorf("shutdown embedded Redis: %w", shutdownErr)
+		}
+		return nil
+	case <-ctx.Done():
+		killErr := m.process.Kill()
+		if killErr != nil {
+			killErr = fmt.Errorf("kill embedded Redis child: %w", killErr)
+		}
+		select {
+		case <-m.exit:
+		default:
+		}
+		if shutdownErr != nil {
+			return errors.Join(fmt.Errorf("shutdown embedded Redis: %w", shutdownErr), ctx.Err(), killErr)
+		}
+		return errors.Join(ctx.Err(), killErr)
 	}
 }
 

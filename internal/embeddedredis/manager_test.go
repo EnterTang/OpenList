@@ -139,6 +139,143 @@ func TestPrepareSerializesLifecycleOwnership(t *testing.T) {
 	proc.exit(nil)
 }
 
+func TestStopDoesNotShutdownSuccessorAfterOwnedChildExit(t *testing.T) {
+	opts := eligibleOptions(t)
+	oldProcess := newFakeProcess()
+	successorProcess := newFakeProcess()
+	processes := []*fakeProcess{oldProcess, successorProcess}
+	var ready atomic.Bool
+	var starts atomic.Int32
+	var shutdowns atomic.Int32
+	shutdownEntered := make(chan struct{})
+	successorStarted := make(chan struct{})
+	stopWaiting := make(chan struct{})
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(context.Context, EffectiveOptions, bool) error {
+			if ready.Load() {
+				return nil
+			}
+			return errors.New("not ready")
+		},
+		occupied: func(context.Context, string) (bool, error) { return false, nil },
+		payload:  func() ([]byte, error) { return []byte("x"), nil },
+		extract:  fakeExtract(opts.DataDir),
+		start: func(*exec.Cmd) (managedProcess, error) {
+			index := int(starts.Add(1)) - 1
+			if index >= len(processes) {
+				t.Fatalf("unexpected process start %d", index+1)
+			}
+			if index == 1 {
+				close(successorStarted)
+			}
+			ready.Store(true)
+			return processes[index], nil
+		},
+		shutdown: func(context.Context, EffectiveOptions) error {
+			close(shutdownEntered)
+			<-successorStarted
+			shutdowns.Add(1)
+			return nil
+		},
+	})
+
+	manager, _, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager == nil || !manager.Owned() {
+		t.Fatalf("manager = %#v, want owned manager", manager)
+	}
+	manager.acquireLock = func(ctx context.Context, path string) (*installLock, error) {
+		close(stopWaiting)
+		return acquireInstallLockContext(ctx, path)
+	}
+
+	lockPath := filepath.Join(opts.DataDir, "runtime", "redis", ".lifecycle.lock")
+	blocker, err := acquireInstallLock(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockerHeld := true
+	defer func() {
+		if blockerHeld {
+			_ = blocker.release()
+		}
+	}()
+
+	ready.Store(false)
+	type prepareResult struct {
+		manager *Manager
+		err     error
+	}
+	successorDone := make(chan prepareResult, 1)
+	go func() {
+		successor, _, err := Prepare(context.Background(), opts)
+		successorDone <- prepareResult{manager: successor, err: err}
+	}()
+	select {
+	case result := <-successorDone:
+		t.Fatalf("successor Prepare completed while lifecycle lock was held: %v", result.err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- manager.Stop(stopCtx) }()
+	select {
+	case <-stopWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not attempt to acquire the lifecycle lock")
+	}
+
+	oldProcess.exit(nil)
+	deadline := time.Now().Add(time.Second)
+	for len(manager.exit) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("owned process exit was not published")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := blocker.release(); err != nil {
+		t.Fatal(err)
+	}
+	blockerHeld = false
+
+	var successor *Manager
+	select {
+	case result := <-successorDone:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		successor = result.manager
+	case <-time.After(time.Second):
+		t.Fatal("successor Prepare did not complete")
+	}
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not complete")
+	}
+	successorProcess.exit(nil)
+
+	if successor == nil || !successor.Owned() || starts.Load() != 2 {
+		t.Fatalf("successor/starts = %#v/%d, want owned successor and two starts", successor, starts.Load())
+	}
+	select {
+	case <-shutdownEntered:
+		t.Fatal("old Stop reached SHUTDOWN after its child exited")
+	default:
+	}
+	if shutdowns.Load() != 0 {
+		t.Fatalf("old Stop issued SHUTDOWN %d time(s) against its successor", shutdowns.Load())
+	}
+}
+
 func TestPrepareReusesPersistedManagedSecret(t *testing.T) {
 	opts := eligibleOptions(t)
 	secret := "persisted-secret"
@@ -252,7 +389,10 @@ func TestPrepareStartsManagedRedisWithGeneratedSecret(t *testing.T) {
 				t.Fatalf("extract args = %q/%q", dataDir, payload)
 			}
 			runtimeDir := filepath.Join(opts.DataDir, "fake-runtime")
-			if err := os.MkdirAll(runtimeDir, 0700); err != nil {
+			if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+				return ExtractedRuntime{}, err
+			}
+			if err := os.Chmod(runtimeDir, 0755); err != nil {
 				return ExtractedRuntime{}, err
 			}
 			return ExtractedRuntime{Dir: runtimeDir, ServerPath: filepath.Join(runtimeDir, "redis-server.exe")}, nil
@@ -271,6 +411,15 @@ func TestPrepareStartsManagedRedisWithGeneratedSecret(t *testing.T) {
 	}
 	if command == nil || command.Dir == "" || len(command.Args) != 2 || filepath.Base(command.Args[1]) != "redis.conf" {
 		t.Fatalf("command = %#v", command)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(command.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0700 {
+			t.Fatalf("runtime directory mode = %o, want 700", info.Mode().Perm())
+		}
 	}
 	config, err := os.ReadFile(command.Args[1])
 	if err != nil {
@@ -590,6 +739,88 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 		}
 		if err := m.Stop(context.Background()); err == nil {
 			t.Fatal("idempotent Stop should retain result")
+		}
+	})
+	t.Run("lifecycle lock deadline can retry", func(t *testing.T) {
+		lockPath := filepath.Join(t.TempDir(), ".lifecycle.lock")
+		blocker, err := acquireInstallLock(lockPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blockerHeld := true
+		defer func() {
+			if blockerHeld {
+				_ = blocker.release()
+			}
+		}()
+
+		proc := newFakeProcess()
+		var shutdowns atomic.Int32
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error {
+			shutdowns.Add(1)
+			proc.exit(nil)
+			return nil
+		})
+		m.lifecycleLockPath = lockPath
+		m.acquireLock = acquireInstallLockContext
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := m.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop error = %v, want lifecycle lock deadline", err)
+		}
+		if shutdowns.Load() != 0 {
+			t.Fatalf("shutdowns after lock deadline = %d, want 0", shutdowns.Load())
+		}
+		if err := blocker.release(); err != nil {
+			t.Fatal(err)
+		}
+		blockerHeld = false
+		if err := m.Stop(context.Background()); err != nil {
+			t.Fatalf("retry Stop: %v", err)
+		}
+		if shutdowns.Load() != 1 {
+			t.Fatalf("shutdowns after retry = %d, want 1", shutdowns.Load())
+		}
+
+		blocker, err = acquireInstallLock(lockPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blockerHeld = true
+		ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := m.Stop(ctx); err != nil {
+			t.Fatalf("completed Stop waited for lifecycle lock: %v", err)
+		}
+	})
+	t.Run("already exited bypasses lifecycle lock", func(t *testing.T) {
+		lockPath := filepath.Join(t.TempDir(), ".lifecycle.lock")
+		proc := newFakeProcess()
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error {
+			t.Fatal("shutdown called for exited process")
+			return nil
+		})
+		m.lifecycleLockPath = lockPath
+		m.acquireLock = acquireInstallLockContext
+		proc.exit(nil)
+		waitForCount(t, &proc.waits, 1)
+		deadline := time.Now().Add(time.Second)
+		for len(m.exit) == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("owned process exit was not published")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		blocker, err := acquireInstallLock(lockPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blocker.release()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := m.Stop(ctx); err != nil {
+			t.Fatalf("Stop for exited process waited for lifecycle lock: %v", err)
 		}
 	})
 	t.Run("shutdown error waits for deadline before kill", func(t *testing.T) {

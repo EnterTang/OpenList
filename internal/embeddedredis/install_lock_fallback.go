@@ -12,10 +12,7 @@ import (
 // management is Windows-only; this fallback keeps the package portable.
 var fallbackInstallMutex sync.Mutex
 
-func lockFile(_ *os.File) error {
-	fallbackInstallMutex.Lock()
-	return nil
-}
+func tryLockFile(_ *os.File) (bool, error) { return fallbackInstallMutex.TryLock(), nil }
 
 func unlockFile(_ *os.File) error {
 	fallbackInstallMutex.Unlock()
