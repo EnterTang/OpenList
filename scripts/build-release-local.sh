@@ -26,6 +26,8 @@ Environment:
   FRONTEND_DIR            Same as --frontend-dir.
   FRONTEND_VERSION        Override embedded frontend version metadata.
   GITHUB_TOKEN            Optional, only needed when downloading frontend i18n.
+  The Windows artifact embeds Redis from a pinned distribution and requires
+  network access to GitHub plus curl, unzip, zip, and sha256sum or shasum.
 
 Output:
   build/compress/openlist-windows-amd64.zip          (--target windows-amd64)
@@ -60,8 +62,37 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found in PATH"
 }
 
+cleanup_embedded_redis() {
+  local original_status=$?
+
+  trap - EXIT
+  if ! bash "$EMBEDDED_REDIS_HELPER" clean; then
+    echo "warning: failed to clean generated embedded Redis payload" >&2
+  fi
+  exit "$original_status"
+}
+
+verify_windows_release_archive() {
+  local archive="$1"
+  local entries
+  local listing
+  local regular_entry_count
+
+  [ -f "$archive" ] || die "expected Windows release archive was not created: $archive"
+  entries="$(unzip -Z1 "$archive")" || die "failed to list Windows release archive: $archive"
+  if [ "$entries" != "openlist.exe" ]; then
+    die "Windows release archive must contain exactly one entry named openlist.exe: $archive"
+  fi
+
+  listing="$(unzip -Z -l "$archive")" || die "failed to inspect Windows release archive: $archive"
+  regular_entry_count="$(printf '%s\n' "$listing" | awk '$NF == "openlist.exe" && substr($1, 1, 1) == "-" { count++ } END { print count + 0 }')"
+  [ "$regular_entry_count" -eq 1 ] ||
+    die "Windows release archive entry openlist.exe is not a regular file: $archive"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+EMBEDDED_REDIS_HELPER="$SCRIPT_DIR/prepare-embedded-redis.sh"
 
 FRONTEND_DIR="${FRONTEND_DIR:-"$BACKEND_DIR/../OpenList-Frontend"}"
 BACKEND_MODE="release"
@@ -151,6 +182,20 @@ FRONTEND_DIR="$(cd "$FRONTEND_DIR" && pwd)" || die "frontend dir does not exist:
 export FRONTEND_DIR
 export FRONTEND_VERSION="${FRONTEND_VERSION:-$(node -p "require('$FRONTEND_DIR/package.json').version")}"
 
+if [ "$TARGET" = "windows-amd64" ]; then
+  [ -f "$EMBEDDED_REDIS_HELPER" ] || die "embedded Redis helper not found: $EMBEDDED_REDIS_HELPER"
+  require_cmd curl
+  require_cmd unzip
+  require_cmd zip
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    die "sha256sum or shasum is required for Windows embedded Redis builds"
+  fi
+
+  trap cleanup_embedded_redis EXIT
+  echo "==> Preparing pinned embedded Redis payload"
+  bash "$EMBEDDED_REDIS_HELPER" prepare
+fi
+
 if [ "$SKIP_FRONTEND_BUILD" != "true" ]; then
   echo "==> Building local frontend in $FRONTEND_DIR"
   if [ "$use_lite_build" = "true" ]; then
@@ -195,6 +240,14 @@ fi
   cd "$BACKEND_DIR"
   bash build.sh "${backend_args[@]}"
 )
+
+if [ "$TARGET" = "windows-amd64" ]; then
+  windows_archive="$BACKEND_DIR/build/compress/openlist-windows-amd64.zip"
+  if [ "$use_lite_build" = "true" ]; then
+    windows_archive="$BACKEND_DIR/build/compress/openlist-windows-amd64-lite.zip"
+  fi
+  verify_windows_release_archive "$windows_archive"
+fi
 
 echo
 echo "==> Done. Release artifacts:"
