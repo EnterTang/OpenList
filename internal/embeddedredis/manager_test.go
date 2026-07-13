@@ -82,6 +82,63 @@ func TestPrepareReusesCompatibleConfiguredRedis(t *testing.T) {
 	}
 }
 
+func TestPrepareSerializesLifecycleOwnership(t *testing.T) {
+	opts := eligibleOptions(t)
+	proc := newFakeProcess()
+	var starts atomic.Int32
+	var ready atomic.Bool
+	startGate := make(chan struct{})
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(context.Context, EffectiveOptions, bool) error {
+			if ready.Load() {
+				return nil
+			}
+			return errors.New("not ready")
+		},
+		occupied: func(context.Context, string) (bool, error) { return false, nil },
+		payload:  func() ([]byte, error) { return []byte("x"), nil },
+		extract:  fakeExtract(opts.DataDir),
+		start: func(*exec.Cmd) (managedProcess, error) {
+			if starts.Add(1) == 1 {
+				close(startGate)
+			}
+			ready.Store(true)
+			return proc, nil
+		},
+	})
+
+	type result struct {
+		manager *Manager
+		err     error
+	}
+	begin := make(chan struct{})
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-begin
+			manager, _, err := Prepare(context.Background(), opts)
+			results <- result{manager: manager, err: err}
+		}()
+	}
+	close(begin)
+	<-startGate
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("Prepare errors = %v, %v", first.err, second.err)
+	}
+	owned := 0
+	for _, manager := range []*Manager{first.manager, second.manager} {
+		if manager != nil && manager.Owned() {
+			owned++
+		}
+	}
+	if starts.Load() != 1 || owned != 1 {
+		t.Fatalf("starts/owned = %d/%d, want 1/1", starts.Load(), owned)
+	}
+	proc.exit(nil)
+}
+
 func TestPrepareReusesPersistedManagedSecret(t *testing.T) {
 	opts := eligibleOptions(t)
 	secret := "persisted-secret"
@@ -89,7 +146,8 @@ func TestPrepareReusesPersistedManagedSecret(t *testing.T) {
 	if err := os.MkdirAll(redisDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(redisDir, secretFilename), []byte(secret+"\n"), 0600); err != nil {
+	secretPath := filepath.Join(redisDir, secretFilename)
+	if err := os.WriteFile(secretPath, []byte(secret+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	var probes []string
@@ -112,6 +170,15 @@ func TestPrepareReusesPersistedManagedSecret(t *testing.T) {
 	}
 	if effective.Password != secret || strings.Join(probes, ",") != ","+secret {
 		t.Fatalf("effective password/probes = %q/%q", effective.Password, probes)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(secretPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("persisted secret mode = %o, want 600", info.Mode().Perm())
+		}
 	}
 }
 
@@ -380,6 +447,7 @@ func TestRedisClientsHonorContextDeadlines(t *testing.T) {
 		if elapsed := time.Since(started); elapsed > 750*time.Millisecond {
 			t.Fatalf("Stop ignored context deadline: %v", elapsed)
 		}
+		waitForStopCleanup(t, m)
 		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
 			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
 		}
@@ -419,6 +487,58 @@ func TestPrepareReportsEarlyExitAndTimeoutKillsAndReaps(t *testing.T) {
 				t.Fatalf("waits = %d, want 1", proc.waits.Load())
 			}
 		})
+	}
+}
+
+func TestWaitUntilReadyRejectsExitedOwnedChildAroundSuccessfulProbe(t *testing.T) {
+	t.Run("before probe", func(t *testing.T) {
+		exit := make(chan error, 1)
+		exit <- errors.New("bind failed")
+		var probes atomic.Int32
+		err := waitUntilReady(context.Background(), func(context.Context, EffectiveOptions, bool) error {
+			probes.Add(1)
+			return nil
+		}, EffectiveOptions{}, false, exit)
+		if err == nil || probes.Load() != 0 {
+			t.Fatalf("waitUntilReady = %v, probes=%d", err, probes.Load())
+		}
+	})
+
+	t.Run("during successful probe", func(t *testing.T) {
+		exit := make(chan error, 1)
+		err := waitUntilReady(context.Background(), func(context.Context, EffectiveOptions, bool) error {
+			exit <- errors.New("bind failed")
+			return nil
+		}, EffectiveOptions{}, false, exit)
+		if err == nil || !strings.Contains(err.Error(), "bind failed") {
+			t.Fatalf("waitUntilReady = %v, want owned child exit", err)
+		}
+	})
+}
+
+func TestPrepareCleanupIsBoundedWhenKillAndWaitFail(t *testing.T) {
+	opts := eligibleOptions(t)
+	opts.StartupTimeout = 25 * time.Millisecond
+	proc := newStubbornProcess(errors.New("kill denied"))
+	defer proc.release()
+	restoreManagerDeps(t, managerDependencies{
+		goos:     "windows",
+		probe:    func(context.Context, EffectiveOptions, bool) error { return errors.New("not ready") },
+		occupied: func(context.Context, string) (bool, error) { return false, nil },
+		payload:  func() ([]byte, error) { return []byte("x"), nil },
+		extract:  fakeExtract(opts.DataDir),
+		start:    func(*exec.Cmd) (managedProcess, error) { return proc, nil },
+	})
+	started := time.Now()
+	manager, _, err := Prepare(context.Background(), opts)
+	if manager != nil || err == nil || !strings.Contains(err.Error(), "kill denied") {
+		t.Fatalf("Prepare = %v, %v", manager, err)
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("Prepare waited for unreaped process: %v", elapsed)
+	}
+	if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
+		t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
 	}
 }
 
@@ -464,6 +584,7 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 		if err := m.Stop(ctx); err == nil {
 			t.Fatal("Stop error = nil, want deadline")
 		}
+		waitForStopCleanup(t, m)
 		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
 			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
 		}
@@ -487,9 +608,14 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 		if proc.kills.Load() != 0 {
 			t.Fatalf("kills before deadline = %d, want 0", proc.kills.Load())
 		}
-		err := <-stopDone
+		firstErr := <-stopDone
+		if !errors.Is(firstErr, context.DeadlineExceeded) {
+			t.Fatalf("Stop error = %v, want deadline error", firstErr)
+		}
+		waitForStopCleanup(t, m)
+		err := m.Stop(context.Background())
 		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "shutdown denied") {
-			t.Fatalf("Stop error = %v, want shutdown and deadline errors", err)
+			t.Fatalf("completed Stop error = %v, want shutdown and deadline errors", err)
 		}
 		if proc.kills.Load() != 1 {
 			t.Fatalf("kills after deadline = %d, want 1", proc.kills.Load())
@@ -546,6 +672,63 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("kill error and stuck wait remain bounded", func(t *testing.T) {
+		proc := newStubbornProcess(errors.New("kill denied"))
+		defer proc.release()
+		m := ownedTestManagerForProcess(proc, func(context.Context, EffectiveOptions) error { return nil })
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		firstErr := m.Stop(ctx)
+		if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+			t.Fatalf("Stop waited for unreaped process: %v", elapsed)
+		}
+		if !errors.Is(firstErr, context.DeadlineExceeded) {
+			t.Fatalf("first Stop error = %v", firstErr)
+		}
+		select {
+		case <-m.stopDone:
+		case <-time.After(300 * time.Millisecond):
+			t.Fatal("cleanup owner blocked on Wait")
+		}
+		err := m.Stop(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "kill denied") {
+			t.Fatalf("completed Stop error = %v, want kill failure", err)
+		}
+		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
+			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
+		}
+	})
+}
+
+func TestSecurePathHelpersRestrictPermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "redis")
+	if err := os.Mkdir(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureDirectory(dir); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "redis.auth")
+	if err := os.WriteFile(file, []byte("secret"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureFile(file); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		dirInfo, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fileInfo, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dirInfo.Mode().Perm() != 0700 || fileInfo.Mode().Perm() != 0600 {
+			t.Fatalf("dir/file modes = %o/%o", dirInfo.Mode().Perm(), fileInfo.Mode().Perm())
+		}
+	}
 }
 
 func eligibleOptions(t *testing.T) Options {
@@ -580,12 +763,40 @@ type fakeProcess struct {
 	waits, kills atomic.Int32
 }
 
+type stubbornProcess struct {
+	done         chan struct{}
+	once         sync.Once
+	killErr      error
+	waits, kills atomic.Int32
+}
+
+func newStubbornProcess(killErr error) *stubbornProcess {
+	return &stubbornProcess{done: make(chan struct{}), killErr: killErr}
+}
+
+func (p *stubbornProcess) Wait() error {
+	p.waits.Add(1)
+	<-p.done
+	return nil
+}
+
+func (p *stubbornProcess) Kill() error {
+	p.kills.Add(1)
+	return p.killErr
+}
+
+func (p *stubbornProcess) release() { p.once.Do(func() { close(p.done) }) }
+
 func newFakeProcess() *fakeProcess    { return &fakeProcess{done: make(chan struct{})} }
 func (p *fakeProcess) Wait() error    { p.waits.Add(1); <-p.done; return p.err }
 func (p *fakeProcess) Kill() error    { p.kills.Add(1); p.exit(errors.New("killed")); return nil }
 func (p *fakeProcess) exit(err error) { p.once.Do(func() { p.err = err; close(p.done) }) }
 
 func ownedTestManager(proc *fakeProcess, shutdown func(context.Context, EffectiveOptions) error) *Manager {
+	return ownedTestManagerForProcess(proc, shutdown)
+}
+
+func ownedTestManagerForProcess(proc managedProcess, shutdown func(context.Context, EffectiveOptions) error) *Manager {
 	m := &Manager{owned: true, process: proc, effective: EffectiveOptions{Address: "127.0.0.1:1"}, shutdown: shutdown, exit: make(chan error, 1), stopDone: make(chan struct{})}
 	go func() { m.exit <- proc.Wait(); close(m.exit) }()
 	return m
@@ -599,6 +810,15 @@ func waitForCount(t *testing.T, value *atomic.Int32, want int32) {
 			t.Fatalf("count = %d, want %d", value.Load(), want)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForStopCleanup(t *testing.T, manager *Manager) {
+	t.Helper()
+	select {
+	case <-manager.stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop cleanup did not complete")
 	}
 }
 

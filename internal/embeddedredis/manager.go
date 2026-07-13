@@ -91,18 +91,38 @@ type Manager struct {
 	exit      chan error
 	stopDone  chan struct{}
 	stopOnce  sync.Once
-	killOnce  sync.Once
 	stopErr   error
 }
 
 func (m *Manager) Owned() bool { return m != nil && m.owned }
 
-func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, error) {
-	effective := effectiveFromOptions(opts)
-	managedAddress := managedEndpointAddress(opts.Address)
+func Prepare(ctx context.Context, opts Options) (manager *Manager, effective EffectiveOptions, err error) {
+	effective = effectiveFromOptions(opts)
 	deps := currentManagerDeps
 	if !ShouldManage(deps.goos, opts) {
 		return nil, effective, nil
+	}
+	lifecycleDir := filepath.Join(opts.DataDir, "runtime", "redis")
+	if err := os.MkdirAll(lifecycleDir, 0700); err != nil {
+		return nil, effective, fmt.Errorf("create Redis lifecycle directory: %w", err)
+	}
+	lifecycleLock, err := acquireInstallLock(filepath.Join(lifecycleDir, ".lifecycle.lock"))
+	if err != nil {
+		return nil, effective, fmt.Errorf("acquire Redis lifecycle lock: %w", err)
+	}
+	defer func() { err = errors.Join(err, lifecycleLock.release()) }()
+	return prepareLocked(ctx, opts, deps)
+}
+
+func prepareLocked(ctx context.Context, opts Options, deps managerDependencies) (*Manager, EffectiveOptions, error) {
+	effective := effectiveFromOptions(opts)
+	managedAddress := managedEndpointAddress(opts.Address)
+	redisDir := filepath.Join(opts.DataDir, "redis")
+	if err := os.MkdirAll(redisDir, 0700); err != nil {
+		return nil, effective, fmt.Errorf("create Redis data directory: %w", err)
+	}
+	if err := secureDirectory(redisDir); err != nil {
+		return nil, effective, fmt.Errorf("secure Redis data directory: %w", err)
 	}
 
 	configuredErr := boundedProbe(ctx, deps.probe, effective, opts.RequireAOF)
@@ -117,11 +137,15 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 		}
 	}
 
-	redisDir := filepath.Join(opts.DataDir, "redis")
 	secretPath := filepath.Join(redisDir, secretFilename)
 	persistedSecret, secretErr := readManagedSecret(secretPath)
 	if secretErr != nil && !os.IsNotExist(secretErr) {
 		return nil, effective, fmt.Errorf("read managed Redis secret: %w", secretErr)
+	}
+	if secretErr == nil {
+		if err := secureFile(secretPath); err != nil {
+			return nil, effective, fmt.Errorf("secure managed Redis secret: %w", err)
+		}
 	}
 	if persistedSecret != "" && persistedSecret != effective.Password {
 		managedEffective := effective
@@ -154,9 +178,6 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 		if persistedSecret != "" {
 			password = persistedSecret
 		} else {
-			if err := os.MkdirAll(redisDir, 0700); err != nil {
-				return nil, effective, fmt.Errorf("create Redis data directory: %w", err)
-			}
 			password, err = createManagedSecret(secretPath)
 			if err != nil {
 				return nil, effective, err
@@ -174,9 +195,6 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 	if err != nil {
 		return nil, effectiveFromOptions(opts), fmt.Errorf("extract embedded Redis payload: %w", err)
 	}
-	if err := os.MkdirAll(redisDir, 0700); err != nil {
-		return nil, effectiveFromOptions(opts), fmt.Errorf("create Redis data directory: %w", err)
-	}
 	_, portString, err := net.SplitHostPort(opts.Address)
 	if err != nil {
 		return nil, effectiveFromOptions(opts), fmt.Errorf("parse Redis address: %w", err)
@@ -193,9 +211,16 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 	if err := writeFileAtomic(configPath, config, 0600); err != nil {
 		return nil, effectiveFromOptions(opts), fmt.Errorf("write Redis config: %w", err)
 	}
+	if err := secureFile(configPath); err != nil {
+		return nil, effectiveFromOptions(opts), fmt.Errorf("secure Redis config: %w", err)
+	}
 	logFile, err := os.OpenFile(filepath.Join(redisDir, "redis.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, effectiveFromOptions(opts), fmt.Errorf("open Redis log: %w", err)
+	}
+	if err := secureFile(logFile.Name()); err != nil {
+		_ = logFile.Close()
+		return nil, effectiveFromOptions(opts), fmt.Errorf("secure Redis log: %w", err)
 	}
 	cmd := exec.Command(extracted.ServerPath, configPath)
 	cmd.Dir = extracted.Dir
@@ -216,9 +241,15 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := waitUntilReady(readyCtx, deps.probe, effective, opts.RequireAOF, m.exit); err != nil {
-		_ = process.Kill()
-		<-m.exit
-		return nil, effectiveFromOptions(opts), err
+		cleanupErr := process.Kill()
+		select {
+		case <-m.exit:
+		default:
+		}
+		if cleanupErr != nil {
+			cleanupErr = fmt.Errorf("kill failed embedded Redis child: %w", cleanupErr)
+		}
+		return nil, effectiveFromOptions(opts), errors.Join(err, cleanupErr)
 	}
 	return m, effective, nil
 }
@@ -227,9 +258,7 @@ func (m *Manager) Stop(ctx context.Context) error {
 	if m == nil || !m.owned {
 		return nil
 	}
-	started := false
 	m.stopOnce.Do(func() {
-		started = true
 		go func() {
 			defer close(m.stopDone)
 			select {
@@ -247,20 +276,22 @@ func (m *Manager) Stop(ctx context.Context) error {
 					m.stopErr = fmt.Errorf("shutdown embedded Redis: %w", shutdownErr)
 				}
 			case <-ctx.Done():
-				m.kill()
-				<-m.exit
+				killErr := m.process.Kill()
+				if killErr != nil {
+					killErr = fmt.Errorf("kill embedded Redis child: %w", killErr)
+				}
+				select {
+				case <-m.exit:
+				default:
+				}
 				if shutdownErr != nil {
-					m.stopErr = errors.Join(fmt.Errorf("shutdown embedded Redis: %w", shutdownErr), ctx.Err())
+					m.stopErr = errors.Join(fmt.Errorf("shutdown embedded Redis: %w", shutdownErr), ctx.Err(), killErr)
 				} else {
-					m.stopErr = ctx.Err()
+					m.stopErr = errors.Join(ctx.Err(), killErr)
 				}
 			}
 		}()
 	})
-	if started {
-		<-m.stopDone
-		return m.stopErr
-	}
 	select {
 	case <-m.stopDone:
 		return m.stopErr
@@ -268,8 +299,6 @@ func (m *Manager) Stop(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-
-func (m *Manager) kill() { m.killOnce.Do(func() { _ = m.process.Kill() }) }
 
 func reusedManager(effective EffectiveOptions, shutdown func(context.Context, EffectiveOptions) error) *Manager {
 	return &Manager{effective: effective, shutdown: shutdown}
@@ -355,6 +384,9 @@ func createManagedSecret(path string) (string, error) {
 	if err := writeFileAtomic(path, []byte(secret+"\n"), 0600); err != nil {
 		return "", fmt.Errorf("write managed Redis secret: %w", err)
 	}
+	if err := secureFile(path); err != nil {
+		return "", fmt.Errorf("secure managed Redis secret: %w", err)
+	}
 	return secret, nil
 }
 
@@ -387,7 +419,13 @@ func waitUntilReady(ctx context.Context, probe func(context.Context, EffectiveOp
 	delay := 20 * time.Millisecond
 	var lastErr error
 	for {
+		if err := ownedProcessExit(exit); err != nil {
+			return err
+		}
 		if err := boundedProbe(ctx, probe, effective, requireAOF); err == nil {
+			if err := ownedProcessExit(exit); err != nil {
+				return err
+			}
 			return nil
 		} else {
 			lastErr = err
@@ -408,6 +446,18 @@ func waitUntilReady(ctx context.Context, probe func(context.Context, EffectiveOp
 		if delay < 250*time.Millisecond {
 			delay *= 2
 		}
+	}
+}
+
+func ownedProcessExit(exit <-chan error) error {
+	select {
+	case err := <-exit:
+		if err == nil {
+			return errors.New("embedded Redis exited before readiness")
+		}
+		return fmt.Errorf("embedded Redis exited before readiness: %w", err)
+	default:
+		return nil
 	}
 }
 
