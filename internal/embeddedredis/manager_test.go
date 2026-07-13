@@ -836,6 +836,70 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 			t.Fatalf("completed Stop waited for lifecycle lock: %v", err)
 		}
 	})
+	t.Run("lifecycle lock waiter honors its own deadline", func(t *testing.T) {
+		lockPath := filepath.Join(t.TempDir(), ".lifecycle.lock")
+		blocker, err := acquireInstallLock(lockPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blockerHeld := true
+		defer func() {
+			if blockerHeld {
+				_ = blocker.release()
+			}
+		}()
+
+		proc := newFakeProcess()
+		var shutdowns atomic.Int32
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error {
+			shutdowns.Add(1)
+			proc.exit(nil)
+			return nil
+		})
+		m.lifecycleLockPath = lockPath
+		acquireStarted := make(chan struct{})
+		m.acquireLock = func(ctx context.Context, path string) (*installLock, error) {
+			close(acquireStarted)
+			return acquireInstallLockContext(ctx, path)
+		}
+
+		ownerDone := make(chan error, 1)
+		go func() { ownerDone <- m.Stop(context.Background()) }()
+		select {
+		case <-acquireStarted:
+		case <-time.After(time.Second):
+			t.Fatal("first Stop did not attempt to acquire the lifecycle lock")
+		}
+
+		waiterCtx, cancelWaiter := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancelWaiter()
+		waiterDone := make(chan error, 1)
+		go func() { waiterDone <- m.Stop(waiterCtx) }()
+		select {
+		case err := <-waiterDone:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("concurrent Stop error = %v, want deadline", err)
+			}
+		case <-time.After(200 * time.Millisecond):
+			if err := blocker.release(); err != nil {
+				t.Fatal(err)
+			}
+			blockerHeld = false
+			<-ownerDone
+			t.Fatal("concurrent Stop remained blocked on the stop mutex")
+		}
+
+		if err := blocker.release(); err != nil {
+			t.Fatal(err)
+		}
+		blockerHeld = false
+		if err := <-ownerDone; err != nil {
+			t.Fatalf("owner Stop: %v", err)
+		}
+		if shutdowns.Load() != 1 {
+			t.Fatalf("shutdowns = %d, want 1", shutdowns.Load())
+		}
+	})
 	t.Run("already exited bypasses lifecycle lock", func(t *testing.T) {
 		lockPath := filepath.Join(t.TempDir(), ".lifecycle.lock")
 		proc := newFakeProcess()

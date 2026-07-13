@@ -83,6 +83,11 @@ func (d managerDependencies) withDefaults() managerDependencies {
 
 var currentManagerDeps = (managerDependencies{}).withDefaults()
 
+type stopAttempt struct {
+	done chan struct{}
+	err  error
+}
+
 type Manager struct {
 	owned             bool
 	process           managedProcess
@@ -94,6 +99,7 @@ type Manager struct {
 	stopDone          chan struct{}
 	stopMu            sync.Mutex
 	stopping          bool
+	stopAttempt       *stopAttempt
 	stopErr           error
 }
 
@@ -276,7 +282,11 @@ func (m *Manager) Stop(ctx context.Context) error {
 	}
 	m.stopMu.Lock()
 	if m.stopping {
+		attempt := m.stopAttempt
 		m.stopMu.Unlock()
+		if err := waitForStopAttempt(ctx, attempt); err != nil {
+			return err
+		}
 		return m.waitForStop(ctx)
 	}
 	select {
@@ -285,6 +295,11 @@ func (m *Manager) Stop(ctx context.Context) error {
 		return nil
 	default:
 	}
+	attempt := &stopAttempt{done: make(chan struct{})}
+	m.stopping = true
+	m.stopAttempt = attempt
+	m.stopMu.Unlock()
+
 	var lifecycleLock *installLock
 	if m.lifecycleLockPath != "" {
 		acquireLock := m.acquireLock
@@ -294,11 +309,20 @@ func (m *Manager) Stop(ctx context.Context) error {
 		var err error
 		lifecycleLock, err = acquireLock(ctx, m.lifecycleLockPath)
 		if err != nil {
+			err = fmt.Errorf("acquire Redis lifecycle lock: %w", err)
+			m.stopMu.Lock()
+			attempt.err = err
+			if m.stopAttempt == attempt {
+				m.stopping = false
+				m.stopAttempt = nil
+			}
+			close(attempt.done)
 			m.stopMu.Unlock()
-			return fmt.Errorf("acquire Redis lifecycle lock: %w", err)
+			return err
 		}
 	}
-	m.stopping = true
+	m.stopMu.Lock()
+	close(attempt.done)
 	m.stopMu.Unlock()
 	go func() {
 		stopErr := m.stopOwned(ctx)
@@ -311,6 +335,18 @@ func (m *Manager) Stop(ctx context.Context) error {
 		close(m.stopDone)
 	}()
 	return m.waitForStop(ctx)
+}
+
+func waitForStopAttempt(ctx context.Context, attempt *stopAttempt) error {
+	if attempt == nil {
+		return nil
+	}
+	select {
+	case <-attempt.done:
+		return attempt.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) waitForStop(ctx context.Context) error {
