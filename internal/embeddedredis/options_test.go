@@ -30,6 +30,8 @@ func TestShouldManage(t *testing.T) {
 		{"custom username", "windows", Options{Role: "worker", Address: "127.0.0.1:6379", Username: "operator"}, false},
 		{"uppercase default username", "windows", Options{Role: "worker", Address: "127.0.0.1:6379", Username: "DEFAULT"}, false},
 		{"mixed-case default username", "windows", Options{Role: "worker", Address: "127.0.0.1:6379", Username: "Default"}, false},
+		{"padded default username", "windows", Options{Role: "worker", Address: "127.0.0.1:6379", Username: " default "}, false},
+		{"whitespace-only username", "windows", Options{Role: "worker", Address: "127.0.0.1:6379", Username: " "}, false},
 	}
 
 	for _, tt := range tests {
@@ -42,12 +44,12 @@ func TestShouldManage(t *testing.T) {
 }
 
 func TestRenderConfigPreservesPrintableValues(t *testing.T) {
-	got, err := RenderConfig(6379, `/数据/缓存`, `密钥\suffix`)
+	got, err := RenderConfig(6379, "/数据/缓存\u2028目录", "密钥\u0085suffix\\end")
 	if err != nil {
 		t.Fatalf("RenderConfig() error = %v", err)
 	}
-	wantDir := `dir "/数据/缓存"`
-	wantPassword := `requirepass "密钥\\suffix"`
+	wantDir := "dir \"/数据/缓存\u2028目录\""
+	wantPassword := "requirepass \"密钥\u0085suffix\\\\end\""
 	if !strings.Contains(string(got), wantDir+"\n") {
 		t.Fatalf("RenderConfig() = %q, want literal Unicode directory %q", got, wantDir)
 	}
@@ -89,12 +91,15 @@ func TestRenderConfigRejectsInvalidInput(t *testing.T) {
 		{"zero port", 0, "data", "secret"},
 		{"port too large", 65536, "data", "secret"},
 		{"empty data directory", 6379, "", "secret"},
+		{"data directory LF", 6379, "bad\ndir", "secret"},
+		{"data directory DEL", 6379, "bad\x7fdir", "secret"},
 		{"empty password", 6379, "data", ""},
 		{"password CR", 6379, "data", "bad\rpassword"},
 		{"password LF", 6379, "data", "bad\npassword"},
 		{"password NUL", 6379, "data", "bad\x00password"},
 		{"password quote", 6379, "data", `bad"password`},
 		{"password tab", 6379, "data", "bad\tpassword"},
+		{"password DEL", 6379, "data", "bad\x7fpassword"},
 	}
 
 	for _, tt := range tests {

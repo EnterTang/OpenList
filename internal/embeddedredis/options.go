@@ -41,7 +41,7 @@ func ShouldManage(goos string, opts Options) bool {
 		return false
 	}
 
-	username := strings.TrimSpace(opts.Username)
+	username := opts.Username
 	if username != "" && username != "default" {
 		return false
 	}
@@ -61,33 +61,50 @@ func RenderConfig(port int, dataDir, password string) ([]byte, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("data directory is required")
 	}
+	normalizedDir := strings.ReplaceAll(dataDir, `\`, "/")
+	quotedDir, err := quoteRedisConfigValue(normalizedDir)
+	if err != nil {
+		return nil, fmt.Errorf("invalid data directory: %w", err)
+	}
 	if password == "" {
 		return nil, fmt.Errorf("password is required")
 	}
-	if strings.ContainsRune(password, '"') || containsC0Control(password) {
+	if strings.ContainsRune(password, '"') {
 		return nil, fmt.Errorf("password contains an unsupported character")
 	}
+	quotedPassword, err := quoteRedisConfigValue(password)
+	if err != nil {
+		return nil, fmt.Errorf("invalid password: %w", err)
+	}
 
-	normalizedDir := strings.ReplaceAll(dataDir, `\`, "/")
 	config := "bind 127.0.0.1\n" +
 		"protected-mode yes\n" +
 		"port " + strconv.Itoa(port) + "\n" +
 		"daemonize no\n" +
-		"dir " + strconv.Quote(normalizedDir) + "\n" +
+		"dir " + quotedDir + "\n" +
 		"appendonly yes\n" +
 		"appendfsync always\n" +
 		"maxmemory-policy noeviction\n" +
-		"requirepass " + strconv.Quote(password) + "\n"
+		"requirepass " + quotedPassword + "\n"
 	return []byte(config), nil
 }
 
-func containsC0Control(value string) bool {
-	for i := range value {
-		if value[i] < 0x20 {
-			return true
+func quoteRedisConfigValue(value string) (string, error) {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] == 0x7f {
+			return "", fmt.Errorf("value contains an unsupported control character")
 		}
+		switch value[i] {
+		case '\\', '"':
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteByte(value[i])
 	}
-	return false
+	quoted.WriteByte('"')
+	return quoted.String(), nil
 }
 
 func isValidPort(port string) bool {
