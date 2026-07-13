@@ -34,7 +34,7 @@
 - Create: `internal/embeddedredis/options.go`
 - Create: `internal/embeddedredis/options_test.go`
 
-- [ ] **Step 1: Write failing tests for activation decisions**
+- [x] **Step 1: Write failing tests for activation decisions**
 
 Add table-driven tests that require management only for Windows worker/hybrid roles using loopback endpoints. Include `127.0.0.1:6379`, `localhost:6380`, `[::1]:6379`, remote IPs, malformed addresses, standalone/coordinator roles, non-Windows platforms, and custom ACL usernames.
 
@@ -60,27 +60,27 @@ func TestShouldManage(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run: `go test ./internal/embeddedredis -run 'TestShouldManage'`
 
 Expected: FAIL because the package and `ShouldManage` do not exist.
 
-- [ ] **Step 3: Implement activation types and loopback parsing**
+- [x] **Step 3: Implement activation types and loopback parsing**
 
 Define `Version = "7.2.14"`, `PayloadFilename = "redis-windows.zip"`, `Options`, `EffectiveOptions`, and `ShouldManage`. Parse endpoints with `net.SplitHostPort`, normalize the role, require `worker` or `hybrid`, require Windows, accept only loopback hostnames/addresses, and leave custom ACL usernames under user management.
 
-- [ ] **Step 4: Write failing tests for generated Redis configuration**
+- [x] **Step 4: Write failing tests for generated Redis configuration**
 
 Assert the configuration contains the selected port, loopback binding, protected mode, foreground mode, password, forward-slash data paths, AOF requirements, and no-eviction policy. Assert quotes and newlines in a password are rejected rather than emitted into the configuration.
 
-- [ ] **Step 5: Run the configuration test and verify RED**
+- [x] **Step 5: Run the configuration test and verify RED**
 
 Run: `go test ./internal/embeddedredis -run 'TestRenderConfig'`
 
 Expected: FAIL because `RenderConfig` is missing.
 
-- [ ] **Step 6: Implement minimal deterministic configuration rendering**
+- [x] **Step 6: Implement minimal deterministic configuration rendering**
 
 Add `RenderConfig(port int, dataDir, password string) ([]byte, error)` using explicit Redis directives:
 
@@ -96,13 +96,13 @@ maxmemory-policy noeviction
 requirepass "<escaped-password>"
 ```
 
-- [ ] **Step 7: Run package tests and verify GREEN**
+- [x] **Step 7: Run package tests and verify GREEN**
 
 Run: `go test ./internal/embeddedredis`
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit activation and configuration behavior**
+- [x] **Step 8: Commit activation and configuration behavior**
 
 Commit the two files with a Conventional Commit title and Lore trailers. Record `go test ./internal/embeddedredis` in `Tested:`.
 
@@ -116,7 +116,7 @@ Commit the two files with a Conventional Commit title and Lore trailers. Record 
 - Create: `internal/embeddedredis/assets/generated/.gitkeep`
 - Modify: `.gitignore`
 
-- [ ] **Step 1: Write failing extraction tests**
+- [x] **Step 1: Write failing extraction tests**
 
 Build ZIP fixtures in memory. Require `ExtractPayload` to extract only expected basenames, reject `../escape`, reject missing `redis-server.exe` or DLLs, write a digest marker, reuse an intact matching directory, and atomically replace an incomplete directory.
 
@@ -133,17 +133,17 @@ required := []string{
 }
 ```
 
-- [ ] **Step 2: Run extraction tests and verify RED**
+- [x] **Step 2: Run extraction tests and verify RED**
 
 Run: `go test ./internal/embeddedredis -run 'TestExtractPayload'`
 
 Expected: FAIL because extraction is not implemented.
 
-- [ ] **Step 3: Implement safe atomic extraction**
+- [x] **Step 3: Implement safe atomic extraction**
 
 Calculate SHA-256 from the embedded ZIP, use `<data>/runtime/redis/7.2.14`, reject absolute paths and path traversal, allow only the required file set, write into a sibling temporary directory, verify every required file, write `.payload-sha256`, then rename into place. Preserve `<data>/redis` separately.
 
-- [ ] **Step 4: Add platform-specific payload providers**
+- [x] **Step 4: Add platform-specific payload providers**
 
 Use a Windows build-tagged file with:
 
@@ -154,7 +154,7 @@ var generatedAssets embed.FS
 
 Read `assets/generated/redis-windows.zip`; return unavailable when only `.gitkeep` exists. The non-Windows provider always reports unavailable without embedding generated assets.
 
-- [ ] **Step 5: Ignore generated payloads**
+- [x] **Step 5: Ignore generated payloads**
 
 Add:
 
@@ -163,13 +163,13 @@ Add:
 !/internal/embeddedredis/assets/generated/.gitkeep
 ```
 
-- [ ] **Step 6: Run extraction and package tests**
+- [x] **Step 6: Run extraction and package tests**
 
 Run: `go test ./internal/embeddedredis`
 
 Expected: PASS.
 
-- [ ] **Step 7: Verify both platform providers compile**
+- [x] **Step 7: Verify both platform providers compile**
 
 Run:
 
@@ -180,7 +180,7 @@ GOOS=windows GOARCH=amd64 go test -c -o /tmp/embeddedredis-windows.test.exe ./in
 
 Expected: both commands exit 0.
 
-- [ ] **Step 8: Commit extraction and embedded asset plumbing**
+- [x] **Step 8: Commit extraction and embedded asset plumbing**
 
 Commit the extraction, provider, `.gitkeep`, and ignore changes with test evidence.
 
@@ -190,7 +190,7 @@ Commit the extraction, provider, `.gitkeep`, and ignore changes with test eviden
 - Create: `internal/embeddedredis/manager.go`
 - Create: `internal/embeddedredis/manager_test.go`
 
-- [ ] **Step 1: Write failing tests for existing Redis reuse and conflicts**
+- [x] **Step 1: Write failing tests for existing Redis reuse and conflicts**
 
 Inject a probe function and assert:
 
@@ -200,39 +200,39 @@ Inject a probe function and assert:
 - An occupied non-Redis port returns a conflict error and does not spawn or kill anything.
 - Remote/custom ACL configurations bypass the manager.
 
-- [ ] **Step 2: Run reuse tests and verify RED**
+- [x] **Step 2: Run reuse tests and verify RED**
 
 Run: `go test ./internal/embeddedredis -run 'TestPrepare.*Reuse|TestPrepare.*Conflict'`
 
 Expected: FAIL because `Prepare` and `Manager` are missing.
 
-- [ ] **Step 3: Implement probes and effective options**
+- [x] **Step 3: Implement probes and effective options**
 
 Use short bounded timeouts. Probe with configured credentials first, then the persisted managed secret. Validate `PING`, `appendonly=yes`, `appendfsync=always`, and `maxmemory-policy=noeviction` when `RequireAOF` is true. Treat successful TCP connection plus failed Redis protocol/authentication as a conflict unless the persisted managed secret succeeds.
 
-- [ ] **Step 4: Write failing tests for managed startup**
+- [x] **Step 4: Write failing tests for managed startup**
 
 Inject asset, extraction, secret generation, process start, readiness probe, clock, and timeout seams. Assert a free local endpoint causes extraction, secure secret persistence, config creation, one child start, readiness wait, password injection into returned options, and `Owned() == true`. Cover early exit and readiness timeout.
 
-- [ ] **Step 5: Run startup tests and verify RED**
+- [x] **Step 5: Run startup tests and verify RED**
 
 Run: `go test ./internal/embeddedredis -run 'TestPrepare.*Start|TestPrepare.*Timeout|TestPrepare.*Exit'`
 
 Expected: FAIL because startup is incomplete.
 
-- [ ] **Step 6: Implement minimal startup supervision**
+- [x] **Step 6: Implement minimal startup supervision**
 
 Start `<runtime>/redis-server.exe redis.conf` with `Cmd.Dir` set to the versioned runtime directory so adjacent MSYS2 DLLs resolve. Store stdout/stderr in `<data>/redis/redis.log`. Wait until authenticated readiness and durability succeed or the process exits/timeout occurs.
 
-- [ ] **Step 7: Write failing tests for shutdown ownership**
+- [x] **Step 7: Write failing tests for shutdown ownership**
 
 Require owned managers to send authenticated `SHUTDOWN`, wait for exit, and kill only their own child after timeout. Require reused managers to leave the Redis process untouched.
 
-- [ ] **Step 8: Implement bounded shutdown**
+- [x] **Step 8: Implement bounded shutdown**
 
 Accept Redis connection-close errors caused by successful `SHUTDOWN`, wait for the child, and call `Process.Kill` only on an owned child that exceeds the timeout.
 
-- [ ] **Step 9: Run manager tests and race detection**
+- [x] **Step 9: Run manager tests and race detection**
 
 Run:
 
@@ -243,7 +243,7 @@ go test -race ./internal/embeddedredis
 
 Expected: PASS with no race reports.
 
-- [ ] **Step 10: Commit manager behavior**
+- [x] **Step 10: Commit manager behavior**
 
 Commit supervisor files with reuse/start/stop verification in the commit trailers.
 
@@ -253,25 +253,25 @@ Commit supervisor files with reuse/start/stop verification in the commit trailer
 - Modify: `internal/cluster/runtime.go`
 - Create or modify: `internal/cluster/runtime_test.go`
 
-- [ ] **Step 1: Write a failing runtime lifecycle test**
+- [x] **Step 1: Write a failing runtime lifecycle test**
 
 Add an injectable embedded Redis preparation hook on `Runtime`. Assert worker startup uses returned address/username/password/DB without mutating `conf.Conf.Cluster.Redis`, and `stopLocked` closes the queue client before stopping the manager. Cover startup failure cleanup.
 
-- [ ] **Step 2: Run the lifecycle test and verify RED**
+- [x] **Step 2: Run the lifecycle test and verify RED**
 
 Run: `go test ./internal/cluster -run 'TestRuntime.*EmbeddedRedis'`
 
 Expected: FAIL because the runtime has no manager hook or field.
 
-- [ ] **Step 3: Integrate effective Redis options**
+- [x] **Step 3: Integrate effective Redis options**
 
 Before `redis.NewClient`, call the embedded manager with the resolved `flags.DataDir`, role, configured address, credentials, DB, and `RequireAOF`. Store the manager on `Runtime`, construct the existing client from returned effective settings, and leave `conf.Conf` unchanged.
 
-- [ ] **Step 4: Centralize Redis cleanup order**
+- [x] **Step 4: Centralize Redis cleanup order**
 
 Add a locked helper used by normal stop and coordinator-fence cleanup. Close the normal Redis client first, then stop the embedded manager with a bounded context, log shutdown errors, and nil both fields. Never stop a reused Redis service.
 
-- [ ] **Step 5: Run focused cluster tests**
+- [x] **Step 5: Run focused cluster tests**
 
 Run:
 
@@ -282,7 +282,7 @@ go test ./internal/conf/...
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit cluster integration**
+- [x] **Step 6: Commit cluster integration**
 
 Commit the runtime lifecycle changes and tests.
 
@@ -293,17 +293,17 @@ Commit the runtime lifecycle changes and tests.
 - Create: `scripts/prepare-embedded-redis-test.sh`
 - Modify: `scripts/build-release-local.sh`
 
-- [ ] **Step 1: Write failing shell tests**
+- [x] **Step 1: Write failing shell tests**
 
 Source the helper behind a main guard. Create temporary ZIP fixtures and assert `verify_sha256` rejects a wrong digest, `assemble_payload` refuses missing required files, and a valid fixture produces `internal/embeddedredis/assets/generated/redis-windows.zip` containing exactly the server, five DLLs, and two license files.
 
-- [ ] **Step 2: Run shell tests and verify RED**
+- [x] **Step 2: Run shell tests and verify RED**
 
 Run: `bash scripts/prepare-embedded-redis-test.sh`
 
 Expected: FAIL because the helper does not exist.
 
-- [ ] **Step 3: Implement pinned download and payload assembly**
+- [x] **Step 3: Implement pinned download and payload assembly**
 
 Pin:
 
@@ -314,11 +314,11 @@ SHA256=b31d0f867608017f0b0962624d55a4c569a745587ad4b08f7fe9eea59d6916c1
 
 Use `curl`, `unzip`, `zip`, and a portable SHA-256 helper (`sha256sum` or `shasum -a 256`). Download Redis BSD `COPYING` and the Windows port Apache `LICENSE`, then build a minimal `zip -X` payload. Provide `prepare` and `clean` commands.
 
-- [ ] **Step 4: Integrate the helper into local Windows builds**
+- [x] **Step 4: Integrate the helper into local Windows builds**
 
 For `windows-amd64`, run `prepare` before the backend build and register an EXIT trap that runs `clean`. Do not prepare Redis for other targets. After the build, inspect `build/compress/openlist-windows-amd64.zip` and fail unless it contains exactly one regular file named `openlist.exe`.
 
-- [ ] **Step 5: Run shell tests and syntax checks**
+- [x] **Step 5: Run shell tests and syntax checks**
 
 Run:
 
@@ -330,7 +330,7 @@ bash -n scripts/build-release-local.sh
 
 Expected: PASS.
 
-- [ ] **Step 6: Run a real preparation and inspect the payload**
+- [x] **Step 6: Run a real preparation and inspect the payload**
 
 Run:
 
@@ -342,7 +342,7 @@ bash scripts/prepare-embedded-redis.sh clean
 
 Expected: checksum verification succeeds; the archive contains only the required eight files; cleanup removes the generated ZIP.
 
-- [ ] **Step 7: Commit build preparation**
+- [x] **Step 7: Commit build preparation**
 
 Commit helper, tests, and local release integration with the verified URL and digest recorded in the body or trailers.
 
@@ -352,7 +352,7 @@ Commit helper, tests, and local release integration with the verified URL and di
 - Modify: `docs/cluster.md`
 - Modify: `docs/superpowers/plans/2026-07-13-windows-embedded-redis.md` (mark completed checkboxes during execution)
 
-- [ ] **Step 1: Document Windows automatic Redis behavior**
+- [x] **Step 1: Document Windows automatic Redis behavior**
 
 Explain that the local Windows build embeds Redis, activation is limited to worker/hybrid loopback configuration, remote/custom Redis remains authoritative, runtime/data paths are separate, and the bundled community Windows port is not the recommended vendor-supported production deployment.
 
