@@ -42,7 +42,7 @@ func ShouldManage(goos string, opts Options) bool {
 	}
 
 	username := strings.TrimSpace(opts.Username)
-	if username != "" && !strings.EqualFold(username, "default") {
+	if username != "" && username != "default" {
 		return false
 	}
 
@@ -64,7 +64,7 @@ func RenderConfig(port int, dataDir, password string) ([]byte, error) {
 	if password == "" {
 		return nil, fmt.Errorf("password is required")
 	}
-	if strings.ContainsAny(password, "\r\n\x00\"") {
+	if strings.ContainsRune(password, '"') || containsC0Control(password) {
 		return nil, fmt.Errorf("password contains an unsupported character")
 	}
 
@@ -79,6 +79,15 @@ func RenderConfig(port int, dataDir, password string) ([]byte, error) {
 		"maxmemory-policy noeviction\n" +
 		"requirepass " + strconv.Quote(password) + "\n"
 	return []byte(config), nil
+}
+
+func containsC0Control(value string) bool {
+	for i := range value {
+		if value[i] < 0x20 {
+			return true
+		}
+	}
+	return false
 }
 
 func isValidPort(port string) bool {
