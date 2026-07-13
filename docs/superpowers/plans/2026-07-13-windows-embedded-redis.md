@@ -356,7 +356,7 @@ Commit helper, tests, and local release integration with the verified URL and di
 
 Explain that the local Windows build embeds Redis, activation is limited to worker/hybrid loopback configuration, remote/custom Redis remains authoritative, runtime/data paths are separate, and the bundled community Windows port is not the recommended vendor-supported production deployment.
 
-- [ ] **Step 2: Run formatting and static verification**
+- [x] **Step 2: Run formatting and static verification**
 
 Run:
 
@@ -368,7 +368,7 @@ git diff --check
 
 Expected: all commands exit 0.
 
-- [ ] **Step 3: Run focused and repository tests**
+- [x] **Step 3: Run focused and repository tests**
 
 Run:
 
@@ -379,7 +379,7 @@ go test ./cmd/... ./internal/...
 
 Expected: PASS. If unrelated pre-existing failures occur, capture exact packages and errors without claiming they pass.
 
-- [ ] **Step 4: Verify Windows cross-compilation with a real payload**
+- [x] **Step 4: Verify Windows cross-compilation with a real payload**
 
 Run preparation, then build the Windows package using the available Zig or Docker+xgo path. At minimum run:
 
@@ -391,7 +391,7 @@ bash scripts/prepare-embedded-redis.sh clean
 
 For the full artifact, run `scripts/build-release-local.sh --target windows-amd64` with an available frontend build or `--skip-frontend-build` when its `dist/` is already present.
 
-- [ ] **Step 5: Inspect the final archive and embedded payload evidence**
+- [x] **Step 5: Inspect the final archive and embedded payload evidence**
 
 Run:
 
@@ -401,10 +401,40 @@ unzip -l build/compress/openlist-windows-amd64.zip
 
 Expected: exactly one file, `openlist.exe`. Record the executable size increase and archive SHA-256.
 
-- [ ] **Step 6: Run Windows runtime verification when available**
+- [x] **Step 6: Run Windows runtime verification when available**
 
 Start a worker/hybrid node from only `openlist.exe`, verify extraction paths, query `CONFIG GET appendonly appendfsync maxmemory-policy`, enqueue data, stop OpenList, restart it, and confirm the AOF-backed stream remains. If no Windows execution environment exists, report this explicitly as the remaining verification gap.
 
-- [ ] **Step 7: Finalize verification state and commit it**
+- [x] **Step 7: Finalize verification state and commit it**
 
 After fresh verification evidence is collected, mark only the completed verification steps, record any remaining gaps, and commit the final plan state.
+
+## Verification Evidence (2026-07-13)
+
+- **Step 2:** `gofmt` left the touched Go files clean; `go vet` passed for
+  `internal/embeddedredis`, `internal/cluster/...`, and `internal/conf/...`;
+  `git diff --check` passed.
+- **Step 3:** Focused tests for `internal/embeddedredis`,
+  `internal/cluster/...`, and `internal/conf/...` passed, including the
+  embedded Redis race test. The wider
+  `go test -count=1 ./cmd/... ./internal/...` run is not claimed passing: it
+  encountered an environment failure in `internal/fuse` because `fuse.h` was
+  unavailable, existing non-constant `fmt.Errorf` vet failures in
+  `internal/offline_download/{115,115_open,pikpak}`, and
+  `internal/net.TestNewOSSClientUsesEnvironmentHTTPSProxy` expecting
+  `*http.Transport` but receiving `*net.safeTransport`.
+- **Step 4:** A real verified payload and the full
+  `scripts/build-release-local.sh --target windows-amd64 --skip-frontend-build --no-install`
+  build succeeded with Zig 0.15.2 after the xgo GHCR pull stalled. The Windows
+  artifact was produced.
+- **Step 5:** The archive contains exactly one regular `openlist.exe`, identified
+  as PE32+ x86-64. The archive is 62,287,332 bytes with SHA-256
+  `6e1e98892688a396e3807cc4ccbeaea6dbbef8fea1a07c8c0ee07ec37233dde1`;
+  the executable is 172,167,680 bytes with SHA-256
+  `583fd787e86672fc6d87f1db483e02288be023842b7b9434ab7bf0149b43fd03`.
+  String inspection found `redis-server.exe`, `msys-2.0.dll`, `COPYING.redis`,
+  and `LICENSE.redis-windows`; the generated payload asset was cleaned.
+- **Step 6:** No Windows execution environment was available. Windows runtime
+  startup, AOF persistence across restart, and ACL/config inspection remain the
+  explicit verification gap; no runtime pass is claimed.
+- **Step 7:** This plan records the final evidence state and remaining gap.
