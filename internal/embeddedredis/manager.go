@@ -99,6 +99,7 @@ func (m *Manager) Owned() bool { return m != nil && m.owned }
 
 func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, error) {
 	effective := effectiveFromOptions(opts)
+	managedAddress := managedEndpointAddress(opts.Address)
 	deps := currentManagerDeps
 	if !ShouldManage(deps.goos, opts) {
 		return nil, effective, nil
@@ -117,6 +118,7 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 	}
 	if persistedSecret != "" && persistedSecret != effective.Password {
 		managedEffective := effective
+		managedEffective.Address = managedAddress
 		managedEffective.Password = persistedSecret
 		if err := boundedProbe(ctx, deps.probe, managedEffective, opts.RequireAOF); err == nil {
 			return reusedManager(managedEffective, deps.shutdown), managedEffective, nil
@@ -129,6 +131,15 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 	}
 	if occupied {
 		return nil, effective, fmt.Errorf("Redis endpoint %s is occupied but incompatible or authentication failed: %w", opts.Address, configuredErr)
+	}
+	if managedAddress != opts.Address {
+		occupied, err = deps.occupied(ctx, managedAddress)
+		if err != nil {
+			return nil, effective, fmt.Errorf("inspect managed Redis endpoint: %w", err)
+		}
+		if occupied {
+			return nil, effective, fmt.Errorf("managed Redis endpoint %s is occupied", managedAddress)
+		}
 	}
 
 	password := opts.Password
@@ -145,6 +156,7 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 			}
 		}
 	}
+	effective.Address = managedAddress
 	effective.Password = password
 
 	payload, err := deps.payload()
@@ -208,32 +220,45 @@ func (m *Manager) Stop(ctx context.Context) error {
 	if m == nil || !m.owned {
 		return nil
 	}
+	started := false
 	m.stopOnce.Do(func() {
+		started = true
 		go func() {
 			defer close(m.stopDone)
+			select {
+			case <-m.exit:
+				return
+			default:
+			}
 			shutdownErr := m.shutdown(ctx, m.effective)
-			if shutdownErr != nil && !isExpectedShutdownError(shutdownErr) {
-				m.kill()
+			if isExpectedShutdownError(shutdownErr) {
+				shutdownErr = nil
 			}
 			select {
 			case <-m.exit:
-				if shutdownErr != nil && !isExpectedShutdownError(shutdownErr) {
+				if shutdownErr != nil {
 					m.stopErr = fmt.Errorf("shutdown embedded Redis: %w", shutdownErr)
 				}
 			case <-ctx.Done():
 				m.kill()
 				<-m.exit
-				m.stopErr = ctx.Err()
+				if shutdownErr != nil {
+					m.stopErr = errors.Join(fmt.Errorf("shutdown embedded Redis: %w", shutdownErr), ctx.Err())
+				} else {
+					m.stopErr = ctx.Err()
+				}
 			}
 		}()
 	})
+	if started {
+		<-m.stopDone
+		return m.stopErr
+	}
 	select {
 	case <-m.stopDone:
 		return m.stopErr
 	case <-ctx.Done():
-		m.kill()
-		<-m.stopDone
-		return m.stopErr
+		return ctx.Err()
 	}
 }
 
@@ -245,6 +270,14 @@ func reusedManager(effective EffectiveOptions, shutdown func(context.Context, Ef
 
 func effectiveFromOptions(opts Options) EffectiveOptions {
 	return EffectiveOptions{Address: opts.Address, Username: opts.Username, Password: opts.Password, DB: opts.DB}
+}
+
+func managedEndpointAddress(address string) string {
+	host, port, err := net.SplitHostPort(address)
+	if err == nil && host == "::1" {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return address
 }
 
 func boundedProbe(ctx context.Context, probe func(context.Context, EffectiveOptions, bool) error, effective EffectiveOptions, requireAOF bool) error {

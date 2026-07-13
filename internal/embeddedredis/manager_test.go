@@ -260,6 +260,59 @@ func TestPreparePreservesConfiguredPasswordForManagedStart(t *testing.T) {
 	proc.exit(nil)
 }
 
+func TestPrepareNormalizesIPv6LoopbackForManagedStartAndReuse(t *testing.T) {
+	opts := eligibleOptions(t)
+	opts.Address = "[::1]:16379"
+	opts.StartupTimeout = 100 * time.Millisecond
+	proc := newFakeProcess()
+	var starts atomic.Int32
+	var probesMu sync.Mutex
+	var probes []EffectiveOptions
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(_ context.Context, effective EffectiveOptions, _ bool) error {
+			probesMu.Lock()
+			probes = append(probes, effective)
+			probesMu.Unlock()
+			if effective.Address == "127.0.0.1:16379" && effective.Password != "" {
+				return nil
+			}
+			return errors.New("not available")
+		},
+		occupied: func(context.Context, string) (bool, error) { return false, nil },
+		payload:  func() ([]byte, error) { return []byte("x"), nil },
+		extract:  fakeExtract(opts.DataDir),
+		start: func(*exec.Cmd) (managedProcess, error) {
+			starts.Add(1)
+			return proc, nil
+		},
+	})
+
+	owned, firstEffective, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !owned.Owned() || firstEffective.Address != "127.0.0.1:16379" {
+		t.Fatalf("first Prepare = owned %v, address %q", owned.Owned(), firstEffective.Address)
+	}
+	reused, secondEffective, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused == nil || reused.Owned() || secondEffective.Address != "127.0.0.1:16379" {
+		t.Fatalf("second Prepare = %#v, address %q", reused, secondEffective.Address)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("starts = %d, want one managed process", starts.Load())
+	}
+	probesMu.Lock()
+	defer probesMu.Unlock()
+	if len(probes) < 3 || probes[0].Address != opts.Address || probes[2].Address != opts.Address {
+		t.Fatalf("configured probe addresses = %#v, want user IPv6 endpoint first on each Prepare", probes)
+	}
+	proc.exit(nil)
+}
+
 func TestPrepareReportsEarlyExitAndTimeoutKillsAndReaps(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -345,6 +398,81 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 			t.Fatal("idempotent Stop should retain result")
 		}
 	})
+	t.Run("shutdown error waits for deadline before kill", func(t *testing.T) {
+		proc := newFakeProcess()
+		shutdownCalled := make(chan struct{})
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error {
+			close(shutdownCalled)
+			return errors.New("ERR shutdown denied")
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		defer cancel()
+		stopDone := make(chan error, 1)
+		go func() { stopDone <- m.Stop(ctx) }()
+		<-shutdownCalled
+		time.Sleep(20 * time.Millisecond)
+		if proc.kills.Load() != 0 {
+			t.Fatalf("kills before deadline = %d, want 0", proc.kills.Load())
+		}
+		err := <-stopDone
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "shutdown denied") {
+			t.Fatalf("Stop error = %v, want shutdown and deadline errors", err)
+		}
+		if proc.kills.Load() != 1 {
+			t.Fatalf("kills after deadline = %d, want 1", proc.kills.Load())
+		}
+	})
+	t.Run("already exited does not shutdown endpoint", func(t *testing.T) {
+		proc := newFakeProcess()
+		var shutdowns atomic.Int32
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error { shutdowns.Add(1); return nil })
+		proc.exit(nil)
+		waitForCount(t, &proc.waits, 1)
+		deadline := time.Now().Add(time.Second)
+		for len(m.exit) == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("process exit was not published")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := m.Stop(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if shutdowns.Load() != 0 || proc.kills.Load() != 0 {
+			t.Fatalf("shutdown/kill = %d/%d, want 0/0", shutdowns.Load(), proc.kills.Load())
+		}
+	})
+	t.Run("concurrent waiter respects own context", func(t *testing.T) {
+		proc := newFakeProcess()
+		shutdownStarted := make(chan struct{})
+		releaseShutdown := make(chan struct{})
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error {
+			close(shutdownStarted)
+			<-releaseShutdown
+			proc.exit(nil)
+			return nil
+		})
+		ownerDone := make(chan error, 1)
+		go func() { ownerDone <- m.Stop(context.Background()) }()
+		<-shutdownStarted
+		waiterCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		err := m.Stop(waiterCtx)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter Stop error = %v", err)
+		}
+		if time.Since(started) > 200*time.Millisecond {
+			t.Fatalf("waiter did not return promptly: %v", time.Since(started))
+		}
+		if proc.kills.Load() != 0 {
+			t.Fatalf("waiter killed owned process: %d", proc.kills.Load())
+		}
+		close(releaseShutdown)
+		if err := <-ownerDone; err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func eligibleOptions(t *testing.T) Options {
@@ -388,6 +516,17 @@ func ownedTestManager(proc *fakeProcess, shutdown func(context.Context, Effectiv
 	m := &Manager{owned: true, process: proc, effective: EffectiveOptions{Address: "127.0.0.1:1"}, shutdown: shutdown, exit: make(chan error, 1), stopDone: make(chan struct{})}
 	go func() { m.exit <- proc.Wait(); close(m.exit) }()
 	return m
+}
+
+func waitForCount(t *testing.T, value *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for value.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("count = %d, want %d", value.Load(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func itoa(n int) string {
