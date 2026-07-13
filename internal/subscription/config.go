@@ -100,6 +100,12 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 
 func normalizeConfig(cfg model.SubscriptionConfig) model.SubscriptionConfig {
 	cfg.DefaultTargetRoot = cleanConfigPath(cfg.DefaultTargetRoot)
+	cfg.DefaultTarget = NormalizeSubscriptionStorageTarget(cfg.DefaultTarget)
+	if cfg.DefaultTarget.Provider == "" && cfg.DefaultTargetRoot != "" {
+		if migrated, ok := MigrateLegacyPathTarget(cfg.DefaultTargetRoot); ok {
+			cfg.DefaultTarget = migrated
+		}
+	}
 	cfg.DefaultCheckIntervalMinutes = 0
 	cfg.DefaultMediaType = ""
 	cfg.DefaultCategory = ""
@@ -291,6 +297,12 @@ func telegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) []string 
 func normalizeTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
 	cfg.Channels = cleanStringList(cfg.Channels, false)
 	cfg.TempTransferRoot = cleanConfigPath(cfg.TempTransferRoot)
+	cfg.TempTransferTarget = NormalizeSubscriptionStorageTarget(cfg.TempTransferTarget)
+	if cfg.TempTransferTarget.Provider == "" && cfg.TempTransferRoot != "" {
+		if migrated, ok := MigrateLegacyPathTarget(cfg.TempTransferRoot); ok {
+			cfg.TempTransferTarget = migrated
+		}
+	}
 	cfg.Cookie = strings.TrimSpace(cfg.Cookie)
 	cfg.RefreshToken = strings.TrimSpace(cfg.RefreshToken)
 	cfg.AccessToken = strings.TrimSpace(cfg.AccessToken)

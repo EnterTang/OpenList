@@ -91,6 +91,11 @@ type SubscriptionRun struct {
 	Error            string     `json:"error" gorm:"type:text"`
 }
 
+type SubscriptionStorageTarget struct {
+	Provider string `json:"provider,omitempty"`
+	Folder   string `json:"folder,omitempty"`
+}
+
 type SubscriptionManualSourceConfig struct {
 	Paths       []string `json:"paths"`
 	Links       []string `json:"links"`
@@ -119,14 +124,15 @@ type SubscriptionTelegramSourceConfig struct {
 }
 
 type SubscriptionTelegramPanConfig struct {
-	Channels          []string `json:"channels"`
-	TempTransferRoot  string   `json:"temp_transfer_root"`
-	DeleteSourceAfter bool     `json:"delete_source_after"`
-	Cookie            string   `json:"cookie,omitempty"`
-	RefreshToken      string   `json:"refresh_token,omitempty"`
-	AccessToken       string   `json:"access_token,omitempty"`
-	DriveID           string   `json:"-"`
-	DriveType         string   `json:"drive_type,omitempty"`
+	Channels           []string                  `json:"channels"`
+	TempTransferRoot   string                    `json:"temp_transfer_root"`
+	TempTransferTarget SubscriptionStorageTarget `json:"temp_transfer_target,omitempty"`
+	DeleteSourceAfter  bool                      `json:"delete_source_after"`
+	Cookie             string                    `json:"cookie,omitempty"`
+	RefreshToken       string                    `json:"refresh_token,omitempty"`
+	AccessToken        string                    `json:"access_token,omitempty"`
+	DriveID            string                    `json:"-"`
+	DriveType          string                    `json:"drive_type,omitempty"`
 }
 
 type SubscriptionPanSouSourceConfig struct {
@@ -140,6 +146,7 @@ type SubscriptionPanSouSourceConfig struct {
 
 type SubscriptionConfig struct {
 	DefaultTargetRoot           string                           `json:"default_target_root,omitempty"`
+	DefaultTarget               SubscriptionStorageTarget        `json:"default_target,omitempty"`
 	DefaultCheckIntervalMinutes int                              `json:"default_check_interval_minutes,omitempty"`
 	DefaultTransferEnabled      bool                             `json:"default_transfer_enabled,omitempty"`
 	DefaultMediaType            string                           `json:"default_media_type,omitempty"`
