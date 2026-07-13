@@ -30,7 +30,7 @@ Environment:
   network access to GitHub plus curl, unzip, zip, and sha256sum or shasum.
 
 Output:
-  build/compress/openlist-windows-amd64.zip          (--target windows-amd64)
+  build/compress/openlist-windows-amd64.zip          (--target windows-amd64, amd64, or all)
   build/compress/openlist-linux-musl-amd64.tar.gz    (--target linux-amd64-musl)
   build/compress/openlist-darwin-amd64.tar.gz        (--target darwin-amd64)
   or all official release archives when --target all
@@ -62,6 +62,13 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found in PATH"
 }
 
+target_requires_windows_amd64() {
+  case "$1" in
+    windows-amd64|amd64|all) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 cleanup_embedded_redis() {
   local original_status=$?
 
@@ -89,6 +96,45 @@ verify_windows_release_archive() {
   [ "$regular_entry_count" -eq 1 ] ||
     die "Windows release archive entry openlist.exe is not a regular file: $archive"
 }
+
+require_info_zip_unzip() (
+  set -e
+
+  local probe_dir
+  local probe_archive
+  local entries
+  local listing
+  local regular_entry_count
+  local cleanup
+
+  require_cmd unzip
+  require_cmd zip
+
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/openlist-unzip-probe.XXXXXX")"
+  printf -v cleanup 'rm -rf %q' "$probe_dir"
+  trap "$cleanup" EXIT
+  probe_archive="$probe_dir/probe.zip"
+  printf 'probe\n' >"$probe_dir/probe.txt"
+  (
+    cd "$probe_dir"
+    zip -X -q "$probe_archive" probe.txt
+  )
+
+  if ! entries="$(unzip -Z1 "$probe_archive" 2>/dev/null)" || [ "$entries" != "probe.txt" ]; then
+    die "unzip must support Info-ZIP-style -Z1 and -Z -l modes required to verify Windows release archives"
+  fi
+
+  if ! listing="$(unzip -Z -l "$probe_archive" 2>/dev/null)"; then
+    die "unzip must support Info-ZIP-style -Z1 and -Z -l modes required to verify Windows release archives"
+  fi
+  regular_entry_count="$(printf '%s\n' "$listing" | awk '$NF == "probe.txt" && substr($1, 1, 1) == "-" { count++ } END { print count + 0 }')"
+  [ "$regular_entry_count" -eq 1 ] ||
+    die "unzip must support Info-ZIP-style -Z1 and -Z -l modes required to verify Windows release archives"
+)
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -182,11 +228,11 @@ FRONTEND_DIR="$(cd "$FRONTEND_DIR" && pwd)" || die "frontend dir does not exist:
 export FRONTEND_DIR
 export FRONTEND_VERSION="${FRONTEND_VERSION:-$(node -p "require('$FRONTEND_DIR/package.json').version")}"
 
-if [ "$TARGET" = "windows-amd64" ]; then
+if target_requires_windows_amd64 "$TARGET"; then
   [ -f "$EMBEDDED_REDIS_HELPER" ] || die "embedded Redis helper not found: $EMBEDDED_REDIS_HELPER"
   require_cmd curl
-  require_cmd unzip
   require_cmd zip
+  require_info_zip_unzip
   if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
     die "sha256sum or shasum is required for Windows embedded Redis builds"
   fi
@@ -241,7 +287,7 @@ fi
   bash build.sh "${backend_args[@]}"
 )
 
-if [ "$TARGET" = "windows-amd64" ]; then
+if target_requires_windows_amd64 "$TARGET"; then
   windows_archive="$BACKEND_DIR/build/compress/openlist-windows-amd64.zip"
   if [ "$use_lite_build" = "true" ]; then
     windows_archive="$BACKEND_DIR/build/compress/openlist-windows-amd64-lite.zip"

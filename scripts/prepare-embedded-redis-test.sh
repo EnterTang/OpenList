@@ -72,6 +72,32 @@ printf 'unexpected\n' >"$unexpected_fixture/redis-cli.exe"
 assert_fails assemble_payload "$unexpected_fixture" "$tmp_dir/unexpected.zip"
 pass "assemble_payload rejects unexpected files"
 
+failed_staging_dir="$tmp_dir/failed-staging"
+cleanup_fixture="$tmp_dir/cleanup-fixture"
+make_fixture "$cleanup_fixture"
+mktemp() {
+  case "$*" in
+    *embedded-redis-payload*)
+      mkdir "$failed_staging_dir"
+      printf '%s\n' "$failed_staging_dir"
+      ;;
+    *) return 1 ;;
+  esac
+}
+assemble_without_inherited_exit_trap() (
+  trap - EXIT
+  assemble_payload "$@"
+)
+set +e
+assemble_without_inherited_exit_trap "$cleanup_fixture" "$tmp_dir/mktemp-failure.zip" >/dev/null 2>&1
+assembly_status=$?
+set -e
+[ "$assembly_status" -ne 0 ] || fail "assemble_payload unexpectedly survived temporary output creation failure"
+unset -f assemble_without_inherited_exit_trap
+unset -f mktemp
+[ ! -e "$failed_staging_dir" ] || fail "assemble_payload leaked staging after temporary output creation failed"
+pass "assemble_payload cleans staging when temporary output creation fails"
+
 valid_fixture="$tmp_dir/valid"
 make_fixture "$valid_fixture"
 first_zip="$tmp_dir/first.zip"
@@ -133,5 +159,50 @@ case "$release_usage" in
   *) fail "local release usage does not disclose the Windows network requirement" ;;
 esac
 pass "local Windows release usage discloses Redis embedding and network access"
+
+# shellcheck source=build-release-local.sh
+source "$LOCAL_RELEASE_SCRIPT"
+
+for target in windows-amd64 amd64 all; do
+  target_requires_windows_amd64 "$target" || fail "$target did not route through Windows AMD64 preparation"
+done
+for target in linux-amd64-musl darwin-amd64; do
+  if target_requires_windows_amd64 "$target"; then
+    fail "$target incorrectly routed through Windows AMD64 preparation"
+  fi
+done
+pass "local release routing recognizes every target that emits Windows AMD64"
+
+require_info_zip_unzip
+pass "local release accepts unzip with required zipinfo modes"
+
+unzip() {
+  echo "fake unzip: zipinfo modes are unsupported" >&2
+  return 2
+}
+unzip_probe_error="$tmp_dir/unzip-probe-error.txt"
+if require_info_zip_unzip 2>"$unzip_probe_error"; then
+  fail "unzip feature probe accepted an implementation without zipinfo modes"
+fi
+unset -f unzip
+grep -F "Info-ZIP-style -Z1 and -Z -l" "$unzip_probe_error" >/dev/null ||
+  fail "unzip feature probe did not explain the required modes"
+pass "local release rejects unzip implementations without required zipinfo modes"
+
+windows_amd64_files="$(GOOS=windows GOARCH=amd64 go list -f '{{join .GoFiles " "}}' ./internal/embeddedredis)"
+case " $windows_amd64_files " in
+  *" payload_windows.go "*) ;;
+  *) fail "Windows AMD64 does not select the embedded payload implementation" ;;
+esac
+
+windows_arm64_files="$(GOOS=windows GOARCH=arm64 go list -f '{{join .GoFiles " "}}' ./internal/embeddedredis)"
+case " $windows_arm64_files " in
+  *" payload_other.go "*) ;;
+  *) fail "Windows ARM64 does not select the unavailable-payload implementation" ;;
+esac
+case " $windows_arm64_files " in
+  *" payload_windows.go "*) fail "Windows ARM64 selected the x64 embedded payload implementation" ;;
+esac
+pass "embedded Redis payload selection is limited to Windows AMD64"
 
 echo "all prepare-embedded-redis tests passed"

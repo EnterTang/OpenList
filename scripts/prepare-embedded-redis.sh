@@ -145,9 +145,10 @@ assemble_payload() (
   output_dir="$(cd "$(dirname "$output")" && pwd)"
   output="$output_dir/$(basename "$output")"
   staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/embedded-redis-payload.XXXXXX")"
+  trap "rm -rf -- $(printf '%q' "$staging_dir")" EXIT
   temporary_output="$(mktemp "$output.tmp.XXXXXX")"
+  trap "rm -rf -- $(printf '%q' "$staging_dir"); rm -f -- $(printf '%q' "$temporary_output")" EXIT
   rm -f "$temporary_output"
-  trap 'rm -rf "$staging_dir"; rm -f "$temporary_output"' EXIT
 
   for name in "${PAYLOAD_FILES[@]}"; do
     cp "$source_dir/$name" "$staging_dir/$name"
