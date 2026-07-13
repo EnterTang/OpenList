@@ -136,8 +136,9 @@ require_cmd node
 
 # Install pnpm if not found
 if ! command -v pnpm >/dev/null 2>&1; then
-  echo "==> pnpm not found, installing via npm"
-  npm install -g pnpm
+  echo "==> pnpm not found, installing via standalone script"
+  curl -fsSL https://get.pnpm.io/install.sh | sh -
+  export PATH="$HOME/.local/share/pnpm:$PATH"
 fi
 
 docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
