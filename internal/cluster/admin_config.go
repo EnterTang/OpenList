@@ -158,9 +158,6 @@ func validateAdminConfig(cfg conf.Cluster) error {
 		if strings.TrimSpace(cfg.EnrollmentToken) == "" {
 			return errors.New("cluster enrollment token is required for coordinator and hybrid roles")
 		}
-		if strings.TrimSpace(cfg.ETFRootPath) == "" {
-			return errors.New("cluster ETF root path is required for coordinator and hybrid roles")
-		}
 	}
 	if role.RunsWorker() {
 		if strings.TrimSpace(cfg.NodeID) == "" {

@@ -175,6 +175,8 @@ func (m UploadETFManifest) TaskContext() TaskContext {
 		Share:                 m.Share,
 		Media:                 m.Media,
 		SourceObjects:         m.SourceObjects,
+		StagingTarget:         m.StagingTarget,
+		DeliveryTarget:        m.DeliveryTarget,
 		TargetProfile:         m.TargetProfile,
 	}
 }

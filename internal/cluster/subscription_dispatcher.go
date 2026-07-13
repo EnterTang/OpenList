@@ -80,6 +80,10 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	if d.runtime == nil || len(tasks) == 0 {
 		return nil, errors.New("cluster subscription dispatcher is unavailable")
 	}
+	config, err := subscription.GetConfig()
+	if err != nil {
+		return nil, err
+	}
 	targets, err := d.runtime.subscriptionDispatchTargets(ctx)
 	if err != nil {
 		return nil, err
@@ -102,24 +106,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			RequiredCapabilities: []string{
 				"share.save", "mobile.upload", "result.report",
 			},
-			TaskContext: protocol.TaskContext{
-				MediaItemID: task.MediaItemID, WorkflowVersion: task.WorkflowVersion,
-				SealedManifestVersion: task.SealedManifestVersion, TargetProfile: target.targetProfile,
-				Subscription: protocol.SubscriptionTaskContext{
-					SubscriptionID: task.SubscriptionID, SubscriptionItemID: task.SubscriptionItemID,
-					SubscriptionName: task.SubscriptionName, SourceKey: task.SourceKey,
-					SourceMessageID: task.SourceMessageID, ShareRefFingerprint: task.ShareRefFingerprint,
-				},
-				Share: protocol.ShareTaskContext{Provider: task.ShareProvider, URL: task.ShareURL, Passcode: task.SharePasscode},
-				Media: protocol.MediaTaskContext{
-					MediaType: task.MediaType, TMDBID: task.TMDBID, Season: task.Season, Episode: task.Episode,
-					LogicalMediaRoot: task.LogicalMediaRoot, LogicalTargetPath: task.LogicalTargetPath,
-				},
-				SourceObjects: []protocol.SourceObject{{
-					Provider: task.ShareProvider, SourceFileID: task.SourceFileID,
-					SourceRelativePath: task.SourceRelativePath, Size: task.SourceSize, Hash: task.SourceHash,
-				}},
-			},
+			TaskContext: subscriptionMediaTaskContext(config, task, target.targetProfile),
 		})
 		requestTaskIndexes = append(requestTaskIndexes, i)
 	}
@@ -150,6 +137,65 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 		}
 	}
 	return results, dispatchErr
+}
+
+func subscriptionMediaTaskContext(cfg model.SubscriptionConfig, task subscription.ClusterMediaTask, targetProfile string) protocol.TaskContext {
+	staging := protocol.ProviderTargetRequirement{
+		Provider:      strings.TrimSpace(task.ShareProvider),
+		NeedShareSave: true,
+		RequiredBytes: max64(task.SourceSize, 0),
+	}
+	source, ok := subscriptionTelegramPanConfigForProvider(cfg.Telegram, task.ShareProvider)
+	if ok {
+		stagingTarget := source.TempTransferTarget
+		if stagingTarget.Provider != "" {
+			staging.Provider = stagingTarget.Provider
+		}
+		staging.Folder = stagingTarget.Folder
+	}
+	delivery := protocol.ProviderTargetRequirement{
+		NeedUpload:    true,
+		RequiredBytes: max64(task.SourceSize, 0),
+	}
+	if migrated, ok := subscription.MigrateLegacyPathTarget(task.LogicalMediaRoot); ok {
+		delivery.Provider = migrated.Provider
+		delivery.Folder = migrated.Folder
+	}
+	return protocol.TaskContext{
+		MediaItemID: task.MediaItemID, WorkflowVersion: task.WorkflowVersion,
+		SealedManifestVersion: task.SealedManifestVersion, TargetProfile: targetProfile,
+		Subscription: protocol.SubscriptionTaskContext{
+			SubscriptionID: task.SubscriptionID, SubscriptionItemID: task.SubscriptionItemID,
+			SubscriptionName: task.SubscriptionName, SourceKey: task.SourceKey,
+			SourceMessageID: task.SourceMessageID, ShareRefFingerprint: task.ShareRefFingerprint,
+		},
+		Share: protocol.ShareTaskContext{Provider: task.ShareProvider, URL: task.ShareURL, Passcode: task.SharePasscode},
+		Media: protocol.MediaTaskContext{
+			MediaType: task.MediaType, TMDBID: task.TMDBID, Season: task.Season, Episode: task.Episode,
+			LogicalMediaRoot: task.LogicalMediaRoot, LogicalTargetPath: task.LogicalTargetPath,
+		},
+		SourceObjects: []protocol.SourceObject{{
+			Provider: task.ShareProvider, SourceFileID: task.SourceFileID,
+			SourceRelativePath: task.SourceRelativePath, Size: task.SourceSize, Hash: task.SourceHash,
+		}},
+		StagingTarget:  staging,
+		DeliveryTarget: delivery,
+	}
+}
+
+func subscriptionTelegramPanConfigForProvider(cfg model.SubscriptionTelegramSourceConfig, provider string) (model.SubscriptionTelegramPanConfig, bool) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "quark":
+		return cfg.Quark, true
+	case "aliyun_drive", "aliyundrive", "aliyun":
+		return cfg.AliyunDrive, true
+	case "pan123", "123":
+		return cfg.Pan123, true
+	case "pan115", "115":
+		return cfg.Pan115, true
+	default:
+		return model.SubscriptionTelegramPanConfig{}, false
+	}
 }
 
 func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchTarget, error) {
@@ -201,7 +247,11 @@ func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchT
 	eligible := make([]*dispatchTarget, 0, len(targets))
 	for _, target := range targets {
 		context := protocol.TaskContext{
-			Share: protocol.ShareTaskContext{Provider: task.ShareProvider}, TargetProfile: target.targetProfile,
+			Share:         protocol.ShareTaskContext{Provider: task.ShareProvider},
+			TargetProfile: target.targetProfile,
+			DeliveryTarget: protocol.ProviderTargetRequirement{
+				Provider: subscriptionMediaTaskContext(model.SubscriptionConfig{}, task, target.targetProfile).DeliveryTarget.Provider,
+			},
 		}
 		ok, err := nodeInventorySupports(ctx, target.nodeID, context, []string{"share.save", "mobile.upload", "result.report"}, task.SourceSize+target.assignedBytes)
 		if err != nil || !ok {

@@ -241,16 +241,26 @@ type StagePermitRequest struct {
 	OperationKey string `json:"operation_key"`
 }
 
+type ProviderTargetRequirement struct {
+	Provider      string `json:"provider,omitempty"`
+	Folder        string `json:"folder,omitempty"`
+	NeedShareSave bool   `json:"need_share_save,omitempty"`
+	NeedUpload    bool   `json:"need_upload,omitempty"`
+	RequiredBytes int64  `json:"required_bytes,omitempty"`
+}
+
 type TaskContext struct {
-	ParentBatchID         string                  `json:"parent_batch_id"`
-	MediaItemID           string                  `json:"media_item_id"`
-	WorkflowVersion       string                  `json:"workflow_version"`
-	SealedManifestVersion string                  `json:"sealed_manifest_version"`
-	Subscription          SubscriptionTaskContext `json:"subscription"`
-	Share                 ShareTaskContext        `json:"share"`
-	Media                 MediaTaskContext        `json:"media"`
-	SourceObjects         []SourceObject          `json:"source_objects"`
-	TargetProfile         string                  `json:"target_profile"`
+	ParentBatchID         string                    `json:"parent_batch_id"`
+	MediaItemID           string                    `json:"media_item_id"`
+	WorkflowVersion       string                    `json:"workflow_version"`
+	SealedManifestVersion string                    `json:"sealed_manifest_version"`
+	Subscription          SubscriptionTaskContext   `json:"subscription"`
+	Share                 ShareTaskContext          `json:"share"`
+	Media                 MediaTaskContext          `json:"media"`
+	SourceObjects         []SourceObject            `json:"source_objects"`
+	StagingTarget         ProviderTargetRequirement `json:"staging_target,omitempty"`
+	DeliveryTarget        ProviderTargetRequirement `json:"delivery_target,omitempty"`
+	TargetProfile         string                    `json:"target_profile"`
 }
 
 type ShareTaskContext struct {
@@ -291,28 +301,30 @@ type SourceObject struct {
 
 type UploadETFManifest struct {
 	AttemptRef
-	ParentBatchID         string                  `json:"parent_batch_id"`
-	MediaItemID           string                  `json:"media_item_id"`
-	OperationKey          string                  `json:"operation_key"`
-	StagePermitToken      string                  `json:"stage_permit_token"`
-	TaskContextHash       string                  `json:"task_context_hash"`
-	WorkflowVersion       string                  `json:"workflow_version"`
-	SealedManifestVersion string                  `json:"sealed_manifest_version"`
-	TargetProfile         string                  `json:"target_profile"`
-	WorkerTargetRoot      string                  `json:"worker_target_root,omitempty"`
-	Subscription          SubscriptionTaskContext `json:"subscription"`
-	Share                 ShareTaskContext        `json:"share"`
-	Media                 MediaTaskContext        `json:"media"`
-	SourceObjects         []SourceObject          `json:"source_objects"`
-	MobileAccountBinding  string                  `json:"mobile_account_binding"`
-	RemoteFileID          string                  `json:"remote_file_id"`
-	RemoteParentID        string                  `json:"remote_parent_id,omitempty"`
-	RemotePath            string                  `json:"remote_path"`
-	Name                  string                  `json:"name"`
-	Size                  int64                   `json:"size"`
-	SHA256                string                  `json:"sha256"`
-	HashSource            string                  `json:"hash_source"`
-	UploadReceipt         string                  `json:"upload_receipt,omitempty"`
+	ParentBatchID         string                    `json:"parent_batch_id"`
+	MediaItemID           string                    `json:"media_item_id"`
+	OperationKey          string                    `json:"operation_key"`
+	StagePermitToken      string                    `json:"stage_permit_token"`
+	TaskContextHash       string                    `json:"task_context_hash"`
+	WorkflowVersion       string                    `json:"workflow_version"`
+	SealedManifestVersion string                    `json:"sealed_manifest_version"`
+	TargetProfile         string                    `json:"target_profile"`
+	WorkerTargetRoot      string                    `json:"worker_target_root,omitempty"`
+	StagingTarget         ProviderTargetRequirement `json:"staging_target,omitempty"`
+	DeliveryTarget        ProviderTargetRequirement `json:"delivery_target,omitempty"`
+	Subscription          SubscriptionTaskContext   `json:"subscription"`
+	Share                 ShareTaskContext          `json:"share"`
+	Media                 MediaTaskContext          `json:"media"`
+	SourceObjects         []SourceObject            `json:"source_objects"`
+	MobileAccountBinding  string                    `json:"mobile_account_binding"`
+	RemoteFileID          string                    `json:"remote_file_id"`
+	RemoteParentID        string                    `json:"remote_parent_id,omitempty"`
+	RemotePath            string                    `json:"remote_path"`
+	Name                  string                    `json:"name"`
+	Size                  int64                     `json:"size"`
+	SHA256                string                    `json:"sha256"`
+	HashSource            string                    `json:"hash_source"`
+	UploadReceipt         string                    `json:"upload_receipt,omitempty"`
 }
 
 type UploadETFManifestAck struct {

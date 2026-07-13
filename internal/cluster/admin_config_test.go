@@ -183,6 +183,28 @@ func TestSaveAdminConfigRejectsInvalidRole(t *testing.T) {
 	}
 }
 
+func TestSaveAdminConfigAllowsCoordinatorWithoutETFRootPath(t *testing.T) {
+	cfg := conf.DefaultConfig(t.TempDir()).Cluster
+	cfg.Role = string(RoleCoordinator)
+	cfg.EnrollmentToken = "enrollment-secret"
+	setupAdminConfigTest(t, cfg)
+
+	got, err := SaveAdminConfig(AdminConfigUpdate{
+		Role:          string(RoleCoordinator),
+		NodeID:        "coordinator-a",
+		WebSocketPath: "/api/cluster/ws",
+		Redis: AdminRedisConfigUpdate{
+			Address: "127.0.0.1:6379",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ETFRootPath != "" {
+		t.Fatalf("ETF root path = %q, want empty", got.ETFRootPath)
+	}
+}
+
 func containsJSONText(body []byte, value string) bool {
 	for i := 0; i+len(value) <= len(body); i++ {
 		if string(body[i:i+len(value)]) == value {

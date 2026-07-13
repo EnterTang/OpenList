@@ -223,6 +223,26 @@ func TestStagePermitIsRequestedJustInTime(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestResolveStagingTempRootPrefersTaskTargetOverConfiguredProviderRoot(t *testing.T) {
+	service := New(&fakeResultQueue{}, nil)
+	service.desiredConfig.ProviderTempRoots = map[string]string{"aliyundrive": "/ali/cluster-temp"}
+	namespace := ".openlist-cluster/job-1/media-1"
+	task := protocol.TaskContext{
+		Share: protocol.ShareTaskContext{Provider: "aliyundrive"},
+		StagingTarget: protocol.ProviderTargetRequirement{
+			Provider:      "pan123",
+			Folder:        "转存至移动",
+			NeedShareSave: true,
+			RequiredBytes: 8 << 30,
+		},
+		SourceObjects: []protocol.SourceObject{{Provider: "aliyundrive", SourceFileID: "file-1", Size: 8 << 30}},
+	}
+
+	got, err := service.resolveStagingTempRoot(context.Background(), task, namespace)
+	require.NoError(t, err)
+	require.Equal(t, "/123/转存至移动/.openlist-cluster/job-1/media-1", got)
+}
+
 func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 	t.Helper()
 	taskContext := protocol.TaskContext{

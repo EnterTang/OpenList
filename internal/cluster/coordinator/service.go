@@ -27,6 +27,19 @@ type Service struct {
 	inspectConsumer ShareInspectConsumer
 }
 
+type NodeInventorySummary struct {
+	CollectedAt      *time.Time                          `json:"collected_at,omitempty"`
+	InventoryHash    string                              `json:"inventory_hash,omitempty"`
+	Capabilities     *protocol.NodeCapabilities          `json:"capabilities,omitempty"`
+	Mounts           []protocol.MountInventory           `json:"mounts,omitempty"`
+	ProviderAccounts []protocol.ProviderAccountInventory `json:"provider_accounts,omitempty"`
+}
+
+type NodeSummary struct {
+	model.ClusterNode
+	LatestInventory *NodeInventorySummary `json:"latest_inventory,omitempty"`
+}
+
 // ShareInspectConsumer is the subscription-facing durable handoff. The
 // manifest remains pending until the consumer returns nil, so a Coordinator
 // restart cannot lose an inspected share tree.
@@ -1045,10 +1058,55 @@ func (s *Service) finishInboxTx(tx *gorm.DB, peer transport.Peer, message protoc
 	return tx.Model(&model.ClusterNodeSession{}).Where("id = ?", peer.SessionID()).Updates(updates).Error
 }
 
-func (s *Service) ListNodes(ctx context.Context) ([]model.ClusterNode, error) {
+func (s *Service) ListNodes(ctx context.Context) ([]NodeSummary, error) {
 	var nodes []model.ClusterNode
-	err := s.db.WithContext(ctx).Order("name ASC, id ASC").Find(&nodes).Error
-	return nodes, err
+	if err := s.db.WithContext(ctx).Order("name ASC, id ASC").Find(&nodes).Error; err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 {
+		return []NodeSummary{}, nil
+	}
+	nodeIDs := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		nodeIDs = append(nodeIDs, node.ID)
+	}
+	var inventories []model.ClusterNodeInventory
+	if err := s.db.WithContext(ctx).Where("node_id IN ?", nodeIDs).Order("node_id ASC, revision DESC").Find(&inventories).Error; err != nil {
+		return nil, err
+	}
+	latestByNode := make(map[string]model.ClusterNodeInventory, len(inventories))
+	for _, inventory := range inventories {
+		if _, exists := latestByNode[inventory.NodeID]; !exists {
+			latestByNode[inventory.NodeID] = inventory
+		}
+	}
+	result := make([]NodeSummary, 0, len(nodes))
+	for _, node := range nodes {
+		summary := NodeSummary{ClusterNode: node}
+		if inventory, ok := latestByNode[node.ID]; ok {
+			view := NodeInventorySummary{CollectedAt: &inventory.CollectedAt, InventoryHash: inventory.InventoryHash}
+			if strings.TrimSpace(inventory.CapabilitiesJSON) != "" {
+				var capabilities protocol.NodeCapabilities
+				if err := json.Unmarshal([]byte(inventory.CapabilitiesJSON), &capabilities); err != nil {
+					return nil, err
+				}
+				view.Capabilities = &capabilities
+			}
+			if strings.TrimSpace(inventory.MountsJSON) != "" {
+				if err := json.Unmarshal([]byte(inventory.MountsJSON), &view.Mounts); err != nil {
+					return nil, err
+				}
+			}
+			if strings.TrimSpace(inventory.ProviderAccountsJSON) != "" {
+				if err := json.Unmarshal([]byte(inventory.ProviderAccountsJSON), &view.ProviderAccounts); err != nil {
+					return nil, err
+				}
+			}
+			summary.LatestInventory = &view
+		}
+		result = append(result, summary)
+	}
+	return result, nil
 }
 
 func (s *Service) ListUploadManifests(ctx context.Context, limit int) ([]model.ClusterUploadManifest, error) {

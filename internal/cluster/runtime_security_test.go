@@ -6,7 +6,10 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestWorkerCoordinatorURLRequiresTLSForRemoteHost(t *testing.T) {
@@ -63,4 +66,26 @@ func TestClusterCheckOrigin(t *testing.T) {
 
 	request.Header.Set("Origin", "https://attacker.example.com")
 	require.False(t, clusterCheckOrigin(request))
+}
+
+func TestCoordinatorStartAllowsMissingETFRootPath(t *testing.T) {
+	original := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = original })
+
+	database, err := gorm.Open(sqlite.Open("file:cluster_runtime_start?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	db.Init(database)
+
+	conf.Conf.Cluster.Role = string(RoleCoordinator)
+	conf.Conf.Cluster.EnrollmentToken = "enrollment-secret"
+	conf.Conf.Cluster.WebSocketPath = "/api/cluster/ws"
+	conf.Conf.Cluster.ETFRootPath = ""
+
+	runtime := &Runtime{}
+	require.NoError(t, runtime.Start())
+	t.Cleanup(runtime.Stop)
+	if runtime.CoordinatorService() == nil {
+		t.Fatal("coordinator service was not initialized")
+	}
 }

@@ -62,6 +62,9 @@ func GetStorageByMountPath(mountPath string) (*model.Storage, error) {
 
 func GetEnabledStorages() ([]model.Storage, error) {
 	var storages []model.Storage
+	if db == nil {
+		return storages, nil
+	}
 	err := addStorageOrder(db).Where(fmt.Sprintf("%s = ?", columnName("disabled")), false).Find(&storages).Error
 	if err != nil {
 		return nil, errors.WithStack(err)

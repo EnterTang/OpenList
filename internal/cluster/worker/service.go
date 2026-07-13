@@ -684,8 +684,11 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if targetProfileRef == "" || targetProfileRef == "/" {
 		return errors.New("cluster target profile must be a mounted destination path")
 	}
-	targetProfile, _, _ := s.resolveTargetBinding(targetProfileRef)
-	targetStorage, _, err := op.GetStorageAndActualPath(targetProfile)
+	targetRootBase, targetBindingMount, err := s.resolveDeliveryTargetRoot(ctx, offer.TaskContext)
+	if err != nil {
+		return fmt.Errorf("resolve cluster delivery target root: %w", err)
+	}
+	targetStorage, _, err := op.GetStorageAndActualPath(targetBindingMount)
 	if err != nil {
 		return fmt.Errorf("resolve cluster target profile: %w", err)
 	}
@@ -703,9 +706,9 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if _, err := s.requestStagePermit(ctx, offer, model.ClusterStageSavingShare); err != nil {
 		return err
 	}
-	requestedTempRoot := namespace
-	if configuredRoot := s.providerTempRoot(offer.TaskContext.Share.Provider); configuredRoot != "" {
-		requestedTempRoot = path.Join(configuredRoot, namespace)
+	requestedTempRoot, err := s.resolveStagingTempRoot(ctx, offer.TaskContext, namespace)
+	if err != nil {
+		return fmt.Errorf("resolve cluster staging temp root: %w", err)
 	}
 	releaseDownload, err := s.acquireDownloadCapacity(ctx)
 	if err != nil {
@@ -728,7 +731,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return err
 	}
 	defer releaseUpload()
-	targetRoot := path.Join(targetProfile, namespace)
+	targetRoot := path.Join(targetRootBase, namespace)
 	if err := fs.MakeDir(ctx, targetRoot); err != nil {
 		return fmt.Errorf("create cluster mobile target: %w", err)
 	}
@@ -749,7 +752,9 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		WorkflowVersion:       offer.TaskContext.WorkflowVersion,
 		SealedManifestVersion: offer.TaskContext.SealedManifestVersion,
 		TargetProfile:         offer.TaskContext.TargetProfile,
-		WorkerTargetRoot:      targetProfile,
+		WorkerTargetRoot:      targetRootBase,
+		StagingTarget:         offer.TaskContext.StagingTarget,
+		DeliveryTarget:        offer.TaskContext.DeliveryTarget,
 		Subscription:          offer.TaskContext.Subscription,
 		Share:                 offer.TaskContext.Share,
 		Media:                 offer.TaskContext.Media,

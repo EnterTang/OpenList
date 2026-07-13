@@ -34,9 +34,30 @@ func resolveInventoryTargetPath(ctx context.Context, nodeID string, targetPath s
 	return path.Clean(binding.MountPath), true
 }
 
-func providerAccountsSupportTarget(accounts []protocol.ProviderAccountInventory, targetPath string, expectedBytes int64) bool {
-	resolvedTargetPath := path.Clean(targetPath)
+func providerAccountsSupportSource(accounts []protocol.ProviderAccountInventory, provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return true
+	}
 	for _, account := range accounts {
+		if !strings.EqualFold(strings.TrimSpace(account.Provider), provider) {
+			continue
+		}
+		if !account.SupportsShareSave || !account.SupportsDownload {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func providerAccountsSupportTarget(accounts []protocol.ProviderAccountInventory, targetPath string, targetProvider string, expectedBytes int64) bool {
+	resolvedTargetPath := path.Clean(targetPath)
+	targetProvider = strings.TrimSpace(targetProvider)
+	for _, account := range accounts {
+		if targetProvider != "" && !strings.EqualFold(strings.TrimSpace(account.Provider), targetProvider) {
+			continue
+		}
 		mountPath := strings.TrimRight(path.Clean(account.MountPath), "/")
 		if resolvedTargetPath != mountPath && !strings.HasPrefix(resolvedTargetPath, mountPath+"/") {
 			continue

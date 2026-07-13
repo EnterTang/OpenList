@@ -147,10 +147,6 @@ func (r *Runtime) Start() error {
 			r.stopLocked()
 			return errors.New("cluster.enrollment_token is required for coordinator and hybrid roles")
 		}
-		if strings.TrimSpace(conf.Conf.Cluster.ETFRootPath) == "" {
-			r.stopLocked()
-			return errors.New("cluster.etf_root_path is required for coordinator and hybrid roles")
-		}
 		r.leaseOwner = coordinatorID() + ":" + uuid.NewString()
 		if err := r.acquireCoordinatorLease(r.ctx, time.Now().UTC()); err != nil {
 			r.stopLocked()
@@ -526,7 +522,10 @@ func nodeInventorySupports(ctx context.Context, nodeID string, taskContext proto
 		}
 	}
 	if len(providerAccounts) > 0 {
-		return providerAccountsSupportTarget(providerAccounts, targetPath, expectedBytes), nil
+		if !providerAccountsSupportSource(providerAccounts, taskContext.Share.Provider) {
+			return false, nil
+		}
+		return providerAccountsSupportTarget(providerAccounts, targetPath, taskContext.DeliveryTarget.Provider, expectedBytes), nil
 	}
 	var mounts []protocol.MountInventory
 	if err := json.Unmarshal([]byte(inventory.MountsJSON), &mounts); err != nil {
