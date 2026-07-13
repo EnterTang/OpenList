@@ -26,11 +26,12 @@ import (
 type Yun139 struct {
 	model.Storage
 	Addition
-	cron              *cron.Cron
-	Account           string
-	ref               *Yun139
-	PersonalCloudHost string
-	RootPath          string
+	cron                  *cron.Cron
+	Account               string
+	ref                   *Yun139
+	runtimeMembershipTier string
+	PersonalCloudHost     string
+	RootPath              string
 }
 
 func (d *Yun139) Config() driver.Config {
@@ -63,6 +64,7 @@ func (d *Yun139) Init(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		d.updateRuntimeMembershipTier(ctx)
 
 		// Query Route Policy
 		var resp QueryRoutePolicyResp

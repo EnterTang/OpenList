@@ -13,7 +13,7 @@ type Addition struct {
 	Username       string `json:"username" required:"true" visible_when:"auth_mode=openlist" label:"用户名"`
 	Password       string `json:"password" required:"true" secret:"true" visible_when:"auth_mode=openlist" label:"密码"`
 	MailCookies    string `json:"mail_cookies" required:"true" type:"text" visible_when:"auth_mode=openlist" label:"邮箱 Cookie" help:"mail.139.com 的 Cookie，用于密码登录换取移动云盘授权。"`
-	MembershipTier string `json:"membership_tier" type:"select" options:"unknown,ordinary,silver,gold,diamond" default:"unknown" label:"会员等级" help:"用于集群能力调度；未知等级禁止集群上传，普通/白银/黄金/钻石分别限制单文件上传为 5/8/20/500 GiB。"`
+	MembershipTier string `json:"membership_tier" type:"select" options:"unknown,ordinary,silver,gold,diamond" default:"unknown" label:"会员等级" help:"用于集群能力调度；unknown 时登录后自动查询。普通/白银/黄金/钻石分别限制单文件上传为 5/8/20/500 GiB，查询失败时保持 unknown。"`
 	driver.RootID
 	Type                                         string `json:"type" type:"select" options:"personal_new,family,group,personal" default:"personal_new" label:"类型"`
 	CloudID                                      string `json:"cloud_id" label:"Cloud ID"`
