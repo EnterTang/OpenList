@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || solaris
 
 package embeddedredis
 
