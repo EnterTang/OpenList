@@ -61,15 +61,16 @@ type InventoryQuery struct {
 }
 
 type InventoryReport struct {
-	RequestID        string            `json:"request_id,omitempty"`
-	Revision         uint64            `json:"revision"`
-	CollectedAt      time.Time         `json:"collected_at"`
-	InventoryHash    string            `json:"inventory_hash"`
-	Capabilities     NodeCapabilities  `json:"capabilities"`
-	Mounts           []MountInventory  `json:"mounts"`
-	RecentError      string            `json:"recent_error,omitempty"`
-	KeyAgreement     *NodeKeyAgreement `json:"key_agreement,omitempty"`
-	ObservedRevision uint64            `json:"observed_revision,omitempty"`
+	RequestID        string                     `json:"request_id,omitempty"`
+	Revision         uint64                     `json:"revision"`
+	CollectedAt      time.Time                  `json:"collected_at"`
+	InventoryHash    string                     `json:"inventory_hash"`
+	Capabilities     NodeCapabilities           `json:"capabilities"`
+	Mounts           []MountInventory           `json:"mounts"`
+	ProviderAccounts []ProviderAccountInventory `json:"provider_accounts,omitempty"`
+	RecentError      string                     `json:"recent_error,omitempty"`
+	KeyAgreement     *NodeKeyAgreement          `json:"key_agreement,omitempty"`
+	ObservedRevision uint64                     `json:"observed_revision,omitempty"`
 }
 
 type NodeCapabilities struct {
@@ -99,6 +100,25 @@ type MountInventory struct {
 	FreeBytes          int64  `json:"free_bytes,omitempty"`
 	DriverVersion      string `json:"driver_version,omitempty"`
 	ConfigSchemaHash   string `json:"config_schema_hash,omitempty"`
+}
+
+type ProviderAccountInventory struct {
+	NodeMountID          string `json:"node_mount_id"`
+	Provider             string `json:"provider"`
+	MountPath            string `json:"mount_path"`
+	AccountAlias         string `json:"account_alias,omitempty"`
+	AccountFingerprint   string `json:"account_fingerprint,omitempty"`
+	Status               string `json:"status"`
+	MembershipTier       string `json:"membership_tier,omitempty"`
+	MembershipWeight     int    `json:"membership_weight,omitempty"`
+	MaxSingleUploadBytes int64  `json:"max_single_upload_bytes,omitempty"`
+	SupportsUpload       bool   `json:"supports_upload"`
+	SupportsDownload     bool   `json:"supports_download"`
+	SupportsShareSave    bool   `json:"supports_share_save"`
+	SupportsETF          bool   `json:"supports_etf"`
+	TotalBytes           int64  `json:"total_bytes,omitempty"`
+	FreeBytes            int64  `json:"free_bytes,omitempty"`
+	ActiveJobs           int    `json:"active_jobs,omitempty"`
 }
 
 type ConfigApply struct {

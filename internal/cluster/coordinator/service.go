@@ -766,14 +766,19 @@ func (s *Service) handleInventory(ctx context.Context, peer transport.Peer, inve
 	if err != nil {
 		return err
 	}
+	providerAccounts, err := json.Marshal(inventory.ProviderAccounts)
+	if err != nil {
+		return err
+	}
 	item := model.ClusterNodeInventory{
-		ID:               uuid.NewString(),
-		NodeID:           peer.NodeID(),
-		Revision:         inventory.Revision,
-		CollectedAt:      inventory.CollectedAt.UTC(),
-		InventoryHash:    inventory.InventoryHash,
-		CapabilitiesJSON: string(capabilities),
-		MountsJSON:       string(mounts),
+		ID:                   uuid.NewString(),
+		NodeID:               peer.NodeID(),
+		Revision:             inventory.Revision,
+		CollectedAt:          inventory.CollectedAt.UTC(),
+		InventoryHash:        inventory.InventoryHash,
+		CapabilitiesJSON:     string(capabilities),
+		MountsJSON:           string(mounts),
+		ProviderAccountsJSON: string(providerAccounts),
 	}
 	if item.CollectedAt.IsZero() {
 		item.CollectedAt = time.Now().UTC()

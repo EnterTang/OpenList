@@ -68,16 +68,17 @@ type ClusterNodeSession struct {
 // ClusterNodeInventory stores an immutable, non-secret capability snapshot.
 // MountsJSON must contain only redacted inventory fields, never Storage.Addition.
 type ClusterNodeInventory struct {
-	ID               string    `json:"id" gorm:"primaryKey;size:64"`
-	CreatedAt        time.Time `json:"created_at"`
-	NodeID           string    `json:"node_id" gorm:"size:64;uniqueIndex:idx_cluster_inventory_revision"`
-	Revision         uint64    `json:"revision" gorm:"uniqueIndex:idx_cluster_inventory_revision"`
-	CollectedAt      time.Time `json:"collected_at" gorm:"index"`
-	InventoryHash    string    `json:"inventory_hash" gorm:"size:64;index"`
-	CapabilitiesJSON string    `json:"capabilities_json" gorm:"type:text"`
-	MountsJSON       string    `json:"mounts_json" gorm:"type:text"`
-	MetricsJSON      string    `json:"metrics_json" gorm:"type:text"`
-	RedisHealthJSON  string    `json:"redis_health_json" gorm:"type:text"`
+	ID                   string    `json:"id" gorm:"primaryKey;size:64"`
+	CreatedAt            time.Time `json:"created_at"`
+	NodeID               string    `json:"node_id" gorm:"size:64;uniqueIndex:idx_cluster_inventory_revision"`
+	Revision             uint64    `json:"revision" gorm:"uniqueIndex:idx_cluster_inventory_revision"`
+	CollectedAt          time.Time `json:"collected_at" gorm:"index"`
+	InventoryHash        string    `json:"inventory_hash" gorm:"size:64;index"`
+	CapabilitiesJSON     string    `json:"capabilities_json" gorm:"type:text"`
+	MountsJSON           string    `json:"mounts_json" gorm:"type:text"`
+	ProviderAccountsJSON string    `json:"provider_accounts_json" gorm:"type:text"`
+	MetricsJSON          string    `json:"metrics_json" gorm:"type:text"`
+	RedisHealthJSON      string    `json:"redis_health_json" gorm:"type:text"`
 }
 
 // ClusterCoordinatorLease prevents two Coordinator processes sharing one

@@ -10,40 +10,24 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
-	"github.com/OpenListTeam/OpenList/v4/internal/db"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
 
 func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protocol.InventoryReport, error) {
-	storages, err := db.GetEnabledStorages()
+	storages, err := listInventoryStorages()
 	if err != nil {
 		return protocol.InventoryReport{}, err
 	}
 	mounts := make([]protocol.MountInventory, 0, len(storages))
+	providerAccounts := make([]protocol.ProviderAccountInventory, 0, len(storages))
 	providers := make(map[string]struct{})
 	for _, storage := range storages {
-		mount := protocol.MountInventory{
-			NodeMountID:  stableMountID(nodeID, storage.ID, storage.MountPath),
-			Driver:       storage.Driver,
-			Provider:     providerName(storage.Driver),
-			MountPath:    storage.MountPath,
-			AccountAlias: strings.TrimSpace(storage.Remark),
-			Status:       storage.Status,
-			ReadOnly:     storage.Disabled,
-			CanUpload:    !storage.Disabled,
-			CanShare:     supportsShare(storage.Driver),
-			SupportsETF:  supportsETF(storage.Driver),
+		snapshot, err := hydrateInventoryStorage(ctx, nodeID, storage)
+		if err != nil {
+			return protocol.InventoryReport{}, err
 		}
-		if driver, driverErr := op.GetStorageByMountPath(storage.MountPath); driverErr == nil {
-			mount.ReadOnly = driver.Config().NoUpload
-			mount.CanUpload = !driver.Config().NoUpload
-			if details, detailsErr := op.GetStorageDetails(ctx, driver); detailsErr == nil && details != nil {
-				mount.TotalBytes = details.TotalSpace
-				mount.FreeBytes = details.FreeSpace()
-			}
-		}
-		providers[mount.Provider] = struct{}{}
-		mounts = append(mounts, mount)
+		providers[snapshot.Mount.Provider] = struct{}{}
+		mounts = append(mounts, snapshot.Mount)
+		providerAccounts = append(providerAccounts, snapshot.Account)
 	}
 	providerList := make([]string, 0, len(providers))
 	for provider := range providers {
@@ -57,12 +41,14 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 			SupportedOperations:  []string{"share.inspect", "share.save", "download", "mobile.upload", "result.report", "config.apply", "storage.apply"},
 			RedisDurabilityReady: redisReady,
 		},
-		Mounts: mounts,
+		Mounts:           mounts,
+		ProviderAccounts: providerAccounts,
 	}
 	raw, err := json.Marshal(struct {
-		Capabilities protocol.NodeCapabilities `json:"capabilities"`
-		Mounts       []protocol.MountInventory `json:"mounts"`
-	}{report.Capabilities, report.Mounts})
+		Capabilities     protocol.NodeCapabilities           `json:"capabilities"`
+		Mounts           []protocol.MountInventory           `json:"mounts"`
+		ProviderAccounts []protocol.ProviderAccountInventory `json:"provider_accounts"`
+	}{report.Capabilities, report.Mounts, report.ProviderAccounts})
 	if err != nil {
 		return protocol.InventoryReport{}, fmt.Errorf("marshal cluster inventory: %w", err)
 	}
@@ -87,7 +73,7 @@ func providerName(driver string) string {
 	case "quark":
 		return "quark"
 	case "139yun", "139 cloud", "139":
-		return "mobile_139"
+		return "yidong139"
 	default:
 		return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(driver), " ", "_"))
 	}
