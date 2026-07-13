@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -516,41 +515,24 @@ func nodeInventorySupports(ctx context.Context, nodeID string, taskContext proto
 	if containsFold(required, model.ClusterJobTypeShareInspect) && strings.TrimSpace(taskContext.TargetProfile) == "" {
 		return true, nil
 	}
+	targetPath, ok := resolveInventoryTargetPath(ctx, nodeID, taskContext.TargetProfile)
+	if !ok {
+		return false, nil
+	}
+	var providerAccounts []protocol.ProviderAccountInventory
+	if strings.TrimSpace(inventory.ProviderAccountsJSON) != "" {
+		if err := json.Unmarshal([]byte(inventory.ProviderAccountsJSON), &providerAccounts); err != nil {
+			return false, err
+		}
+	}
+	if len(providerAccounts) > 0 {
+		return providerAccountsSupportTarget(providerAccounts, targetPath, expectedBytes), nil
+	}
 	var mounts []protocol.MountInventory
 	if err := json.Unmarshal([]byte(inventory.MountsJSON), &mounts); err != nil {
 		return false, err
 	}
-	targetPath := strings.TrimSpace(taskContext.TargetProfile)
-	if targetPath != "" && !path.IsAbs(targetPath) {
-		var desired model.ClusterNodeDesiredConfig
-		if err := db.GetDb().WithContext(ctx).First(&desired, "node_id = ? AND status = ? AND observed_revision >= revision", nodeID, model.ClusterDesiredStatusApplied).Error; err != nil {
-			return false, nil
-		}
-		var config protocol.WorkerDesiredConfig
-		if json.Unmarshal([]byte(desired.ConfigJSON), &config) != nil {
-			return false, nil
-		}
-		binding, ok := config.TargetBindings[targetPath]
-		if !ok {
-			return false, nil
-		}
-		targetPath = binding.MountPath
-	}
-	for _, mount := range mounts {
-		mountPath := strings.TrimRight(path.Clean(mount.MountPath), "/")
-		resolvedTargetPath := path.Clean(targetPath)
-		if resolvedTargetPath != mountPath && !strings.HasPrefix(resolvedTargetPath, mountPath+"/") {
-			continue
-		}
-		if !mount.CanUpload || !mount.SupportsETF {
-			continue
-		}
-		if expectedBytes > 0 && mount.FreeBytes > 0 && mount.FreeBytes < expectedBytes {
-			continue
-		}
-		return true, nil
-	}
-	return false, nil
+	return mountsSupportTarget(mounts, targetPath, expectedBytes), nil
 }
 
 func containsFold(values []string, expected string) bool {
