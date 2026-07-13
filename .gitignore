@@ -34,3 +34,5 @@ output/
 .VSCodeCounter
 .omx/
 *.tgz
+/internal/embeddedredis/assets/generated/*
+!/internal/embeddedredis/assets/generated/.gitkeep
