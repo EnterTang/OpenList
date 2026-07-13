@@ -405,6 +405,6 @@ Expected: exactly one file, `openlist.exe`. Record the executable size increase 
 
 Start a worker/hybrid node from only `openlist.exe`, verify extraction paths, query `CONFIG GET appendonly appendfsync maxmemory-policy`, enqueue data, stop OpenList, restart it, and confirm the AOF-backed stream remains. If no Windows execution environment exists, report this explicitly as the remaining verification gap.
 
-- [ ] **Step 7: Commit documentation and plan completion state**
+- [ ] **Step 7: Finalize verification state and commit it**
 
-Commit documentation and checked plan state only after fresh verification evidence is collected.
+After fresh verification evidence is collected, mark only the completed verification steps, record any remaining gaps, and commit the final plan state.

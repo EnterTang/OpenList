@@ -81,18 +81,20 @@ Local Windows AMD64 artifacts built by `scripts/build-release-local.sh` with
 the `windows-amd64`, `amd64`, or `all` target embed Redis while keeping the
 distribution ZIP to one file: `openlist.exe`. On Windows, a worker or hybrid
 configured with a loopback Redis address and exactly a blank or `default` ACL
-username automatically extracts the versioned runtime beneath
+username is eligible for automatic management. When the manager must start its
+own Redis, it extracts the versioned runtime beneath
 `<data>/runtime/redis/7.2.14`. Persistent AOF data, the generated authentication
 secret, and logs remain beneath `<data>/redis`.
 
 External, remote, and custom-ACL Redis configurations remain authoritative.
 The manager also reuses an existing compatible Redis service when it satisfies
-the configured authentication and durability checks. A Redis process started
-by OpenList binds only to loopback with protected mode enabled, uses
-`appendonly yes`, `appendfsync always`, and `maxmemory-policy noeviction`, and
-receives a generated password when none is configured. That generated password
-is not written to `config.json`. OpenList gracefully stops only a Redis child it
-owns (with a bounded forced-stop fallback); reused services are left running.
+the configured authentication checks and, when `require_aof` is enabled, the
+durability checks. A Redis process started by OpenList binds only to loopback
+with protected mode enabled, uses `appendonly yes`, `appendfsync always`, and
+`maxmemory-policy noeviction`, and receives a generated password when none is
+configured. That generated password is not written to `config.json`. OpenList
+gracefully stops only a Redis child it owns (with a bounded forced-stop
+fallback); reused services are left running.
 
 The embedded runtime is the Redis 7.2.14 community Windows MSYS2 port. Its
 extracted runtime includes the BSD Redis and Apache Windows-port license
