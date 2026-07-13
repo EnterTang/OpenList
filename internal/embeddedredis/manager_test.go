@@ -1,0 +1,467 @@
+package embeddedredis
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestPrepareBypassesIneligibleOptionsWithoutSideEffects(t *testing.T) {
+	base := Options{Role: "worker", Address: "127.0.0.1:6379", Password: "original", DB: 2, DataDir: t.TempDir()}
+	tests := []Options{
+		func() Options { o := base; o.Address = "redis.example:6379"; return o }(),
+		func() Options { o := base; o.Username = "service"; return o }(),
+		func() Options { o := base; o.Role = "api"; return o }(),
+	}
+	for _, opts := range tests {
+		var calls atomic.Int32
+		restoreManagerDeps(t, managerDependencies{
+			goos:    "windows",
+			probe:   func(context.Context, EffectiveOptions, bool) error { calls.Add(1); return nil },
+			payload: func() ([]byte, error) { calls.Add(1); return nil, nil },
+			start:   func(*exec.Cmd) (managedProcess, error) { calls.Add(1); return nil, nil },
+		})
+		manager, effective, err := Prepare(context.Background(), opts)
+		if err != nil || manager != nil {
+			t.Fatalf("Prepare() = (%v, %#v, %v), want nil manager and no error", manager, effective, err)
+		}
+		if effective != effectiveFrom(opts) {
+			t.Fatalf("effective = %#v, want unchanged %#v", effective, effectiveFrom(opts))
+		}
+		if calls.Load() != 0 {
+			t.Fatalf("side effect calls = %d, want 0", calls.Load())
+		}
+	}
+
+	if runtime.GOOS != "windows" {
+		var calls atomic.Int32
+		restoreManagerDeps(t, managerDependencies{goos: runtime.GOOS, probe: func(context.Context, EffectiveOptions, bool) error { calls.Add(1); return nil }})
+		manager, effective, err := Prepare(context.Background(), base)
+		if err != nil || manager != nil || effective != effectiveFrom(base) || calls.Load() != 0 {
+			t.Fatalf("native non-Windows bypass = (%v, %#v, %v, calls %d)", manager, effective, err, calls.Load())
+		}
+	}
+}
+
+func TestPrepareReusesCompatibleConfiguredRedis(t *testing.T) {
+	opts := eligibleOptions(t)
+	opts.Password = "configured"
+	var got EffectiveOptions
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(_ context.Context, effective EffectiveOptions, requireAOF bool) error {
+			got = effective
+			if !requireAOF {
+				t.Fatal("probe did not require durability")
+			}
+			return nil
+		},
+		payload: func() ([]byte, error) { t.Fatal("payload called"); return nil, nil },
+	})
+	manager, effective, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager == nil || manager.Owned() {
+		t.Fatalf("manager = %#v, want reused manager", manager)
+	}
+	if effective != effectiveFrom(opts) || got != effectiveFrom(opts) {
+		t.Fatalf("effective/probe = %#v/%#v", effective, got)
+	}
+}
+
+func TestPrepareReusesPersistedManagedSecret(t *testing.T) {
+	opts := eligibleOptions(t)
+	secret := "persisted-secret"
+	redisDir := filepath.Join(opts.DataDir, "redis")
+	if err := os.MkdirAll(redisDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(redisDir, secretFilename), []byte(secret+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var probes []string
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(_ context.Context, effective EffectiveOptions, _ bool) error {
+			probes = append(probes, effective.Password)
+			if effective.Password == secret {
+				return nil
+			}
+			return errors.New("NOAUTH")
+		},
+	})
+	manager, effective, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager == nil || manager.Owned() {
+		t.Fatalf("manager = %#v, want reused", manager)
+	}
+	if effective.Password != secret || strings.Join(probes, ",") != ","+secret {
+		t.Fatalf("effective password/probes = %q/%q", effective.Password, probes)
+	}
+}
+
+func TestProbeRequiresEveryDurabilitySetting(t *testing.T) {
+	var mu sync.Mutex
+	var configKeys []string
+	server, address := newRESPServer(t, func(command []string) string {
+		switch strings.ToLower(command[0]) {
+		case "auth", "select":
+			return "+OK\r\n"
+		case "ping":
+			return "+PONG\r\n"
+		case "config":
+			key := command[len(command)-1]
+			mu.Lock()
+			configKeys = append(configKeys, key)
+			mu.Unlock()
+			value := map[string]string{"appendonly": "yes", "appendfsync": "everysec", "maxmemory-policy": "allkeys-lru"}[key]
+			return "*2\r\n$" + itoa(len(key)) + "\r\n" + key + "\r\n$" + itoa(len(value)) + "\r\n" + value + "\r\n"
+		}
+		return "-ERR unsupported\r\n"
+	})
+	defer server.Close()
+	err := probeRedis(context.Background(), EffectiveOptions{Address: address}, true)
+	if err == nil || !strings.Contains(err.Error(), "appendfsync") {
+		t.Fatalf("probeRedis error = %v, want appendfsync durability mismatch", err)
+	}
+	mu.Lock()
+	gotKeys := strings.Join(configKeys, ",")
+	mu.Unlock()
+	if gotKeys != "appendonly,appendfsync,maxmemory-policy" {
+		t.Fatalf("CONFIG GET keys = %q, want every durability setting", gotKeys)
+	}
+}
+
+func TestPrepareRejectsOccupiedConflictWithoutStarting(t *testing.T) {
+	opts := eligibleOptions(t)
+	var starts atomic.Int32
+	restoreManagerDeps(t, managerDependencies{
+		goos:     "windows",
+		probe:    func(context.Context, EffectiveOptions, bool) error { return errors.New("invalid protocol") },
+		occupied: func(context.Context, string) (bool, error) { return true, nil },
+		start:    func(*exec.Cmd) (managedProcess, error) { starts.Add(1); return nil, nil },
+	})
+	manager, _, err := Prepare(context.Background(), opts)
+	if err == nil || !strings.Contains(err.Error(), "occupied") || manager != nil || starts.Load() != 0 {
+		t.Fatalf("Prepare() = (%v, %v), starts=%d", manager, err, starts.Load())
+	}
+}
+
+func TestPrepareStartsManagedRedisWithGeneratedSecret(t *testing.T) {
+	opts := eligibleOptions(t)
+	proc := newFakeProcess()
+	var probes atomic.Int32
+	var command *exec.Cmd
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(_ context.Context, effective EffectiveOptions, _ bool) error {
+			if probes.Add(1) < 2 {
+				return errors.New("connection refused")
+			}
+			if effective.Password == "" {
+				t.Fatal("readiness password empty")
+			}
+			return nil
+		},
+		occupied: func(context.Context, string) (bool, error) { return false, nil },
+		payload:  func() ([]byte, error) { return []byte("payload"), nil },
+		extract: func(dataDir string, payload []byte) (ExtractedRuntime, error) {
+			if dataDir != opts.DataDir || string(payload) != "payload" {
+				t.Fatalf("extract args = %q/%q", dataDir, payload)
+			}
+			runtimeDir := filepath.Join(opts.DataDir, "fake-runtime")
+			if err := os.MkdirAll(runtimeDir, 0700); err != nil {
+				return ExtractedRuntime{}, err
+			}
+			return ExtractedRuntime{Dir: runtimeDir, ServerPath: filepath.Join(runtimeDir, "redis-server.exe")}, nil
+		},
+		start: func(cmd *exec.Cmd) (managedProcess, error) { command = cmd; return proc, nil },
+	})
+	manager, effective, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager == nil || !manager.Owned() || effective.Password == "" {
+		t.Fatalf("manager/effective = %#v/%#v", manager, effective)
+	}
+	if opts.Password != "" {
+		t.Fatalf("caller password mutated to %q", opts.Password)
+	}
+	if command == nil || command.Dir == "" || len(command.Args) != 2 || filepath.Base(command.Args[1]) != "redis.conf" {
+		t.Fatalf("command = %#v", command)
+	}
+	config, err := os.ReadFile(command.Args[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(config), "requirepass \""+effective.Password+"\"") {
+		t.Fatalf("config missing password: %s", config)
+	}
+	secret, err := os.ReadFile(filepath.Join(opts.DataDir, "redis", secretFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(secret)) != effective.Password {
+		t.Fatalf("secret = %q", secret)
+	}
+	info, err := os.Stat(filepath.Join(opts.DataDir, "redis", secretFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		t.Fatalf("secret mode = %o", info.Mode().Perm())
+	}
+	proc.exit(nil)
+}
+
+func TestPreparePreservesConfiguredPasswordForManagedStart(t *testing.T) {
+	opts := eligibleOptions(t)
+	opts.Password = "chosen-password"
+	proc := newFakeProcess()
+	var calls atomic.Int32
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(_ context.Context, effective EffectiveOptions, _ bool) error {
+			if calls.Add(1) == 1 {
+				return errors.New("refused")
+			}
+			if effective.Password != opts.Password {
+				t.Fatalf("password = %q", effective.Password)
+			}
+			return nil
+		},
+		occupied: func(context.Context, string) (bool, error) { return false, nil },
+		payload:  func() ([]byte, error) { return []byte("x"), nil },
+		extract:  fakeExtract(opts.DataDir),
+		start:    func(*exec.Cmd) (managedProcess, error) { return proc, nil },
+	})
+	manager, effective, err := Prepare(context.Background(), opts)
+	if err != nil || effective.Password != opts.Password || !manager.Owned() {
+		t.Fatalf("Prepare = %#v %#v %v", manager, effective, err)
+	}
+	if _, err := os.Stat(filepath.Join(opts.DataDir, "redis", secretFilename)); !os.IsNotExist(err) {
+		t.Fatalf("managed secret created for configured password: %v", err)
+	}
+	proc.exit(nil)
+}
+
+func TestPrepareReportsEarlyExitAndTimeoutKillsAndReaps(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		early bool
+	}{{"early exit", true}, {"timeout", false}} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := eligibleOptions(t)
+			opts.StartupTimeout = 25 * time.Millisecond
+			proc := newFakeProcess()
+			restoreManagerDeps(t, managerDependencies{
+				goos: "windows", probe: func(context.Context, EffectiveOptions, bool) error { return errors.New("not ready") },
+				occupied: func(context.Context, string) (bool, error) { return false, nil }, payload: func() ([]byte, error) { return []byte("x"), nil },
+				extract: fakeExtract(opts.DataDir), start: func(*exec.Cmd) (managedProcess, error) {
+					if test.early {
+						proc.exit(nil)
+					}
+					return proc, nil
+				},
+			})
+			manager, _, err := Prepare(context.Background(), opts)
+			if err == nil || manager != nil {
+				t.Fatalf("Prepare = %v, %v", manager, err)
+			}
+			if test.early && strings.Contains(err.Error(), "%!w") {
+				t.Fatalf("early exit error contains formatting failure: %v", err)
+			}
+			if !test.early && proc.kills.Load() != 1 {
+				t.Fatalf("kills = %d, want 1", proc.kills.Load())
+			}
+			if proc.waits.Load() != 1 {
+				t.Fatalf("waits = %d, want 1", proc.waits.Load())
+			}
+		})
+	}
+}
+
+func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
+	t.Run("reused", func(t *testing.T) {
+		var shutdowns atomic.Int32
+		m := &Manager{shutdown: func(context.Context, EffectiveOptions) error { shutdowns.Add(1); return nil }}
+		if err := m.Stop(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if shutdowns.Load() != 0 {
+			t.Fatalf("shutdowns = %d", shutdowns.Load())
+		}
+	})
+	t.Run("owned concurrent graceful", func(t *testing.T) {
+		proc := newFakeProcess()
+		var shutdowns atomic.Int32
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error {
+			shutdowns.Add(1)
+			proc.exit(nil)
+			return errors.New("EOF")
+		})
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := m.Stop(context.Background()); err != nil {
+					t.Errorf("Stop: %v", err)
+				}
+			}()
+		}
+		wg.Wait()
+		if shutdowns.Load() != 1 || proc.waits.Load() != 1 || proc.kills.Load() != 0 {
+			t.Fatalf("shutdown/wait/kill = %d/%d/%d", shutdowns.Load(), proc.waits.Load(), proc.kills.Load())
+		}
+	})
+	t.Run("deadline kills", func(t *testing.T) {
+		proc := newFakeProcess()
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error { return nil })
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := m.Stop(ctx); err == nil {
+			t.Fatal("Stop error = nil, want deadline")
+		}
+		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
+			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
+		}
+		if err := m.Stop(context.Background()); err == nil {
+			t.Fatal("idempotent Stop should retain result")
+		}
+	})
+}
+
+func eligibleOptions(t *testing.T) Options {
+	return Options{Role: "worker", Address: "127.0.0.1:16379", DataDir: t.TempDir(), RequireAOF: true, StartupTimeout: time.Second}
+}
+
+func effectiveFrom(opts Options) EffectiveOptions {
+	return EffectiveOptions{Address: opts.Address, Username: opts.Username, Password: opts.Password, DB: opts.DB}
+}
+
+func restoreManagerDeps(t *testing.T, deps managerDependencies) {
+	t.Helper()
+	old := currentManagerDeps
+	currentManagerDeps = deps.withDefaults()
+	t.Cleanup(func() { currentManagerDeps = old })
+}
+
+func fakeExtract(dataDir string) func(string, []byte) (ExtractedRuntime, error) {
+	return func(string, []byte) (ExtractedRuntime, error) {
+		dir := filepath.Join(dataDir, "runtime-test")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return ExtractedRuntime{}, err
+		}
+		return ExtractedRuntime{Dir: dir, ServerPath: filepath.Join(dir, "redis-server.exe")}, nil
+	}
+}
+
+type fakeProcess struct {
+	done         chan struct{}
+	once         sync.Once
+	err          error
+	waits, kills atomic.Int32
+}
+
+func newFakeProcess() *fakeProcess    { return &fakeProcess{done: make(chan struct{})} }
+func (p *fakeProcess) Wait() error    { p.waits.Add(1); <-p.done; return p.err }
+func (p *fakeProcess) Kill() error    { p.kills.Add(1); p.exit(errors.New("killed")); return nil }
+func (p *fakeProcess) exit(err error) { p.once.Do(func() { p.err = err; close(p.done) }) }
+
+func ownedTestManager(proc *fakeProcess, shutdown func(context.Context, EffectiveOptions) error) *Manager {
+	m := &Manager{owned: true, process: proc, effective: EffectiveOptions{Address: "127.0.0.1:1"}, shutdown: shutdown, exit: make(chan error, 1), stopDone: make(chan struct{})}
+	go func() { m.exit <- proc.Wait(); close(m.exit) }()
+	return m
+}
+
+func itoa(n int) string {
+	const digits = "0123456789"
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = digits[n%10]
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+type respServer struct{ net.Listener }
+
+func newRESPServer(t *testing.T, handler func([]string) string) (*respServer, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &respServer{ln}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveRESP(c, handler)
+		}
+	}()
+	return s, ln.Addr().String()
+}
+func serveRESP(conn net.Conn, handler func([]string) string) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	for {
+		command, err := readRESPCommand(reader)
+		if err != nil {
+			return
+		}
+		if _, err = conn.Write([]byte(handler(command))); err != nil {
+			return
+		}
+	}
+}
+func readRESPCommand(reader *bufio.Reader) ([]string, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "*")))
+	if err != nil {
+		return nil, err
+	}
+	command := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		lengthLine, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		length, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(lengthLine, "$")))
+		if err != nil {
+			return nil, err
+		}
+		value := make([]byte, length+2)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return nil, err
+		}
+		command = append(command, string(value[:length]))
+	}
+	return command, nil
+}
