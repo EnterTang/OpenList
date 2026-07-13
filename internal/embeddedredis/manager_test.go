@@ -725,6 +725,48 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 			t.Fatalf("shutdown/wait/kill = %d/%d/%d", shutdowns.Load(), proc.waits.Load(), proc.kills.Load())
 		}
 	})
+	t.Run("concurrent waiter after exit returns owner error", func(t *testing.T) {
+		proc := newFakeProcess()
+		shutdownStarted := make(chan struct{})
+		finishShutdown := make(chan struct{})
+		shutdownErr := errors.New("shutdown failed")
+		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error {
+			close(shutdownStarted)
+			proc.exit(nil)
+			<-finishShutdown
+			return shutdownErr
+		})
+
+		ownerDone := make(chan error, 1)
+		go func() { ownerDone <- m.Stop(context.Background()) }()
+		<-shutdownStarted
+		waitForCount(t, &proc.waits, 1)
+		deadline := time.Now().Add(time.Second)
+		for len(m.exit) == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("owned process exit was not published")
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		waiterDone := make(chan error, 1)
+		go func() { waiterDone <- m.Stop(context.Background()) }()
+		select {
+		case err := <-waiterDone:
+			t.Fatalf("concurrent Stop returned before owner completed: %v", err)
+		case <-time.After(25 * time.Millisecond):
+		}
+
+		close(finishShutdown)
+		ownerErr := <-ownerDone
+		waiterErr := <-waiterDone
+		if !errors.Is(ownerErr, shutdownErr) {
+			t.Fatalf("owner Stop error = %v, want shutdown error", ownerErr)
+		}
+		if waiterErr != ownerErr {
+			t.Fatalf("concurrent Stop error = %v, want cached owner error %v", waiterErr, ownerErr)
+		}
+	})
 	t.Run("deadline kills", func(t *testing.T) {
 		proc := newFakeProcess()
 		m := ownedTestManager(proc, func(context.Context, EffectiveOptions) error { return nil })

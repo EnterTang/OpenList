@@ -92,7 +92,8 @@ type Manager struct {
 	acquireLock       func(context.Context, string) (*installLock, error)
 	exit              chan error
 	stopDone          chan struct{}
-	stopOnce          sync.Once
+	stopMu            sync.Mutex
+	stopping          bool
 	stopErr           error
 }
 
@@ -273,13 +274,14 @@ func (m *Manager) Stop(ctx context.Context) error {
 	if m == nil || !m.owned {
 		return nil
 	}
-	select {
-	case <-m.stopDone:
-		return m.stopErr
-	default:
+	m.stopMu.Lock()
+	if m.stopping {
+		m.stopMu.Unlock()
+		return m.waitForStop(ctx)
 	}
 	select {
 	case <-m.exit:
+		m.stopMu.Unlock()
 		return nil
 	default:
 	}
@@ -292,33 +294,36 @@ func (m *Manager) Stop(ctx context.Context) error {
 		var err error
 		lifecycleLock, err = acquireLock(ctx, m.lifecycleLockPath)
 		if err != nil {
+			m.stopMu.Unlock()
 			return fmt.Errorf("acquire Redis lifecycle lock: %w", err)
 		}
 	}
-	started := false
-	m.stopOnce.Do(func() {
-		started = true
-		go func() {
-			defer close(m.stopDone)
-			m.stopErr = m.stopOwned(ctx)
-			if lifecycleLock != nil {
-				if err := lifecycleLock.release(); err != nil {
-					m.stopErr = errors.Join(m.stopErr, fmt.Errorf("release Redis lifecycle lock: %w", err))
-				}
+	m.stopping = true
+	m.stopMu.Unlock()
+	go func() {
+		stopErr := m.stopOwned(ctx)
+		if lifecycleLock != nil {
+			if err := lifecycleLock.release(); err != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("release Redis lifecycle lock: %w", err))
 			}
-		}()
-	})
-	var releaseErr error
-	if !started && lifecycleLock != nil {
-		if err := lifecycleLock.release(); err != nil {
-			releaseErr = fmt.Errorf("release Redis lifecycle lock: %w", err)
 		}
+		m.stopErr = stopErr
+		close(m.stopDone)
+	}()
+	return m.waitForStop(ctx)
+}
+
+func (m *Manager) waitForStop(ctx context.Context) error {
+	select {
+	case <-m.stopDone:
+		return m.stopErr
+	default:
 	}
 	select {
 	case <-m.stopDone:
-		return errors.Join(m.stopErr, releaseErr)
+		return m.stopErr
 	case <-ctx.Done():
-		return errors.Join(ctx.Err(), releaseErr)
+		return ctx.Err()
 	}
 }
 
