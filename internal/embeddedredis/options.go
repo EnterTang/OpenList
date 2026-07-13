@@ -50,7 +50,7 @@ func ShouldManage(goos string, opts Options) bool {
 	if err != nil || !isValidPort(port) {
 		return false
 	}
-	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.ToLower(host)
 	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
@@ -82,6 +82,14 @@ func RenderConfig(port int, dataDir, password string) ([]byte, error) {
 }
 
 func isValidPort(port string) bool {
+	if port == "" {
+		return false
+	}
+	for i := range port {
+		if port[i] < '0' || port[i] > '9' {
+			return false
+		}
+	}
 	n, err := strconv.Atoi(port)
 	return err == nil && n >= 1 && n <= 65535
 }

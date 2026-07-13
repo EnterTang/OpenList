@@ -17,6 +17,8 @@ func TestShouldManage(t *testing.T) {
 		{"worker IPv6 loopback", "windows", Options{Role: "Worker", Address: "[::1]:6379"}, true},
 		{"remote address", "windows", Options{Role: "worker", Address: "192.0.2.1:6379"}, false},
 		{"malformed address", "windows", Options{Role: "worker", Address: "localhost"}, false},
+		{"host with leading whitespace", "windows", Options{Role: "worker", Address: " localhost:6379"}, false},
+		{"port with leading plus", "windows", Options{Role: "worker", Address: "localhost:+6379"}, false},
 		{"linux", "linux", Options{Role: "worker", Address: "127.0.0.1:6379"}, false},
 		{"coordinator", "windows", Options{Role: "coordinator", Address: "127.0.0.1:6379"}, false},
 		{"standalone", "windows", Options{Role: "standalone", Address: "127.0.0.1:6379"}, false},
