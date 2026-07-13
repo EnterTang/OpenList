@@ -124,19 +124,94 @@ func TestPrepareSerializesLifecycleOwnership(t *testing.T) {
 	close(begin)
 	<-startGate
 	first, second := <-results, <-results
-	if first.err != nil || second.err != nil {
-		t.Fatalf("Prepare errors = %v, %v", first.err, second.err)
-	}
 	owned := 0
-	for _, manager := range []*Manager{first.manager, second.manager} {
-		if manager != nil && manager.Owned() {
+	rejected := 0
+	for _, result := range []result{first, second} {
+		if result.manager != nil && result.manager.Owned() {
 			owned++
 		}
+		if result.err != nil && strings.Contains(result.err.Error(), "managed Redis is owned by another OpenList process") {
+			rejected++
+		}
 	}
-	if starts.Load() != 1 || owned != 1 {
-		t.Fatalf("starts/owned = %d/%d, want 1/1", starts.Load(), owned)
+	if starts.Load() != 1 || owned != 1 || rejected != 1 {
+		t.Fatalf("starts/owned/rejected = %d/%d/%d, want 1/1/1 (errors %v, %v)", starts.Load(), owned, rejected, first.err, second.err)
 	}
 	proc.exit(nil)
+}
+
+func TestPrepareAdoptsUnownedManagedEndpoint(t *testing.T) {
+	opts := eligibleOptions(t)
+	opts.Password = "managed-secret"
+	markerPath := filepath.Join(opts.DataDir, "runtime", "redis", managedMarkerFilename)
+	if err := writeManagedMarker(markerPath, managedMarkerFor(effectiveFromOptions(opts))); err != nil {
+		t.Fatal(err)
+	}
+	var live atomic.Bool
+	live.Store(true)
+	var shutdowns atomic.Int32
+	var starts atomic.Int32
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(context.Context, EffectiveOptions, bool) error {
+			if live.Load() {
+				return nil
+			}
+			return errors.New("connection refused")
+		},
+		occupied: func(context.Context, string) (bool, error) { return live.Load(), nil },
+		start:    func(*exec.Cmd) (managedProcess, error) { starts.Add(1); return nil, errors.New("unexpected start") },
+		shutdown: func(context.Context, EffectiveOptions) error {
+			shutdowns.Add(1)
+			live.Store(false)
+			return nil
+		},
+	})
+
+	manager, effective, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager == nil || !manager.Owned() || manager.process != nil || effective != effectiveFromOptions(opts) {
+		t.Fatalf("Prepare = (%#v, %#v), want adopted owner", manager, effective)
+	}
+	if err := manager.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.Stopped() || shutdowns.Load() != 1 || starts.Load() != 0 {
+		t.Fatalf("stopped/shutdowns/starts = %v/%d/%d", manager.Stopped(), shutdowns.Load(), starts.Load())
+	}
+}
+
+func TestPrepareLeavesExternalRedisUnownedWhenMarkerDoesNotMatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		marker *managedMarker
+	}{
+		{name: "missing"},
+		{name: "mismatched", marker: func() *managedMarker {
+			marker := managedMarkerFor(EffectiveOptions{Address: "127.0.0.1:16379", Password: "other"})
+			return &marker
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := eligibleOptions(t)
+			opts.Password = "external-secret"
+			if test.marker != nil {
+				if err := writeManagedMarker(filepath.Join(opts.DataDir, "runtime", "redis", managedMarkerFilename), *test.marker); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restoreManagerDeps(t, managerDependencies{goos: "windows", probe: func(context.Context, EffectiveOptions, bool) error { return nil }})
+			manager, _, err := Prepare(context.Background(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if manager == nil || manager.Owned() {
+				t.Fatalf("manager = %#v, want external reuse", manager)
+			}
+		})
+	}
 }
 
 func TestStopDoesNotShutdownSuccessorAfterOwnedChildExit(t *testing.T) {
@@ -1036,6 +1111,25 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
 		}
 	})
+	t.Run("kill failure is retryable", func(t *testing.T) {
+		proc := newRetryKillProcess()
+		m := ownedTestManagerForProcess(proc, func(context.Context, EffectiveOptions) error { return nil })
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		firstErr := m.Stop(ctx)
+		if firstErr == nil || !strings.Contains(firstErr.Error(), "kill denied") {
+			t.Fatalf("first Stop error = %v, want kill failure", firstErr)
+		}
+		if m.Stopped() {
+			t.Fatal("manager marked stopped after unconfirmed kill failure")
+		}
+		if err := m.Stop(context.Background()); err != nil {
+			t.Fatalf("retry Stop: %v", err)
+		}
+		if !m.Stopped() || proc.kills.Load() != 2 || proc.waits.Load() != 1 {
+			t.Fatalf("stopped/kill/wait = %v/%d/%d", m.Stopped(), proc.kills.Load(), proc.waits.Load())
+		}
+	})
 }
 
 func TestSecurePathHelpersRestrictPermissions(t *testing.T) {
@@ -1105,6 +1199,22 @@ type stubbornProcess struct {
 	once         sync.Once
 	killErr      error
 	waits, kills atomic.Int32
+}
+
+type retryKillProcess struct {
+	done         chan struct{}
+	once         sync.Once
+	waits, kills atomic.Int32
+}
+
+func newRetryKillProcess() *retryKillProcess { return &retryKillProcess{done: make(chan struct{})} }
+func (p *retryKillProcess) Wait() error      { p.waits.Add(1); <-p.done; return nil }
+func (p *retryKillProcess) Kill() error {
+	if p.kills.Add(1) == 1 {
+		return errors.New("kill denied")
+	}
+	p.once.Do(func() { close(p.done) })
+	return nil
 }
 
 func newStubbornProcess(killErr error) *stubbornProcess {

@@ -216,6 +216,24 @@ func TestEmbeddedRedisCleanupFailureKeepsManagerForRetry(t *testing.T) {
 	require.Equal(t, []string{"close-client", "stop-manager", "stop-manager"}, events)
 }
 
+func TestEmbeddedRedisCleanupDiagnosticClearsConfirmedStoppedManager(t *testing.T) {
+	manager := &embeddedredis.Manager{}
+	stopDiagnostic := context.DeadlineExceeded
+	runtime := &Runtime{
+		embeddedRedis: manager,
+		stopEmbeddedRedis: func(ctx context.Context, got *embeddedredis.Manager) error {
+			require.Same(t, manager, got)
+			require.NoError(t, got.Stop(ctx))
+			return stopDiagnostic
+		},
+	}
+
+	err := runtime.cleanupWorkerRedisLocked()
+	require.ErrorIs(t, err, stopDiagnostic)
+	require.True(t, manager.Stopped())
+	require.Nil(t, runtime.embeddedRedis)
+}
+
 func TestWorkerRedisPreparationRefusesToOverwritePendingManager(t *testing.T) {
 	originalConfig := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())

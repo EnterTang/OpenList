@@ -760,6 +760,10 @@ func (r *Runtime) cleanupWorkerRedisLocked() error {
 		cancel()
 		if err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop embedded Redis manager: %w", err))
+			if r.embeddedRedis.Stopped() {
+				log.Warnf("embedded Redis stopped with cleanup diagnostic: %v", err)
+				r.embeddedRedis = nil
+			}
 		} else {
 			r.embeddedRedis = nil
 		}
