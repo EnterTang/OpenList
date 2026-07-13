@@ -130,10 +130,15 @@ done
 [[ "$IMAGE" == */* ]] || die "DockerHub image should include a namespace, for example tangente/openlist-etf:latest"
 
 require_cmd docker
-require_cmd pnpm
 require_cmd rsync
 require_cmd curl
 require_cmd node
+
+# Install pnpm if not found
+if ! command -v pnpm >/dev/null 2>&1; then
+  echo "==> pnpm not found, installing via npm"
+  npm install -g pnpm
+fi
 
 docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 
