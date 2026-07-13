@@ -109,6 +109,13 @@ func Prepare(ctx context.Context, opts Options) (*Manager, EffectiveOptions, err
 	if configuredErr == nil {
 		return reusedManager(effective, deps.shutdown), effective, nil
 	}
+	if managedAddress != opts.Address {
+		managedEffective := effective
+		managedEffective.Address = managedAddress
+		if err := boundedProbe(ctx, deps.probe, managedEffective, opts.RequireAOF); err == nil {
+			return reusedManager(managedEffective, deps.shutdown), managedEffective, nil
+		}
+	}
 
 	redisDir := filepath.Join(opts.DataDir, "redis")
 	secretPath := filepath.Join(redisDir, secretFilename)
@@ -287,7 +294,7 @@ func boundedProbe(ctx context.Context, probe func(context.Context, EffectiveOpti
 }
 
 func probeRedis(ctx context.Context, effective EffectiveOptions, requireAOF bool) error {
-	client := redis.NewClient(&redis.Options{Addr: effective.Address, Username: effective.Username, Password: effective.Password, DB: effective.DB})
+	client := redis.NewClient(redisClientOptions(effective))
 	defer client.Close()
 	if err := client.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("PING: %w", err)
@@ -405,9 +412,20 @@ func waitUntilReady(ctx context.Context, probe func(context.Context, EffectiveOp
 }
 
 func shutdownRedis(ctx context.Context, effective EffectiveOptions) error {
-	client := redis.NewClient(&redis.Options{Addr: effective.Address, Username: effective.Username, Password: effective.Password, DB: effective.DB})
+	client := redis.NewClient(redisClientOptions(effective))
 	defer client.Close()
 	return client.Shutdown(ctx).Err()
+}
+
+func redisClientOptions(effective EffectiveOptions) *redis.Options {
+	return &redis.Options{
+		Addr:                  effective.Address,
+		Username:              effective.Username,
+		Password:              effective.Password,
+		DB:                    effective.DB,
+		MaxRetries:            -1,
+		ContextTimeoutEnabled: true,
+	}
 }
 
 func isExpectedShutdownError(err error) bool {

@@ -307,10 +307,83 @@ func TestPrepareNormalizesIPv6LoopbackForManagedStartAndReuse(t *testing.T) {
 	}
 	probesMu.Lock()
 	defer probesMu.Unlock()
-	if len(probes) < 3 || probes[0].Address != opts.Address || probes[2].Address != opts.Address {
-		t.Fatalf("configured probe addresses = %#v, want user IPv6 endpoint first on each Prepare", probes)
+	if len(probes) != 6 || probes[0].Address != opts.Address || probes[3].Address != opts.Address {
+		t.Fatalf("probe addresses = %#v, want user IPv6 endpoint first on each Prepare", probes)
 	}
 	proc.exit(nil)
+}
+
+func TestPrepareReusesIPv6ManagedRedisWithConfiguredPassword(t *testing.T) {
+	opts := eligibleOptions(t)
+	opts.Address = "[::1]:16379"
+	opts.Password = "configured-password"
+	var probes []EffectiveOptions
+	restoreManagerDeps(t, managerDependencies{
+		goos: "windows",
+		probe: func(_ context.Context, effective EffectiveOptions, _ bool) error {
+			probes = append(probes, effective)
+			if effective.Address == "127.0.0.1:16379" && effective.Password == opts.Password {
+				return nil
+			}
+			return errors.New("not available")
+		},
+		payload: func() ([]byte, error) { t.Fatal("payload called for surviving managed Redis"); return nil, nil },
+		start: func(*exec.Cmd) (managedProcess, error) {
+			t.Fatal("process started for surviving managed Redis")
+			return nil, nil
+		},
+	})
+
+	manager, effective, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager == nil || manager.Owned() {
+		t.Fatalf("manager = %#v, want reused", manager)
+	}
+	if effective.Address != "127.0.0.1:16379" || effective.Password != opts.Password {
+		t.Fatalf("effective = %#v", effective)
+	}
+	if len(probes) != 2 || probes[0].Address != opts.Address || probes[1].Address != effective.Address {
+		t.Fatalf("probes = %#v, want configured endpoint then normalized managed endpoint", probes)
+	}
+}
+
+func TestRedisClientsHonorContextDeadlines(t *testing.T) {
+	server := newSilentTCPServer(t)
+	defer server.Close()
+
+	t.Run("probe", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		err := probeRedis(ctx, EffectiveOptions{Address: server.Addr().String()}, false)
+		if err == nil {
+			t.Fatal("probeRedis error = nil, want timeout")
+		}
+		if elapsed := time.Since(started); elapsed > 750*time.Millisecond {
+			t.Fatalf("probeRedis ignored context deadline: %v", elapsed)
+		}
+	})
+
+	t.Run("stop shutdown", func(t *testing.T) {
+		proc := newFakeProcess()
+		m := ownedTestManager(proc, shutdownRedis)
+		m.effective.Address = server.Addr().String()
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		err := m.Stop(ctx)
+		if err == nil {
+			t.Fatal("Stop error = nil, want timeout")
+		}
+		if elapsed := time.Since(started); elapsed > 750*time.Millisecond {
+			t.Fatalf("Stop ignored context deadline: %v", elapsed)
+		}
+		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
+			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
+		}
+	})
 }
 
 func TestPrepareReportsEarlyExitAndTimeoutKillsAndReaps(t *testing.T) {
@@ -545,6 +618,43 @@ func itoa(n int) string {
 }
 
 type respServer struct{ net.Listener }
+
+type silentTCPServer struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func newSilentTCPServer(t *testing.T) *silentTCPServer {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &silentTCPServer{Listener: listener}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			server.mu.Lock()
+			server.conns = append(server.conns, conn)
+			server.mu.Unlock()
+		}
+	}()
+	return server
+}
+
+func (s *silentTCPServer) Close() error {
+	err := s.Listener.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, conn := range s.conns {
+		_ = conn.Close()
+	}
+	return err
+}
 
 func newRESPServer(t *testing.T, handler func([]string) string) (*respServer, string) {
 	t.Helper()
