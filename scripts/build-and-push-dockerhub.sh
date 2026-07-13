@@ -148,7 +148,13 @@ FRONTEND_DIR="$(cd "$FRONTEND_DIR" && pwd)" || die "frontend dir does not exist:
 mkdir -p "$BUILD_TMP_ROOT"
 
 FRONTEND_PACKAGE_MANAGER="$(cd "$FRONTEND_DIR" && node -p "require('./package.json').packageManager || ''" 2>/dev/null || true)"
-FRONTEND_PNPM=(pnpm)
+
+# Determine pnpm command - try PATH first, then use full path if just installed
+if command -v pnpm >/dev/null 2>&1; then
+  FRONTEND_PNPM=(pnpm)
+else
+  FRONTEND_PNPM=("$HOME/.local/share/pnpm/pnpm")
+fi
 if [[ "$FRONTEND_PACKAGE_MANAGER" == pnpm@* ]]; then
   REQUIRED_PNPM_VERSION="${FRONTEND_PACKAGE_MANAGER#pnpm@}"
   CURRENT_PNPM_VERSION="$(pnpm --version 2>/dev/null || true)"
