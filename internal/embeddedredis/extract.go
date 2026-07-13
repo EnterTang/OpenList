@@ -14,6 +14,11 @@ import (
 
 var ErrPayloadUnavailable = errors.New("embedded Redis payload unavailable")
 
+const (
+	maxPayloadFileSize  = int64(32 << 20)
+	maxPayloadTotalSize = int64(128 << 20)
+)
+
 var requiredPayloadFiles = []string{
 	"redis-server.exe",
 	"msys-2.0.dll",
@@ -31,21 +36,26 @@ type ExtractedRuntime struct {
 	PayloadSHA256 string
 }
 
-func ExtractPayload(dataDir string, payload []byte) (ExtractedRuntime, error) {
+func ExtractPayload(dataDir string, payload []byte) (result ExtractedRuntime, err error) {
 	sha := fmt.Sprintf("%x", sha256.Sum256(payload))
 	target := filepath.Join(dataDir, "runtime", "redis", Version)
-	result := ExtractedRuntime{Dir: target, ServerPath: filepath.Join(target, "redis-server.exe"), PayloadSHA256: sha}
+	runtime := ExtractedRuntime{Dir: target, ServerPath: filepath.Join(target, "redis-server.exe"), PayloadSHA256: sha}
+	parent := filepath.Dir(target)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return ExtractedRuntime{}, fmt.Errorf("create runtime parent: %w", err)
+	}
+	lock, err := acquireInstallLock(filepath.Join(parent, ".install.lock"))
+	if err != nil {
+		return ExtractedRuntime{}, err
+	}
+	defer func() { err = errors.Join(err, lock.release()) }()
 	if runtimeValid(target, sha) {
-		return result, nil
+		return runtime, nil
 	}
 
 	files, err := validatePayload(payload)
 	if err != nil {
 		return ExtractedRuntime{}, err
-	}
-	parent := filepath.Dir(target)
-	if err := os.MkdirAll(parent, 0700); err != nil {
-		return ExtractedRuntime{}, fmt.Errorf("create runtime parent: %w", err)
 	}
 	temp, err := os.MkdirTemp(parent, ".redis-"+Version+"-tmp-")
 	if err != nil {
@@ -66,7 +76,7 @@ func ExtractPayload(dataDir string, payload []byte) (ExtractedRuntime, error) {
 	if err := replaceDirectory(target, temp); err != nil {
 		return ExtractedRuntime{}, err
 	}
-	return result, nil
+	return runtime, nil
 }
 
 func validatePayload(payload []byte) (map[string]*zip.File, error) {
@@ -79,6 +89,7 @@ func validatePayload(payload []byte) (map[string]*zip.File, error) {
 		allowed[name] = true
 	}
 	files := make(map[string]*zip.File, len(requiredPayloadFiles))
+	var totalSize int64
 	for _, file := range zr.File {
 		name := file.Name
 		if name == "" || filepath.IsAbs(name) || strings.Contains(name, "\\") || strings.Contains(name, "/") || name == "." || name == ".." {
@@ -94,6 +105,17 @@ func validatePayload(payload []byte) (map[string]*zip.File, error) {
 		if mode&os.ModeSymlink != 0 || mode.IsDir() || !mode.IsRegular() {
 			return nil, fmt.Errorf("payload entry %q is not a regular file", name)
 		}
+		if file.UncompressedSize64 > uint64(maxPayloadFileSize) {
+			return nil, fmt.Errorf("payload entry %q exceeds the size limit", name)
+		}
+		size := int64(file.UncompressedSize64)
+		if size > maxPayloadTotalSize-totalSize {
+			return nil, errors.New("Redis payload exceeds the total size limit")
+		}
+		if (name == "redis-server.exe" || strings.HasSuffix(name, ".dll")) && size == 0 {
+			return nil, fmt.Errorf("required payload binary %q is empty", name)
+		}
+		totalSize += size
 		files[name] = file
 	}
 	for _, name := range requiredPayloadFiles {
@@ -114,13 +136,19 @@ func extractFile(file *zip.File, destination string) error {
 	if err != nil {
 		return fmt.Errorf("create payload file %q: %w", file.Name, err)
 	}
-	_, copyErr := io.Copy(w, r)
+	written, copyErr := io.Copy(w, io.LimitReader(r, maxPayloadFileSize+1))
 	closeErr := w.Close()
 	if copyErr != nil {
 		return fmt.Errorf("extract payload file %q: %w", file.Name, copyErr)
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close payload file %q: %w", file.Name, closeErr)
+	}
+	if written > maxPayloadFileSize {
+		return fmt.Errorf("payload entry %q exceeds the size limit", file.Name)
+	}
+	if uint64(written) != file.UncompressedSize64 {
+		return fmt.Errorf("payload entry %q size does not match its metadata", file.Name)
 	}
 	return nil
 }
@@ -155,12 +183,16 @@ func replaceDirectory(target, prepared string) error {
 	}
 	if err := os.Rename(prepared, target); err != nil {
 		if hadTarget {
-			_ = os.Rename(backup, target)
+			if restoreErr := os.Rename(backup, target); restoreErr != nil {
+				return errors.Join(fmt.Errorf("install Redis runtime: %w", err), fmt.Errorf("restore previous runtime: %w", restoreErr))
+			}
 		}
 		return fmt.Errorf("install Redis runtime: %w", err)
 	}
 	if hadTarget {
-		_ = os.RemoveAll(backup)
+		if err := os.RemoveAll(backup); err != nil {
+			return fmt.Errorf("installed Redis runtime but failed to remove backup: %w", err)
+		}
 	}
 	return nil
 }

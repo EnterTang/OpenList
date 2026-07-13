@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -59,6 +60,53 @@ func TestExtractPayloadInstallsAndReusesValidRuntime(t *testing.T) {
 	if !info.ModTime().Equal(old) {
 		t.Fatalf("sentinel mtime changed: %v", info.ModTime())
 	}
+}
+
+func TestExtractPayloadConcurrentCallsShareInstallation(t *testing.T) {
+	payload := zipPayload(t, nil)
+	dataDir := t.TempDir()
+	const callers = 8
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := ExtractPayload(dataDir, payload)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent extraction failed: %v", err)
+		}
+	}
+	sha := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if !runtimeValid(filepath.Join(dataDir, "runtime", "redis", Version), sha) {
+		t.Fatal("final runtime is invalid")
+	}
+}
+
+func TestExtractPayloadRejectsOversizedEntries(t *testing.T) {
+	t.Run("per file", func(t *testing.T) {
+		payload := zipPayload(t, map[string]zipEntry{
+			"redis-server.exe": {size: maxPayloadFileSize + 1},
+		})
+		assertRejected(t, payload)
+	})
+	t.Run("total", func(t *testing.T) {
+		overrides := make(map[string]zipEntry, len(requiredPayloadFiles))
+		for _, name := range requiredPayloadFiles {
+			overrides[name] = zipEntry{size: maxPayloadTotalSize/int64(len(requiredPayloadFiles)) + 1}
+		}
+		assertRejected(t, zipPayload(t, overrides))
+	})
+}
+
+func TestExtractPayloadRejectsEmptyRequiredBinary(t *testing.T) {
+	assertRejected(t, zipPayload(t, map[string]zipEntry{"msys-2.0.dll": {empty: true}}))
 }
 
 func TestExtractPayloadReplacesInvalidRuntime(t *testing.T) {
@@ -139,6 +187,8 @@ type zipEntry struct {
 	name, body string
 	mode       os.FileMode
 	omit       bool
+	empty      bool
+	size       int64
 }
 
 func zipPayload(t *testing.T, overrides map[string]zipEntry, extras ...zipEntry) []byte {
@@ -156,6 +206,12 @@ func zipPayload(t *testing.T, overrides map[string]zipEntry, extras ...zipEntry)
 			}
 			if o.body != "" {
 				e.body = o.body
+			}
+			if o.empty {
+				e.body = ""
+			}
+			if o.size != 0 {
+				e.body = strings.Repeat("x", int(o.size))
 			}
 			if o.mode != 0 {
 				e.mode = o.mode
