@@ -133,11 +133,32 @@ func telegramPanSourceConfigWithStorageFallback(provider ShareProviderName, cfg 
 	case ShareProviderPan123:
 		cfg = pan123ConfigWithStorageFallback(cfg)
 	}
+	cfg = telegramPanTempTargetWithResolver(provider, cfg)
 	cfg = telegramPanTempRootWithStorageFallback(provider, cfg)
 	if provider == ShareProviderAliyunDrive {
 		cfg = aliyunDriveConfigWithTempRootFallback(cfg)
 	}
 	return cfg
+}
+
+func telegramPanTempTargetWithResolver(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
+	cfg = normalizeTelegramPanConfig(cfg)
+	target := cfg.TempTransferTarget
+	if target.Provider == "" && target.Folder != "" {
+		target.Provider = providerTargetNameForShareProvider(provider)
+	}
+	if target.Provider == "" || target.Folder == "" {
+		return cfg
+	}
+	resolved, err := ResolveProviderTarget(context.Background(), ResolveProviderTargetRequest{
+		Provider: target.Provider,
+		Folder:   target.Folder,
+	})
+	if err != nil {
+		return cfg
+	}
+	cfg.TempTransferRoot = resolved.FullPath
+	return normalizeTelegramPanConfig(cfg)
 }
 
 func telegramPanTempRootWithStorageFallback(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
