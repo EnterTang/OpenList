@@ -307,6 +307,9 @@ func (r *Runtime) startWorkerLocked() error {
 }
 
 func (r *Runtime) prepareWorkerRedisLocked() error {
+	if r.embeddedRedis != nil {
+		return errors.New("embedded Redis cleanup is pending")
+	}
 	redisCfg := conf.Conf.Cluster.Redis
 	prepare := r.prepareEmbeddedRedis
 	if prepare == nil {
@@ -326,7 +329,12 @@ func (r *Runtime) prepareWorkerRedisLocked() error {
 		RequireAOF: redisCfg.RequireAOF,
 	})
 	if err != nil {
-		return fmt.Errorf("prepare cluster worker Redis: %w", err)
+		prepareErr := fmt.Errorf("prepare cluster worker Redis: %w", err)
+		if manager == nil {
+			return prepareErr
+		}
+		r.embeddedRedis = manager
+		return errors.Join(prepareErr, r.cleanupWorkerRedisLocked())
 	}
 	r.embeddedRedis = manager
 	newClient := r.newRedisClient
@@ -454,7 +462,9 @@ func (r *Runtime) fenceLostCoordinator() {
 	if r.workerClient != nil {
 		_ = r.workerClient.Close()
 	}
-	r.cleanupWorkerRedisLocked()
+	if err := r.cleanupWorkerRedisLocked(); err != nil {
+		log.Errorf("cleanup cluster worker Redis after coordinator fence: %v", err)
+	}
 	clusterworker.SetDefaultService(nil)
 	r.hub = nil
 	r.coordinatorService = nil
@@ -711,7 +721,9 @@ func (r *Runtime) stopLocked() {
 	if r.hub != nil {
 		_ = r.hub.Close()
 	}
-	r.cleanupWorkerRedisLocked()
+	if err := r.cleanupWorkerRedisLocked(); err != nil {
+		log.Errorf("cleanup cluster worker Redis during runtime stop: %v", err)
+	}
 	if r.leaseOwner != "" && db.GetDb() != nil {
 		_ = db.GetDb().Model(&model.ClusterCoordinatorLease{}).
 			Where("name = ? AND owner_id = ?", "control-plane", r.leaseOwner).
@@ -724,14 +736,15 @@ func (r *Runtime) stopLocked() {
 	r.started = false
 }
 
-func (r *Runtime) cleanupWorkerRedisLocked() {
+func (r *Runtime) cleanupWorkerRedisLocked() error {
+	var cleanupErr error
 	if r.redisClient != nil {
 		closeClient := r.closeRedisClient
 		if closeClient == nil {
 			closeClient = func(client *redis.Client) error { return client.Close() }
 		}
 		if err := closeClient(r.redisClient); err != nil {
-			log.Errorf("close cluster worker Redis client: %v", err)
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("close cluster worker Redis client: %w", err))
 		}
 		r.redisClient = nil
 	}
@@ -743,12 +756,15 @@ func (r *Runtime) cleanupWorkerRedisLocked() {
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := stopManager(ctx, r.embeddedRedis); err != nil {
-			log.Errorf("stop embedded Redis manager: %v", err)
-		}
+		err := stopManager(ctx, r.embeddedRedis)
 		cancel()
-		r.embeddedRedis = nil
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("stop embedded Redis manager: %w", err))
+		} else {
+			r.embeddedRedis = nil
+		}
 	}
+	return cleanupErr
 }
 
 func (r *Runtime) WebSocketHandler() http.Handler {

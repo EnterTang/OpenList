@@ -83,28 +83,68 @@ func TestWorkerRedisUsesEffectiveOptionsWithoutMutatingConfig(t *testing.T) {
 	require.Equal(t, before, after)
 }
 
-func TestWorkerRedisPreparationErrorDoesNotCreateClientOrStoreManager(t *testing.T) {
+func TestWorkerRedisPreparationErrorPreservesManagerWhenCleanupFails(t *testing.T) {
 	originalConfig := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())
 	t.Cleanup(func() { conf.Conf = originalConfig })
 
 	prepareErr := errors.New("prepare failed")
+	stopErr := errors.New("stop failed")
+	manager := &embeddedredis.Manager{}
 	clientCreations := 0
+	stopCalls := 0
 	runtime := &Runtime{
 		role: RoleWorker,
 		ctx:  context.Background(),
 		prepareEmbeddedRedis: func(context.Context, embeddedredis.Options) (*embeddedredis.Manager, embeddedredis.EffectiveOptions, error) {
-			return &embeddedredis.Manager{}, embeddedredis.EffectiveOptions{}, prepareErr
+			return manager, embeddedredis.EffectiveOptions{}, prepareErr
 		},
 		newRedisClient: func(opts *redis.Options) *redis.Client {
 			clientCreations++
 			return redis.NewClient(opts)
 		},
+		stopEmbeddedRedis: func(context.Context, *embeddedredis.Manager) error {
+			stopCalls++
+			return stopErr
+		},
 	}
 
 	err := runtime.prepareWorkerRedisLocked()
 	require.ErrorIs(t, err, prepareErr)
+	require.ErrorIs(t, err, stopErr)
 	require.Zero(t, clientCreations)
+	require.Equal(t, 1, stopCalls)
+	require.Nil(t, runtime.redisClient)
+	require.Same(t, manager, runtime.embeddedRedis)
+}
+
+func TestWorkerRedisPreparationErrorClearsManagerAfterCleanup(t *testing.T) {
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+
+	prepareErr := errors.New("prepare failed")
+	manager := &embeddedredis.Manager{}
+	stopCalls := 0
+	runtime := &Runtime{
+		role: RoleWorker,
+		ctx:  context.Background(),
+		prepareEmbeddedRedis: func(context.Context, embeddedredis.Options) (*embeddedredis.Manager, embeddedredis.EffectiveOptions, error) {
+			return manager, embeddedredis.EffectiveOptions{}, prepareErr
+		},
+		newRedisClient: func(opts *redis.Options) *redis.Client {
+			t.Fatal("Redis client must not be created after preparation failure")
+			return redis.NewClient(opts)
+		},
+		stopEmbeddedRedis: func(context.Context, *embeddedredis.Manager) error {
+			stopCalls++
+			return nil
+		},
+	}
+
+	err := runtime.prepareWorkerRedisLocked()
+	require.ErrorIs(t, err, prepareErr)
+	require.Equal(t, 1, stopCalls)
 	require.Nil(t, runtime.redisClient)
 	require.Nil(t, runtime.embeddedRedis)
 }
@@ -130,14 +170,80 @@ func TestEmbeddedRedisCleanupClosesClientBeforeStoppingManager(t *testing.T) {
 		},
 	}
 
-	runtime.cleanupWorkerRedisLocked()
+	require.NoError(t, runtime.cleanupWorkerRedisLocked())
 
 	require.Equal(t, []string{"close-client", "stop-manager"}, events)
 	require.Nil(t, runtime.redisClient)
 	require.Nil(t, runtime.embeddedRedis)
 
-	runtime.cleanupWorkerRedisLocked()
+	require.NoError(t, runtime.cleanupWorkerRedisLocked())
 	require.Equal(t, []string{"close-client", "stop-manager"}, events)
+}
+
+func TestEmbeddedRedisCleanupFailureKeepsManagerForRetry(t *testing.T) {
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	manager := &embeddedredis.Manager{}
+	stopErr := errors.New("stop failed")
+	events := make([]string, 0, 3)
+	stopCalls := 0
+	runtime := &Runtime{
+		redisClient:   client,
+		embeddedRedis: manager,
+		closeRedisClient: func(got *redis.Client) error {
+			require.Same(t, client, got)
+			events = append(events, "close-client")
+			return got.Close()
+		},
+		stopEmbeddedRedis: func(_ context.Context, got *embeddedredis.Manager) error {
+			require.Same(t, manager, got)
+			stopCalls++
+			events = append(events, "stop-manager")
+			if stopCalls == 1 {
+				return stopErr
+			}
+			return nil
+		},
+	}
+
+	err := runtime.cleanupWorkerRedisLocked()
+	require.ErrorIs(t, err, stopErr)
+	require.Nil(t, runtime.redisClient)
+	require.Same(t, manager, runtime.embeddedRedis)
+
+	require.NoError(t, runtime.cleanupWorkerRedisLocked())
+	require.Nil(t, runtime.redisClient)
+	require.Nil(t, runtime.embeddedRedis)
+	require.Equal(t, []string{"close-client", "stop-manager", "stop-manager"}, events)
+}
+
+func TestWorkerRedisPreparationRefusesToOverwritePendingManager(t *testing.T) {
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+
+	manager := &embeddedredis.Manager{}
+	prepareCalls := 0
+	clientCreations := 0
+	runtime := &Runtime{
+		role:          RoleWorker,
+		ctx:           context.Background(),
+		embeddedRedis: manager,
+		prepareEmbeddedRedis: func(context.Context, embeddedredis.Options) (*embeddedredis.Manager, embeddedredis.EffectiveOptions, error) {
+			prepareCalls++
+			return nil, embeddedredis.EffectiveOptions{}, nil
+		},
+		newRedisClient: func(opts *redis.Options) *redis.Client {
+			clientCreations++
+			return redis.NewClient(opts)
+		},
+	}
+
+	err := runtime.prepareWorkerRedisLocked()
+	require.ErrorContains(t, err, "cleanup is pending")
+	require.Zero(t, prepareCalls)
+	require.Zero(t, clientCreations)
+	require.Nil(t, runtime.redisClient)
+	require.Same(t, manager, runtime.embeddedRedis)
 }
 
 func TestEmbeddedRedisManagerIsStoppedWhenLaterWorkerStartupFails(t *testing.T) {
@@ -264,7 +370,7 @@ func TestEmbeddedRedisFenceCleanupClosesClientBeforeStoppingManager(t *testing.T
 	require.False(t, runtime.started)
 }
 
-func TestWorkerRedisBackgroundLoopsUseCapturedStateAfterRuntimeReset(t *testing.T) {
+func TestWorkerRedisBackgroundLoopsReturnWithCapturedCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	workerService := &clusterworker.Service{}
