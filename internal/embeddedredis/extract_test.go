@@ -84,7 +84,15 @@ func TestExtractPayloadConcurrentCallsShareInstallation(t *testing.T) {
 		}
 	}
 	sha := fmt.Sprintf("%x", sha256.Sum256(payload))
-	if !runtimeValid(filepath.Join(dataDir, "runtime", "redis", Version), sha) {
+	files, err := validatePayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := payloadManifest(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runtimeValid(filepath.Join(dataDir, "runtime", "redis", Version), sha, manifest) {
 		t.Fatal("final runtime is invalid")
 	}
 }
@@ -147,6 +155,48 @@ func TestExtractPayloadReplacesInvalidRuntime(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(target, "stale")); !os.IsNotExist(err) {
 				t.Fatalf("stale file remains: %v", err)
+			}
+		})
+	}
+}
+
+func TestExtractPayloadReplacesRuntimeWithModifiedFiles(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		file    string
+		content []byte
+	}{
+		{name: "tampered executable", file: "redis-server.exe", content: []byte("tampered")},
+		{name: "truncated DLL", file: "msys-ssl-3.dll", content: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := zipPayload(t, nil)
+			dataDir := t.TempDir()
+			runtime, err := ExtractPayload(dataDir, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(runtime.Dir, test.file), test.content, 0600); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(runtime.Dir, "stale")
+			if err := os.WriteFile(sentinel, []byte("old"), 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := ExtractPayload(dataDir, payload); err != nil {
+				t.Fatal(err)
+			}
+			want := "contents:" + test.file
+			got, err := os.ReadFile(filepath.Join(runtime.Dir, test.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != want {
+				t.Fatalf("restored file = %q, want %q", got, want)
+			}
+			if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+				t.Fatalf("invalid runtime was not replaced: %v", err)
 			}
 		})
 	}

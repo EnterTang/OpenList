@@ -363,6 +363,11 @@ func (m *Manager) Stop(ctx context.Context) error {
 	attempt := &stopAttempt{done: make(chan struct{})}
 	m.stopAttempt = attempt
 	m.stopMu.Unlock()
+	if m.process != nil && processExited(m.exit) {
+		stopErr := m.releaseOwnerLock()
+		m.finishStopAttempt(attempt, true, stopErr)
+		return stopErr
+	}
 
 	var lifecycleLock *installLock
 	if m.lifecycleLockPath != "" {

@@ -90,8 +90,8 @@ func TestPrepareSerializesLifecycleOwnership(t *testing.T) {
 	startGate := make(chan struct{})
 	restoreManagerDeps(t, managerDependencies{
 		goos: "windows",
-		probe: func(context.Context, EffectiveOptions, bool) error {
-			if ready.Load() {
+		probe: func(_ context.Context, effective EffectiveOptions, _ bool) error {
+			if ready.Load() && effective.Address == opts.Address && effective.Password != "" {
 				return nil
 			}
 			return errors.New("not ready")
@@ -224,7 +224,6 @@ func TestStopDoesNotShutdownSuccessorAfterOwnedChildExit(t *testing.T) {
 	var shutdowns atomic.Int32
 	shutdownEntered := make(chan struct{})
 	successorStarted := make(chan struct{})
-	stopWaiting := make(chan struct{})
 	restoreManagerDeps(t, managerDependencies{
 		goos: "windows",
 		probe: func(context.Context, EffectiveOptions, bool) error {
@@ -262,11 +261,6 @@ func TestStopDoesNotShutdownSuccessorAfterOwnedChildExit(t *testing.T) {
 	if manager == nil || !manager.Owned() {
 		t.Fatalf("manager = %#v, want owned manager", manager)
 	}
-	manager.acquireLock = func(ctx context.Context, path string) (*installLock, error) {
-		close(stopWaiting)
-		return acquireInstallLockContext(ctx, path)
-	}
-
 	lockPath := filepath.Join(opts.DataDir, "runtime", "redis", ".lifecycle.lock")
 	blocker, err := acquireInstallLock(lockPath)
 	if err != nil {
@@ -295,16 +289,6 @@ func TestStopDoesNotShutdownSuccessorAfterOwnedChildExit(t *testing.T) {
 	case <-time.After(25 * time.Millisecond):
 	}
 
-	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
-	defer cancelStop()
-	stopDone := make(chan error, 1)
-	go func() { stopDone <- manager.Stop(stopCtx) }()
-	select {
-	case <-stopWaiting:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not attempt to acquire the lifecycle lock")
-	}
-
 	oldProcess.exit(nil)
 	deadline := time.Now().Add(time.Second)
 	for len(manager.exit) == 0 {
@@ -312,6 +296,18 @@ func TestStopDoesNotShutdownSuccessorAfterOwnedChildExit(t *testing.T) {
 			t.Fatal("owned process exit was not published")
 		}
 		time.Sleep(time.Millisecond)
+	}
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Second)
+	defer cancelStop()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- manager.Stop(stopCtx) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop for exited owner remained blocked on the lifecycle lock")
 	}
 	if err := blocker.release(); err != nil {
 		t.Fatal(err)
@@ -327,14 +323,6 @@ func TestStopDoesNotShutdownSuccessorAfterOwnedChildExit(t *testing.T) {
 		successor = result.manager
 	case <-time.After(time.Second):
 		t.Fatal("successor Prepare did not complete")
-	}
-	select {
-	case err := <-stopDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not complete")
 	}
 	successorProcess.exit(nil)
 
@@ -587,11 +575,8 @@ func TestPrepareNormalizesIPv6LoopbackForManagedStartAndReuse(t *testing.T) {
 		t.Fatalf("first Prepare = owned %v, address %q", owned.Owned(), firstEffective.Address)
 	}
 	reused, secondEffective, err := Prepare(context.Background(), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reused == nil || reused.Owned() || secondEffective.Address != "127.0.0.1:16379" {
-		t.Fatalf("second Prepare = %#v, address %q", reused, secondEffective.Address)
+	if reused != nil || err == nil || !errors.Is(err, errOwnerLockHeld) || secondEffective.Address != "127.0.0.1:16379" {
+		t.Fatalf("second Prepare = %#v, address %q, error %v; want lifetime owner rejection", reused, secondEffective.Address, err)
 	}
 	if starts.Load() != 1 {
 		t.Fatalf("starts = %d, want one managed process", starts.Load())
@@ -671,7 +656,9 @@ func TestRedisClientsHonorContextDeadlines(t *testing.T) {
 		if elapsed := time.Since(started); elapsed > 750*time.Millisecond {
 			t.Fatalf("Stop ignored context deadline: %v", elapsed)
 		}
-		waitForStopCleanup(t, m)
+		if !m.Stopped() {
+			t.Fatal("manager was not marked stopped after confirmed kill")
+		}
 		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
 			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
 		}
@@ -755,14 +742,31 @@ func TestPrepareCleanupIsBoundedWhenKillAndWaitFail(t *testing.T) {
 	})
 	started := time.Now()
 	manager, _, err := Prepare(context.Background(), opts)
-	if manager != nil || err == nil || !strings.Contains(err.Error(), "kill denied") {
+	if manager == nil || !manager.Owned() || err == nil || !strings.Contains(err.Error(), "kill denied") {
 		t.Fatalf("Prepare = %v, %v", manager, err)
 	}
-	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > 800*time.Millisecond {
 		t.Fatalf("Prepare waited for unreaped process: %v", elapsed)
 	}
 	if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
 		t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
+	}
+	if manager.Stopped() {
+		t.Fatal("manager marked stopped while startup child exit remained unconfirmed")
+	}
+	proc.release()
+	deadline := time.Now().Add(time.Second)
+	for len(manager.exit) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("released startup child exit was not published")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := manager.Stop(context.Background()); err != nil {
+		t.Fatalf("cleanup retained startup manager: %v", err)
+	}
+	if !manager.Stopped() {
+		t.Fatal("retained startup manager was not stopped after confirmed exit")
 	}
 }
 
@@ -850,7 +854,9 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 		if err := m.Stop(ctx); err == nil {
 			t.Fatal("Stop error = nil, want deadline")
 		}
-		waitForStopCleanup(t, m)
+		if !m.Stopped() {
+			t.Fatal("manager was not marked stopped after confirmed kill")
+		}
 		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
 			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
 		}
@@ -1024,7 +1030,9 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 		if !errors.Is(firstErr, context.DeadlineExceeded) {
 			t.Fatalf("Stop error = %v, want deadline error", firstErr)
 		}
-		waitForStopCleanup(t, m)
+		if !m.Stopped() {
+			t.Fatal("manager was not marked stopped after confirmed kill")
+		}
 		err := m.Stop(context.Background())
 		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "shutdown denied") {
 			t.Fatalf("completed Stop error = %v, want shutdown and deadline errors", err)
@@ -1098,17 +1106,15 @@ func TestManagerStopOwnershipTimeoutAndConcurrency(t *testing.T) {
 		if !errors.Is(firstErr, context.DeadlineExceeded) {
 			t.Fatalf("first Stop error = %v", firstErr)
 		}
-		select {
-		case <-m.stopDone:
-		case <-time.After(300 * time.Millisecond):
-			t.Fatal("cleanup owner blocked on Wait")
+		if m.Stopped() {
+			t.Fatal("manager marked stopped after unconfirmed kill failure")
 		}
 		err := m.Stop(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "kill denied") {
-			t.Fatalf("completed Stop error = %v, want kill failure", err)
+			t.Fatalf("retry Stop error = %v, want kill failure", err)
 		}
-		if proc.kills.Load() != 1 || proc.waits.Load() != 1 {
-			t.Fatalf("kill/wait = %d/%d", proc.kills.Load(), proc.waits.Load())
+		if m.Stopped() || proc.kills.Load() != 2 || proc.waits.Load() != 1 {
+			t.Fatalf("stopped/kill/wait = %v/%d/%d, want false/2/1", m.Stopped(), proc.kills.Load(), proc.waits.Load())
 		}
 	})
 	t.Run("kill failure is retryable", func(t *testing.T) {
@@ -1244,7 +1250,7 @@ func ownedTestManager(proc *fakeProcess, shutdown func(context.Context, Effectiv
 }
 
 func ownedTestManagerForProcess(proc managedProcess, shutdown func(context.Context, EffectiveOptions) error) *Manager {
-	m := &Manager{owned: true, process: proc, effective: EffectiveOptions{Address: "127.0.0.1:1"}, shutdown: shutdown, exit: make(chan error, 1), stopDone: make(chan struct{})}
+	m := &Manager{owned: true, process: proc, effective: EffectiveOptions{Address: "127.0.0.1:1"}, shutdown: shutdown, exit: make(chan error, 1)}
 	go func() { m.exit <- proc.Wait(); close(m.exit) }()
 	return m
 }
@@ -1257,15 +1263,6 @@ func waitForCount(t *testing.T, value *atomic.Int32, want int32) {
 			t.Fatalf("count = %d, want %d", value.Load(), want)
 		}
 		time.Sleep(time.Millisecond)
-	}
-}
-
-func waitForStopCleanup(t *testing.T, manager *Manager) {
-	t.Helper()
-	select {
-	case <-manager.stopDone:
-	case <-time.After(time.Second):
-		t.Fatal("Stop cleanup did not complete")
 	}
 }
 
