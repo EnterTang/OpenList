@@ -627,7 +627,7 @@ func clusterTaskNamespace(jobID, mediaItemID string) string {
 	return path.Join(".openlist-cluster", safeClusterPathSegment(jobID), safeClusterPathSegment(mediaItemID))
 }
 
-func NewCleanupRequest(manifest protocol.UploadETFManifest, storageMountPath string) (resultqueue.CleanupRequest, error) {
+func NewCleanupRequest(manifest protocol.UploadETFManifest, storageMountPath string, additionalTargets ...resultqueue.CleanupTarget) (resultqueue.CleanupRequest, error) {
 	targetRoot := strings.TrimSpace(manifest.WorkerTargetRoot)
 	if targetRoot == "" {
 		targetRoot = manifest.TargetProfile
@@ -642,6 +642,9 @@ func NewCleanupRequest(manifest protocol.UploadETFManifest, storageMountPath str
 		Name:             manifest.Name,
 		EmptyRecycleBin:  true,
 		CreatedAt:        time.Now().UTC(),
+	}
+	if len(additionalTargets) > 0 {
+		request.AdditionalTargets = append(request.AdditionalTargets, additionalTargets...)
 	}
 	if err := request.Validate(); err != nil {
 		return resultqueue.CleanupRequest{}, err
@@ -824,11 +827,10 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		manifest.RemoteFileID = existing.GetID()
 		manifest.RemotePath = targetFilePath
 		manifest.UploadReceipt = existing.GetID()
-		cleanup, cleanupErr := NewCleanupRequest(manifest, targetStorage.GetStorage().MountPath)
+		cleanup, cleanupErr := NewCleanupRequest(manifest, targetStorage.GetStorage().MountPath, sourceCleanup)
 		if cleanupErr != nil {
 			return cleanupErr
 		}
-		cleanup.AdditionalTargets = append(cleanup.AdditionalTargets, sourceCleanup)
 		if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
 			return fmt.Errorf("reconcile existing cluster upload: %w", enqueueErr)
 		}

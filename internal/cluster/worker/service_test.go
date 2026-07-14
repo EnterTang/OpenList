@@ -141,6 +141,23 @@ func TestNewCleanupRequestUsesExactIsolatedPath(t *testing.T) {
 	require.True(t, request.EmptyRecycleBin)
 }
 
+func TestNewCleanupRequestIncludesStagedSourceCleanupByDefault(t *testing.T) {
+	manifest := validUploadManifest(t)
+	source := resultqueue.CleanupTarget{
+		OpenListPath:     "/123/转存至移动/.openlist-cluster/job-1/media-1/Episode.mkv",
+		StorageMountPath: "/123",
+		RemoteFileID:     "staged-source",
+		Name:             "Episode.mkv",
+		EmptyRecycleBin:  true,
+	}
+
+	request, err := NewCleanupRequest(manifest, "/mobile", source)
+
+	require.NoError(t, err)
+	require.Len(t, request.AdditionalTargets, 1)
+	require.Equal(t, source, request.AdditionalTargets[0])
+}
+
 func TestCancelActiveCancelsConnectionBoundTasks(t *testing.T) {
 	service := New(nil, nil)
 	ctx, cancel := context.WithCancelCause(context.Background())

@@ -203,7 +203,10 @@ func supportsETFAccount(storage model.Storage) bool {
 		return false
 	}
 	values := storageAdditionValues(storage)
-	dedicated, _ := values["cluster_dedicated_account"].(bool)
+	dedicated := true
+	if raw, ok := values["cluster_dedicated_account"]; ok {
+		dedicated, _ = raw.(bool)
+	}
 	typeName := strings.ToLower(strings.TrimSpace(fmt.Sprint(values["type"])))
 	return dedicated && (typeName == "" || typeName == "personal_new")
 }

@@ -140,11 +140,10 @@ func (d *Yun139) afterPersonalUploadETF(ctx context.Context, dstDir model.Obj, s
 		if manifest.UploadReceipt == "" {
 			manifest.UploadReceipt = uploadedObj.GetID()
 		}
-		cleanup, err := clusterworker.NewCleanupRequest(manifest, d.GetStorage().MountPath)
+		cleanup, err := clusterworker.NewCleanupRequest(manifest, d.GetStorage().MountPath, clusterworker.AdditionalCleanupTargetsFromContext(ctx)...)
 		if err != nil {
 			return fmt.Errorf("build cluster cleanup request: %w", err)
 		}
-		cleanup.AdditionalTargets = append(cleanup.AdditionalTargets, clusterworker.AdditionalCleanupTargetsFromContext(ctx)...)
 		_, err = clusterworker.CompleteClusterUpload(ctx, manifest, cleanup)
 		return err
 	}

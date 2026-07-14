@@ -59,6 +59,25 @@ func TestProviderAccountInventoryKeepsUnknown139MembershipWithoutUploadLimit(t *
 	}
 }
 
+func TestProviderAccountInventoryDefaults139PersonalNewToETFSupport(t *testing.T) {
+	storage := model.Storage{ID: 10, MountPath: "/139-c", Driver: "139Yun", Status: "work", Addition: `{"type":"personal_new"}`}
+	account := providerAccountInventory("node-1", storage, 10<<30, 20<<30)
+	mount := providerMountInventory("node-1", storage)
+
+	if !account.SupportsETF || !mount.SupportsETF {
+		t.Fatalf("supports ETF account=%v mount=%v, want true by default for personal_new 139", account.SupportsETF, mount.SupportsETF)
+	}
+}
+
+func TestProviderAccountInventoryAllowsDisabling139ETFSupport(t *testing.T) {
+	storage := model.Storage{ID: 11, MountPath: "/139-d", Driver: "139Yun", Status: "work", Addition: `{"type":"personal_new","cluster_dedicated_account":false}`}
+	account := providerAccountInventory("node-1", storage, 10<<30, 20<<30)
+
+	if account.SupportsETF {
+		t.Fatalf("supports ETF = true, want false when cluster_dedicated_account is explicitly disabled")
+	}
+}
+
 func TestProviderAccountInventoryMapsConfigured123And115Membership(t *testing.T) {
 	for _, storage := range []model.Storage{
 		{ID: 1, MountPath: "/123", Driver: "123Pan", Status: "work", Addition: `{"membership_tier":"svip"}`},

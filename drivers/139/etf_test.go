@@ -1096,6 +1096,8 @@ func Test139ETFConfigMetadataIsChineseAndCollapsed(t *testing.T) {
 		"etf_root_folder":           "ETF 管理目录",
 		"etf_temp_folder":           "ETF 临时播放目录",
 		"auto_rename_on_share_risk": "分享失败后自动重命名",
+		"cluster_dedicated_account": "集群专用账号",
+		"delete_source_after_etf":   "生成后删除源文件",
 	}
 	for name, wantLabel := range wantLabels {
 		raw, ok := items[name]
@@ -1109,6 +1111,15 @@ func Test139ETFConfigMetadataIsChineseAndCollapsed(t *testing.T) {
 		if item.Label != wantLabel || item.Help == "" {
 			t.Fatalf("%s label/help should be localized, got label=%q help=%q", name, item.Label, item.Help)
 		}
+	}
+	if item := items["cluster_dedicated_account"]; item.Default != "true" {
+		t.Fatalf("cluster_dedicated_account default = %q, want true", item.Default)
+	}
+	if item := items["cluster_dedicated_account"]; strings.Contains(item.Help, "账号不得存放个人") || !strings.Contains(item.Help, "临时转存目录") {
+		t.Fatalf("cluster_dedicated_account help = %q, want scoped temp-folder warning", item.Help)
+	}
+	if item := items["delete_source_after_etf"]; item.Default != "true" {
+		t.Fatalf("delete_source_after_etf default = %q, want true", item.Default)
 	}
 }
 
