@@ -42,18 +42,15 @@ func TestExtractPayloadInstallsAndReusesValidRuntime(t *testing.T) {
 		}
 	}
 
-	sentinel := filepath.Join(wantDir, "sentinel")
-	if err := os.WriteFile(sentinel, []byte("keep"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	serverPath := filepath.Join(wantDir, "redis-server.exe")
 	old := time.Unix(123, 0)
-	if err := os.Chtimes(sentinel, old, old); err != nil {
+	if err := os.Chtimes(serverPath, old, old); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ExtractPayload(dataDir, payload); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(sentinel)
+	info, err := os.Stat(serverPath)
 	if err != nil {
 		t.Fatalf("valid runtime was replaced: %v", err)
 	}
@@ -113,8 +110,12 @@ func TestExtractPayloadRejectsOversizedEntries(t *testing.T) {
 	})
 }
 
-func TestExtractPayloadRejectsEmptyRequiredBinary(t *testing.T) {
-	assertRejected(t, zipPayload(t, map[string]zipEntry{"msys-2.0.dll": {empty: true}}))
+func TestExtractPayloadRejectsEmptyRequiredFiles(t *testing.T) {
+	for _, name := range requiredPayloadFiles {
+		t.Run(name, func(t *testing.T) {
+			assertRejected(t, zipPayload(t, map[string]zipEntry{name: {empty: true}}))
+		})
+	}
 }
 
 func TestExtractPayloadReplacesInvalidRuntime(t *testing.T) {
@@ -168,6 +169,7 @@ func TestExtractPayloadReplacesRuntimeWithModifiedFiles(t *testing.T) {
 	}{
 		{name: "tampered executable", file: "redis-server.exe", content: []byte("tampered")},
 		{name: "truncated DLL", file: "msys-ssl-3.dll", content: nil},
+		{name: "unexpected DLL", file: "untrusted.dll", content: []byte("untrusted")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			payload := zipPayload(t, nil)
@@ -187,13 +189,19 @@ func TestExtractPayloadReplacesRuntimeWithModifiedFiles(t *testing.T) {
 			if _, err := ExtractPayload(dataDir, payload); err != nil {
 				t.Fatal(err)
 			}
-			want := "contents:" + test.file
-			got, err := os.ReadFile(filepath.Join(runtime.Dir, test.file))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(got) != want {
-				t.Fatalf("restored file = %q, want %q", got, want)
+			if test.file == "untrusted.dll" {
+				if _, err := os.Stat(filepath.Join(runtime.Dir, test.file)); !os.IsNotExist(err) {
+					t.Fatalf("unexpected DLL remains after reinstall: %v", err)
+				}
+			} else {
+				want := "contents:" + test.file
+				got, err := os.ReadFile(filepath.Join(runtime.Dir, test.file))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != want {
+					t.Fatalf("restored file = %q, want %q", got, want)
+				}
 			}
 			if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
 				t.Fatalf("invalid runtime was not replaced: %v", err)

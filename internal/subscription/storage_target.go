@@ -46,17 +46,55 @@ func ValidateSubscriptionStorageTarget(target model.SubscriptionStorageTarget) e
 	if rawFolder == "" {
 		return nil
 	}
-	if _, migrated := MigrateLegacyPathTarget(rawFolder); migrated {
+	if migratedTarget, migrated := MigrateLegacyPathTarget(rawFolder); migrated {
+		if !strings.EqualFold(target.Provider, migratedTarget.Provider) {
+			return fmt.Errorf("provider target provider %q does not match legacy folder provider %q", target.Provider, migratedTarget.Provider)
+		}
 		return nil
 	}
 	normalizedSeparators := strings.ReplaceAll(rawFolder, `\`, "/")
-	if stdpath.IsAbs(normalizedSeparators) || filepath.IsAbs(rawFolder) || strings.HasPrefix(rawFolder, `\`) {
+	hasWindowsDrivePrefix := len(normalizedSeparators) >= 3 &&
+		((normalizedSeparators[0] >= 'a' && normalizedSeparators[0] <= 'z') ||
+			(normalizedSeparators[0] >= 'A' && normalizedSeparators[0] <= 'Z')) &&
+		normalizedSeparators[1] == ':' && normalizedSeparators[2] == '/'
+	if stdpath.IsAbs(normalizedSeparators) || filepath.IsAbs(rawFolder) || strings.HasPrefix(rawFolder, `\`) || hasWindowsDrivePrefix {
 		return fmt.Errorf("provider target folder must be relative")
 	}
 	for _, part := range strings.Split(normalizedSeparators, "/") {
 		if part == ".." {
 			return fmt.Errorf("provider target folder must not contain parent traversal")
 		}
+	}
+	return nil
+}
+
+func validateSubscriptionTempTarget(target model.SubscriptionStorageTarget) error {
+	target = NormalizeSubscriptionStorageTarget(target)
+	if target.Provider == "" {
+		return nil
+	}
+	if target.Provider != "pan123" && target.Provider != "pan115" {
+		return fmt.Errorf("temporary target provider must be pan123 or pan115")
+	}
+	if target.Folder == "" {
+		return fmt.Errorf("temporary target folder is required")
+	}
+	return nil
+}
+
+func validateSubscriptionDeliveryTarget(target model.SubscriptionStorageTarget, required bool) error {
+	target = NormalizeSubscriptionStorageTarget(target)
+	if target.Provider == "" {
+		if required {
+			return fmt.Errorf("delivery target is required when transfer is enabled")
+		}
+		return nil
+	}
+	if target.Provider != "yidong139" {
+		return fmt.Errorf("delivery target provider must be yidong139")
+	}
+	if target.Folder == "" {
+		return fmt.Errorf("delivery target folder is required")
 	}
 	return nil
 }

@@ -43,8 +43,8 @@ func (c TaskContext) Validate() error {
 	if c.SealedManifestVersion == "" {
 		return errors.New("sealed manifest version is required")
 	}
-	if c.TargetProfile == "" {
-		return errors.New("target profile is required")
+	if c.TargetProfile == "" && strings.TrimSpace(c.DeliveryTarget.Provider) == "" {
+		return errors.New("target profile or delivery provider target is required")
 	}
 	if c.Subscription.SubscriptionID == 0 {
 		return errors.New("subscription id is required")

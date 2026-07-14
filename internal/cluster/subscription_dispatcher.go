@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"sort"
 	"strings"
 
@@ -215,11 +214,16 @@ func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchT
 		if json.Unmarshal([]byte(inventory.ProviderAccountsJSON), &accounts) != nil {
 			continue
 		}
+		hasProviderTarget := false
 		for _, account := range accounts {
 			if !providerAccountHealthy(account) || !account.SupportsUpload || !account.SupportsETF {
 				continue
 			}
-			targets = append(targets, &dispatchTarget{nodeID: nodeID, targetProfile: path.Clean(account.MountPath)})
+			hasProviderTarget = true
+			break
+		}
+		if hasProviderTarget {
+			targets = append(targets, &dispatchTarget{nodeID: nodeID})
 		}
 	}
 	if len(targets) > 0 {

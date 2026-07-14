@@ -27,7 +27,7 @@ const (
 	secretFilename        = "redis.auth"
 	managedMarkerFilename = "managed.json"
 	ownerLockFilename     = ".owner.lock"
-	managedMarkerVersion  = 1
+	managedMarkerVersion  = 2
 	defaultStartupTimeout = 15 * time.Second
 	probeTimeout          = 750 * time.Millisecond
 	stopReapTimeout       = 500 * time.Millisecond
@@ -59,6 +59,7 @@ type managerDependencies struct {
 	extract  func(string, []byte) (ExtractedRuntime, error)
 	start    func(*exec.Cmd) (managedProcess, error)
 	shutdown func(context.Context, EffectiveOptions) error
+	identity func(context.Context, EffectiveOptions) (string, error)
 }
 
 func (d managerDependencies) withDefaults() managerDependencies {
@@ -88,6 +89,9 @@ func (d managerDependencies) withDefaults() managerDependencies {
 	if d.shutdown == nil {
 		d.shutdown = shutdownRedis
 	}
+	if d.identity == nil {
+		d.identity = redisRunID
+	}
 	return d
 }
 
@@ -102,6 +106,7 @@ type managedMarker struct {
 	Version             int    `json:"version"`
 	Address             string `json:"address"`
 	PasswordFingerprint string `json:"password_fingerprint"`
+	RunID               string `json:"run_id,omitempty"`
 }
 
 type Manager struct {
@@ -111,6 +116,8 @@ type Manager struct {
 	shutdown          func(context.Context, EffectiveOptions) error
 	probe             func(context.Context, EffectiveOptions, bool) error
 	occupied          func(context.Context, string) (bool, error)
+	identity          func(context.Context, EffectiveOptions) (string, error)
+	runID             string
 	requireAOF        bool
 	lifecycleLockPath string
 	acquireLock       func(context.Context, string) (*installLock, error)
@@ -277,7 +284,7 @@ func prepareLocked(ctx context.Context, opts Options, deps managerDependencies, 
 		_ = logFile.Close()
 		return nil, effectiveFromOptions(opts), fmt.Errorf("secure Redis log: %w", err)
 	}
-	cmd := exec.Command(extracted.ServerPath, configPath)
+	cmd := exec.Command(extracted.ServerPath, filepath.Base(configPath))
 	cmd.Dir = extracted.Dir
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	configureManagedCommand(cmd)
@@ -292,10 +299,6 @@ func prepareLocked(ctx context.Context, opts Options, deps managerDependencies, 
 			_ = ownerLock.release()
 		}
 	}()
-	if err := writeManagedMarker(markerPath, managedMarkerFor(effective)); err != nil {
-		_ = logFile.Close()
-		return nil, effectiveFromOptions(opts), fmt.Errorf("write managed Redis marker: %w", err)
-	}
 	process, err := deps.start(cmd)
 	if err != nil {
 		_ = logFile.Close()
@@ -315,14 +318,7 @@ func prepareLocked(ctx context.Context, opts Options, deps managerDependencies, 
 		exit:              make(chan error, 1),
 	}
 	go func() { m.exit <- process.Wait(); close(m.exit); _ = logFile.Close() }()
-
-	timeout := opts.StartupTimeout
-	if timeout <= 0 {
-		timeout = defaultStartupTimeout
-	}
-	readyCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	if err := waitUntilReady(readyCtx, deps.probe, effective, opts.RequireAOF, m.exit); err != nil {
+	cleanupStartedProcess := func(startErr error) (*Manager, EffectiveOptions, error) {
 		cleanupErr := process.Kill()
 		confirmed := waitForExit(m.exit, stopReapTimeout)
 		if cleanupErr != nil {
@@ -331,11 +327,30 @@ func prepareLocked(ctx context.Context, opts Options, deps managerDependencies, 
 		if confirmed {
 			releaseOwner = false
 			releaseErr := m.releaseOwnerLock()
-			return nil, effectiveFromOptions(opts), errors.Join(err, cleanupErr, releaseErr)
+			return nil, effectiveFromOptions(opts), errors.Join(startErr, cleanupErr, releaseErr)
 		}
 		releaseOwner = false
-		return m, effectiveFromOptions(opts), errors.Join(err, cleanupErr, errors.New("embedded Redis child exit was not confirmed"))
+		return m, effectiveFromOptions(opts), errors.Join(startErr, cleanupErr, errors.New("embedded Redis child exit was not confirmed"))
 	}
+
+	timeout := opts.StartupTimeout
+	if timeout <= 0 {
+		timeout = defaultStartupTimeout
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := waitUntilReady(readyCtx, deps.probe, effective, opts.RequireAOF, m.exit); err != nil {
+		return cleanupStartedProcess(err)
+	}
+	runID, err := boundedIdentity(ctx, deps.identity, effective)
+	if err != nil {
+		return cleanupStartedProcess(fmt.Errorf("identify embedded Redis child: %w", err))
+	}
+	if err := writeManagedMarker(markerPath, managedMarkerFor(effective, runID)); err != nil {
+		return cleanupStartedProcess(fmt.Errorf("write managed Redis marker: %w", err))
+	}
+	m.identity = deps.identity
+	m.runID = runID
 	releaseOwner = false
 	return m, effective, nil
 }
@@ -475,6 +490,19 @@ func (m *Manager) killAndConfirm(diagnostic error) (bool, error) {
 }
 
 func (m *Manager) stopAdopted(ctx context.Context) (bool, error) {
+	if m.runID != "" && m.identity != nil {
+		currentRunID, identityErr := boundedIdentity(ctx, m.identity, m.effective)
+		if identityErr == nil && currentRunID != m.runID {
+			return true, nil
+		}
+		if identityErr != nil {
+			occupied, occupiedErr := m.occupied(ctx, m.effective.Address)
+			if occupiedErr == nil && !occupied {
+				return true, nil
+			}
+			return false, errors.Join(fmt.Errorf("verify adopted embedded Redis identity: %w", identityErr), occupiedErr)
+		}
+	}
 	shutdownErr := m.shutdown(ctx, m.effective)
 	if isExpectedShutdownError(shutdownErr) {
 		shutdownErr = nil
@@ -540,12 +568,24 @@ func reusedManager(effective EffectiveOptions, shutdown func(context.Context, Ef
 }
 
 func managerForReadyEndpoint(effective EffectiveOptions, requireAOF bool, deps managerDependencies, lifecycleLockPath, ownerLockPath string, marker *managedMarker) (*Manager, error) {
-	if marker == nil || *marker != managedMarkerFor(effective) {
+	if marker == nil || marker.RunID == "" || marker.Address != managedEndpointAddress(effective.Address) || marker.PasswordFingerprint != passwordFingerprint(effective.Password) {
+		return reusedManager(effective, deps.shutdown), nil
+	}
+	runID, err := boundedIdentity(context.Background(), deps.identity, effective)
+	if err != nil || runID != marker.RunID {
 		return reusedManager(effective, deps.shutdown), nil
 	}
 	ownerLock, err := acquireOwnerLock(ownerLockPath)
 	if err != nil {
 		return nil, err
+	}
+	runID, identityErr := boundedIdentity(context.Background(), deps.identity, effective)
+	if identityErr != nil || runID != marker.RunID {
+		releaseErr := ownerLock.release()
+		if releaseErr != nil {
+			return nil, fmt.Errorf("release managed Redis owner lock after identity mismatch: %w", releaseErr)
+		}
+		return reusedManager(effective, deps.shutdown), nil
 	}
 	return &Manager{
 		owned:             true,
@@ -553,6 +593,8 @@ func managerForReadyEndpoint(effective EffectiveOptions, requireAOF bool, deps m
 		shutdown:          deps.shutdown,
 		probe:             deps.probe,
 		occupied:          deps.occupied,
+		identity:          deps.identity,
+		runID:             marker.RunID,
 		requireAOF:        requireAOF,
 		lifecycleLockPath: lifecycleLockPath,
 		acquireLock:       acquireInstallLockContext,
@@ -581,13 +623,22 @@ func acquireOwnerLock(path string) (*installLock, error) {
 	return &installLock{file: file}, nil
 }
 
-func managedMarkerFor(effective EffectiveOptions) managedMarker {
-	fingerprint := sha256.Sum256([]byte(effective.Password))
+func managedMarkerFor(effective EffectiveOptions, runIDs ...string) managedMarker {
+	runID := ""
+	if len(runIDs) > 0 {
+		runID = strings.TrimSpace(runIDs[0])
+	}
 	return managedMarker{
 		Version:             managedMarkerVersion,
 		Address:             managedEndpointAddress(effective.Address),
-		PasswordFingerprint: hex.EncodeToString(fingerprint[:]),
+		PasswordFingerprint: passwordFingerprint(effective.Password),
+		RunID:               runID,
 	}
+}
+
+func passwordFingerprint(password string) string {
+	fingerprint := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(fingerprint[:])
 }
 
 func readManagedMarker(path string) (*managedMarker, error) {
@@ -602,7 +653,7 @@ func readManagedMarker(path string) (*managedMarker, error) {
 	if err := json.Unmarshal(data, &marker); err != nil {
 		return nil, err
 	}
-	if marker.Version != managedMarkerVersion || marker.Address == "" || marker.PasswordFingerprint == "" {
+	if (marker.Version != 1 && marker.Version != managedMarkerVersion) || marker.Address == "" || marker.PasswordFingerprint == "" || (marker.Version == managedMarkerVersion && marker.RunID == "") {
 		return nil, errors.New("managed Redis marker is invalid")
 	}
 	return &marker, nil
@@ -636,6 +687,36 @@ func boundedProbe(ctx context.Context, probe func(context.Context, EffectiveOpti
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	return probe(probeCtx, effective, requireAOF)
+}
+
+func boundedIdentity(ctx context.Context, identity func(context.Context, EffectiveOptions) (string, error), effective EffectiveOptions) (string, error) {
+	identityCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	runID, err := identity(identityCtx, effective)
+	if err != nil {
+		return "", err
+	}
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return "", errors.New("Redis run_id is empty")
+	}
+	return runID, nil
+}
+
+func redisRunID(ctx context.Context, effective EffectiveOptions) (string, error) {
+	client := redis.NewClient(redisClientOptions(effective))
+	defer client.Close()
+	info, err := client.Info(ctx, "server").Result()
+	if err != nil {
+		return "", fmt.Errorf("INFO server: %w", err)
+	}
+	for _, line := range strings.Split(info, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && key == "run_id" && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value), nil
+		}
+	}
+	return "", errors.New("INFO server did not include run_id")
 }
 
 func probeRedis(ctx context.Context, effective EffectiveOptions, requireAOF bool) error {

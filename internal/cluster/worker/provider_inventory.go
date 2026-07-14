@@ -15,8 +15,9 @@ import (
 )
 
 var (
-	listInventoryStorages   = db.GetEnabledStorages
-	hydrateInventoryStorage = defaultHydrateInventoryStorage
+	listInventoryStorages          = db.GetEnabledStorages
+	hydrateInventoryStorage        = defaultHydrateInventoryStorage
+	getInventoryStorageByMountPath = op.GetStorageByMountPath
 )
 
 type inventoryStorageSnapshot struct {
@@ -28,10 +29,14 @@ type clusterMembershipTierReporter interface {
 	ClusterMembershipTier() string
 }
 
+type clusterMembershipDetailsReporter interface {
+	ClusterMembershipDetails() model.MembershipDetails
+}
+
 func defaultHydrateInventoryStorage(ctx context.Context, nodeID string, storage model.Storage) (inventoryStorageSnapshot, error) {
 	mount := providerMountInventory(nodeID, storage)
 	account := providerAccountInventory(nodeID, storage, 0, 0)
-	if driver, driverErr := op.GetStorageByMountPath(storage.MountPath); driverErr == nil {
+	if driver, driverErr := getInventoryStorageByMountPath(storage.MountPath); driverErr == nil {
 		healthy := storageHealthy(*driver.GetStorage())
 		writable := healthy && !driver.Config().NoUpload
 		mount.ReadOnly = !writable
@@ -43,21 +48,34 @@ func defaultHydrateInventoryStorage(ctx context.Context, nodeID string, storage 
 		account.SupportsDownload = healthy
 		account.SupportsShareSave = healthy && supportsShare(storage.Driver)
 		account.SupportsETF = writable && supportsETFAccount(storage)
-		if reporter, ok := driver.(clusterMembershipTierReporter); ok && (account.MembershipTier == "" || account.MembershipTier == "unknown") {
-			if runtimeTier := normalizeProviderMembershipTier(reporter.ClusterMembershipTier()); runtimeTier != "" && runtimeTier != "unknown" {
-				account.MembershipTier = runtimeTier
-				account.MembershipWeight = providerMembershipWeight(runtimeTier)
-				account.MaxSingleUploadBytes = mobileProviderUploadLimit(account.Provider, runtimeTier)
-			}
-		}
 		if details, detailsErr := op.GetStorageDetails(ctx, driver); detailsErr == nil && details != nil {
 			mount.TotalBytes = details.TotalSpace
 			mount.FreeBytes = details.FreeSpace()
 			account.TotalBytes = details.TotalSpace
 			account.FreeBytes = details.FreeSpace()
 		}
+		if reporter, ok := driver.(clusterMembershipDetailsReporter); ok {
+			applyRuntimeMembership(&account, reporter.ClusterMembershipDetails())
+		} else if reporter, ok := driver.(clusterMembershipTierReporter); ok {
+			applyRuntimeMembership(&account, model.MembershipDetails{Tier: reporter.ClusterMembershipTier()})
+		}
 	}
 	return inventoryStorageSnapshot{Mount: mount, Account: account}, nil
+}
+
+func applyRuntimeMembership(account *protocol.ProviderAccountInventory, membership model.MembershipDetails) {
+	account.MembershipStatus = strings.TrimSpace(membership.Status)
+	account.MembershipExpireDate = strings.TrimSpace(membership.ExpireDate)
+	if account.MembershipTier != "" && account.MembershipTier != "unknown" {
+		return
+	}
+	runtimeTier := normalizeProviderMembershipTier(membership.Tier)
+	if runtimeTier == "" || runtimeTier == "unknown" {
+		return
+	}
+	account.MembershipTier = runtimeTier
+	account.MembershipWeight = providerMembershipWeight(runtimeTier)
+	account.MaxSingleUploadBytes = mobileProviderUploadLimit(account.Provider, runtimeTier)
 }
 
 func providerMountInventory(nodeID string, storage model.Storage) protocol.MountInventory {

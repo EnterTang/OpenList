@@ -29,7 +29,9 @@ import (
 type Pan123 struct {
 	model.Storage
 	Addition
-	apiRateLimit sync.Map
+	apiRateLimit      sync.Map
+	membershipMu      sync.RWMutex
+	runtimeMembership model.MembershipDetails
 }
 
 func (d *Pan123) Config() driver.Config {
@@ -41,10 +43,51 @@ func (d *Pan123) GetAddition() driver.Additional {
 }
 
 func (d *Pan123) Init(ctx context.Context) error {
+	var userInfo UserInfoResp
 	_, err := d.Request(UserInfo, http.MethodGet, func(req *resty.Request) {
 		req.SetHeader("platform", "web")
-	}, nil)
+		req.SetContext(ctx)
+	}, &userInfo)
+	if err == nil {
+		d.setRuntimeMembership(membershipDetailsFromUserInfo(&userInfo))
+	}
 	return err
+}
+
+func membershipDetailsFromUserInfo(userInfo *UserInfoResp) model.MembershipDetails {
+	details := model.MembershipDetails{
+		Tier:       "ordinary",
+		Status:     "inactive",
+		ExpireDate: userInfo.Data.VipExpire,
+	}
+	if userInfo.Data.Vip {
+		details.Tier = "vip"
+		details.Status = "active"
+		if userInfo.Data.VipLevel == 2 {
+			details.Tier = "svip"
+		}
+	}
+	return details
+}
+
+func (d *Pan123) setRuntimeMembership(details model.MembershipDetails) {
+	d.membershipMu.Lock()
+	d.runtimeMembership = details
+	d.membershipMu.Unlock()
+}
+
+func (d *Pan123) ClusterMembershipDetails() model.MembershipDetails {
+	d.membershipMu.RLock()
+	details := d.runtimeMembership
+	d.membershipMu.RUnlock()
+	if configured := strings.ToLower(strings.TrimSpace(d.MembershipTier)); configured != "" && configured != "unknown" {
+		details.Tier = configured
+	}
+	return details
+}
+
+func (d *Pan123) ClusterMembershipTier() string {
+	return d.ClusterMembershipDetails().Tier
 }
 
 func (d *Pan123) Drop(ctx context.Context) error {
@@ -260,11 +303,14 @@ func (d *Pan123) GetDetails(ctx context.Context) (*model.StorageDetails, error) 
 	if err != nil {
 		return nil, err
 	}
+	membership := membershipDetailsFromUserInfo(userInfo)
+	d.setRuntimeMembership(membership)
 	return &model.StorageDetails{
 		DiskUsage: model.DiskUsage{
 			TotalSpace: userInfo.Data.SpacePermanent + userInfo.Data.SpaceTemp,
 			UsedSpace:  userInfo.Data.SpaceUsed,
 		},
+		Membership: &membership,
 	}, nil
 }
 

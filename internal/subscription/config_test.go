@@ -226,6 +226,9 @@ func TestApplyConfigDefaultsMigratesLegacySubscriptionTarget(t *testing.T) {
 	if sub.DeliveryTarget.Provider != "yidong139" || sub.DeliveryTarget.Folder != "港台剧" {
 		t.Fatalf("delivery target = %#v", sub.DeliveryTarget)
 	}
+	if sub.TargetRoot != "" {
+		t.Fatalf("legacy target root was not cleared: %q", sub.TargetRoot)
+	}
 }
 
 func TestApplyConfigDefaultsRejectsUnknownLegacySubscriptionTarget(t *testing.T) {
@@ -233,6 +236,23 @@ func TestApplyConfigDefaultsRejectsUnknownLegacySubscriptionTarget(t *testing.T)
 	err := ApplyConfigDefaults(sub, model.SubscriptionConfig{})
 	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
 		t.Fatalf("error = %v, want manual confirmation error", err)
+	}
+}
+
+func TestApplyConfigDefaultsRequiresValidTargetsForTransfer(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		sub  model.Subscription
+	}{
+		{name: "missing delivery", sub: model.Subscription{TransferEnabled: true}},
+		{name: "invalid temp provider", sub: model.Subscription{TempTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "temp"}, DeliveryTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "delivery"}, TransferEnabled: true}},
+		{name: "invalid delivery provider", sub: model.Subscription{DeliveryTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "delivery"}, TransferEnabled: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := ApplyConfigDefaults(&test.sub, model.SubscriptionConfig{}); err == nil {
+				t.Fatal("expected target validation error")
+			}
+		})
 	}
 }
 
@@ -244,6 +264,35 @@ func TestApplyConfigDefaultsRejectsUnknownLegacyTempTransferRoot(t *testing.T) {
 	err := ApplyConfigDefaults(sub, cfg)
 	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
 		t.Fatalf("error = %v, want manual confirmation error", err)
+	}
+}
+
+func TestSaveConfigMigratesRecognizedLegacyTargetsBeforeValidation(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	saved, err := SaveConfig(model.SubscriptionConfig{
+		DefaultTargetRoot: "/139_60t/剧集",
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Pan123: model.SubscriptionTelegramPanConfig{TempTransferRoot: "/123/转存"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.DefaultTarget != (model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "剧集"}) || saved.DefaultTargetRoot != "" {
+		t.Fatalf("default target migration = %#v / %q", saved.DefaultTarget, saved.DefaultTargetRoot)
+	}
+	if saved.Telegram.Pan123.TempTransferTarget != (model.SubscriptionStorageTarget{Provider: "pan123", Folder: "转存"}) || saved.Telegram.Pan123.TempTransferRoot != "" {
+		t.Fatalf("temp target migration = %#v / %q", saved.Telegram.Pan123.TempTransferTarget, saved.Telegram.Pan123.TempTransferRoot)
+	}
+}
+
+func TestSaveConfigRejectsInvalidTargetRoles(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	_, err := SaveConfig(model.SubscriptionConfig{
+		DefaultTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "delivery"},
+	})
+	if err == nil {
+		t.Fatal("pan123 default delivery target unexpectedly accepted")
 	}
 }
 

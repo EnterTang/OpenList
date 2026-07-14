@@ -46,10 +46,10 @@ func GetConfig() (model.SubscriptionConfig, error) {
 }
 
 func SaveConfig(cfg model.SubscriptionConfig) (model.SubscriptionConfig, error) {
+	cfg = normalizeConfig(cfg)
 	if err := validateSubscriptionConfigTargets(cfg); err != nil {
 		return cfg, err
 	}
-	cfg = normalizeConfig(cfg)
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return cfg, err
@@ -98,6 +98,15 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 	if sub.DeliveryTarget.Provider == "" && cfg.DefaultTarget.Provider != "" {
 		sub.DeliveryTarget = cfg.DefaultTarget
 	}
+	if sub.DeliveryTarget.Provider != "" {
+		sub.TargetRoot = ""
+	}
+	if err := validateSubscriptionTempTarget(sub.TempTarget); err != nil {
+		return errors.WithMessage(err, "invalid temp target")
+	}
+	if err := validateSubscriptionDeliveryTarget(sub.DeliveryTarget, sub.TransferEnabled); err != nil {
+		return errors.WithMessage(err, "invalid delivery target")
+	}
 	if sub.CheckIntervalMinutes <= 0 {
 		sub.CheckIntervalMinutes = 60
 	}
@@ -123,21 +132,29 @@ func validateSubscriptionConfigTargets(cfg model.SubscriptionConfig) error {
 	if err := ValidateSubscriptionStorageTarget(cfg.DefaultTarget); err != nil {
 		return errors.WithMessage(err, "invalid default target")
 	}
+	if err := validateSubscriptionDeliveryTarget(cfg.DefaultTarget, false); err != nil {
+		return errors.WithMessage(err, "invalid default target")
+	}
 	if cfg.DefaultTarget.Provider == "" && strings.TrimSpace(cfg.DefaultTargetRoot) != "" {
 		return errors.Errorf("legacy default_target_root %q is not a recognized provider mount and requires manual confirmation", cfg.DefaultTargetRoot)
 	}
 	panTargets := []struct {
-		name   string
-		target model.SubscriptionStorageTarget
+		name             string
+		expectedProvider string
+		target           model.SubscriptionStorageTarget
 	}{
-		{"quark", cfg.Telegram.Quark.TempTransferTarget},
-		{"aliyun_drive", cfg.Telegram.AliyunDrive.TempTransferTarget},
-		{"pan123", cfg.Telegram.Pan123.TempTransferTarget},
-		{"pan115", cfg.Telegram.Pan115.TempTransferTarget},
+		{"quark", "quark", cfg.Telegram.Quark.TempTransferTarget},
+		{"aliyun_drive", "aliyun_drive", cfg.Telegram.AliyunDrive.TempTransferTarget},
+		{"pan123", "pan123", cfg.Telegram.Pan123.TempTransferTarget},
+		{"pan115", "pan115", cfg.Telegram.Pan115.TempTransferTarget},
 	}
 	for _, item := range panTargets {
 		if err := ValidateSubscriptionStorageTarget(item.target); err != nil {
 			return errors.WithMessagef(err, "invalid %s temp transfer target", item.name)
+		}
+		target := NormalizeSubscriptionStorageTarget(item.target)
+		if target.Provider != "" && (target.Provider != item.expectedProvider || target.Folder == "") {
+			return errors.Errorf("invalid %s temp transfer target: provider must be %s and folder is required", item.name, item.expectedProvider)
 		}
 	}
 	panRoots := []struct {
@@ -164,6 +181,7 @@ func normalizeConfig(cfg model.SubscriptionConfig) model.SubscriptionConfig {
 	if cfg.DefaultTarget.Provider == "" && cfg.DefaultTargetRoot != "" {
 		if migrated, ok := MigrateLegacyPathTarget(cfg.DefaultTargetRoot); ok {
 			cfg.DefaultTarget = migrated
+			cfg.DefaultTargetRoot = ""
 		}
 	}
 	cfg.DefaultCheckIntervalMinutes = 0
@@ -361,6 +379,7 @@ func normalizeTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) model.S
 	if cfg.TempTransferTarget.Provider == "" && cfg.TempTransferRoot != "" {
 		if migrated, ok := MigrateLegacyPathTarget(cfg.TempTransferRoot); ok {
 			cfg.TempTransferTarget = migrated
+			cfg.TempTransferRoot = ""
 		}
 	}
 	cfg.Cookie = strings.TrimSpace(cfg.Cookie)

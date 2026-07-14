@@ -53,6 +53,7 @@ type Runtime struct {
 	closeRedisClient     func(*redis.Client) error
 	stopEmbeddedRedis    func(context.Context, *embeddedredis.Manager) error
 	dispatchTransport    runtimeDispatchTransport
+	workerBackground     sync.WaitGroup
 
 	mu        sync.RWMutex
 	controlMu sync.Mutex
@@ -307,13 +308,21 @@ func (r *Runtime) startWorkerLocked() error {
 	workerService.ConfigureControlPlane(nodeID, keyPair, nil)
 	r.workerService = workerService
 	clusterworker.SetDefaultService(workerService)
+	r.workerBackground.Add(3)
 	go func(ctx context.Context, client *transport.WorkerClient) {
+		defer r.workerBackground.Done()
 		if err := client.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Errorf("cluster worker websocket stopped: %v", err)
 		}
 	}(workerCtx, workerClient)
-	go r.runReporter(workerCtx, workerService, queue)
-	go r.runCleanupProcessor(workerCtx, workerService)
+	go func() {
+		defer r.workerBackground.Done()
+		r.runReporter(workerCtx, workerService, queue)
+	}()
+	go func() {
+		defer r.workerBackground.Done()
+		r.runCleanupProcessor(workerCtx, workerService)
+	}()
 	return nil
 }
 
@@ -675,6 +684,7 @@ func (r *Runtime) stopLocked() {
 	if r.hub != nil {
 		_ = r.hub.Close()
 	}
+	r.workerBackground.Wait()
 	if err := r.cleanupWorkerRedisLocked(); err != nil {
 		log.Errorf("cleanup cluster worker Redis during runtime stop: %v", err)
 	}

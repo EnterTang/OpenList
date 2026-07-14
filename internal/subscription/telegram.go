@@ -78,10 +78,11 @@ type telegramAuthCommandResp struct {
 }
 
 type telegramPanSubscriptionSource struct {
-	Name            string
-	Config          model.SubscriptionTelegramPanConfig
-	BoundShareNames map[string]struct{}
-	BoundSharePaths map[string]struct{}
+	Name                  string
+	Config                model.SubscriptionTelegramPanConfig
+	runtimeConfigResolved bool
+	BoundShareNames       map[string]struct{}
+	BoundSharePaths       map[string]struct{}
 }
 
 type telegramTempCandidate struct {
@@ -243,7 +244,11 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 			saved = append(saved, *stored)
 		}
 	}
-	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, telegramPanSourcesForTransfer(cfg, triggeredSources), cfg, transfer, now)
+	transferSources, err := telegramPanSourcesForTransfer(cfg, triggeredSources)
+	if err != nil {
+		return saved, sub.LastTreeHash, added, changed, transferred, err
+	}
+	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, transferSources, cfg, transfer, now)
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
@@ -334,18 +339,29 @@ func runTelegramSearchCommand(ctx context.Context, sub *model.Subscription, cfg 
 	return parseTelegramRows(stdout)
 }
 
-func telegramPanSourcesForTransfer(cfg model.SubscriptionTelegramSourceConfig, triggered map[string]telegramPanSubscriptionSource) map[string]telegramPanSubscriptionSource {
+func telegramPanSourcesForTransfer(cfg model.SubscriptionTelegramSourceConfig, triggered map[string]telegramPanSubscriptionSource) (map[string]telegramPanSubscriptionSource, error) {
 	merged := make(map[string]telegramPanSubscriptionSource, len(triggered)+4)
 	for _, source := range telegramPanSources(cfg) {
+		if triggeredSource, ok := triggered[source.Name]; ok && triggeredSource.runtimeConfigResolved {
+			continue
+		}
+		if source.Config.TempTransferTarget.Provider != "" {
+			resolved, err := telegramPanSourceConfigWithStorageFallback(ShareProviderName(source.Name), source.Config)
+			if err != nil {
+				return nil, err
+			}
+			source.Config = resolved
+			source.runtimeConfigResolved = true
+		}
 		if strings.TrimSpace(source.Config.TempTransferRoot) == "" {
 			continue
 		}
 		merged[source.Name] = source
 	}
 	for name, source := range triggered {
-		merged[name] = source
+		merged[name] = mergeBoundShareSource(merged[name], source)
 	}
-	return merged
+	return merged, nil
 }
 
 func runTelegramTempTransfers(ctx context.Context, sub *model.Subscription, sources map[string]telegramPanSubscriptionSource, cfg model.SubscriptionTelegramSourceConfig, transfer bool, seenAt time.Time) ([]model.SubscriptionItem, string, int, int, int, error) {
@@ -465,7 +481,7 @@ func telegramPanSources(cfg model.SubscriptionTelegramSourceConfig) []telegramPa
 	sources := make([]telegramPanSubscriptionSource, 0, len(candidates))
 	for _, candidate := range candidates {
 		candidate.Config = normalizeTelegramPanConfig(candidate.Config)
-		if len(candidate.Config.Channels) == 0 && candidate.Config.TempTransferRoot == "" {
+		if len(candidate.Config.Channels) == 0 && candidate.Config.TempTransferRoot == "" && candidate.Config.TempTransferTarget.Provider == "" {
 			continue
 		}
 		sources = append(sources, candidate)

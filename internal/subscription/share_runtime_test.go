@@ -353,8 +353,68 @@ func TestTrySaveShareLinkToTempUsesPan123StorageAccessTokenFallback(t *testing.T
 	if !handled || source.Name != "pan123" {
 		t.Fatalf("handled/source = %v/%#v, want pan123 handled", handled, source)
 	}
+	if !source.runtimeConfigResolved {
+		t.Fatal("runtime config resolved = false, want true after successful storage fallback")
+	}
 	if factoryConfig.AccessToken != "storage-token-123" {
 		t.Fatalf("factory access token = %q, want storage-token-123", factoryConfig.AccessToken)
+	}
+}
+
+func TestTrySaveShareLinkToTempLeavesRuntimeConfigUnresolvedWhenStorageResolutionFails(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@pan123"},
+			TempTransferRoot:   "/123-legacy/temp",
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+			AccessToken:        "stale-token",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "SomeShow"}, cfg, "https://www.123pan.com/s/7Tx1jv-pVu7v?pwd=xoxo")
+	if err == nil || !strings.Contains(err.Error(), "no compatible provider account for pan123") {
+		t.Fatalf("save share link error = %v, want storage resolution error", err)
+	}
+	if handled {
+		t.Fatal("handled = true, want false")
+	}
+	if source.runtimeConfigResolved {
+		t.Fatal("runtime config resolved = true after failed storage fallback")
+	}
+	if source.Config.TempTransferRoot != "/123-legacy/temp" {
+		t.Fatalf("temp transfer root = %q, want preserved legacy root", source.Config.TempTransferRoot)
+	}
+}
+
+func TestMergeBoundShareSourcePreservesResolvedRuntimeConfig(t *testing.T) {
+	existing := telegramPanSubscriptionSource{
+		Name:                  "pan123",
+		runtimeConfigResolved: true,
+		Config: model.SubscriptionTelegramPanConfig{
+			TempTransferRoot: "/123-selected/temp",
+			AccessToken:      "selected-token",
+		},
+		BoundShareNames: map[string]struct{}{"old.mkv": {}},
+	}
+	incoming := telegramPanSubscriptionSource{
+		Name: "pan123",
+		Config: model.SubscriptionTelegramPanConfig{
+			TempTransferRoot:   "/123-legacy/temp",
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+		},
+		BoundSharePaths: map[string]struct{}{`/new.mkv`: {}},
+	}
+
+	merged := mergeBoundShareSource(existing, incoming)
+	if !merged.runtimeConfigResolved || merged.Config.TempTransferRoot != "/123-selected/temp" || merged.Config.AccessToken != "selected-token" {
+		t.Fatalf("merged source = %#v, want existing resolved runtime config", merged)
+	}
+	if _, ok := merged.BoundShareNames["old.mkv"]; !ok {
+		t.Fatalf("bound names = %#v, want existing marker", merged.BoundShareNames)
+	}
+	if _, ok := merged.BoundSharePaths["/new.mkv"]; !ok {
+		t.Fatalf("bound paths = %#v, want incoming marker", merged.BoundSharePaths)
 	}
 }
 

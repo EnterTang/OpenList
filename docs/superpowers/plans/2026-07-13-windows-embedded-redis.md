@@ -295,7 +295,7 @@ Commit the runtime lifecycle changes and tests.
 
 - [x] **Step 1: Write failing shell tests**
 
-Source the helper behind a main guard. Create temporary ZIP fixtures and assert `verify_sha256` rejects a wrong digest, `assemble_payload` refuses missing required files, and a valid fixture produces `internal/embeddedredis/assets/generated/redis-windows.zip` containing exactly the server, five DLLs, and two license files.
+Source the helper behind a main guard. Create temporary ZIP fixtures and assert `verify_sha256` rejects a wrong digest, `assemble_payload` refuses missing required files, and a valid fixture produces `internal/embeddedredis/assets/generated/redis-windows.zip` containing exactly the server, three runtime DLLs, five license files, and `THIRD_PARTY_NOTICES.txt`.
 
 - [x] **Step 2: Run shell tests and verify RED**
 
@@ -312,7 +312,7 @@ URL=https://github.com/redis-windows/redis-windows/releases/download/7.2.14/Redi
 SHA256=b31d0f867608017f0b0962624d55a4c569a745587ad4b08f7fe9eea59d6916c1
 ```
 
-Use `curl`, `unzip`, `zip`, and a portable SHA-256 helper (`sha256sum` or `shasum -a 256`). Download Redis BSD `COPYING` and the Windows port Apache `LICENSE`, then build a minimal `zip -X` payload. Provide `prepare` and `clean` commands.
+Use `curl`, `unzip`, `zip`, `tar`, and a portable SHA-256 helper (`sha256sum` or `shasum -a 256`). Download and verify Redis BSD `COPYING`, the Windows port Apache `LICENSE`, the pinned MSYS2 runtime package and license, LGPL-3.0, and the pinned OpenSSL license. Build a minimal deterministic `zip -X` payload with third-party notices. Provide `prepare` and `clean` commands.
 
 - [x] **Step 4: Integrate the helper into local Windows builds**
 
@@ -340,7 +340,20 @@ unzip -l internal/embeddedredis/assets/generated/redis-windows.zip
 bash scripts/prepare-embedded-redis.sh clean
 ```
 
-Expected: checksum verification succeeds; the archive contains only the required eight files; cleanup removes the generated ZIP.
+Expected: checksum verification succeeds; the archive contains only these ten files; cleanup removes the generated ZIP:
+
+```text
+COPYING.redis
+LICENSE.LGPL-3.0
+LICENSE.msys2-runtime
+LICENSE.openssl
+LICENSE.redis-windows
+THIRD_PARTY_NOTICES.txt
+msys-2.0.dll
+msys-crypto-3.dll
+msys-ssl-3.dll
+redis-server.exe
+```
 
 - [x] **Step 7: Commit build preparation**
 
@@ -401,40 +414,42 @@ unzip -l build/compress/openlist-windows-amd64.zip
 
 Expected: exactly one file, `openlist.exe`. Record the executable size increase and archive SHA-256.
 
-- [x] **Step 6: Run Windows runtime verification when available**
+- [ ] **Step 6: Run Windows runtime verification when available**
 
 Start a worker/hybrid node from only `openlist.exe`, verify extraction paths, query `CONFIG GET appendonly appendfsync maxmemory-policy`, enqueue data, stop OpenList, restart it, and confirm the AOF-backed stream remains. If no Windows execution environment exists, report this explicitly as the remaining verification gap.
 
-- [x] **Step 7: Finalize verification state and commit it**
+- [ ] **Step 7: Finalize verification state and commit it**
 
 After fresh verification evidence is collected, mark only the completed verification steps, record any remaining gaps, and commit the final plan state.
 
-## Verification Evidence (2026-07-13)
+## Verification Evidence (2026-07-14; supersedes the 2026-07-13 artifact values)
 
-- **Step 2:** `gofmt` left the touched Go files clean; `go vet` passed for
-  `internal/embeddedredis`, `internal/cluster/...`, and `internal/conf/...`;
-  `git diff --check` passed.
-- **Step 3:** Focused tests for `internal/embeddedredis`,
-  `internal/cluster/...`, and `internal/conf/...` passed, including the
-  embedded Redis race test. The wider
-  `go test -count=1 ./cmd/... ./internal/...` run is not claimed passing: it
-  encountered an environment failure in `internal/fuse` because `fuse.h` was
-  unavailable, existing non-constant `fmt.Errorf` vet failures in
-  `internal/offline_download/{115,115_open,pikpak}`, and
-  `internal/net.TestNewOSSClientUsesEnvironmentHTTPSProxy` expecting
-  `*http.Transport` but receiving `*net.safeTransport`.
+- **Step 2:** Shell syntax checks passed for all three release/payload scripts;
+  `scripts/prepare-embedded-redis-test.sh` passed every fixture, PE verifier,
+  generated-directory, cleanup, routing, and toolchain case. `go vet` passed
+  for `internal/embeddedredis`, `internal/cluster/...`,
+  `internal/subscription`, `internal/model`, and `drivers/123`.
+- **Step 3:** Fresh focused tests passed for `internal/embeddedredis`,
+  `internal/cluster/...`, `internal/subscription`, `internal/model`, and
+  `drivers/123`. The same focused set, excluding the model-only package, also
+  passed with `-race`. The wider repository suite is not claimed passing;
+  its previously recorded environment and unrelated legacy failures remain
+  outside this change.
 - **Step 4:** A real verified payload and the full
   `scripts/build-release-local.sh --target windows-amd64 --skip-frontend-build --no-install`
-  build succeeded with Zig 0.15.2 after the xgo GHCR pull stalled. The Windows
-  artifact was produced.
+  build succeeded with Zig 0.15.2. Direct GitHub downloads were unstable, so
+  the successful verification run consumed a temporary local download cache;
+  every cached input matched the SHA-256 pinned by the helper before the
+  unchanged build and verifier pipeline ran.
 - **Step 5:** The archive contains exactly one regular `openlist.exe`, identified
-  as PE32+ x86-64. The archive is 62,287,332 bytes with SHA-256
-  `6e1e98892688a396e3807cc4ccbeaea6dbbef8fea1a07c8c0ee07ec37233dde1`;
-  the executable is 172,167,680 bytes with SHA-256
-  `583fd787e86672fc6d87f1db483e02288be023842b7b9434ab7bf0149b43fd03`.
-  String inspection found `redis-server.exe`, `msys-2.0.dll`, `COPYING.redis`,
-  and `LICENSE.redis-windows`; the generated payload asset was cleaned.
+  as PE32+ x86-64. The archive is 61,515,202 bytes with SHA-256
+  `1d2454716bd89c78f51965454cb4958e956fa8e4351e8d4a5a229ff1c9a4c1ba`;
+  the executable is 171,508,224 bytes with SHA-256
+  `fbf419a44d36a4d3e6583489847bd5a4927e184a679b74b90eb2501b275f494c`.
+  The release verifier confirmed the current ten-file payload appears exactly
+  once in the executable; the generated payload asset was cleaned.
 - **Step 6:** No Windows execution environment was available. Windows runtime
   startup, AOF persistence across restart, and ACL/config inspection remain the
   explicit verification gap; no runtime pass is claimed.
-- **Step 7:** This plan records the final evidence state and remaining gap.
+- **Step 7:** This plan records the fresh evidence and remaining gaps, but no
+  commit is claimed in this verification pass.

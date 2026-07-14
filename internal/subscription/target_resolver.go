@@ -15,12 +15,17 @@ import (
 )
 
 var (
-	listProviderTargetStorages    = db.GetEnabledStorages
-	storageFreeBytesForMountPath  = defaultStorageFreeBytesForMountPath
-	storageActiveJobsForMountPath = func(string) int { return 0 }
-	ensureProviderTargetFolder    = fs.MakeDir
-	observeResolvedProviderTarget func(ResolveProviderTargetRequest, ResolvedProviderTarget)
+	listProviderTargetStorages     = db.GetEnabledStorages
+	storageFreeBytesForMountPath   = defaultStorageFreeBytesForMountPath
+	storageActiveJobsForMountPath  = defaultStorageActiveJobsForMountPath
+	liveMembershipTierForMountPath = defaultLiveMembershipTierForMountPath
+	ensureProviderTargetFolder     = fs.MakeDir
+	observeResolvedProviderTarget  func(ResolveProviderTargetRequest, ResolvedProviderTarget)
 )
+
+type membershipTierReporter interface {
+	ClusterMembershipTier() string
+}
 
 type ResolveProviderTargetRequest struct {
 	Provider      string
@@ -187,6 +192,11 @@ func providerAccountCandidateFromStorage(ctx context.Context, storage model.Stor
 	provider := storageProviderName(storage.Driver)
 	freeBytes, hasFree := storageFreeBytesForMountPath(ctx, storage.MountPath)
 	tier, weight, maxUpload := providerAccountMetadata(storage.Addition)
+	if normalizeMembershipTier(tier) == "unknown" {
+		if liveTier := normalizeMembershipTier(liveMembershipTierForMountPath(storage.MountPath)); liveTier != "" && liveTier != "unknown" {
+			tier = liveTier
+		}
+	}
 	if weight == 0 {
 		weight = membershipWeight(tier)
 	}
@@ -215,6 +225,18 @@ func providerAccountCandidateFromStorage(ctx context.Context, storage model.Stor
 		HasFreeBytes:         hasFree,
 		ActiveJobs:           storageActiveJobsForMountPath(storage.MountPath),
 	}
+}
+
+func defaultLiveMembershipTierForMountPath(mountPath string) string {
+	driver, err := op.GetStorageByMountPath(mountPath)
+	if err != nil || driver == nil {
+		return ""
+	}
+	reporter, ok := driver.(membershipTierReporter)
+	if !ok {
+		return ""
+	}
+	return reporter.ClusterMembershipTier()
 }
 
 func providerAccountMetadata(addition string) (tier string, weight int, maxUpload int64) {
@@ -338,6 +360,27 @@ func defaultStorageFreeBytesForMountPath(ctx context.Context, mountPath string) 
 		return 0, false
 	}
 	return details.FreeSpace(), true
+}
+
+func defaultStorageActiveJobsForMountPath(mountPath string) int {
+	if db.GetDb() == nil {
+		return 0
+	}
+	var targetDirs []string
+	if err := db.GetDb().Model(&model.SubscriptionItem{}).
+		Where("status = ?", model.SubscriptionItemStatusTransferring).
+		Pluck("target_dir", &targetDirs).Error; err != nil {
+		return 0
+	}
+	mountPath = cleanConfigPath(mountPath)
+	count := 0
+	for _, targetDir := range targetDirs {
+		targetDir = cleanConfigPath(targetDir)
+		if targetDir == mountPath || strings.HasPrefix(targetDir, strings.TrimSuffix(mountPath, "/")+"/") {
+			count++
+		}
+	}
+	return count
 }
 
 func storageProviderName(driverName string) string {

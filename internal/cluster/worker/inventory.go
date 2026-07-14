@@ -87,6 +87,10 @@ func supportsETF(driver string) bool {
 }
 
 func supportsShare(driver string) bool {
-	lower := strings.ToLower(driver)
-	return strings.Contains(lower, "139") || strings.Contains(lower, "115") || strings.Contains(lower, "aliyun") || strings.Contains(lower, "123") || strings.Contains(lower, "quark")
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "123pan", "123 open", "115 cloud", "aliyundriveopen", "quark":
+		return true
+	default:
+		return false
+	}
 }

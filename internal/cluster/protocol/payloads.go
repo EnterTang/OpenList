@@ -112,6 +112,8 @@ type ProviderAccountInventory struct {
 	Status               string `json:"status"`
 	MembershipTier       string `json:"membership_tier,omitempty"`
 	MembershipWeight     int    `json:"membership_weight,omitempty"`
+	MembershipStatus     string `json:"membership_status,omitempty"`
+	MembershipExpireDate string `json:"membership_expire_date,omitempty"`
 	MaxSingleUploadBytes int64  `json:"max_single_upload_bytes,omitempty"`
 	SupportsUpload       bool   `json:"supports_upload"`
 	SupportsDownload     bool   `json:"supports_download"`

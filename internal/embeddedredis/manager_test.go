@@ -144,7 +144,7 @@ func TestPrepareAdoptsUnownedManagedEndpoint(t *testing.T) {
 	opts := eligibleOptions(t)
 	opts.Password = "managed-secret"
 	markerPath := filepath.Join(opts.DataDir, "runtime", "redis", managedMarkerFilename)
-	if err := writeManagedMarker(markerPath, managedMarkerFor(effectiveFromOptions(opts))); err != nil {
+	if err := writeManagedMarker(markerPath, managedMarkerFor(effectiveFromOptions(opts), "managed-run-id")); err != nil {
 		t.Fatal(err)
 	}
 	var live atomic.Bool
@@ -153,6 +153,9 @@ func TestPrepareAdoptsUnownedManagedEndpoint(t *testing.T) {
 	var starts atomic.Int32
 	restoreManagerDeps(t, managerDependencies{
 		goos: "windows",
+		identity: func(context.Context, EffectiveOptions) (string, error) {
+			return "managed-run-id", nil
+		},
 		probe: func(context.Context, EffectiveOptions, bool) error {
 			if live.Load() {
 				return nil
@@ -183,16 +186,59 @@ func TestPrepareAdoptsUnownedManagedEndpoint(t *testing.T) {
 	}
 }
 
+func TestAdoptedManagerDoesNotShutdownReplacementProcess(t *testing.T) {
+	opts := eligibleOptions(t)
+	opts.Password = "managed-secret"
+	markerPath := filepath.Join(opts.DataDir, "runtime", "redis", managedMarkerFilename)
+	if err := writeManagedMarker(markerPath, managedMarkerFor(effectiveFromOptions(opts), "managed-run-id")); err != nil {
+		t.Fatal(err)
+	}
+	var runID atomic.Value
+	runID.Store("managed-run-id")
+	var shutdowns atomic.Int32
+	restoreManagerDeps(t, managerDependencies{
+		goos:  "windows",
+		probe: func(context.Context, EffectiveOptions, bool) error { return nil },
+		identity: func(context.Context, EffectiveOptions) (string, error) {
+			return runID.Load().(string), nil
+		},
+		shutdown: func(context.Context, EffectiveOptions) error {
+			shutdowns.Add(1)
+			return nil
+		},
+	})
+
+	manager, _, err := Prepare(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager == nil || !manager.Owned() || manager.process != nil {
+		t.Fatalf("manager = %#v, want adopted manager", manager)
+	}
+	runID.Store("external-replacement-run-id")
+	if err := manager.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if shutdowns.Load() != 0 || !manager.Stopped() {
+		t.Fatalf("shutdowns/stopped = %d/%v, want 0/true", shutdowns.Load(), manager.Stopped())
+	}
+}
+
 func TestPrepareLeavesExternalRedisUnownedWhenMarkerDoesNotMatch(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		marker *managedMarker
+		name       string
+		marker     *managedMarker
+		identityID string
 	}{
 		{name: "missing"},
 		{name: "mismatched", marker: func() *managedMarker {
-			marker := managedMarkerFor(EffectiveOptions{Address: "127.0.0.1:16379", Password: "other"})
+			marker := managedMarkerFor(EffectiveOptions{Address: "127.0.0.1:16379", Password: "other"}, "external-run-id")
 			return &marker
 		}()},
+		{name: "matching credentials but different process", marker: func() *managedMarker {
+			marker := managedMarkerFor(EffectiveOptions{Address: "127.0.0.1:6379", Password: "external-secret"}, "old-managed-run-id")
+			return &marker
+		}(), identityID: "external-run-id"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			opts := eligibleOptions(t)
@@ -202,7 +248,13 @@ func TestPrepareLeavesExternalRedisUnownedWhenMarkerDoesNotMatch(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			restoreManagerDeps(t, managerDependencies{goos: "windows", probe: func(context.Context, EffectiveOptions, bool) error { return nil }})
+			restoreManagerDeps(t, managerDependencies{
+				goos:  "windows",
+				probe: func(context.Context, EffectiveOptions, bool) error { return nil },
+				identity: func(context.Context, EffectiveOptions) (string, error) {
+					return test.identityID, nil
+				},
+			})
 			manager, _, err := Prepare(context.Background(), opts)
 			if err != nil {
 				t.Fatal(err)
@@ -472,7 +524,7 @@ func TestPrepareStartsManagedRedisWithGeneratedSecret(t *testing.T) {
 	if opts.Password != "" {
 		t.Fatalf("caller password mutated to %q", opts.Password)
 	}
-	if command == nil || command.Dir == "" || len(command.Args) != 2 || filepath.Base(command.Args[1]) != "redis.conf" {
+	if command == nil || command.Dir == "" || len(command.Args) != 2 || command.Args[1] != "redis.conf" {
 		t.Fatalf("command = %#v", command)
 	}
 	if runtime.GOOS != "windows" {
@@ -484,7 +536,7 @@ func TestPrepareStartsManagedRedisWithGeneratedSecret(t *testing.T) {
 			t.Fatalf("runtime directory mode = %o, want 700", info.Mode().Perm())
 		}
 	}
-	config, err := os.ReadFile(command.Args[1])
+	config, err := os.ReadFile(filepath.Join(command.Dir, command.Args[1]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1178,6 +1230,9 @@ func effectiveFrom(opts Options) EffectiveOptions {
 
 func restoreManagerDeps(t *testing.T, deps managerDependencies) {
 	t.Helper()
+	if deps.identity == nil {
+		deps.identity = func(context.Context, EffectiveOptions) (string, error) { return "test-run-id", nil }
+	}
 	old := currentManagerDeps
 	currentManagerDeps = deps.withDefaults()
 	t.Cleanup(func() { currentManagerDeps = old })

@@ -33,7 +33,7 @@ func TestNormalizeSubscriptionStorageTargetMigratesLegacyFolderPath(t *testing.T
 }
 
 func TestValidateSubscriptionStorageTargetRejectsUnsafeFolders(t *testing.T) {
-	for _, folder := range []string{"/absolute", "../escape", "series/../../escape", `..\escape`} {
+	for _, folder := range []string{"/absolute", "../escape", "series/../../escape", `..\escape`, `C:\escape`} {
 		t.Run(folder, func(t *testing.T) {
 			err := ValidateSubscriptionStorageTarget(model.SubscriptionStorageTarget{
 				Provider: "pan123",
@@ -43,6 +43,16 @@ func TestValidateSubscriptionStorageTargetRejectsUnsafeFolders(t *testing.T) {
 				t.Fatalf("expected folder %q to be rejected", folder)
 			}
 		})
+	}
+}
+
+func TestValidateSubscriptionStorageTargetRejectsMismatchedLegacyProvider(t *testing.T) {
+	err := ValidateSubscriptionStorageTarget(model.SubscriptionStorageTarget{
+		Provider: "pan123",
+		Folder:   "/115/series",
+	})
+	if err == nil {
+		t.Fatal("expected a legacy folder from another provider to be rejected")
 	}
 }
 

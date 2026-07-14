@@ -2,8 +2,10 @@ package subscription
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -97,6 +99,23 @@ func TestResolveProviderTargetFromCandidatesPrefersLowerLoadAfterCapacityTie(t *
 	}
 }
 
+func TestDefaultStorageActiveJobsCountsTransfersForMount(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	items := []model.SubscriptionItem{
+		{SubscriptionID: 1, SourceKey: "a", TargetDir: "/139-a/剧集", Status: model.SubscriptionItemStatusTransferring},
+		{SubscriptionID: 1, SourceKey: "b", TargetDir: "/139-b/剧集", Status: model.SubscriptionItemStatusTransferring},
+		{SubscriptionID: 1, SourceKey: "c", TargetDir: "/139-a/电影", Status: model.SubscriptionItemStatusTransferred},
+	}
+	for i := range items {
+		if _, _, err := db.UpsertSubscriptionItem(&items[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := defaultStorageActiveJobsForMountPath("/139-a"); got != 1 {
+		t.Fatalf("active jobs = %d, want 1", got)
+	}
+}
+
 func TestResolveProviderTargetRejectsAbnormalOrNonDownloadableShareAccounts(t *testing.T) {
 	_, err := ResolveProviderTargetFromCandidates(context.Background(), ResolveProviderTargetRequest{
 		Provider: "pan123", Folder: "转存", NeedShareSave: true,
@@ -147,6 +166,44 @@ func TestResolveProviderTargetEnforcesConfiguredOrdinary139UploadLimit(t *testin
 	})
 	if err == nil {
 		t.Fatal("expected configured ordinary 139 account 5 GiB upload limit rejection")
+	}
+}
+
+func TestResolveProviderTargetUsesLive139MembershipTier(t *testing.T) {
+	oldList := listProviderTargetStorages
+	oldFree := storageFreeBytesForMountPath
+	oldLiveTier := liveMembershipTierForMountPath
+	defer func() {
+		listProviderTargetStorages = oldList
+		storageFreeBytesForMountPath = oldFree
+		liveMembershipTierForMountPath = oldLiveTier
+	}()
+
+	listProviderTargetStorages = func() ([]model.Storage, error) {
+		return []model.Storage{{ID: 39, MountPath: "/139-live", Driver: "139Yun", Status: "work", Addition: `{"membership_tier":"unknown"}`}}, nil
+	}
+	storageFreeBytesForMountPath = func(context.Context, string) (int64, bool) { return 100 << 30, true }
+	liveMembershipTierForMountPath = func(mountPath string) string {
+		if mountPath != "/139-live" {
+			t.Fatalf("mount path = %q", mountPath)
+		}
+		return "ordinary"
+	}
+
+	resolved, err := ResolveProviderTarget(context.Background(), ResolveProviderTargetRequest{
+		Provider: "yidong139", Folder: "剧集", NeedUpload: true, FileSize: 1 << 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.MembershipTier != "ordinary" || resolved.MaxSingleUploadBytes != 5<<30 {
+		t.Fatalf("resolved = %#v, want live ordinary/5GiB", resolved)
+	}
+	_, err = ResolveProviderTarget(context.Background(), ResolveProviderTargetRequest{
+		Provider: "yidong139", Folder: "剧集", NeedUpload: true, FileSize: 6 << 30,
+	})
+	if err == nil {
+		t.Fatal("6GiB upload unexpectedly accepted by live ordinary account")
 	}
 }
 
@@ -259,5 +316,69 @@ func TestTelegramPanSourceConfigWithStorageFallbackResolvesTempTransferTarget(t 
 	}
 	if cfg.TempTransferTarget.Provider != "pan123" || cfg.TempTransferTarget.Folder != "转存至移动" {
 		t.Fatalf("temp transfer target = %#v", cfg.TempTransferTarget)
+	}
+}
+
+func TestTelegramPanSourceConfigBindsSelectedAccountCredentials(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	oldFree := storageFreeBytesForMountPath
+	storageFreeBytesForMountPath = func(context.Context, string) (int64, bool) { return 100 << 30, true }
+	t.Cleanup(func() { storageFreeBytesForMountPath = oldFree })
+
+	storages := []*model.Storage{
+		{MountPath: "/123-low", Driver: "123Pan", Status: "work", Addition: `{"AccessToken":"token-low","membership_weight":10}`},
+		{MountPath: "/123-high", Driver: "123Pan", Status: "work", Addition: `{"AccessToken":"token-high","membership_weight":20}`},
+		{MountPath: "/115-low", Driver: "115 Cloud", Status: "work", Addition: `{"cookie":"cookie-low","membership_weight":10}`},
+		{MountPath: "/115-high", Driver: "115 Cloud", Status: "work", Addition: `{"cookie":"cookie-high","membership_weight":20}`},
+	}
+	for _, storage := range storages {
+		if err := db.CreateStorage(storage); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pan123, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "staging"},
+		AccessToken:        "global-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pan123.TempTransferRoot != "/123-high/staging" || pan123.AccessToken != "token-high" {
+		t.Fatalf("pan123 config = %#v, want high account path and token", pan123)
+	}
+
+	pan115, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan115, model.SubscriptionTelegramPanConfig{
+		TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan115", Folder: "staging"},
+		Cookie:             "global-cookie",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pan115.TempTransferRoot != "/115-high/staging" || pan115.Cookie != "cookie-high" {
+		t.Fatalf("pan115 config = %#v, want high account path and cookie", pan115)
+	}
+}
+
+func TestTelegramPanSourceConfigRejectsMismatchedTempTargetProvider(t *testing.T) {
+	oldList := listProviderTargetStorages
+	oldFree := storageFreeBytesForMountPath
+	defer func() {
+		listProviderTargetStorages = oldList
+		storageFreeBytesForMountPath = oldFree
+	}()
+
+	listProviderTargetStorages = func() ([]model.Storage, error) {
+		return []model.Storage{{ID: 5, MountPath: "/115-main", Driver: "115 Cloud", Status: "work"}}, nil
+	}
+	storageFreeBytesForMountPath = func(context.Context, string) (int64, bool) {
+		return 300, true
+	}
+
+	_, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan115", Folder: "转存"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("error = %v, want mismatched provider rejection", err)
 	}
 }

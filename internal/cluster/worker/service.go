@@ -699,7 +699,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return fmt.Errorf("unsupported cluster job type %q", offer.JobType)
 	}
 	targetProfileRef := strings.TrimSpace(offer.TaskContext.TargetProfile)
-	if targetProfileRef == "" || targetProfileRef == "/" {
+	if strings.TrimSpace(offer.TaskContext.DeliveryTarget.Provider) == "" && (targetProfileRef == "" || targetProfileRef == "/") {
 		return errors.New("cluster target profile must be a mounted destination path")
 	}
 	targetRootBase, targetBindingMount, err := s.resolveDeliveryTargetRoot(ctx, offer.TaskContext)

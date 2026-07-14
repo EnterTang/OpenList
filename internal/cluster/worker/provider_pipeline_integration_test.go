@@ -44,7 +44,7 @@ func TestWorkerOfferHandlerResolvesBoundPan115And139BeforeTransfer(t *testing.T)
 	stagingAccount := providerAccountInventory(nodeID, pan115, 200<<30, 1<<40)
 	deliveryAccount := providerAccountInventory(nodeID, mobile139, 800<<30, 2<<40)
 	task := protocol.TaskContext{
-		ParentBatchID: "batch-1", MediaItemID: "media-1", WorkflowVersion: "v1", SealedManifestVersion: "v1", TargetProfile: "/worker-139-diamond",
+		ParentBatchID: "batch-1", MediaItemID: "media-1", WorkflowVersion: "v1", SealedManifestVersion: "v1",
 		Subscription: protocol.SubscriptionTaskContext{SubscriptionID: 1, SubscriptionItemID: 2, SourceKey: "source-1"},
 		Share:        protocol.ShareTaskContext{Provider: "pan115", URL: "https://115.com/s/test"},
 		Media:        protocol.MediaTaskContext{MediaType: "tv", LogicalTargetPath: "/剧集/episode.mkv"},

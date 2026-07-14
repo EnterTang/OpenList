@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+EMBEDDED_REDIS_HELPER="$SCRIPT_DIR/prepare-embedded-redis.sh"
+EMBEDDED_REDIS_VERIFIER="$SCRIPT_DIR/verify-embedded-redis-payload.go"
+EMBEDDED_REDIS_OUTPUT="${EMBEDDED_REDIS_OUTPUT:-$BACKEND_DIR/internal/embeddedredis/assets/generated/redis-windows.zip}"
+export EMBEDDED_REDIS_OUTPUT
+
 usage() {
   cat <<'USAGE'
 Build OpenList release artifacts with the official build.sh pipeline, embedding a
@@ -26,8 +33,13 @@ Environment:
   FRONTEND_DIR            Same as --frontend-dir.
   FRONTEND_VERSION        Override embedded frontend version metadata.
   GITHUB_TOKEN            Optional, only needed when downloading frontend i18n.
-  The Windows artifact embeds Redis from a pinned distribution and requires
-  network access to GitHub plus curl, unzip, zip, and sha256sum or shasum.
+
+The Windows artifact embeds Redis from pinned upstream packages and requires
+network access to:
+  - github.com
+  - raw.githubusercontent.com
+  - repo.msys2.org
+  - www.gnu.org
 
 Output:
   build/compress/openlist-windows-amd64.zip          (--target windows-amd64, amd64, or all)
@@ -37,7 +49,14 @@ Output:
 
 Requirements:
   - Go 1.26.4
-  - Docker + xgo for Windows/macOS targets:
+  - Node.js and pnpm
+  - curl
+  - Info-ZIP zip/unzip
+  - tar with zstd support
+  - awk
+  - sha256sum or shasum
+  - windows-amd64, darwin-amd64, and amd64 need zig or xgo + usable Docker.
+  - all needs xgo + usable Docker:
       go install github.com/crazy-max/xgo@latest
   - linux-amd64-musl only needs Go + downloaded musl toolchain (no Docker)
 
@@ -62,12 +81,82 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found in PATH"
 }
 
+command_available() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+docker_is_usable() {
+  docker info >/dev/null 2>&1
+}
+
+require_target_toolchain() {
+  local target="$1"
+
+  case "$target" in
+    linux-amd64-musl)
+      return 0
+      ;;
+    all)
+      command_available xgo ||
+        die "xgo is required for target all; run: go install github.com/crazy-max/xgo@latest"
+      command_available docker ||
+        die "Docker is required for target all but was not found in PATH"
+      docker_is_usable || die "Docker is required for target all but is not available"
+      ;;
+    windows-amd64|darwin-amd64|amd64)
+      if command_available zig; then
+        return 0
+      fi
+      command_available xgo ||
+        die "zig or xgo is required for target $target; install zig or run: go install github.com/crazy-max/xgo@latest"
+      command_available docker ||
+        die "Docker is required when target $target uses xgo but was not found in PATH"
+      docker_is_usable || die "Docker is required when target $target uses xgo but is not available"
+      ;;
+    *)
+      die "unsupported toolchain target: $target"
+      ;;
+  esac
+}
+
 target_requires_windows_amd64() {
   case "$1" in
     windows-amd64|amd64|all) return 0 ;;
     *) return 1 ;;
   esac
 }
+
+verify_embedded_redis_generated_dir() (
+  set -e
+
+  local output="${1:-$EMBEDDED_REDIS_OUTPUT}"
+  local generated_dir
+  local output_name
+  local entry
+  local entry_name
+  local entries
+
+  generated_dir="$(dirname "$output")"
+  output_name="$(basename "$output")"
+  [ -d "$generated_dir" ] && [ ! -L "$generated_dir" ] ||
+    die "embedded Redis generated directory is missing or is a symlink: $generated_dir"
+  [ -f "$generated_dir/.gitkeep" ] && [ ! -L "$generated_dir/.gitkeep" ] ||
+    die "embedded Redis generated .gitkeep must be a regular non-symlink file"
+  [ -f "$output" ] && [ ! -L "$output" ] ||
+    die "embedded Redis output must be a regular non-symlink file: $output"
+
+  shopt -s dotglob nullglob
+  entries=("$generated_dir"/*)
+  [ "${#entries[@]}" -eq 2 ] ||
+    die "embedded Redis generated directory must contain only .gitkeep and $output_name"
+  for entry in "${entries[@]}"; do
+    entry_name="${entry##*/}"
+    case "$entry_name" in
+      .gitkeep|"$output_name") ;;
+      *) die "unexpected embedded Redis generated entry: $entry_name" ;;
+    esac
+  done
+)
 
 cleanup_embedded_redis() {
   local original_status=$?
@@ -89,6 +178,7 @@ cleanup_embedded_redis() {
 
 verify_windows_release_archive() {
   local archive="$1"
+  local payload="${2:-}"
   local entries
   local listing
   local regular_entry_count
@@ -103,6 +193,13 @@ verify_windows_release_archive() {
   regular_entry_count="$(printf '%s\n' "$listing" | awk '$NF == "openlist.exe" && substr($1, 1, 1) == "-" { count++ } END { print count + 0 }')"
   [ "$regular_entry_count" -eq 1 ] ||
     die "Windows release archive entry openlist.exe is not a regular file: $archive"
+
+  [ -n "$payload" ] || die "embedded Redis payload path is required for Windows release verification"
+  [ -f "$payload" ] || die "embedded Redis payload was not found for release verification: $payload"
+  [ -f "$EMBEDDED_REDIS_VERIFIER" ] || die "embedded Redis verifier was not found: $EMBEDDED_REDIS_VERIFIER"
+  require_cmd go
+  go run "$EMBEDDED_REDIS_VERIFIER" "$archive" "$payload" ||
+    die "Windows openlist.exe does not contain the exact embedded Redis payload: $archive"
 }
 
 require_info_zip_unzip() (
@@ -140,13 +237,36 @@ require_info_zip_unzip() (
     die "unzip must support Info-ZIP-style -Z1 and -Z -l modes required to verify Windows release archives"
 )
 
+require_windows_embedded_redis_commands() {
+  require_cmd curl
+  require_cmd zip
+  require_cmd tar
+  require_cmd awk
+  require_info_zip_unzip
+  if ! command_available sha256sum && ! command_available shasum; then
+    die "sha256sum or shasum is required for Windows embedded Redis builds"
+  fi
+}
+
+run_backend_build() {
+  local target="$1"
+  shift
+
+  if target_requires_windows_amd64 "$target"; then
+    verify_embedded_redis_generated_dir "$EMBEDDED_REDIS_OUTPUT" || return 1
+  fi
+  (
+    cd "$BACKEND_DIR"
+    bash build.sh "$@"
+  ) || return 1
+  if target_requires_windows_amd64 "$target"; then
+    verify_embedded_redis_generated_dir "$EMBEDDED_REDIS_OUTPUT" || return 1
+  fi
+}
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-EMBEDDED_REDIS_HELPER="$SCRIPT_DIR/prepare-embedded-redis.sh"
 
 FRONTEND_DIR="${FRONTEND_DIR:-"$BACKEND_DIR/../OpenList-Frontend"}"
 BACKEND_MODE="release"
@@ -217,12 +337,7 @@ case "$TARGET" in
   *) die "invalid target: $TARGET" ;;
 esac
 
-if [ "$BUILD_PLATFORM" != "linux_amd64_musl" ] && [ "$BUILD_PLATFORM" != "windows_amd64" ] && [ "$BUILD_PLATFORM" != "darwin_amd64" ] && [ "$BUILD_PLATFORM" != "amd64" ]; then
-  require_cmd docker
-  command -v xgo >/dev/null 2>&1 || die "xgo is required for target $TARGET; run: go install github.com/crazy-max/xgo@latest"
-elif ! command -v zig >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
-  die "install zig (brew install zig) or start Docker for cross-compilation"
-fi
+require_target_toolchain "$TARGET"
 require_cmd go
 require_cmd pnpm
 require_cmd node
@@ -238,16 +353,12 @@ export FRONTEND_VERSION="${FRONTEND_VERSION:-$(node -p "require('$FRONTEND_DIR/p
 
 if target_requires_windows_amd64 "$TARGET"; then
   [ -f "$EMBEDDED_REDIS_HELPER" ] || die "embedded Redis helper not found: $EMBEDDED_REDIS_HELPER"
-  require_cmd curl
-  require_cmd zip
-  require_info_zip_unzip
-  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
-    die "sha256sum or shasum is required for Windows embedded Redis builds"
-  fi
+  require_windows_embedded_redis_commands
 
   trap cleanup_embedded_redis EXIT
   echo "==> Preparing pinned embedded Redis payload"
   bash "$EMBEDDED_REDIS_HELPER" prepare
+  verify_embedded_redis_generated_dir "$EMBEDDED_REDIS_OUTPUT"
 fi
 
 if [ "$SKIP_FRONTEND_BUILD" != "true" ]; then
@@ -290,17 +401,14 @@ if [ "$use_lite_build" = "true" ]; then
   backend_args+=("lite")
 fi
 
-(
-  cd "$BACKEND_DIR"
-  bash build.sh "${backend_args[@]}"
-)
+run_backend_build "$TARGET" "${backend_args[@]}"
 
 if target_requires_windows_amd64 "$TARGET"; then
   windows_archive="$BACKEND_DIR/build/compress/openlist-windows-amd64.zip"
   if [ "$use_lite_build" = "true" ]; then
     windows_archive="$BACKEND_DIR/build/compress/openlist-windows-amd64-lite.zip"
   fi
-  verify_windows_release_archive "$windows_archive"
+  verify_windows_release_archive "$windows_archive" "$EMBEDDED_REDIS_OUTPUT"
 fi
 
 echo

@@ -23,11 +23,13 @@ var requiredPayloadFiles = []string{
 	"redis-server.exe",
 	"msys-2.0.dll",
 	"msys-crypto-3.dll",
-	"msys-gcc_s-seh-1.dll",
 	"msys-ssl-3.dll",
-	"msys-stdc++-6.dll",
 	"COPYING.redis",
+	"LICENSE.LGPL-3.0",
+	"LICENSE.msys2-runtime",
+	"LICENSE.openssl",
 	"LICENSE.redis-windows",
+	"THIRD_PARTY_NOTICES.txt",
 }
 
 type ExtractedRuntime struct {
@@ -142,8 +144,8 @@ func validatePayload(payload []byte) (map[string]*zip.File, error) {
 		if size > maxPayloadTotalSize-totalSize {
 			return nil, errors.New("Redis payload exceeds the total size limit")
 		}
-		if (name == "redis-server.exe" || strings.HasSuffix(name, ".dll")) && size == 0 {
-			return nil, fmt.Errorf("required payload binary %q is empty", name)
+		if size == 0 {
+			return nil, fmt.Errorf("required payload file %q is empty", name)
 		}
 		totalSize += size
 		files[name] = file
@@ -203,6 +205,21 @@ func runtimeValid(dir, sha string, manifest map[string][sha256.Size]byte) bool {
 		closeErr := file.Close()
 		expected := manifest[name]
 		if copyErr != nil || closeErr != nil || written > maxPayloadFileSize || !bytes.Equal(h.Sum(nil), expected[:]) {
+			return false
+		}
+	}
+	allowed := make(map[string]struct{}, len(requiredPayloadFiles)+2)
+	for _, name := range requiredPayloadFiles {
+		allowed[name] = struct{}{}
+	}
+	allowed[".payload-sha256"] = struct{}{}
+	allowed["redis.conf"] = struct{}{}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if _, ok := allowed[entry.Name()]; !ok {
 			return false
 		}
 	}

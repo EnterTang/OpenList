@@ -77,6 +77,25 @@ func (d DiskUsage) MarshalJSON() ([]byte, error) {
 
 type StorageDetails struct {
 	DiskUsage
+	Membership *MembershipDetails `json:"membership,omitempty"`
+}
+
+type MembershipDetails struct {
+	Tier       string `json:"tier,omitempty"`
+	Status     string `json:"status,omitempty"`
+	ExpireDate string `json:"expire_date,omitempty"`
+}
+
+func (d StorageDetails) MarshalJSON() ([]byte, error) {
+	result := map[string]interface{}{
+		"total_space": d.TotalSpace,
+		"used_space":  d.UsedSpace,
+		"free_space":  d.FreeSpace(),
+	}
+	if d.Membership != nil {
+		result["membership"] = d.Membership
+	}
+	return json.Marshal(result)
 }
 
 type ObjWithStorageDetails interface {

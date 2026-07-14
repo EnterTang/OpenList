@@ -20,9 +20,7 @@ import (
 )
 
 func (s *Service) ProcessPendingManifests(ctx context.Context, limit int) (int, error) {
-	if strings.TrimSpace(conf.Conf.Cluster.ETFRootPath) == "" {
-		return 0, nil
-	}
+	materializeETF := strings.TrimSpace(conf.Conf.Cluster.ETFRootPath) != ""
 	if limit <= 0 {
 		limit = 20
 	}
@@ -34,7 +32,13 @@ func (s *Service) ProcessPendingManifests(ctx context.Context, limit int) (int, 
 	}
 	processed := 0
 	for i := range manifests {
-		if err := s.materializeManifest(ctx, &manifests[i]); err != nil {
+		var err error
+		if materializeETF {
+			err = s.materializeManifest(ctx, &manifests[i])
+		} else {
+			err = s.completeManifestMaterialization(ctx, manifests[i].ID, manifests[i].JobID, model.ClusterNotificationStatusNotRequired, time.Now().UTC())
+		}
+		if err != nil {
 			_ = s.db.WithContext(ctx).Model(&model.ClusterUploadManifest{}).Where("id = ?", manifests[i].ID).Update("last_error", err.Error()).Error
 			continue
 		}

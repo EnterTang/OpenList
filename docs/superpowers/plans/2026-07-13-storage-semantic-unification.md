@@ -627,13 +627,13 @@ git commit -m "feat(cluster-ui): show provider account capability pools"
 - Consumes: all previous tasks
 - Produces: verified backend + frontend feature set with legacy path entry points removed from primary UX
 
-- [ ] **Step 1: Run the backend subscription and cluster suites**
+- [x] **Step 1: Run the backend subscription and cluster suites**
 
 Run: `go test ./internal/subscription ./internal/cluster/...`
 
 Expected: PASS for new storage target, resolver, inventory, and dispatch behavior.
 
-- [ ] **Step 2: Run frontend verification**
+- [x] **Step 2: Run frontend verification**
 
 Run: `pnpm lint && pnpm build`
 
@@ -664,6 +664,23 @@ Clean up any remaining labels, placeholders, helper text, or API adapters that s
 git add -A
 git commit -m "refactor(subscription): finalize provider target semantics"
 ```
+
+## Verification Evidence (2026-07-14)
+
+- Fresh backend tests passed for `internal/subscription`,
+  `internal/cluster/...`, `internal/embeddedredis`, `internal/model`, and
+  `drivers/123`; the concurrency-sensitive backend set also passed with
+  `-race`, and focused `go vet` passed.
+- A completion audit found that an explicit provider could disagree with a
+  migratable legacy folder prefix. A regression test first reproduced
+  `provider=pan123` with `/115/...` being accepted; validation now rejects the
+  mismatch and the focused subscription suite is green.
+- Fresh frontend `pnpm lint && pnpm build` passed. Vite emitted only the known
+  browser-crypto externalization and chunk-size warnings.
+- The manual browser walkthrough in Step 3 has not been performed, so no UI
+  walkthrough pass is claimed.
+- The backend and frontend working trees still contain uncommitted delivery
+  changes; Step 5 is intentionally not marked complete.
 
 ## Self-Review
 

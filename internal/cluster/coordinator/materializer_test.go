@@ -6,10 +6,55 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestProcessPendingManifestsCompletesWithoutETFRootPath(t *testing.T) {
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+	database := openMaterializerTestDB(t, "without_etf_root",
+		&model.ClusterUploadManifest{},
+		&model.ClusterJobStage{},
+		&model.ClusterJob{},
+		&model.SubscriptionItem{},
+	)
+	conf.Conf.Cluster.ETFRootPath = ""
+	conf.Conf.Cluster.TargetBaseURL = ""
+
+	manifest := model.ClusterUploadManifest{ID: "manifest-no-root", JobID: "job-no-root", MediaItemID: "media-no-root", PayloadHash: "payload-no-root", Status: model.ClusterUploadManifestStatusAccepted, ReceivedAt: time.Now().UTC()}
+	stage := model.ClusterJobStage{ID: "stage-no-root", JobID: manifest.JobID, AttemptID: "attempt-no-root", Name: model.ClusterStageETFMaterializing, Status: model.ClusterStageStatusPending}
+	item := model.SubscriptionItem{ID: 11, SubscriptionID: 8, SourceKey: "source-no-root", Status: model.SubscriptionItemStatusTransferring, ClusterJobID: manifest.JobID}
+	job := model.ClusterJob{ID: manifest.JobID, IdempotencyKey: manifest.JobID, Status: model.ClusterJobStatusRunning, SubscriptionID: item.SubscriptionID, SubscriptionItemID: item.ID}
+	for _, value := range []any{&manifest, &stage, &item, &job} {
+		if err := database.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	processed, err := New(database, "token").ProcessPendingManifests(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+	if err := database.First(&manifest, "id = ?", manifest.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Status != model.ClusterUploadManifestStatusConsumed || manifest.ConsumedAt == nil {
+		t.Fatalf("manifest = %#v, want consumed", manifest)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusSucceeded || job.NotificationStatus != model.ClusterNotificationStatusNotRequired {
+		t.Fatalf("job = %#v, want succeeded without notification", job)
+	}
+}
 
 func TestSafeRelativeMediaRoot(t *testing.T) {
 	got, err := safeRelativeMediaRoot("/TV/Example/Season 01/episode.mkv")

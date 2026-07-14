@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
@@ -426,6 +427,20 @@ func TestSubscriptionEntryMatchesNoisyMixedLanguagePath(t *testing.T) {
 }
 
 func TestTelegramPanSourcesForTransferMergesConfiguredAndTriggered(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	oldFree := storageFreeBytesForMountPath
+	storageFreeBytesForMountPath = func(context.Context, string) (int64, bool) { return 100 << 30, true }
+	t.Cleanup(func() { storageFreeBytesForMountPath = oldFree })
+
+	for _, storage := range []*model.Storage{
+		{MountPath: "/123-low", Driver: "123Pan", Status: "work", Addition: `{"AccessToken":"token-low","membership_weight":10}`},
+		{MountPath: "/123-high", Driver: "123Pan", Status: "work", Addition: `{"AccessToken":"token-high","membership_weight":20}`},
+	} {
+		if err := db.CreateStorage(storage); err != nil {
+			t.Fatalf("create storage: %v", err)
+		}
+	}
+
 	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
 		Pan123: model.SubscriptionTelegramPanConfig{
 			Channels:         []string{"@mixed"},
@@ -434,22 +449,164 @@ func TestTelegramPanSourcesForTransferMergesConfiguredAndTriggered(t *testing.T)
 		Quark: model.SubscriptionTelegramPanConfig{
 			TempTransferRoot: "/quark/temp",
 		},
+		Pan115: model.SubscriptionTelegramPanConfig{
+			TempTransferRoot: "/configured/115/temp",
+		},
 	})
-	triggered := map[string]telegramPanSubscriptionSource{
-		"pan115": {Name: "pan115", Config: model.SubscriptionTelegramPanConfig{TempTransferRoot: "/115/temp"}},
+	if cfg.Pan123.TempTransferRoot != "" || cfg.Pan123.TempTransferTarget.Provider != "pan123" || cfg.Pan123.TempTransferTarget.Folder != "temp" {
+		t.Fatalf("normalized pan123 config = %#v, want structured pan123 temp target", cfg.Pan123)
 	}
-	merged := telegramPanSourcesForTransfer(cfg, triggered)
+	triggered := map[string]telegramPanSubscriptionSource{
+		"pan115": {Name: "pan115", Config: model.SubscriptionTelegramPanConfig{TempTransferRoot: "/triggered/115/temp"}},
+	}
+	merged, err := telegramPanSourcesForTransfer(cfg, triggered)
+	if err != nil {
+		t.Fatalf("merge telegram pan sources: %v", err)
+	}
 	if got, want := len(merged), 3; got != want {
 		t.Fatalf("merged count = %d, want %d (%#v)", got, want, merged)
 	}
-	if merged["pan123"].Config.TempTransferRoot != "/123/temp" {
-		t.Fatalf("pan123 = %#v", merged["pan123"])
+	if merged["pan123"].Config.TempTransferRoot != "/123-high/temp" || merged["pan123"].Config.AccessToken != "token-high" {
+		t.Fatalf("pan123 = %#v, want selected high account root and token", merged["pan123"])
 	}
 	if merged["quark"].Config.TempTransferRoot != "/quark/temp" {
 		t.Fatalf("quark = %#v", merged["quark"])
 	}
-	if merged["pan115"].Config.TempTransferRoot != "/115/temp" {
-		t.Fatalf("pan115 = %#v", merged["pan115"])
+	if merged["pan115"].Config.TempTransferRoot != "/triggered/115/temp" {
+		t.Fatalf("pan115 = %#v, want triggered source to override configured source", merged["pan115"])
+	}
+}
+
+func TestTelegramPanSourcesForTransferSkipsConfiguredResolutionForResolvedTriggeredSource(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels: []string{"@pan123"},
+			TempTransferTarget: model.SubscriptionStorageTarget{
+				Provider: "pan123",
+				Folder:   "temp",
+			},
+		},
+	})
+	triggered := map[string]telegramPanSubscriptionSource{
+		"pan123": {
+			Name:                  "pan123",
+			runtimeConfigResolved: true,
+			Config: model.SubscriptionTelegramPanConfig{
+				TempTransferRoot: "/123-selected/temp",
+				AccessToken:      "triggered-token",
+			},
+		},
+	}
+
+	merged, err := telegramPanSourcesForTransfer(cfg, triggered)
+	if err != nil {
+		t.Fatalf("merge telegram pan sources: %v", err)
+	}
+	if got := merged["pan123"].Config; got.TempTransferRoot != "/123-selected/temp" || got.AccessToken != "triggered-token" {
+		t.Fatalf("pan123 = %#v, want resolved triggered source", merged["pan123"])
+	}
+}
+
+func TestTelegramPanSourcesForTransferDoesNotSkipConfiguredResolutionForUnresolvedTriggeredSource(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels: []string{"@pan123"},
+			TempTransferTarget: model.SubscriptionStorageTarget{
+				Provider: "pan123",
+				Folder:   "temp",
+			},
+		},
+	})
+	triggered := map[string]telegramPanSubscriptionSource{
+		"pan123": {
+			Name: "pan123",
+			Config: model.SubscriptionTelegramPanConfig{
+				TempTransferRoot:   "/123-legacy/temp",
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+				AccessToken:        "stale-token",
+			},
+		},
+	}
+
+	_, err := telegramPanSourcesForTransfer(cfg, triggered)
+	if err == nil || !strings.Contains(err.Error(), "no compatible provider account for pan123") {
+		t.Fatalf("merge error = %v, want configured temp target resolution error", err)
+	}
+}
+
+func TestTelegramPanSourcesForTransferPreservesResolvedConfiguredSourceWhenTriggeredIsUnresolved(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/123-selected",
+		Driver:    "123Pan",
+		Status:    "work",
+		Addition:  `{"AccessToken":"selected-token"}`,
+	}); err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@pan123"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+		},
+	})
+	triggered := map[string]telegramPanSubscriptionSource{
+		"pan123": {
+			Name:   "pan123",
+			Config: model.SubscriptionTelegramPanConfig{TempTransferRoot: "relative/temp"},
+			BoundShareNames: map[string]struct{}{
+				"triggered.mkv": {},
+			},
+			BoundSharePaths: map[string]struct{}{
+				"/triggered.mkv": {},
+			},
+		},
+	}
+
+	merged, err := telegramPanSourcesForTransfer(cfg, triggered)
+	if err != nil {
+		t.Fatalf("merge telegram pan sources: %v", err)
+	}
+	pan123 := merged["pan123"]
+	if !pan123.runtimeConfigResolved || pan123.Config.TempTransferRoot != "/123-selected/temp" || pan123.Config.AccessToken != "selected-token" {
+		t.Fatalf("pan123 = %#v, want resolved configured source", pan123)
+	}
+	if _, ok := pan123.BoundShareNames["triggered.mkv"]; !ok {
+		t.Fatalf("bound names = %#v, want triggered marker", pan123.BoundShareNames)
+	}
+	if _, ok := pan123.BoundSharePaths["/triggered.mkv"]; !ok {
+		t.Fatalf("bound paths = %#v, want triggered marker", pan123.BoundSharePaths)
+	}
+}
+
+func TestRunTelegramPropagatesConfiguredTempTargetResolutionError(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	oldSearch := builtinTelegramSearch
+	builtinTelegramSearch = func(context.Context, *model.Subscription, model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { builtinTelegramSearch = oldSearch })
+
+	body, err := json.Marshal(model.SubscriptionTelegramSourceConfig{
+		APIID:   1,
+		APIHash: "hash",
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels: []string{"@pan123"},
+			TempTransferTarget: model.SubscriptionStorageTarget{
+				Provider: "pan123",
+				Folder:   "temp",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal telegram config: %v", err)
+	}
+
+	_, _, _, _, _, err = runTelegram(context.Background(), &model.Subscription{SourceConfig: string(body)}, false)
+	if err == nil || !strings.Contains(err.Error(), "no compatible provider account for pan123") {
+		t.Fatalf("run telegram error = %v, want configured temp target resolution error", err)
 	}
 }
 

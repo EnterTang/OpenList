@@ -73,3 +73,11 @@ func TestProviderAccountInventoryMapsConfigured123And115Membership(t *testing.T)
 		}
 	}
 }
+
+func TestProviderAccountInventoryDoesNotAdvertiseUnsupported115OpenShareSave(t *testing.T) {
+	storage := model.Storage{ID: 3, MountPath: "/115-open", Driver: "115 Open", Status: "work"}
+	account := providerAccountInventory("node-1", storage, 1<<40, 2<<40)
+	if account.SupportsShareSave {
+		t.Fatalf("115 Open account unexpectedly advertises share-save support: %#v", account)
+	}
+}

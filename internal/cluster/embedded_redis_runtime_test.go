@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/transport"
@@ -396,4 +397,55 @@ func TestWorkerRedisBackgroundLoopsReturnWithCapturedCanceledContext(t *testing.
 
 	runtime.runReporter(ctx, workerService, nil)
 	runtime.runCleanupProcessor(ctx, workerService)
+}
+
+func TestRuntimeStopWaitsForWorkerBackgroundLoopsBeforeStoppingRedis(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	manager := &embeddedredis.Manager{}
+	loopCanceled := make(chan struct{})
+	releaseLoop := make(chan struct{})
+	redisStopped := make(chan struct{}, 1)
+	runtime := &Runtime{
+		ctx:           ctx,
+		cancel:        cancel,
+		embeddedRedis: manager,
+		stopEmbeddedRedis: func(context.Context, *embeddedredis.Manager) error {
+			redisStopped <- struct{}{}
+			return nil
+		},
+	}
+	runtime.workerBackground.Add(1)
+	go func() {
+		defer runtime.workerBackground.Done()
+		<-ctx.Done()
+		close(loopCanceled)
+		<-releaseLoop
+	}()
+
+	stopDone := make(chan struct{})
+	go func() {
+		runtime.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-loopCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("worker loop did not observe cancellation")
+	}
+	select {
+	case <-redisStopped:
+		t.Fatal("Redis stopped before worker loop exited")
+	default:
+	}
+	close(releaseLoop)
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime stop did not finish")
+	}
+	select {
+	case <-redisStopped:
+	default:
+		t.Fatal("Redis manager was not stopped after worker loop exit")
+	}
 }
