@@ -163,6 +163,45 @@ pass "local Windows release usage discloses Redis embedding and network access"
 # shellcheck source=build-release-local.sh
 source "$LOCAL_RELEASE_SCRIPT"
 
+failing_clean_helper="$tmp_dir/failing-clean-helper.sh"
+cat >"$failing_clean_helper" <<'HELPER'
+#!/usr/bin/env bash
+exit 23
+HELPER
+chmod +x "$failing_clean_helper"
+cleanup_error="$tmp_dir/cleanup-error.txt"
+set +e
+(
+  trap - EXIT
+  EMBEDDED_REDIS_HELPER="$failing_clean_helper"
+  cleanup_embedded_redis
+) 2>"$cleanup_error"
+cleanup_status=$?
+set -e
+[ "$cleanup_status" -ne 0 ] || fail "local release ignored embedded Redis cleanup failure after success"
+grep -F "failed to clean generated embedded Redis payload" "$cleanup_error" >/dev/null ||
+  fail "local release cleanup failure did not explain the error"
+pass "local release fails when post-build embedded Redis cleanup fails"
+
+embedded_archive_dir="$tmp_dir/embedded-archive"
+mkdir -p "$embedded_archive_dir"
+embedded_payload="$tmp_dir/embedded-payload.zip"
+printf 'embedded Redis payload fixture\000with binary data\n' >"$embedded_payload"
+printf 'PE fixture prefix\n' >"$embedded_archive_dir/openlist.exe"
+cat "$embedded_payload" >>"$embedded_archive_dir/openlist.exe"
+printf 'PE fixture suffix\n' >>"$embedded_archive_dir/openlist.exe"
+embedded_archive="$tmp_dir/embedded.zip"
+(
+  cd "$embedded_archive_dir"
+  zip -X -q "$embedded_archive" openlist.exe
+)
+verify_windows_release_archive "$embedded_archive" "$embedded_payload"
+
+missing_payload="$tmp_dir/missing-payload.zip"
+printf 'different Redis payload fixture\n' >"$missing_payload"
+assert_fails verify_windows_release_archive "$embedded_archive" "$missing_payload"
+pass "local release verifies the exact embedded Redis payload in openlist.exe"
+
 for target in windows-amd64 amd64 all; do
   target_requires_windows_amd64 "$target" || fail "$target did not route through Windows AMD64 preparation"
 done

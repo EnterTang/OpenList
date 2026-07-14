@@ -71,12 +71,20 @@ target_requires_windows_amd64() {
 
 cleanup_embedded_redis() {
   local original_status=$?
+  local cleanup_status=0
+  local final_status="$original_status"
 
   trap - EXIT
-  if ! bash "$EMBEDDED_REDIS_HELPER" clean; then
-    echo "warning: failed to clean generated embedded Redis payload" >&2
+  if bash "$EMBEDDED_REDIS_HELPER" clean; then
+    cleanup_status=0
+  else
+    cleanup_status=$?
+    echo "error: failed to clean generated embedded Redis payload" >&2
   fi
-  exit "$original_status"
+  if [ "$original_status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+    final_status="$cleanup_status"
+  fi
+  exit "$final_status"
 }
 
 verify_windows_release_archive() {

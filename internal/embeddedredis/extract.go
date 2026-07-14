@@ -38,6 +38,14 @@ type ExtractedRuntime struct {
 
 func ExtractPayload(dataDir string, payload []byte) (result ExtractedRuntime, err error) {
 	sha := fmt.Sprintf("%x", sha256.Sum256(payload))
+	files, err := validatePayload(payload)
+	if err != nil {
+		return ExtractedRuntime{}, err
+	}
+	manifest, err := payloadManifest(files)
+	if err != nil {
+		return ExtractedRuntime{}, err
+	}
 	target := filepath.Join(dataDir, "runtime", "redis", Version)
 	runtime := ExtractedRuntime{Dir: target, ServerPath: filepath.Join(target, "redis-server.exe"), PayloadSHA256: sha}
 	parent := filepath.Dir(target)
@@ -49,13 +57,8 @@ func ExtractPayload(dataDir string, payload []byte) (result ExtractedRuntime, er
 		return ExtractedRuntime{}, err
 	}
 	defer func() { err = errors.Join(err, lock.release()) }()
-	if runtimeValid(target, sha) {
+	if runtimeValid(target, sha, manifest) {
 		return runtime, nil
-	}
-
-	files, err := validatePayload(payload)
-	if err != nil {
-		return ExtractedRuntime{}, err
 	}
 	temp, err := os.MkdirTemp(parent, ".redis-"+Version+"-tmp-")
 	if err != nil {
@@ -70,13 +73,40 @@ func ExtractPayload(dataDir string, payload []byte) (result ExtractedRuntime, er
 	if err := os.WriteFile(filepath.Join(temp, ".payload-sha256"), []byte(sha+"\n"), 0600); err != nil {
 		return ExtractedRuntime{}, fmt.Errorf("write payload marker: %w", err)
 	}
-	if !runtimeValid(temp, sha) {
+	if !runtimeValid(temp, sha, manifest) {
 		return ExtractedRuntime{}, errors.New("extracted Redis runtime failed verification")
 	}
 	if err := replaceDirectory(target, temp); err != nil {
 		return ExtractedRuntime{}, err
 	}
 	return runtime, nil
+}
+
+func payloadManifest(files map[string]*zip.File) (map[string][sha256.Size]byte, error) {
+	manifest := make(map[string][sha256.Size]byte, len(requiredPayloadFiles))
+	for _, name := range requiredPayloadFiles {
+		file := files[name]
+		r, err := file.Open()
+		if err != nil {
+			return nil, fmt.Errorf("open payload entry %q for verification: %w", name, err)
+		}
+		h := sha256.New()
+		written, copyErr := io.Copy(h, io.LimitReader(r, maxPayloadFileSize+1))
+		closeErr := r.Close()
+		if copyErr != nil {
+			return nil, fmt.Errorf("hash payload entry %q: %w", name, copyErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close payload entry %q after verification: %w", name, closeErr)
+		}
+		if written > maxPayloadFileSize || uint64(written) != file.UncompressedSize64 {
+			return nil, fmt.Errorf("payload entry %q size does not match its metadata", name)
+		}
+		var digest [sha256.Size]byte
+		copy(digest[:], h.Sum(nil))
+		manifest[name] = digest
+	}
+	return manifest, nil
 }
 
 func validatePayload(payload []byte) (map[string]*zip.File, error) {
@@ -153,14 +183,26 @@ func extractFile(file *zip.File, destination string) error {
 	return nil
 }
 
-func runtimeValid(dir, sha string) bool {
+func runtimeValid(dir, sha string, manifest map[string][sha256.Size]byte) bool {
 	marker, err := os.ReadFile(filepath.Join(dir, ".payload-sha256"))
 	if err != nil || strings.TrimSpace(string(marker)) != sha {
 		return false
 	}
 	for _, name := range requiredPayloadFiles {
-		info, err := os.Lstat(filepath.Join(dir, name))
+		path := filepath.Join(dir, name)
+		info, err := os.Lstat(path)
 		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return false
+		}
+		h := sha256.New()
+		written, copyErr := io.Copy(h, io.LimitReader(file, maxPayloadFileSize+1))
+		closeErr := file.Close()
+		expected := manifest[name]
+		if copyErr != nil || closeErr != nil || written > maxPayloadFileSize || !bytes.Equal(h.Sum(nil), expected[:]) {
 			return false
 		}
 	}
