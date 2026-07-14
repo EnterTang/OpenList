@@ -15,6 +15,7 @@ type SaveShareOptions struct {
 	TempRoot     string
 	Match        func(TreeEntry) bool
 	Subscription *model.Subscription
+	Flatten      bool
 }
 
 type shareTreePair struct {
@@ -63,6 +64,9 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 	groupOrder := make([]shareSaveGroup, 0)
 	for _, pair := range matched {
 		dirPath := importedParentPath(pair.entry.Path)
+		if opts.Flatten {
+			dirPath = ""
+		}
 		itemDstDirID := dstDirID
 		if dirPath != "" {
 			itemDstDirID, err = ensureImportedDir(ctx, provider, tempRoot, dirPath, dirIDs)

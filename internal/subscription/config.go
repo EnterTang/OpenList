@@ -95,16 +95,18 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 			return errors.Errorf("legacy target_root %q is not a recognized provider mount and requires manual confirmation", sub.TargetRoot)
 		}
 	}
-	if sub.DeliveryTarget.Provider == "" && cfg.DefaultTarget.Provider != "" {
-		sub.DeliveryTarget = cfg.DefaultTarget
-	}
 	if sub.DeliveryTarget.Provider != "" {
 		sub.TargetRoot = ""
 	}
 	if err := validateSubscriptionTempTarget(sub.TempTarget); err != nil {
 		return errors.WithMessage(err, "invalid temp target")
 	}
-	if err := validateSubscriptionDeliveryTarget(sub.DeliveryTarget, sub.TransferEnabled); err != nil {
+	// Delivery targets are intentionally optional on the subscription record.
+	// Cluster workers resolve their own staging and delivery folders, while
+	// standalone runs resolve an empty target through SubscriptionConfig at
+	// runtime. Do not materialize cfg.DefaultTarget here: doing so would leak a
+	// coordinator-local path into every newly created subscription.
+	if err := validateSubscriptionDeliveryTarget(sub.DeliveryTarget); err != nil {
 		return errors.WithMessage(err, "invalid delivery target")
 	}
 	if sub.CheckIntervalMinutes <= 0 {
@@ -132,7 +134,7 @@ func validateSubscriptionConfigTargets(cfg model.SubscriptionConfig) error {
 	if err := ValidateSubscriptionStorageTarget(cfg.DefaultTarget); err != nil {
 		return errors.WithMessage(err, "invalid default target")
 	}
-	if err := validateSubscriptionDeliveryTarget(cfg.DefaultTarget, false); err != nil {
+	if err := validateSubscriptionDeliveryTarget(cfg.DefaultTarget); err != nil {
 		return errors.WithMessage(err, "invalid default target")
 	}
 	if cfg.DefaultTarget.Provider == "" && strings.TrimSpace(cfg.DefaultTargetRoot) != "" {

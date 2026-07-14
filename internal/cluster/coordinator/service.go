@@ -21,10 +21,11 @@ import (
 )
 
 type Service struct {
-	db              *gorm.DB
-	enrollmentToken string
-	inspectMu       sync.RWMutex
-	inspectConsumer ShareInspectConsumer
+	db               *gorm.DB
+	enrollmentToken  string
+	inspectMu        sync.RWMutex
+	inspectProcessMu sync.Mutex
+	inspectConsumer  ShareInspectConsumer
 }
 
 type NodeInventorySummary struct {
@@ -44,6 +45,8 @@ type NodeSummary struct {
 // manifest remains pending until the consumer returns nil, so a Coordinator
 // restart cannot lose an inspected share tree.
 type ShareInspectConsumer func(context.Context, model.ClusterShareInspectManifest, protocol.ShareInspectManifest) error
+
+var ErrShareInspectObservationIncomplete = errors.New("cluster share inspect observation is incomplete")
 
 func New(database *gorm.DB, enrollmentToken string) *Service {
 	return &Service{db: database, enrollmentToken: strings.TrimSpace(enrollmentToken)}
@@ -67,6 +70,8 @@ func (s *Service) ShareInspectManifest(ctx context.Context, jobID string) (*mode
 // subscription consumer. Delivery is intentionally pull/retry based: result
 // persistence succeeds even when no consumer is currently registered.
 func (s *Service) ProcessPendingShareInspects(ctx context.Context, limit int) (int, error) {
+	s.inspectProcessMu.Lock()
+	defer s.inspectProcessMu.Unlock()
 	s.inspectMu.RLock()
 	consumer := s.inspectConsumer
 	s.inspectMu.RUnlock()
@@ -82,13 +87,22 @@ func (s *Service) ProcessPendingShareInspects(ctx context.Context, limit int) (i
 	}
 	consumed := 0
 	for i := range items {
+		var current model.ClusterShareInspectManifest
+		if err := s.db.WithContext(ctx).Select("status").First(&current, "id = ?", items[i].ID).Error; err != nil {
+			return consumed, err
+		}
+		if current.Status != model.ClusterShareInspectStatusPending {
+			continue
+		}
 		var manifest protocol.ShareInspectManifest
 		if err := json.Unmarshal([]byte(items[i].PayloadJSON), &manifest); err != nil {
 			_ = s.db.WithContext(ctx).Model(&items[i]).Update("last_error", err.Error()).Error
 			continue
 		}
 		if err := consumer(ctx, items[i], manifest); err != nil {
-			_ = s.db.WithContext(ctx).Model(&items[i]).Update("last_error", err.Error()).Error
+			if !errors.Is(err, ErrShareInspectObservationIncomplete) {
+				_ = s.db.WithContext(ctx).Model(&items[i]).Update("last_error", err.Error()).Error
+			}
 			continue
 		}
 		now := time.Now().UTC()
@@ -620,9 +634,17 @@ func persistShareInspectResultTx(tx *gorm.DB, nodeID string, job *model.ClusterJ
 	item := model.ClusterShareInspectManifest{
 		ID: uuid.NewString(), JobID: job.ID, AttemptID: attempt.ID, NodeID: nodeID,
 		Generation: attempt.Generation, SubscriptionID: job.SubscriptionID,
-		Version: manifest.Version, CanonicalRef: manifest.CanonicalRef,
+		ObservationKey:      taskContext.Subscription.ObservationKey,
+		ObservationExpected: taskContext.Subscription.ObservationExpected,
+		Version:             manifest.Version, CanonicalRef: manifest.CanonicalRef,
 		ObjectHash: objectHash, PayloadJSON: string(raw), PayloadHash: payloadHash,
 		Status: model.ClusterShareInspectStatusPending, InspectedAt: manifest.InspectedAt.UTC(),
+	}
+	if strings.TrimSpace(item.ObservationKey) == "" {
+		item.ObservationKey = job.ID
+	}
+	if item.ObservationExpected <= 0 {
+		item.ObservationExpected = 1
 	}
 	if item.InspectedAt.IsZero() {
 		item.InspectedAt = time.Now().UTC()

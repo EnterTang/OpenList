@@ -149,19 +149,21 @@ func runStandaloneTargetWorkflowResult(t *testing.T, fileSize int64) ([]resolved
 		return item, 1, nil
 	}
 
-	if _, err := SaveConfig(model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
-		Pan123: model.SubscriptionTelegramPanConfig{
-			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "staging"},
-			AccessToken:        "token-1",
+	if _, err := SaveConfig(model.SubscriptionConfig{
+		DefaultTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "delivery"},
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Pan123: model.SubscriptionTelegramPanConfig{
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "staging"},
+				AccessToken:        "token-1",
+			},
 		},
-	}}); err != nil {
+	}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
 	sub := &model.Subscription{
 		Name: "Standalone target", SourceType: model.SubscriptionSourceManual,
 		SourceConfig:    fmt.Sprintf(`{"imports_text":"123FSLinkV2$bc18e4ea5fb89ec5778d1f38c9772f5f#%d#Movie.mkv"}`, fileSize),
 		TransferEnabled: true, TMDBName: "Movie", MediaType: "movie",
-		DeliveryTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "delivery"},
 	}
 	if err := db.CreateSubscription(sub); err != nil {
 		t.Fatalf("create subscription: %v", err)

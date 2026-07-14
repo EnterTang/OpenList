@@ -98,11 +98,16 @@ func selectTelegramTempTransferCandidates(sub *model.Subscription, candidates []
 		priorityIndex[name] = index
 	}
 	bestBySlot := make(map[string]telegramTempCandidate, len(candidates))
+	passthrough := make([]telegramTempCandidate, 0)
 	for _, candidate := range candidates {
 		if candidate.Item == nil || !subscriptionEpisodeMatches(sub, candidate.Item.Season, candidate.Item.Episode) {
 			continue
 		}
 		candidate.Item.SourceProvider = normalizeSubscriptionProvider(candidate.Source.Name)
+		if sub != nil && !strings.EqualFold(strings.TrimSpace(sub.MediaType), "movie") && candidate.Item.Episode <= 0 {
+			passthrough = append(passthrough, candidate)
+			continue
+		}
 		slot := mediaSlotKey(sub, candidate.Item)
 		if slot == "" {
 			continue
@@ -112,19 +117,15 @@ func selectTelegramTempTransferCandidates(sub *model.Subscription, candidates []
 			bestBySlot[slot] = candidate
 			continue
 		}
-		candidateRank := providerPriorityRank(candidate.Source.Name, priorityIndex)
-		existingRank := providerPriorityRank(existing.Source.Name, priorityIndex)
-		switch {
-		case candidateRank < existingRank:
-			bestBySlot[slot] = candidate
-		case candidateRank == existingRank && candidate.Entry.Size > existing.Entry.Size:
+		if betterTelegramTempCandidate(candidate, existing, priorityIndex) {
 			bestBySlot[slot] = candidate
 		}
 	}
-	selected := make([]telegramTempCandidate, 0, len(bestBySlot))
+	selected := make([]telegramTempCandidate, 0, len(bestBySlot)+len(passthrough))
 	for _, candidate := range bestBySlot {
 		selected = append(selected, candidate)
 	}
+	selected = append(selected, passthrough...)
 	sort.Slice(selected, func(i, j int) bool {
 		left, right := selected[i].Item, selected[j].Item
 		if left.Season != right.Season {
@@ -136,6 +137,24 @@ func selectTelegramTempTransferCandidates(sub *model.Subscription, candidates []
 		return providerPriorityRank(selected[i].Source.Name, priorityIndex) < providerPriorityRank(selected[j].Source.Name, priorityIndex)
 	})
 	return selected
+}
+
+func betterTelegramTempCandidate(candidate, existing telegramTempCandidate, priorityIndex map[string]int) bool {
+	if candidate.Entry.Size != existing.Entry.Size {
+		return candidate.Entry.Size > existing.Entry.Size
+	}
+	candidateRank := providerPriorityRank(candidate.Source.Name, priorityIndex)
+	existingRank := providerPriorityRank(existing.Source.Name, priorityIndex)
+	if candidateRank != existingRank {
+		return candidateRank < existingRank
+	}
+	candidateKey := strings.Join([]string{
+		normalizeSubscriptionProvider(candidate.Source.Name), candidate.Entry.Path, candidate.Entry.ID, candidate.Item.SourceKey,
+	}, "\x00")
+	existingKey := strings.Join([]string{
+		normalizeSubscriptionProvider(existing.Source.Name), existing.Entry.Path, existing.Entry.ID, existing.Item.SourceKey,
+	}, "\x00")
+	return candidateKey < existingKey
 }
 
 func mediaSlotKey(sub *model.Subscription, item *model.SubscriptionItem) string {
@@ -211,6 +230,9 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 				continue
 			}
 			nextCursor.advance(row)
+		}
+		if !telegramRowMatchesSubscription(sub, row) {
+			continue
 		}
 		links, sources := rowLinksForTelegramPanSources(row, cfg)
 		for _, source := range sources {
@@ -525,20 +547,31 @@ func channelInList(channel string, channels []string) bool {
 }
 
 func subscriptionEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
+	if !subscriptionSeasonMatches(sub, entry) {
+		return false
+	}
+	return subscriptionTitleMatches(sub,
+		strings.TrimSpace(entry.Name),
+		strings.TrimSpace(entry.Path),
+		strings.TrimSpace(fullPath(entry)),
+	)
+}
+
+// telegramRowMatchesSubscription verifies the Telegram message context before
+// accepting a share. Share trees often name files only by episode, so title
+// matching belongs to the message rather than boundShareEntryMatches.
+func telegramRowMatchesSubscription(sub *model.Subscription, row telegramCommandRow) bool {
+	return subscriptionTitleMatches(sub, rowText(row))
+}
+
+func subscriptionTitleMatches(sub *model.Subscription, haystacks ...string) bool {
 	needles := subscriptionMatchNeedles(sub)
 	if len(needles) == 0 {
 		return false
 	}
-	if !subscriptionSeasonMatches(sub, entry) {
-		return false
-	}
-	haystacks := []string{
-		strings.TrimSpace(entry.Name),
-		strings.TrimSpace(entry.Path),
-		strings.TrimSpace(fullPath(entry)),
-	}
 	for _, needle := range needles {
 		for _, haystack := range haystacks {
+			haystack = strings.TrimSpace(haystack)
 			if haystack != "" && titlematch.TitlesCompatible(needle, haystack) {
 				return true
 			}

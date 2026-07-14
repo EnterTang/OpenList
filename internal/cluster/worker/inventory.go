@@ -11,7 +11,11 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 )
+
+var getInventorySubscriptionConfig = subscription.GetConfig
 
 func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protocol.InventoryReport, error) {
 	storages, err := listInventoryStorages()
@@ -21,10 +25,29 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 	mounts := make([]protocol.MountInventory, 0, len(storages))
 	providerAccounts := make([]protocol.ProviderAccountInventory, 0, len(storages))
 	providers := make(map[string]struct{})
+	var subscriptionConfig model.SubscriptionConfig
+	var subscriptionConfigLoaded bool
+	var subscriptionConfigErr error
 	for _, storage := range storages {
 		snapshot, err := hydrateInventoryStorage(ctx, nodeID, storage)
 		if err != nil {
 			return protocol.InventoryReport{}, err
+		}
+		// Healthy provider credentials still require worker-local subscription
+		// routing. Otherwise the coordinator could assign a provider-only task
+		// that the worker must reject because it has no Pan123/Pan115 staging
+		// folder or 139 delivery folder.
+		if requiresWorkerStagingRouting(snapshot.Account.Provider) || requiresWorkerDeliveryRouting(snapshot.Account.Provider) {
+			if !subscriptionConfigLoaded {
+				subscriptionConfig, subscriptionConfigErr = getInventorySubscriptionConfig()
+				subscriptionConfigLoaded = true
+			}
+			if requiresWorkerStagingRouting(snapshot.Account.Provider) && (subscriptionConfigErr != nil || !hasWorkerStagingRouting(subscriptionConfig, snapshot.Account.Provider)) {
+				snapshot.Account.SupportsShareSave = false
+			}
+			if requiresWorkerDeliveryRouting(snapshot.Account.Provider) && (subscriptionConfigErr != nil || !hasWorkerDeliveryRouting(subscriptionConfig)) {
+				snapshot.Account.SupportsUpload = false
+			}
 		}
 		providers[snapshot.Mount.Provider] = struct{}{}
 		mounts = append(mounts, snapshot.Mount)
@@ -57,6 +80,39 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 	sum := sha256.Sum256(raw)
 	report.InventoryHash = hex.EncodeToString(sum[:])
 	return report, nil
+}
+
+func requiresWorkerStagingRouting(provider string) bool {
+	switch normalizeControlKey(provider) {
+	case "pan123", "pan115":
+		return true
+	default:
+		return false
+	}
+}
+
+func requiresWorkerDeliveryRouting(provider string) bool {
+	return normalizeControlKey(provider) == "yidong139"
+}
+
+func hasWorkerStagingRouting(cfg model.SubscriptionConfig, provider string) bool {
+	provider = normalizeControlKey(provider)
+	var target model.SubscriptionStorageTarget
+	switch provider {
+	case "pan123":
+		target = cfg.Telegram.Pan123.TempTransferTarget
+	case "pan115":
+		target = cfg.Telegram.Pan115.TempTransferTarget
+	default:
+		return true
+	}
+	target = subscription.NormalizeSubscriptionStorageTarget(target)
+	return target.Provider == provider && target.Folder != "" && subscription.ValidateSubscriptionStorageTarget(target) == nil
+}
+
+func hasWorkerDeliveryRouting(cfg model.SubscriptionConfig) bool {
+	target := subscription.NormalizeSubscriptionStorageTarget(cfg.DefaultTarget)
+	return target.Provider == "yidong139" && target.Folder != "" && subscription.ValidateSubscriptionStorageTarget(target) == nil
 }
 
 func stableMountID(nodeID string, storageID uint, mountPath string) string {

@@ -82,12 +82,9 @@ func validateSubscriptionTempTarget(target model.SubscriptionStorageTarget) erro
 	return nil
 }
 
-func validateSubscriptionDeliveryTarget(target model.SubscriptionStorageTarget, required bool) error {
+func validateSubscriptionDeliveryTarget(target model.SubscriptionStorageTarget) error {
 	target = NormalizeSubscriptionStorageTarget(target)
 	if target.Provider == "" {
-		if required {
-			return fmt.Errorf("delivery target is required when transfer is enabled")
-		}
 		return nil
 	}
 	if target.Provider != "yidong139" {

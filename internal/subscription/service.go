@@ -104,6 +104,16 @@ func resolveSubscriptionDeliveryTargetForFile(ctx context.Context, sub *model.Su
 	runtimeSub := *sub
 	target := NormalizeSubscriptionStorageTarget(sub.DeliveryTarget)
 	if target.Provider == "" {
+		cfg, err := GetConfig()
+		if err != nil {
+			return nil, fmt.Errorf("get standalone subscription target defaults: %w", err)
+		}
+		target = NormalizeSubscriptionStorageTarget(cfg.DefaultTarget)
+	}
+	if target.Provider == "" {
+		if sub.TransferEnabled {
+			return nil, errors.New("delivery target is required for standalone subscriptions; configure subscription_config.default_target or an explicit delivery target")
+		}
 		return &runtimeSub, nil
 	}
 	resolved, err := ResolveProviderTarget(ctx, ResolveProviderTargetRequest{

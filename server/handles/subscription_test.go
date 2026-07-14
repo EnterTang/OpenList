@@ -70,6 +70,16 @@ func TestNormalizeSubscriptionClearsMovieSeasons(t *testing.T) {
 	}
 }
 
+func TestNormalizeSubscriptionPreservesEmptyLegacyTargetRoot(t *testing.T) {
+	item := &model.Subscription{TargetRoot: "   "}
+
+	normalizeSubscription(item)
+
+	if item.TargetRoot != "" {
+		t.Fatalf("target root = %q, want empty optional legacy target", item.TargetRoot)
+	}
+}
+
 func TestValidateSubscriptionEpisodeRange(t *testing.T) {
 	tests := []struct {
 		name    string

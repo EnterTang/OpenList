@@ -11,14 +11,16 @@ import (
 )
 
 type recordingClusterDispatcher struct {
-	tasks []ClusterMediaTask
-	err   error
+	inspectTasks []ClusterInspectTask
+	tasks        []ClusterMediaTask
+	err          error
 }
 
 func (d *recordingClusterDispatcher) DispatchSubscriptionInspect(_ context.Context, task ClusterInspectTask) (string, error) {
 	if d.err != nil {
 		return "", d.err
 	}
+	d.inspectTasks = append(d.inspectTasks, task)
 	return "inspect-" + task.IdempotencyKey, nil
 }
 
@@ -32,6 +34,195 @@ func (d *recordingClusterDispatcher) DispatchSubscriptionMedia(_ context.Context
 		results = append(results, ClusterDispatchResult{SourceKey: task.SourceKey, JobID: "job-" + task.SourceKey})
 	}
 	return results, nil
+}
+
+func TestRunTelegramClusterSkipsMessagesWithoutSubscriptionTitle(t *testing.T) {
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	oldSearch := builtinTelegramSearch
+	builtinTelegramSearch = func(context.Context, *model.Subscription, model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
+		return []telegramCommandRow{
+			{MsgID: int64(19575), Channel: "@shows", Text: "君九龄.2021.S01E04 https://pan.quark.cn/s/bc18e4ea5fb8"},
+			{MsgID: int64(19576), Channel: "@shows", Text: "小芳.2026.S01E04 https://pan.quark.cn/s/bc18e4ea5fb9"},
+		}, nil
+	}
+	t.Cleanup(func() { builtinTelegramSearch = oldSearch })
+
+	sub := &model.Subscription{
+		ID:           88,
+		Name:         "小芳",
+		TMDBName:     "小芳",
+		SourceType:   model.SubscriptionSourceTelegram,
+		SourceConfig: `{"api_id":1,"api_hash":"hash"}`,
+	}
+	_, _, _, _, dispatched, err := runTelegramCluster(context.Background(), sub)
+	if err != nil {
+		t.Fatalf("run Telegram cluster: %v", err)
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatched = %d, want 1", dispatched)
+	}
+	if len(dispatcher.inspectTasks) != 1 {
+		t.Fatalf("inspect tasks = %#v, want one matching message", dispatcher.inspectTasks)
+	}
+	if got := dispatcher.inspectTasks[0].SourceMessageID; got != "19576" {
+		t.Fatalf("source message ID = %q, want 19576", got)
+	}
+}
+
+func TestRunTelegramClusterGroupsAllMessageLinksIntoOneObservation(t *testing.T) {
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	oldSearch := builtinTelegramSearch
+	builtinTelegramSearch = func(context.Context, *model.Subscription, model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
+		return []telegramCommandRow{{
+			MsgID: int64(20001), Channel: "@shows",
+			Text: "小芳.2026.S01E04 https://pan.quark.cn/s/bc18e4ea5fb8 https://www.123pan.com/s/example",
+		}}, nil
+	}
+	t.Cleanup(func() { builtinTelegramSearch = oldSearch })
+
+	sub := &model.Subscription{ID: 89, Name: "小芳", TMDBName: "小芳", SourceType: model.SubscriptionSourceTelegram, SourceConfig: `{"api_id":1,"api_hash":"hash"}`}
+	_, _, _, _, dispatched, err := runTelegramCluster(context.Background(), sub)
+	if err != nil {
+		t.Fatalf("run Telegram cluster: %v", err)
+	}
+	if dispatched != 2 || len(dispatcher.inspectTasks) != 2 {
+		t.Fatalf("dispatched=%d tasks=%#v, want two inspections", dispatched, dispatcher.inspectTasks)
+	}
+	if dispatcher.inspectTasks[0].ObservationKey == "" || dispatcher.inspectTasks[0].ObservationKey != dispatcher.inspectTasks[1].ObservationKey {
+		t.Fatalf("observation keys = %q/%q", dispatcher.inspectTasks[0].ObservationKey, dispatcher.inspectTasks[1].ObservationKey)
+	}
+	for _, task := range dispatcher.inspectTasks {
+		if task.ObservationExpected != 2 {
+			t.Fatalf("observation expected = %d, want 2", task.ObservationExpected)
+		}
+	}
+}
+
+func TestSourceMessageFromTelegramRowPreservesAllTitleFields(t *testing.T) {
+	message := sourceMessageFromTelegramRow(telegramCommandRow{
+		MsgID:   int64(19576),
+		Text:    "S01E04",
+		RawText: "小芳.2026.S01E04",
+	})
+	if !subscriptionTitleMatches(&model.Subscription{Name: "小芳", TMDBName: "小芳"}, message.Text) {
+		t.Fatalf("source message lost the title-bearing raw text: %q", message.Text)
+	}
+}
+
+func TestApplyClusterInspectManifestRequiresTelegramMessageTitleButAllowsEpisodeOnlyFile(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		Name:                     "小芳",
+		TMDBName:                 "小芳",
+		SourceType:               model.SubscriptionSourceTelegram,
+		TransferEnabled:          true,
+		MediaType:                "tv",
+		Season:                   1,
+		TargetRoot:               "/tv",
+		LatestSeasonEpisodeStart: 4,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	objects := []ClusterInspectObject{{FileID: "episode-4", RelativePath: "S01E04.mp4", Size: 1024}}
+	baseTask := ClusterInspectTask{
+		SubscriptionID: sub.ID,
+		ShareProvider:  string(ShareProviderQuark),
+		ShareURL:       "https://pan.quark.cn/s/bc18e4ea5fb8",
+	}
+
+	badTask := baseTask
+	badTask.SourceMessageID = "19575"
+	badTask.SourceMessageText = "君九龄.2021.S01E04"
+	count, err := ApplyClusterInspectManifest(context.Background(), badTask, objects)
+	if err != nil {
+		t.Fatalf("apply unrelated Telegram manifest: %v", err)
+	}
+	if count != 0 || len(dispatcher.tasks) != 0 {
+		t.Fatalf("unrelated Telegram message dispatched %d tasks: %#v", count, dispatcher.tasks)
+	}
+
+	goodTask := baseTask
+	goodTask.SourceMessageID = "19576"
+	goodTask.SourceMessageText = "小芳.2026.S01E04"
+	count, err = ApplyClusterInspectManifest(context.Background(), goodTask, objects)
+	if err != nil {
+		t.Fatalf("apply matching Telegram manifest: %v", err)
+	}
+	if count != 1 || len(dispatcher.tasks) != 1 {
+		t.Fatalf("matching message dispatched %d tasks: %#v", count, dispatcher.tasks)
+	}
+	if dispatcher.tasks[0].SourceRelativePath != "S01E04.mp4" {
+		t.Fatalf("source file = %q, want episode-only filename", dispatcher.tasks[0].SourceRelativePath)
+	}
+}
+
+func TestApplyClusterInspectObservationSelectsLargestEpisodeAcrossShares(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		Name: "Example", TMDBName: "Example", SourceType: model.SubscriptionSourceManual,
+		TransferEnabled: true, MediaType: "tv", TargetRoot: "/tv",
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	inputs := []ClusterInspectManifestInput{
+		{
+			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderQuark), ShareURL: "https://pan.quark.cn/s/bc18e4ea5fb8"},
+			Objects: []ClusterInspectObject{
+				{FileID: "quark-small", RelativePath: "Example.S01E01.small.mkv", Size: 600},
+				{FileID: "quark-season-two", RelativePath: "Example.S02E01.mkv", Size: 700},
+				{FileID: "quark-special-a", RelativePath: "Example.Special.A.mkv", Size: 100},
+			},
+		},
+		{
+			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan123), ShareURL: "https://www.123pan.com/s/example"},
+			Objects: []ClusterInspectObject{
+				{FileID: "pan123-large", RelativePath: "Example.S01E01.large.mkv", Size: 900},
+				{FileID: "pan123-special-b", RelativePath: "Example.Special.B.mkv", Size: 110},
+			},
+		},
+	}
+
+	count, err := ApplyClusterInspectObservation(context.Background(), inputs)
+	if err != nil {
+		t.Fatalf("apply observation: %v", err)
+	}
+	if count != 4 || len(dispatcher.tasks) != 4 {
+		t.Fatalf("dispatched=%d tasks=%#v, want largest S01E01, S02E01, and two unknown episodes", count, dispatcher.tasks)
+	}
+	var seasonOne *ClusterMediaTask
+	unknown := 0
+	for i := range dispatcher.tasks {
+		task := &dispatcher.tasks[i]
+		if task.Season == 1 && task.Episode == 1 {
+			seasonOne = task
+		}
+		if task.Episode <= 0 {
+			unknown++
+		}
+	}
+	if seasonOne == nil || seasonOne.SourceFileID != "pan123-large" || seasonOne.SourceSize != 900 {
+		t.Fatalf("season one winner = %#v, want largest pan123 file", seasonOne)
+	}
+	if unknown != 2 {
+		t.Fatalf("unknown episode tasks = %d, want 2", unknown)
+	}
 }
 
 func TestClusterDispatchPersistsContextAndTransitionsStatus(t *testing.T) {
@@ -78,7 +269,7 @@ func TestClusterDispatchPersistsContextAndTransitionsStatus(t *testing.T) {
 	}
 }
 
-func TestClusterDispatchCarriesSubscriptionProviderTargets(t *testing.T) {
+func TestClusterDispatchDoesNotCarrySubscriptionFolders(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	dispatcher := &recordingClusterDispatcher{}
 	RegisterClusterDispatcher(dispatcher)
@@ -114,12 +305,6 @@ func TestClusterDispatchCarriesSubscriptionProviderTargets(t *testing.T) {
 		t.Fatalf("tasks = %d, want 1", len(dispatcher.tasks))
 	}
 	task := dispatcher.tasks[0]
-	if task.TempTarget.Provider != "pan123" || task.TempTarget.Folder != "转存至移动" {
-		t.Fatalf("temp target = %#v", task.TempTarget)
-	}
-	if task.DeliveryTarget.Provider != "yidong139" || task.DeliveryTarget.Folder != "港台剧/热播" {
-		t.Fatalf("delivery target = %#v", task.DeliveryTarget)
-	}
 	if task.LogicalMediaRoot != "" {
 		t.Fatalf("logical media root = %q, want no legacy path dependency", task.LogicalMediaRoot)
 	}

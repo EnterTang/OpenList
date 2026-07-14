@@ -89,3 +89,17 @@ func TestCoordinatorStartAllowsMissingETFRootPath(t *testing.T) {
 		t.Fatal("coordinator service was not initialized")
 	}
 }
+
+func TestNodeLocalCleanupQueueNamesAreStableAndIsolated(t *testing.T) {
+	streamA, groupA, dlqA := nodeLocalCleanupQueueNames("cluster:local-cleanup:v1", "worker-a")
+	streamAAgain, groupAAgain, dlqAAgain := nodeLocalCleanupQueueNames("cluster:local-cleanup:v1", "worker-a")
+	streamB, groupB, dlqB := nodeLocalCleanupQueueNames("cluster:local-cleanup:v1", "worker-b")
+
+	require.Equal(t, streamA, streamAAgain)
+	require.Equal(t, groupA, groupAAgain)
+	require.Equal(t, dlqA, dlqAAgain)
+	require.NotEqual(t, streamA, streamB)
+	require.NotEqual(t, groupA, groupB)
+	require.NotEqual(t, dlqA, dlqB)
+	require.Equal(t, streamA+":dlq", dlqA)
+}

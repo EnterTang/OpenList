@@ -10,9 +10,11 @@ import (
 func TestBuildInventoryIncludesProviderAccounts(t *testing.T) {
 	oldList := listInventoryStorages
 	oldHydrate := hydrateInventoryStorage
+	oldConfig := getInventorySubscriptionConfig
 	defer func() {
 		listInventoryStorages = oldList
 		hydrateInventoryStorage = oldHydrate
+		getInventorySubscriptionConfig = oldConfig
 	}()
 
 	listInventoryStorages = func() ([]model.Storage, error) {
@@ -31,6 +33,9 @@ func TestBuildInventoryIncludesProviderAccounts(t *testing.T) {
 			Account: providerAccountInventory(nodeID, storage, 1024, 2048),
 		}, nil
 	}
+	getInventorySubscriptionConfig = func() (model.SubscriptionConfig, error) {
+		return model.SubscriptionConfig{DefaultTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "worker-delivery"}}, nil
+	}
 
 	report, err := BuildInventory(context.Background(), "node-1", true)
 	if err != nil {
@@ -48,6 +53,129 @@ func TestBuildInventoryIncludesProviderAccounts(t *testing.T) {
 	}
 	if account.MembershipTier != "diamond" || account.MembershipWeight != 400 || account.MaxSingleUploadBytes != 500<<30 {
 		t.Fatalf("provider account membership = %#v", account)
+	}
+}
+
+func TestBuildInventoryRequiresWorkerLocalDeliveryRoutingFor139Upload(t *testing.T) {
+	oldList := listInventoryStorages
+	oldHydrate := hydrateInventoryStorage
+	oldConfig := getInventorySubscriptionConfig
+	defer func() {
+		listInventoryStorages = oldList
+		hydrateInventoryStorage = oldHydrate
+		getInventorySubscriptionConfig = oldConfig
+	}()
+
+	storage := model.Storage{
+		ID: 7, MountPath: "/139", Driver: "139Yun", Status: "work",
+		Addition: `{"type":"personal_new","cluster_dedicated_account":true,"membership_tier":"diamond"}`,
+	}
+	listInventoryStorages = func() ([]model.Storage, error) { return []model.Storage{storage}, nil }
+	hydrateInventoryStorage = func(_ context.Context, nodeID string, storage model.Storage) (inventoryStorageSnapshot, error) {
+		return inventoryStorageSnapshot{
+			Mount:   providerMountInventory(nodeID, storage),
+			Account: providerAccountInventory(nodeID, storage, 1<<40, 2<<40),
+		}, nil
+	}
+
+	for _, tc := range []struct {
+		name   string
+		config model.SubscriptionConfig
+		want   bool
+	}{
+		{name: "missing", want: false},
+		{
+			name:   "configured",
+			config: model.SubscriptionConfig{DefaultTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "worker-delivery"}},
+			want:   true,
+		},
+		{
+			name:   "invalid folder",
+			config: model.SubscriptionConfig{DefaultTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "../unsafe"}},
+			want:   false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			getInventorySubscriptionConfig = func() (model.SubscriptionConfig, error) { return tc.config, nil }
+			report, err := BuildInventory(context.Background(), "node-1", true)
+			if err != nil {
+				t.Fatalf("build inventory: %v", err)
+			}
+			if got, want := report.ProviderAccounts[0].SupportsUpload, tc.want; got != want {
+				t.Fatalf("SupportsUpload = %v, want %v for worker config %#v", got, want, tc.config)
+			}
+		})
+	}
+}
+
+func TestBuildInventoryRequiresWorkerLocalStagingRoutingForPanShareSave(t *testing.T) {
+	oldList := listInventoryStorages
+	oldHydrate := hydrateInventoryStorage
+	oldConfig := getInventorySubscriptionConfig
+	defer func() {
+		listInventoryStorages = oldList
+		hydrateInventoryStorage = oldHydrate
+		getInventorySubscriptionConfig = oldConfig
+	}()
+
+	for _, tc := range []struct {
+		provider string
+		driver   string
+		config   model.SubscriptionConfig
+		want     bool
+	}{
+		{provider: "pan123", driver: "123Pan", want: false},
+		{provider: "pan115", driver: "115 Cloud", want: false},
+		{
+			provider: "pan123",
+			driver:   "123Pan",
+			config: model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+				Pan123: model.SubscriptionTelegramPanConfig{
+					TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "worker-staging"},
+				},
+			}},
+			want: true,
+		},
+		{
+			provider: "pan115",
+			driver:   "115 Cloud",
+			config: model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+				Pan115: model.SubscriptionTelegramPanConfig{
+					TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan115", Folder: "worker-staging"},
+				},
+			}},
+			want: true,
+		},
+		{
+			provider: "pan123",
+			driver:   "123Pan",
+			config: model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+				Pan123: model.SubscriptionTelegramPanConfig{
+					TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "../unsafe"},
+				},
+			}},
+			want: false,
+		},
+	} {
+		t.Run(tc.provider+"/"+tc.driver, func(t *testing.T) {
+			storage := model.Storage{ID: 7, MountPath: "/" + tc.provider, Driver: tc.driver, Status: "work"}
+			listInventoryStorages = func() ([]model.Storage, error) { return []model.Storage{storage}, nil }
+			hydrateInventoryStorage = func(_ context.Context, nodeID string, storage model.Storage) (inventoryStorageSnapshot, error) {
+				return inventoryStorageSnapshot{
+					Mount:   providerMountInventory(nodeID, storage),
+					Account: providerAccountInventory(nodeID, storage, 1<<40, 2<<40),
+				}, nil
+			}
+			getInventorySubscriptionConfig = func() (model.SubscriptionConfig, error) { return tc.config, nil }
+
+			report, err := BuildInventory(context.Background(), "node-1", true)
+			if err != nil {
+				t.Fatalf("build inventory: %v", err)
+			}
+			if got, want := report.ProviderAccounts[0].SupportsShareSave, tc.want; got != want {
+				t.Fatalf("SupportsShareSave = %v, want %v for worker config %#v", got, want, tc.config)
+			}
+		})
 	}
 }
 

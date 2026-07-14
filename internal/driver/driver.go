@@ -25,6 +25,25 @@ type Meta interface {
 	Drop(ctx context.Context) error
 }
 
+// ETFArchiveSettings describes the optional archive policy owned by a storage
+// driver. Cluster coordinators use it when their configured ETF root selects
+// the storage mount itself, so the driver's normal archive folder and target
+// notification settings remain the single source of truth.
+type ETFArchiveSettings struct {
+	RelativeRoot              string
+	AutoSubscriptionEnabled   bool
+	TargetBaseURL             string
+	TargetAPIToken            string
+	TargetSupportsIdempotency bool
+	QuietWindowSeconds        int
+	SharePeriodUnit           int
+	ShareType                 string
+}
+
+type ETFArchiveSettingsProvider interface {
+	ETFArchiveSettings() ETFArchiveSettings
+}
+
 type Other interface {
 	Other(ctx context.Context, args model.OtherArgs) (interface{}, error)
 }

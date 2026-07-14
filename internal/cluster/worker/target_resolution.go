@@ -12,17 +12,24 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 )
 
-var ensureResolvedProviderFolder = subscription.EnsureResolvedProviderFolder
+var (
+	ensureResolvedProviderFolder = subscription.EnsureResolvedProviderFolder
+	getWorkerSubscriptionConfig  = subscription.GetConfig
+)
 
-func (s *Service) resolveStagingTempRoot(ctx context.Context, task protocol.TaskContext, namespace string) (string, error) {
-	namespace = path.Clean(strings.TrimSpace(namespace))
-	if namespace == "" || namespace == "." || namespace == "/" {
-		return "", fmt.Errorf("cluster staging namespace is required")
-	}
+func (s *Service) resolveStagingTempRoot(ctx context.Context, task protocol.TaskContext) (string, error) {
 	target := subscription.NormalizeSubscriptionStorageTarget(model.SubscriptionStorageTarget{
 		Provider: task.StagingTarget.Provider,
 		Folder:   task.StagingTarget.Folder,
 	})
+	if localTarget, configured, err := localStagingTarget(task); err != nil {
+		return "", err
+	} else if configured {
+		target.Provider = localTarget.Provider
+		target.Folder = localTarget.Folder
+	} else if target.Provider != "" && target.Folder == "" {
+		return "", fmt.Errorf("worker local %s staging folder is required for a provider-only subscription task", target.Provider)
+	}
 	if target.Provider != "" {
 		requirement := task.StagingTarget
 		requirement.Provider = target.Provider
@@ -31,19 +38,27 @@ func (s *Service) resolveStagingTempRoot(ctx context.Context, task protocol.Task
 		requirement.RequiredBytes = stagingRequiredBytes(task)
 		resolved, err := s.resolveProviderTargetRequirement(ctx, requirement)
 		if err == nil {
-			return path.Join(resolved.FullPath, namespace), nil
+			return resolved.FullPath, nil
 		}
 		return "", err
 	}
 	if configuredRoot := s.providerTempRoot(task.Share.Provider); configuredRoot != "" {
-		return path.Join(configuredRoot, namespace), nil
+		return configuredRoot, nil
 	}
-	return namespace, nil
+	return "", fmt.Errorf("cluster staging root is required")
 }
 
 func (s *Service) resolveDeliveryTargetRoot(ctx context.Context, task protocol.TaskContext) (string, string, error) {
 	if strings.TrimSpace(task.DeliveryTarget.Provider) != "" {
 		requirement := task.DeliveryTarget
+		if localTarget, configured, err := localDeliveryTarget(task); err != nil {
+			return "", "", err
+		} else if configured {
+			requirement.Provider = localTarget.Provider
+			requirement.Folder = localTarget.Folder
+		} else if strings.TrimSpace(requirement.Folder) == "" {
+			return "", "", fmt.Errorf("worker local yidong139 delivery folder is required for a provider-only subscription task")
+		}
 		requirement.NeedUpload = true
 		if requirement.RequiredBytes <= 0 {
 			requirement.RequiredBytes = primarySourceObject(task.SourceObjects).Size
@@ -93,6 +108,63 @@ func (s *Service) resolveDeliveryTargetRoot(ctx context.Context, task protocol.T
 		root = path.Join(bindingMount, target.Folder)
 	}
 	return root, bindingMount, nil
+}
+
+// localStagingTarget returns the local temporary target for a provider-only
+// subscription task. Task account bindings remain untouched; the worker owns
+// the folder because mounts and directory layouts are local to that worker.
+func localStagingTarget(task protocol.TaskContext) (model.SubscriptionStorageTarget, bool, error) {
+	provider := normalizeControlKey(task.StagingTarget.Provider)
+	if provider != "pan123" && provider != "pan115" {
+		return model.SubscriptionStorageTarget{}, false, nil
+	}
+	cfg, err := getWorkerSubscriptionConfig()
+	if err != nil {
+		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("load worker subscription config: %w", err)
+	}
+	var target model.SubscriptionStorageTarget
+	switch provider {
+	case "pan123":
+		target = cfg.Telegram.Pan123.TempTransferTarget
+	case "pan115":
+		target = cfg.Telegram.Pan115.TempTransferTarget
+	}
+	target = subscription.NormalizeSubscriptionStorageTarget(target)
+	if err := subscription.ValidateSubscriptionStorageTarget(target); err != nil {
+		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("invalid worker local %s staging target: %w", provider, err)
+	}
+	if target.Provider == "" && target.Folder == "" {
+		return model.SubscriptionStorageTarget{}, false, nil
+	}
+	if target.Provider != provider || target.Folder == "" {
+		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("worker local %s staging target must use provider %s with a folder", provider, provider)
+	}
+	return target, true, nil
+}
+
+// localDeliveryTarget returns the local ETF delivery target for a provider-only
+// subscription task. The coordinator selects the account; it must not select
+// the directory underneath that account.
+func localDeliveryTarget(task protocol.TaskContext) (model.SubscriptionStorageTarget, bool, error) {
+	provider := normalizeControlKey(task.DeliveryTarget.Provider)
+	if provider != "yidong139" {
+		return model.SubscriptionStorageTarget{}, false, nil
+	}
+	cfg, err := getWorkerSubscriptionConfig()
+	if err != nil {
+		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("load worker subscription config: %w", err)
+	}
+	target := subscription.NormalizeSubscriptionStorageTarget(cfg.DefaultTarget)
+	if err := subscription.ValidateSubscriptionStorageTarget(target); err != nil {
+		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("invalid worker local delivery target: %w", err)
+	}
+	if target.Provider == "" && target.Folder == "" {
+		return model.SubscriptionStorageTarget{}, false, nil
+	}
+	if target.Provider != provider || target.Folder == "" {
+		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("worker local delivery target must use provider yidong139 with a folder")
+	}
+	return target, true, nil
 }
 
 func (s *Service) resolveProviderTargetRequirement(ctx context.Context, requirement protocol.ProviderTargetRequirement) (subscription.ResolvedProviderTarget, error) {

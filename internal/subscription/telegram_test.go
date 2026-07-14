@@ -140,6 +140,36 @@ func TestRunTelegramSearchUsesBuiltinWhenAPIConfigPresentWithoutCommand(t *testi
 	}
 }
 
+func TestRunTelegramSkipsMessagesWithoutSubscriptionTitle(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	oldSearch := builtinTelegramSearch
+	builtinTelegramSearch = func(context.Context, *model.Subscription, model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
+		return []telegramCommandRow{
+			{MsgID: int64(19575), Channel: "@shows", Text: "君九龄.2021.S01E04", Links: []string{"https://example.com/shares/jiu"}},
+			{MsgID: int64(19576), Channel: "@shows", Text: "小芳.2026.S01E04", Links: []string{"https://example.com/shares/xiaofang"}},
+		}, nil
+	}
+	t.Cleanup(func() { builtinTelegramSearch = oldSearch })
+
+	sub := &model.Subscription{
+		ID:           89,
+		Name:         "小芳",
+		TMDBName:     "小芳",
+		SourceType:   model.SubscriptionSourceTelegram,
+		SourceConfig: `{"api_id":1,"api_hash":"hash"}`,
+	}
+	items, _, added, _, _, err := runTelegram(context.Background(), sub, false)
+	if err != nil {
+		t.Fatalf("run Telegram: %v", err)
+	}
+	if added != 1 || len(items) != 1 {
+		t.Fatalf("items/added = %#v/%d, want one matching message", items, added)
+	}
+	if items[0].SourceURL != "https://example.com/shares/xiaofang" {
+		t.Fatalf("source URL = %q, want matching message URL", items[0].SourceURL)
+	}
+}
+
 func TestTelegramSearchQueryUsesSubscriptionNames(t *testing.T) {
 	if got := telegramSearchQuery(&model.Subscription{TMDBName: " 三体 ", Name: "fallback"}); got != "三体" {
 		t.Fatalf("query = %q, want 三体", got)
@@ -610,7 +640,7 @@ func TestRunTelegramPropagatesConfiguredTempTargetResolutionError(t *testing.T) 
 	}
 }
 
-func TestSelectTelegramTempTransferCandidatesPrefersConfiguredProviderPriority(t *testing.T) {
+func TestSelectTelegramTempTransferCandidatesPrefersLargestAcrossProviders(t *testing.T) {
 	sub := &model.Subscription{
 		ID:         8,
 		TMDBName:   "飞常日志",
@@ -650,8 +680,8 @@ func TestSelectTelegramTempTransferCandidatesPrefersConfiguredProviderPriority(t
 	if got, want := len(selected), 1; got != want {
 		t.Fatalf("selected count = %d, want %d: %#v", got, want, selected)
 	}
-	if selected[0].Source.Name != "pan123" {
-		t.Fatalf("selected source = %q, want pan123", selected[0].Source.Name)
+	if selected[0].Source.Name != "quark" {
+		t.Fatalf("selected source = %q, want largest quark candidate", selected[0].Source.Name)
 	}
 	if selected[0].Item.Season != 2 || selected[0].Item.Episode != 10 {
 		t.Fatalf("selected season/episode = %d/%d, want 2/10", selected[0].Item.Season, selected[0].Item.Episode)
@@ -736,6 +766,20 @@ func TestSelectTelegramTempTransferCandidatesDedupesSameProviderEpisode(t *testi
 	}
 	if !strings.Contains(selected[0].Entry.Name, "MyTVSuper") {
 		t.Fatalf("selected entry = %q, want larger MyTVSuper candidate", selected[0].Entry.Name)
+	}
+}
+
+func TestSelectTelegramTempTransferCandidatesUsesProviderPriorityOnlyForEqualSize(t *testing.T) {
+	sub := &model.Subscription{MediaType: "tv", TMDBName: "Example", Seasons: []int{1}}
+	seenAt := time.Now()
+	candidates := []telegramTempCandidate{
+		testTelegramTempCandidate(sub, "quark", TreeEntry{Path: "/Example.S01E01.quark.mkv", Name: "Example.S01E01.quark.mkv", ID: "quark", Size: 800}, seenAt),
+		testTelegramTempCandidate(sub, "pan123", TreeEntry{Path: "/Example.S01E01.pan123.mkv", Name: "Example.S01E01.pan123.mkv", ID: "pan123", Size: 800}, seenAt),
+	}
+
+	selected := selectTelegramTempTransferCandidates(sub, candidates, []string{"pan123", "quark"})
+	if len(selected) != 1 || selected[0].Source.Name != "pan123" {
+		t.Fatalf("selected = %#v, want equal-size pan123 priority winner", selected)
 	}
 }
 

@@ -123,15 +123,29 @@ func TestCleanupRequestAllowsOwnedSourceAndMobileTargets(t *testing.T) {
 	request := CleanupRequest{
 		Version: "v1", JobID: "job-1", MediaItemID: "media-1",
 		OpenListPath:     "/mobile/.openlist-cluster/job-1/media-1/episode.mkv",
-		StorageMountPath: "/mobile", Name: "episode.mkv", EmptyRecycleBin: true,
+		StorageMountPath: "/mobile", RemoteFileID: "mobile-file", Name: "episode.mkv", EmptyRecycleBin: true,
 		AdditionalTargets: []CleanupTarget{{
-			OpenListPath:     "/aliyun/transfer/.openlist-cluster/job-1/media-1/episode.mkv",
-			StorageMountPath: "/aliyun", Name: "episode.mkv",
+			OpenListPath:     "/aliyun/transfer/episode.mkv",
+			StorageMountPath: "/aliyun", OwnedRootPath: "/aliyun/transfer",
+			RemoteFileID: "source-file", Name: "episode.mkv", ExactFile: true,
 		}},
 	}
 	require.NoError(t, request.Validate())
-	request.AdditionalTargets[0].OpenListPath = "/aliyun/transfer/.openlist-cluster/job-2/media-1/episode.mkv"
+	request.AdditionalTargets[0].RemoteFileID = ""
 	require.Error(t, request.Validate())
+}
+
+func TestCleanupRequestRejectsFlatExactTargetOutsideOwnedRoot(t *testing.T) {
+	request := CleanupRequest{
+		Version: "v1", JobID: "job-1", MediaItemID: "media-1",
+		OpenListPath:     "/mobile/.openlist-cluster/job-1/media-1/episode.mkv",
+		StorageMountPath: "/mobile", Name: "episode.mkv",
+		AdditionalTargets: []CleanupTarget{{
+			OpenListPath: "/aliyun/other/episode.mkv", StorageMountPath: "/aliyun",
+			OwnedRootPath: "/aliyun/transfer", RemoteFileID: "source-file", Name: "episode.mkv", ExactFile: true,
+		}},
+	}
+	require.ErrorContains(t, request.Validate(), "direct file")
 }
 
 func TestEnqueueResultAndCleanupDurablyCommitsBothStreams(t *testing.T) {

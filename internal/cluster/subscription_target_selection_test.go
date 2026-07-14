@@ -13,7 +13,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 )
 
-func TestChooseDispatchTargetRequiresMatchingDeliveryProvider(t *testing.T) {
+func TestChooseDispatchTargetIgnoresLegacySubscriptionDeliveryProvider(t *testing.T) {
 	database := openClusterRuntimeTestDB(t)
 	oldConf := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())
@@ -91,11 +91,9 @@ func TestChooseDispatchTargetRequiresMatchingDeliveryProvider(t *testing.T) {
 	target := runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-4", targetProfile: "mobile-primary"}}, subscription.ClusterMediaTask{
 		ShareProvider:    "pan123",
 		SourceSize:       1 << 30,
-		TempTarget:       model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
-		DeliveryTarget:   model.SubscriptionStorageTarget{Provider: "pan115", Folder: "剧集"},
 		LogicalMediaRoot: "/115/剧集",
 	})
-	if target != nil {
-		t.Fatal("expected target selection to reject mismatched delivery provider")
+	if target == nil {
+		t.Fatal("expected target selection to use the worker's yidong139 account")
 	}
 }

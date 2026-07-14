@@ -78,9 +78,11 @@ type CleanupRequest struct {
 type CleanupTarget struct {
 	OpenListPath     string `json:"openlist_path"`
 	StorageMountPath string `json:"storage_mount_path"`
+	OwnedRootPath    string `json:"owned_root_path,omitempty"`
 	RemoteFileID     string `json:"remote_file_id,omitempty"`
 	Name             string `json:"name"`
 	EmptyRecycleBin  bool   `json:"empty_recycle_bin"`
+	ExactFile        bool   `json:"exact_file,omitempty"`
 }
 
 func (r CleanupRequest) Validate() error {
@@ -113,6 +115,25 @@ func validateCleanupTarget(jobID, mediaItemID string, target CleanupTarget) erro
 	if cleanPath != mountPath && !strings.HasPrefix(cleanPath, strings.TrimSuffix(mountPath, "/")+"/") {
 		return errors.New("cleanup request path must remain inside its storage mount")
 	}
+	if path.Base(cleanPath) != target.Name || target.Name == "" || target.Name == "." || target.Name == ".." || strings.Contains(target.Name, "/") || strings.Contains(target.Name, "\\") {
+		return errors.New("cleanup request name does not match its exact path")
+	}
+	if target.EmptyRecycleBin && strings.TrimSpace(target.RemoteFileID) == "" {
+		return errors.New("recycle-bin cleanup request requires a remote file id")
+	}
+	if target.ExactFile {
+		ownedRoot := path.Clean(strings.TrimSpace(target.OwnedRootPath))
+		if strings.TrimSpace(target.RemoteFileID) == "" {
+			return errors.New("exact cleanup request requires a remote file id")
+		}
+		if !strings.HasPrefix(ownedRoot, "/") || ownedRoot == mountPath || !strings.HasPrefix(ownedRoot, strings.TrimSuffix(mountPath, "/")+"/") {
+			return errors.New("exact cleanup owned root must be an absolute child of its storage mount")
+		}
+		if path.Dir(cleanPath) != ownedRoot {
+			return errors.New("exact cleanup request must target a direct file in its owned root")
+		}
+		return nil
+	}
 	relative := strings.TrimPrefix(cleanPath, strings.TrimSuffix(mountPath, "/"))
 	parts := strings.Split(strings.TrimPrefix(relative, "/"), "/")
 	namespaceIndex := -1
@@ -124,9 +145,6 @@ func validateCleanupTarget(jobID, mediaItemID string, target CleanupTarget) erro
 	}
 	if namespaceIndex < 0 || len(parts) < namespaceIndex+4 || parts[namespaceIndex+1] != jobID || parts[namespaceIndex+2] != mediaItemID {
 		return errors.New("cleanup request must target its .openlist-cluster job/media namespace")
-	}
-	if path.Base(cleanPath) != target.Name || target.Name == "" || target.Name == "." || target.Name == ".." || strings.ContainsAny(target.Name, `/\\`) {
-		return errors.New("cleanup request name does not match its exact path")
 	}
 	return nil
 }

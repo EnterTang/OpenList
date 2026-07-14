@@ -51,6 +51,27 @@ type resultQueue interface {
 	Stats(context.Context) (resultqueue.Stats, error)
 }
 
+var (
+	getCleanupStorageAndActualPath = op.GetStorageAndActualPath
+	getCleanupObject               = getFreshCleanupObject
+	removeCleanupObjectExact       = op.RemoveExact
+)
+
+func getFreshCleanupObject(ctx context.Context, storage driver.Driver, actualPath string, _ ...bool) (model.Obj, error) {
+	actualPath = path.Clean(strings.TrimSpace(actualPath))
+	objects, err := op.List(ctx, storage, path.Dir(actualPath), model.ListArgs{Refresh: true})
+	if err != nil {
+		return nil, err
+	}
+	name := path.Base(actualPath)
+	for _, object := range objects {
+		if object.GetName() == name {
+			return object, nil
+		}
+	}
+	return nil, errs.ObjectNotFound
+}
+
 type activeTask struct {
 	attempt       protocol.AttemptRef
 	ctx           context.Context
@@ -196,21 +217,39 @@ func executeCleanup(ctx context.Context, request resultqueue.CleanupRequest) err
 }
 
 func executeCleanupTarget(ctx context.Context, target resultqueue.CleanupTarget) error {
-	storage, _, err := op.GetStorageAndActualPath(target.OpenListPath)
+	storage, actualPath, err := getCleanupStorageAndActualPath(target.OpenListPath)
 	if err != nil {
 		return fmt.Errorf("resolve cleanup storage: %w", err)
 	}
 	if path.Clean(storage.GetStorage().MountPath) != path.Clean(target.StorageMountPath) {
 		return errors.New("cleanup storage mount changed; refusing deletion")
 	}
-	var cleanupObj model.Obj = &model.Object{ID: target.RemoteFileID, Name: target.Name}
-	if found, getErr := fs.Get(ctx, target.OpenListPath, &fs.GetArgs{NoLog: true}); getErr == nil {
-		if target.RemoteFileID != "" && found.GetID() != target.RemoteFileID {
-			return errors.New("cleanup target remote id changed; refusing deletion")
+	cleanupObj, err := getCleanupObject(ctx, storage, actualPath, true)
+	if err != nil {
+		if errs.IsObjectNotFound(err) {
+			if target.EmptyRecycleBin {
+				cleaner, ok := storage.(driver.RecycleEntryCleaner)
+				if !ok {
+					return errors.New("cleanup storage does not support recycle-bin cleanup")
+				}
+				if strings.TrimSpace(target.RemoteFileID) == "" {
+					return errors.New("cleanup request is missing remote id for recycle-bin cleanup")
+				}
+				if err := cleaner.ClearRecycleEntry(ctx, &model.Object{ID: target.RemoteFileID, Name: target.Name}); err != nil {
+					return fmt.Errorf("clear missing cleanup recycle entry: %w", err)
+				}
+			}
+			return nil
 		}
-		cleanupObj = found
+		return fmt.Errorf("read cleanup target: %w", err)
 	}
-	if err := fs.Remove(ctx, target.OpenListPath); err != nil && !errs.IsNotFoundError(err) {
+	if target.RemoteFileID != "" && cleanupObj.GetID() != target.RemoteFileID {
+		return errors.New("cleanup target remote id changed; refusing deletion")
+	}
+	if target.ExactFile && strings.TrimSpace(target.RemoteFileID) == "" {
+		return errors.New("exact cleanup target is missing its remote id")
+	}
+	if err := removeCleanupObjectExact(ctx, storage, actualPath, cleanupObj); err != nil && !errs.IsNotFoundError(err) {
 		return err
 	}
 	if target.EmptyRecycleBin {
@@ -652,22 +691,33 @@ func NewCleanupRequest(manifest protocol.UploadETFManifest, storageMountPath str
 	return request, nil
 }
 
-func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFManifest, sourcePath string) (resultqueue.CleanupTarget, error) {
-	storage, _, err := op.GetStorageAndActualPath(sourcePath)
+func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFManifest, ownedRoot, sourcePath string) (resultqueue.CleanupTarget, error) {
+	ownedRoot = path.Clean(strings.TrimSpace(ownedRoot))
+	sourcePath = path.Clean(strings.TrimSpace(sourcePath))
+	if path.Dir(sourcePath) != ownedRoot {
+		return resultqueue.CleanupTarget{}, errors.New("cluster source cleanup must target a direct file in the staging root")
+	}
+	storage, actualPath, err := getCleanupStorageAndActualPath(sourcePath)
 	if err != nil {
 		return resultqueue.CleanupTarget{}, fmt.Errorf("resolve cluster source cleanup storage: %w", err)
 	}
 	target := resultqueue.CleanupTarget{
 		OpenListPath: path.Clean(sourcePath), StorageMountPath: path.Clean(storage.GetStorage().MountPath),
-		Name: path.Base(sourcePath), EmptyRecycleBin: false,
+		OwnedRootPath: ownedRoot, Name: path.Base(sourcePath), EmptyRecycleBin: false, ExactFile: true,
 	}
-	if obj, getErr := fs.Get(ctx, sourcePath, &fs.GetArgs{NoLog: true}); getErr == nil && obj != nil {
-		target.RemoteFileID = obj.GetID()
+	obj, err := getCleanupObject(ctx, storage, actualPath, true)
+	if err != nil {
+		return resultqueue.CleanupTarget{}, fmt.Errorf("read cluster source cleanup object: %w", err)
 	}
+	if obj == nil || obj.IsDir() || strings.TrimSpace(obj.GetID()) == "" {
+		return resultqueue.CleanupTarget{}, errors.New("cluster source cleanup requires an exact remote file id")
+	}
+	target.RemoteFileID = obj.GetID()
 	probe := resultqueue.CleanupRequest{
 		Version: "v1", JobID: safeClusterPathSegment(manifest.JobID), MediaItemID: safeClusterPathSegment(manifest.MediaItemID),
-		OpenListPath: target.OpenListPath, StorageMountPath: target.StorageMountPath,
-		RemoteFileID: target.RemoteFileID, Name: target.Name, CreatedAt: time.Now().UTC(),
+		OpenListPath:     path.Join(target.StorageMountPath, clusterTaskNamespace(manifest.JobID, manifest.MediaItemID), target.Name),
+		StorageMountPath: target.StorageMountPath, Name: target.Name, CreatedAt: time.Now().UTC(),
+		AdditionalTargets: []resultqueue.CleanupTarget{target},
 	}
 	if err := probe.Validate(); err != nil {
 		return resultqueue.CleanupTarget{}, err
@@ -730,7 +780,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if _, err := s.requestStagePermit(ctx, offer, model.ClusterStageSavingShare); err != nil {
 		return err
 	}
-	requestedTempRoot, err := s.resolveStagingTempRoot(ctx, offer.TaskContext, namespace)
+	requestedTempRoot, err := s.resolveStagingTempRoot(ctx, offer.TaskContext)
 	if err != nil {
 		return fmt.Errorf("resolve cluster staging temp root: %w", err)
 	}
@@ -795,7 +845,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		SourceObjects:         offer.TaskContext.SourceObjects,
 		MobileAccountBinding:  targetStorage.GetStorage().MountPath,
 	}
-	sourceCleanup, err := NewSourceCleanupTarget(ctx, manifest, stagedSource)
+	sourceCleanup, err := NewSourceCleanupTarget(ctx, manifest, requestedTempRoot, stagedSource)
 	if err != nil {
 		return fmt.Errorf("build cluster source cleanup request: %w", err)
 	}

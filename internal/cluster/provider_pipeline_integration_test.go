@@ -28,7 +28,6 @@ func TestHybridDispatcherPersistsAndOffersHighestWeightProviderBindings(t *testi
 	fakeTransport := &providerPipelineTransport{nodes: []string{"hybrid-local"}}
 	task := validProviderPipelineTask(20 << 30)
 	task.IdempotencyKey = "hybrid-provider-pipeline"
-	task.TempTarget = model.SubscriptionStorageTarget{Provider: "pan123", Folder: "转存"}
 	results, err := (subscriptionDispatcher{runtime: &Runtime{dispatchTransport: fakeTransport}}).DispatchSubscriptionMedia(t.Context(), []subscription.ClusterMediaTask{task})
 	if err != nil || len(results) != 1 || results[0].JobID == "" {
 		t.Fatalf("dispatch results = %#v, err=%v", results, err)
@@ -85,7 +84,6 @@ func validProviderPipelineTask(size int64) subscription.ClusterMediaTask {
 		SubscriptionID: 1, SubscriptionItemID: 2, SubscriptionName: "pipeline", SourceKey: "source-1", IdempotencyKey: "pipeline-task",
 		ShareProvider: "pan123", ShareURL: "https://www.123pan.com/s/test", SourceFileID: "file-1", SourceRelativePath: "episode.mkv", SourceSize: size,
 		MediaItemID: "media-1", MediaType: "tv", LogicalMediaRoot: "/legacy", LogicalTargetPath: "/legacy/episode.mkv",
-		TempTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"}, DeliveryTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "剧集"},
 		WorkflowVersion: subscription.ClusterWorkflowVersion, SealedManifestVersion: subscription.ClusterSealedManifestVersion,
 	}
 }

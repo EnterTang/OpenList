@@ -588,10 +588,31 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		}
 		return errors.WithMessage(err, "failed to get object")
 	}
+	return RemoveExact(ctx, storage, path, rawObj)
+}
+
+// RemoveExact removes the already-resolved object without looking the path up
+// again. Callers that verified a remote object ID can use this to avoid a
+// time-of-check/time-of-use deletion race.
+func RemoveExact(ctx context.Context, storage driver.Driver, path string, rawObj model.Obj) error {
+	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+		return errors.WithMessagef(errs.StorageNotInit, "storage status: %s", storage.GetStorage().Status)
+	}
+	path = utils.FixAndCleanPath(path)
+	if utils.PathEqual(path, "/") {
+		return errors.New("delete root folder is not allowed")
+	}
+	if rawObj == nil {
+		return errors.New("exact removal object is required")
+	}
+	if stdpath.Base(path) != rawObj.GetName() {
+		return errors.New("exact removal object name does not match path")
+	}
 	if model.ObjHasMask(rawObj, model.NoRemove) {
 		return errors.WithStack(errs.PermissionDenied)
 	}
 	dirPath := stdpath.Dir(path)
+	var err error
 
 	switch s := storage.(type) {
 	case driver.Remove:

@@ -76,7 +76,7 @@ func TestSaveClusterShareSelectionBindsSelectedCredentialForAbsoluteStagingRoot(
 				fileID   = "selected-file"
 				fileName = "Selected.Movie.mkv"
 			)
-			stagingRoot := tc.selectedMount + "/.openlist-cluster/job/media"
+			stagingRoot := tc.selectedMount + "/临时转存"
 			saver := &fakeShareSaver{
 				fakeShareTreeProvider: fakeShareTreeProvider{
 					name: tc.provider,
@@ -127,10 +127,9 @@ func TestSaveClusterShareSelectionBindsSelectedCredentialForAbsoluteStagingRoot(
 	}
 }
 
-func TestResolveClusterShareTempRootAppendsTaskNamespace(t *testing.T) {
-	got, err := resolveClusterShareTempRoot("/ali/转存至移动", ".openlist-cluster/job-1/media-1")
-	require.NoError(t, err)
-	require.Equal(t, "/ali/转存至移动/.openlist-cluster/job-1/media-1", got)
+func TestResolveClusterShareTempRootRejectsTaskNamespace(t *testing.T) {
+	_, err := resolveClusterShareTempRoot("/ali/转存至移动", ".openlist-cluster/job-1/media-1")
+	require.ErrorContains(t, err, "must be absolute")
 }
 
 func TestResolveClusterShareTempRootPreservesExplicitAbsoluteRoot(t *testing.T) {
@@ -144,7 +143,7 @@ func TestResolveClusterShareTempRootRejectsTraversal(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestResolveClusterShareTempRootRequiresConfiguredBaseForNamespace(t *testing.T) {
+func TestResolveClusterShareTempRootRejectsRelativeRootWithoutConfiguredBase(t *testing.T) {
 	_, err := resolveClusterShareTempRoot("", ".openlist-cluster/job-1/media-1")
 	require.Error(t, err)
 }

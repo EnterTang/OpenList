@@ -223,12 +223,15 @@ func (r *Runtime) startWorkerLocked() error {
 	if err := r.prepareWorkerRedisLocked(); err != nil {
 		return err
 	}
+	cleanupStream, cleanupGroup, cleanupDLQ := nodeLocalCleanupQueueNames(redisCfg.CleanupStream, nodeID)
 	queue := resultqueue.New(r.redisClient, resultqueue.Config{
 		Stream:          redisCfg.ResultStream,
 		Group:           redisCfg.ConsumerGroup,
 		DLQ:             redisCfg.DeadLetterStream,
 		Consumer:        nodeID,
-		CleanupStream:   redisCfg.CleanupStream,
+		CleanupStream:   cleanupStream,
+		CleanupGroup:    cleanupGroup,
+		CleanupDLQ:      cleanupDLQ,
 		CleanupConsumer: nodeID,
 	})
 	keyFile := strings.TrimSpace(conf.Conf.Cluster.WorkerKeyFile)
@@ -251,13 +254,7 @@ func (r *Runtime) startWorkerLocked() error {
 			return nil
 		}
 		if message.Type == protocol.MessageInventoryQuery {
-			redisReady := queue.ValidateDurability(ctx) == nil
-			report, inventoryErr := clusterworker.BuildInventory(ctx, nodeID, redisReady)
-			if inventoryErr != nil {
-				return inventoryErr
-			}
-			workerService.DecorateInventory(&report)
-			return workerService.SendInventory(ctx, report)
+			return reportWorkerInventory(ctx, nodeID, workerService, queue)
 		}
 		return workerService.HandleMessage(ctx, peer, message)
 	})
@@ -283,15 +280,8 @@ func (r *Runtime) startWorkerLocked() error {
 			return &protocol.NodeKeyAgreement{Algorithm: protocol.KeyAgreementX25519, KeyID: keyPair.KeyID(), PublicKey: keyPair.PublicKey()}, 0
 		},
 		OnConnect: func(_ transport.Peer, _ protocol.Welcome) {
-			redisReady := queue.ValidateDurability(workerCtx) == nil
-			report, inventoryErr := clusterworker.BuildInventory(workerCtx, nodeID, redisReady)
-			if inventoryErr != nil {
-				log.Errorf("build cluster worker inventory: %v", inventoryErr)
-				return
-			}
-			workerService.DecorateInventory(&report)
-			if inventoryErr = workerService.SendInventory(workerCtx, report); inventoryErr != nil {
-				log.Errorf("send cluster worker inventory: %v", inventoryErr)
+			if err := reportWorkerInventory(workerCtx, nodeID, workerService, queue); err != nil {
+				log.Errorf("report cluster worker inventory: %v", err)
 			}
 		},
 		OnDisconnect: func(cause error) {
@@ -308,7 +298,7 @@ func (r *Runtime) startWorkerLocked() error {
 	workerService.ConfigureControlPlane(nodeID, keyPair, nil)
 	r.workerService = workerService
 	clusterworker.SetDefaultService(workerService)
-	r.workerBackground.Add(3)
+	r.workerBackground.Add(4)
 	go func(ctx context.Context, client *transport.WorkerClient) {
 		defer r.workerBackground.Done()
 		if err := client.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -323,7 +313,47 @@ func (r *Runtime) startWorkerLocked() error {
 		defer r.workerBackground.Done()
 		r.runCleanupProcessor(workerCtx, workerService)
 	}()
+	go func() {
+		defer r.workerBackground.Done()
+		refreshInventoryAfterStoragesLoaded(workerCtx, func(ctx context.Context) error {
+			return reportWorkerInventory(ctx, nodeID, workerService, queue)
+		})
+	}()
 	return nil
+}
+
+func nodeLocalCleanupQueueNames(baseStream, nodeID string) (string, string, string) {
+	baseStream = strings.TrimSpace(baseStream)
+	if baseStream == "" {
+		baseStream = "cluster:local-cleanup:v1"
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.TrimSpace(nodeID))))[:16]
+	stream := baseStream + ":" + digest
+	return stream, "cluster-local-cleaners-v1:" + digest, stream + ":dlq"
+}
+
+func reportWorkerInventory(ctx context.Context, nodeID string, workerService *clusterworker.Service, queue *resultqueue.Queue) error {
+	redisReady := queue.ValidateDurability(ctx) == nil
+	report, err := clusterworker.BuildInventory(ctx, nodeID, redisReady)
+	if err != nil {
+		return err
+	}
+	workerService.DecorateInventory(&report)
+	return workerService.SendInventory(ctx, report)
+}
+
+func refreshInventoryAfterStoragesLoaded(ctx context.Context, refresh func(context.Context) error) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-conf.StoragesLoadSignal():
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	if err := refresh(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, transport.ErrNotConnected) {
+		log.Errorf("refresh cluster worker inventory after storages loaded: %v", err)
+	}
 }
 
 func (r *Runtime) prepareWorkerRedisLocked() error {

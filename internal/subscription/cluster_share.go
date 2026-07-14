@@ -61,6 +61,7 @@ func SaveClusterShareSelection(ctx context.Context, rawURL, passcode, tempRoot s
 	}
 	entries, err := SaveShareToTemp(ctx, provider, ref, SaveShareOptions{
 		TempRoot: source.Config.TempTransferRoot,
+		Flatten:  true,
 		Match: func(entry TreeEntry) bool {
 			_, matched := selected[entry.ID]
 			return matched
@@ -71,7 +72,7 @@ func SaveClusterShareSelection(ctx context.Context, rawURL, passcode, tempRoot s
 	}
 	paths := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		paths = append(paths, utils.FixAndCleanPath(path.Join(source.Config.TempTransferRoot, strings.TrimPrefix(entry.Path, "/"))))
+		paths = append(paths, utils.FixAndCleanPath(path.Join(source.Config.TempTransferRoot, path.Base(entry.Path))))
 	}
 	if len(paths) == 0 {
 		return nil, errors.New("none of the assigned share files were found")
@@ -87,15 +88,5 @@ func resolveClusterShareTempRoot(configuredRoot, requestedRoot string) (string, 
 	if path.IsAbs(requestedRoot) {
 		return cleanConfigPath(requestedRoot), nil
 	}
-	configuredRoot = cleanConfigPath(configuredRoot)
-	if configuredRoot == "" || configuredRoot == "/" {
-		return "", errors.New("share provider staging root is required before applying a cluster task namespace")
-	}
-	cleaned := path.Clean(requestedRoot)
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", errors.New("cluster share temp namespace cannot escape its configured root")
-	}
-	// Cluster callers pass a task namespace so files from concurrent jobs
-	// never share the provider's configured staging directory.
-	return cleanConfigPath(path.Join(configuredRoot, cleaned)), nil
+	return "", errors.New("cluster share staging root must be absolute")
 }

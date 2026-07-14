@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -43,16 +44,24 @@ func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.S
 			continue
 		}
 		nextCursor.advance(row)
+		if !telegramRowMatchesSubscription(sub, row) {
+			continue
+		}
 		message := sourceMessageFromTelegramRow(row)
 		links, _ := rowLinksForTelegramPanSources(row, cfg)
 		accessCode := rowAccessCode(row)
+		refs := make([]ShareRef, 0, len(links))
 		for _, link := range links {
 			rawLink := normalizeTelegramLinkWithAccessCode(link, accessCode)
 			ref, err := ParseShareURL(rawLink)
 			if err != nil {
 				return saved, sub.LastTreeHash, added, changed, dispatched, err
 			}
-			if _, err := dispatchClusterInspect(ctx, sub, ref, message); err != nil {
+			refs = append(refs, ref)
+		}
+		observationKey := clusterObservationKey(sub.ID, "telegram", message, refs)
+		for _, ref := range refs {
+			if _, err := dispatchClusterInspectObservation(ctx, sub, ref, message, observationKey, len(refs)); err != nil {
 				return saved, sub.LastTreeHash, added, changed, dispatched, err
 			}
 			dispatched++
@@ -76,13 +85,22 @@ func runManualCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 	var saved []model.SubscriptionItem
 	added, changed, dispatched := 0, 0, 0
 	observationID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	type manualObservationItem struct {
+		ref     ShareRef
+		message clusterSourceMessage
+	}
+	items := make([]manualObservationItem, 0, len(cfg.Links))
 	for _, link := range cfg.Links {
 		message := clusterSourceMessage{ID: "manual:" + observationID + ":" + shortHash(link), Text: strings.TrimSpace(link)}
 		ref, err := ParseShareURL(link)
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, dispatched, err
 		}
-		if _, err := dispatchClusterInspect(ctx, sub, ref, message); err != nil {
+		items = append(items, manualObservationItem{ref: ref, message: message})
+	}
+	observationKey := hashClusterSource("observation", fmt.Sprint(sub.ID), "manual", observationID)
+	for _, item := range items {
+		if _, err := dispatchClusterInspectObservation(ctx, sub, item.ref, item.message, observationKey, len(items)); err != nil {
 			return saved, sub.LastTreeHash, added, changed, dispatched, err
 		}
 		dispatched++
@@ -103,6 +121,11 @@ func runPanSouCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 	var saved []model.SubscriptionItem
 	added, changed, dispatched := 0, 0, 0
 	observationID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	type panSouObservationItem struct {
+		ref     ShareRef
+		message clusterSourceMessage
+	}
+	items := make([]panSouObservationItem, 0)
 	for _, result := range results {
 		message := clusterSourceMessage{ID: "pansou:" + observationID + ":" + shortHash(result.MessageURL+result.Title), URL: result.MessageURL, Text: strings.TrimSpace(result.Content)}
 		for _, link := range result.Links {
@@ -110,13 +133,30 @@ func runPanSouCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 			if err != nil {
 				continue
 			}
-			if _, err := dispatchClusterInspect(ctx, sub, ref, message); err != nil {
-				return saved, sub.LastTreeHash, added, changed, dispatched, err
-			}
-			dispatched++
+			items = append(items, panSouObservationItem{ref: ref, message: message})
 		}
 	}
+	observationKey := hashClusterSource("observation", fmt.Sprint(sub.ID), "pansou", observationID)
+	for _, item := range items {
+		if _, err := dispatchClusterInspectObservation(ctx, sub, item.ref, item.message, observationKey, len(items)); err != nil {
+			return saved, sub.LastTreeHash, added, changed, dispatched, err
+		}
+		dispatched++
+	}
 	return saved, combinedHash("cluster-inspect", panSouResultLinks(results)), added, changed, dispatched, nil
+}
+
+func clusterObservationKey(subscriptionID uint, source string, message clusterSourceMessage, refs []ShareRef) string {
+	identities := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		identities = append(identities, string(ref.Provider)+"\x00"+ref.ShareID+"\x00"+ref.Passcode)
+	}
+	sort.Strings(identities)
+	return hashClusterSource(
+		"observation", fmt.Sprint(subscriptionID), source,
+		message.ID, message.Channel, message.URL, message.Text,
+		strings.Join(identities, "\x01"),
+	)
 }
 
 func upsertClusterItems(items []*model.SubscriptionItem) ([]*model.SubscriptionItem, int, int, error) {

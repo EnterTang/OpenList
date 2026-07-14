@@ -314,7 +314,10 @@ func normalizeSubscription(item *model.Subscription) {
 	if item.SourceType == "" {
 		item.SourceType = model.SubscriptionSourceTelegram
 	}
-	item.TargetRoot = utils.FixAndCleanPath(item.TargetRoot)
+	item.TargetRoot = strings.TrimSpace(item.TargetRoot)
+	if item.TargetRoot != "" {
+		item.TargetRoot = utils.FixAndCleanPath(item.TargetRoot)
+	}
 	item.MediaType = strings.ToLower(strings.TrimSpace(item.MediaType))
 	if item.MediaType != "movie" {
 		item.MediaType = "tv"

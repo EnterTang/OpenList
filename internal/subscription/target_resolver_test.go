@@ -287,6 +287,40 @@ func TestResolveSubscriptionDeliveryTargetUsesRuntimePathWithoutMutatingStoredLe
 	}
 }
 
+func TestResolveSubscriptionDeliveryTargetUsesConfigDefaultWithoutPersistingIt(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	oldList := listProviderTargetStorages
+	oldFree := storageFreeBytesForMountPath
+	defer func() {
+		listProviderTargetStorages = oldList
+		storageFreeBytesForMountPath = oldFree
+	}()
+	listProviderTargetStorages = func() ([]model.Storage, error) {
+		return []model.Storage{{ID: 8, MountPath: "/139-account", Driver: "139Yun", Status: "work", Addition: `{"membership_tier":"diamond"}`}}, nil
+	}
+	storageFreeBytesForMountPath = func(context.Context, string) (int64, bool) { return 100 << 30, true }
+	if _, err := SaveConfig(model.SubscriptionConfig{
+		DefaultTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "默认剧集"},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	sub := &model.Subscription{TransferEnabled: true}
+	runtimeSub, err := resolveSubscriptionDeliveryTarget(context.Background(), sub, false)
+	if err != nil {
+		t.Fatalf("resolve subscription target: %v", err)
+	}
+	if runtimeSub.TargetRoot != "/139-account/默认剧集" {
+		t.Fatalf("runtime target = %q, want config default path", runtimeSub.TargetRoot)
+	}
+	if runtimeSub.DeliveryTarget.Provider != "" || runtimeSub.DeliveryTarget.Folder != "" {
+		t.Fatalf("runtime default target was persisted onto subscription copy: %#v", runtimeSub.DeliveryTarget)
+	}
+	if sub.DeliveryTarget.Provider != "" || sub.DeliveryTarget.Folder != "" {
+		t.Fatalf("stored subscription target was mutated: %#v", sub.DeliveryTarget)
+	}
+}
+
 func TestTelegramPanSourceConfigWithStorageFallbackResolvesTempTransferTarget(t *testing.T) {
 	oldList := listProviderTargetStorages
 	oldFree := storageFreeBytesForMountPath

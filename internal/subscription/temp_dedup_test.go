@@ -138,3 +138,16 @@ func TestSaveShareToTempKeepsLargestPerEpisode(t *testing.T) {
 		t.Fatalf("entries count = %d, want %d", got, want)
 	}
 }
+
+func TestFilterLargestSharePairsPerSlotPreservesUnknownTVEpisodes(t *testing.T) {
+	sub := &model.Subscription{MediaType: "tv", TMDBName: "Example"}
+	pairs := []shareTreePair{
+		{entry: TreeEntry{ID: "special-a", Path: "/Example.Special.A.mkv", Name: "Example.Special.A.mkv", Size: 100}},
+		{entry: TreeEntry{ID: "special-b", Path: "/Example.Special.B.mkv", Name: "Example.Special.B.mkv", Size: 200}},
+	}
+
+	selected := filterLargestSharePairsPerSlot(sub, pairs)
+	if len(selected) != 2 {
+		t.Fatalf("selected = %#v, want both unknown-episode files", selected)
+	}
+}

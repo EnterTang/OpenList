@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -193,6 +195,75 @@ func TestClusterTargetNotificationStatus(t *testing.T) {
 	}
 	if got := clusterTargetNotificationStatus("https://target.example/api/v1"); got != model.ClusterNotificationStatusPending {
 		t.Fatalf("configured target status = %q, want pending", got)
+	}
+}
+
+func TestMergeClusterMaterializationSettingsUsesDriverArchiveRootAtMount(t *testing.T) {
+	root, notification := mergeClusterMaterializationSettings(
+		"/139_60t",
+		"/139_60t",
+		etfauto.Config{},
+		driver.ETFArchiveSettings{RelativeRoot: "ETF转存归档"},
+	)
+	if root != "/139_60t/ETF转存归档" {
+		t.Fatalf("root = %q, want driver archive root", root)
+	}
+	if notification.Enabled || notification.TargetBaseURL != "" {
+		t.Fatalf("notification = %#v, want disabled", notification)
+	}
+}
+
+func TestMergeClusterMaterializationSettingsPreservesExplicitDeeperRoot(t *testing.T) {
+	root, _ := mergeClusterMaterializationSettings(
+		"/139_60t/custom-archive",
+		"/139_60t",
+		etfauto.Config{},
+		driver.ETFArchiveSettings{RelativeRoot: "ETF转存归档"},
+	)
+	if root != "/139_60t/custom-archive" {
+		t.Fatalf("root = %q, want explicit cluster root", root)
+	}
+}
+
+func TestMergeClusterMaterializationSettingsFallsBackToDriverTarget(t *testing.T) {
+	_, notification := mergeClusterMaterializationSettings(
+		"/139_60t",
+		"/139_60t",
+		etfauto.Config{},
+		driver.ETFArchiveSettings{
+			AutoSubscriptionEnabled:   true,
+			TargetBaseURL:             "https://target.example/api/v1/",
+			TargetAPIToken:            " token ",
+			TargetSupportsIdempotency: true,
+			QuietWindowSeconds:        45,
+			SharePeriodUnit:           2,
+			ShareType:                 "etf",
+		},
+	)
+	if !notification.Enabled || notification.TargetBaseURL != "https://target.example/api/v1" || notification.TargetAPIToken != "token" {
+		t.Fatalf("notification = %#v, want driver target", notification)
+	}
+	if !notification.TargetSupportsIdempotency || notification.QuietWindow != 45*time.Second || notification.SharePeriodUnit != 2 || notification.ShareType != "etf" {
+		t.Fatalf("notification policy = %#v", notification)
+	}
+	if status := clusterTargetNotificationStatus(notification.TargetBaseURL); status != model.ClusterNotificationStatusPending {
+		t.Fatalf("notification status = %q, want pending", status)
+	}
+}
+
+func TestMergeClusterMaterializationSettingsKeepsExplicitClusterTarget(t *testing.T) {
+	explicit := etfauto.Config{
+		Enabled: true, TargetBaseURL: "https://cluster.example/api/v1", TargetAPIToken: "cluster-token",
+		QuietWindow: 10 * time.Second, SharePeriodUnit: 3, ShareType: "regular",
+	}
+	_, notification := mergeClusterMaterializationSettings(
+		"/139_60t",
+		"/139_60t",
+		explicit,
+		driver.ETFArchiveSettings{AutoSubscriptionEnabled: true, TargetBaseURL: "https://driver.example/api/v1"},
+	)
+	if notification.TargetBaseURL != explicit.TargetBaseURL || notification.TargetAPIToken != explicit.TargetAPIToken || notification.ShareType != explicit.ShareType {
+		t.Fatalf("notification = %#v, want explicit cluster target %#v", notification, explicit)
 	}
 }
 

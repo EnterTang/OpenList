@@ -161,6 +161,31 @@ func TestETFDownloadRestoreEnabledUsesConfig(t *testing.T) {
 	}
 }
 
+func TestETFArchiveSettingsExposeDriverArchiveAndTargetPolicy(t *testing.T) {
+	d := &Yun139{Addition: Addition{
+		ETFRootFolder:                                "ETF转存归档",
+		ETFRootPath:                                  "分类/剧集",
+		ETFAutoSubscriptionEnabled:                   true,
+		ETFAutoSubscriptionTargetBaseURL:             " https://target.example/api/v1/ ",
+		ETFAutoSubscriptionTargetAPIToken:            " token ",
+		ETFAutoSubscriptionTargetSupportsIdempotency: true,
+		ETFAutoSubscriptionQuietSeconds:              45,
+		ETFAutoSubscriptionSharePeriodUnit:           2,
+		ETFAutoSubscriptionShareType:                 "etf",
+	}}
+
+	settings := d.ETFArchiveSettings()
+	if settings.RelativeRoot != "ETF转存归档/分类/剧集" {
+		t.Fatalf("relative root = %q", settings.RelativeRoot)
+	}
+	if !settings.AutoSubscriptionEnabled || settings.TargetBaseURL != "https://target.example/api/v1" || settings.TargetAPIToken != "token" {
+		t.Fatalf("target settings = %#v", settings)
+	}
+	if !settings.TargetSupportsIdempotency || settings.QuietWindowSeconds != 45 || settings.SharePeriodUnit != 2 || settings.ShareType != "etf" {
+		t.Fatalf("target policy = %#v", settings)
+	}
+}
+
 func TestETFPreviewNameReturnsOriginalName(t *testing.T) {
 	setup139Resty(t)
 	data, err := etfmeta.Encode(&etfmeta.Info{Name: "Movie.mkv", Size: 2048, SHA256: strings.Repeat("A", 64)})

@@ -30,8 +30,8 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 	if err := ApplyConfigDefaults(sub, cfg); err != nil {
 		t.Fatalf("apply defaults: %v", err)
 	}
-	if sub.DeliveryTarget != cfg.DefaultTarget {
-		t.Fatalf("delivery target = %#v, want %#v", sub.DeliveryTarget, cfg.DefaultTarget)
+	if sub.DeliveryTarget.Provider != "" || sub.DeliveryTarget.Folder != "" {
+		t.Fatalf("global delivery target was persisted onto subscription: %#v", sub.DeliveryTarget)
 	}
 	if sub.Category != "" {
 		t.Fatalf("removed default category was applied: %#v", sub)
@@ -206,8 +206,8 @@ func TestApplyConfigDefaultsMergesTelegramProviderTarget(t *testing.T) {
 	if err := ApplyConfigDefaults(sub, cfg); err != nil {
 		t.Fatalf("apply defaults: %v", err)
 	}
-	if sub.DeliveryTarget != cfg.DefaultTarget {
-		t.Fatalf("delivery target = %#v, want %#v", sub.DeliveryTarget, cfg.DefaultTarget)
+	if sub.DeliveryTarget.Provider != "" || sub.DeliveryTarget.Folder != "" {
+		t.Fatalf("global delivery target was persisted onto subscription: %#v", sub.DeliveryTarget)
 	}
 	var source model.SubscriptionTelegramSourceConfig
 	if err := json.Unmarshal([]byte(sub.SourceConfig), &source); err != nil {
@@ -239,18 +239,28 @@ func TestApplyConfigDefaultsRejectsUnknownLegacySubscriptionTarget(t *testing.T)
 	}
 }
 
-func TestApplyConfigDefaultsRequiresValidTargetsForTransfer(t *testing.T) {
+func TestApplyConfigDefaultsAllowsMissingTargetsButRejectsInvalidExplicitTargets(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		sub  model.Subscription
 	}{
-		{name: "missing delivery", sub: model.Subscription{TransferEnabled: true}},
+		{name: "missing targets", sub: model.Subscription{TransferEnabled: true}},
 		{name: "invalid temp provider", sub: model.Subscription{TempTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "temp"}, DeliveryTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "delivery"}, TransferEnabled: true}},
 		{name: "invalid delivery provider", sub: model.Subscription{DeliveryTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "delivery"}, TransferEnabled: true}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if err := ApplyConfigDefaults(&test.sub, model.SubscriptionConfig{}); err == nil {
-				t.Fatal("expected target validation error")
+			err := ApplyConfigDefaults(&test.sub, model.SubscriptionConfig{})
+			if test.name == "missing targets" {
+				if err != nil {
+					t.Fatalf("empty targets should be accepted: %v", err)
+				}
+				if test.sub.TempTarget.Provider != "" || test.sub.DeliveryTarget.Provider != "" {
+					t.Fatalf("empty targets were unexpectedly defaulted: %#v", test.sub)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected explicit target validation error")
 			}
 		})
 	}

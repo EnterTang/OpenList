@@ -21,6 +21,14 @@ func TestWorkerOfferHandlerResolvesBoundPan115And139BeforeTransfer(t *testing.T)
 	original := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())
 	t.Cleanup(func() { conf.Conf = original })
+	setWorkerSubscriptionConfig(t, model.SubscriptionConfig{
+		DefaultTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "worker-delivery"},
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Pan115: model.SubscriptionTelegramPanConfig{
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan115", Folder: "worker-staging"},
+			},
+		},
+	})
 
 	database, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
 	require.NoError(t, err)
@@ -49,12 +57,12 @@ func TestWorkerOfferHandlerResolvesBoundPan115And139BeforeTransfer(t *testing.T)
 		Share:        protocol.ShareTaskContext{Provider: "pan115", URL: "https://115.com/s/test"},
 		Media:        protocol.MediaTaskContext{MediaType: "tv", LogicalTargetPath: "/剧集/episode.mkv"},
 		StagingTarget: protocol.ProviderTargetRequirement{
-			Provider: "pan115", Folder: "转存至移动", StorageID: stagingAccount.StorageID,
+			Provider: "pan115", StorageID: stagingAccount.StorageID,
 			NodeMountID: stagingAccount.NodeMountID, AccountFingerprint: stagingAccount.AccountFingerprint,
 			NeedShareSave: true, RequiredBytes: 12 << 30,
 		},
 		DeliveryTarget: protocol.ProviderTargetRequirement{
-			Provider: "yidong139", Folder: "剧集/港台剧", StorageID: deliveryAccount.StorageID,
+			Provider: "yidong139", StorageID: deliveryAccount.StorageID,
 			NodeMountID: deliveryAccount.NodeMountID, AccountFingerprint: deliveryAccount.AccountFingerprint,
 			NeedUpload: true, RequiredBytes: 12 << 30,
 		},
@@ -79,8 +87,9 @@ func TestWorkerOfferHandlerResolvesBoundPan115And139BeforeTransfer(t *testing.T)
 
 	select {
 	case targets := <-resolved:
-		require.Equal(t, "/worker-115-vip/转存至移动/.openlist-cluster/job-1/media-1", targets.StagingRoot)
-		require.Equal(t, "/worker-139-diamond/剧集/港台剧", targets.DeliveryRoot)
+		require.Equal(t, "/worker-115-vip/worker-staging", targets.StagingRoot)
+		require.NotContains(t, targets.StagingRoot, ".openlist-cluster")
+		require.Equal(t, "/worker-139-diamond/worker-delivery", targets.DeliveryRoot)
 		require.Equal(t, "/worker-139-diamond", targets.DeliveryMount)
 		require.NotContains(t, targets.StagingRoot, "/115/转存至移动")
 		require.NotContains(t, targets.DeliveryRoot, "/139_60t/")

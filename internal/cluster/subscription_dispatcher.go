@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/cluster/coordinator"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -40,6 +42,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context,
 				SourceMessageID: task.SourceMessageID, SourceMessageChannel: task.SourceMessageChannel,
 				SourceMessageURL: task.SourceMessageURL, SourceMessageText: task.SourceMessageText,
 				ShareRefFingerprint: task.ShareRefFingerprint,
+				ObservationKey:      task.ObservationKey, ObservationExpected: task.ObservationExpected,
 			},
 			Share: protocol.ShareTaskContext{Provider: task.ShareProvider, URL: task.ShareURL, Passcode: task.SharePasscode},
 		},
@@ -51,30 +54,77 @@ func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context,
 }
 
 func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterShareInspectManifest, manifest protocol.ShareInspectManifest) error {
-	var job model.ClusterJob
-	if err := db.GetDb().WithContext(ctx).First(&job, "id = ?", record.JobID).Error; err != nil {
+	expected := record.ObservationExpected
+	if expected <= 0 {
+		expected = 1
+	}
+	observationKey := strings.TrimSpace(record.ObservationKey)
+	if observationKey == "" {
+		observationKey = record.JobID
+	}
+	var records []model.ClusterShareInspectManifest
+	query := db.GetDb().WithContext(ctx).Where("subscription_id = ? AND observation_key = ?", record.SubscriptionID, observationKey).
+		Order("created_at ASC, id ASC")
+	if err := query.Find(&records).Error; err != nil {
 		return err
 	}
-	var taskContext protocol.TaskContext
-	if err := json.Unmarshal([]byte(job.TaskContextJSON), &taskContext); err != nil {
+	if len(records) < expected {
+		return fmt.Errorf("%w: received %d of %d manifests", coordinator.ErrShareInspectObservationIncomplete, len(records), expected)
+	}
+	if len(records) > expected {
+		return fmt.Errorf("cluster share inspect observation %s has %d manifests, expected %d", observationKey, len(records), expected)
+	}
+	inputs := make([]subscription.ClusterInspectManifestInput, 0, len(records))
+	for _, item := range records {
+		var decoded protocol.ShareInspectManifest
+		if item.ID == record.ID {
+			decoded = manifest
+		} else if err := json.Unmarshal([]byte(item.PayloadJSON), &decoded); err != nil {
+			return err
+		}
+		var job model.ClusterJob
+		if err := db.GetDb().WithContext(ctx).First(&job, "id = ?", item.JobID).Error; err != nil {
+			return err
+		}
+		var taskContext protocol.TaskContext
+		if err := json.Unmarshal([]byte(job.TaskContextJSON), &taskContext); err != nil {
+			return err
+		}
+		task := subscription.ClusterInspectTask{
+			SubscriptionID: taskContext.Subscription.SubscriptionID, SubscriptionName: taskContext.Subscription.SubscriptionName,
+			SourceMessageID: taskContext.Subscription.SourceMessageID, SourceMessageChannel: taskContext.Subscription.SourceMessageChannel,
+			SourceMessageURL: taskContext.Subscription.SourceMessageURL, SourceMessageText: taskContext.Subscription.SourceMessageText,
+			ShareProvider: taskContext.Share.Provider, ShareURL: taskContext.Share.URL, SharePasscode: taskContext.Share.Passcode,
+			ShareRefFingerprint: taskContext.Subscription.ShareRefFingerprint,
+			ObservationKey:      taskContext.Subscription.ObservationKey, ObservationExpected: taskContext.Subscription.ObservationExpected,
+		}
+		objects := make([]subscription.ClusterInspectObject, 0, len(decoded.Objects))
+		for _, object := range decoded.Objects {
+			objects = append(objects, subscription.ClusterInspectObject{
+				FileID: object.SourceFileID, RelativePath: object.SourceRelativePath,
+				Size: object.Size, Hash: object.Hash, ModifiedAt: object.ModifiedAt,
+			})
+		}
+		inputs = append(inputs, subscription.ClusterInspectManifestInput{Task: task, Objects: objects})
+	}
+	if _, err := subscription.ApplyClusterInspectObservation(ctx, inputs); err != nil {
 		return err
 	}
-	task := subscription.ClusterInspectTask{
-		SubscriptionID: taskContext.Subscription.SubscriptionID, SubscriptionName: taskContext.Subscription.SubscriptionName,
-		SourceMessageID: taskContext.Subscription.SourceMessageID, SourceMessageChannel: taskContext.Subscription.SourceMessageChannel,
-		SourceMessageURL: taskContext.Subscription.SourceMessageURL, SourceMessageText: taskContext.Subscription.SourceMessageText,
-		ShareProvider: taskContext.Share.Provider, ShareURL: taskContext.Share.URL, SharePasscode: taskContext.Share.Passcode,
-		ShareRefFingerprint: taskContext.Subscription.ShareRefFingerprint,
+	now := time.Now().UTC()
+	ids := make([]string, 0, len(records)-1)
+	for _, item := range records {
+		if item.ID != record.ID {
+			ids = append(ids, item.ID)
+		}
 	}
-	objects := make([]subscription.ClusterInspectObject, 0, len(manifest.Objects))
-	for _, object := range manifest.Objects {
-		objects = append(objects, subscription.ClusterInspectObject{
-			FileID: object.SourceFileID, RelativePath: object.SourceRelativePath,
-			Size: object.Size, Hash: object.Hash, ModifiedAt: object.ModifiedAt,
-		})
+	if len(ids) > 0 {
+		if err := db.GetDb().WithContext(ctx).Model(&model.ClusterShareInspectManifest{}).
+			Where("id IN ? AND status = ?", ids, model.ClusterShareInspectStatusPending).
+			Updates(map[string]any{"status": model.ClusterShareInspectStatusConsumed, "consumed_at": now, "last_error": ""}).Error; err != nil {
+			return err
+		}
 	}
-	_, err := subscription.ApplyClusterInspectManifest(ctx, task, objects)
-	return err
+	return nil
 }
 
 func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, tasks []subscription.ClusterMediaTask) ([]subscription.ClusterDispatchResult, error) {
@@ -139,20 +189,13 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 }
 
 func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProfile string) protocol.TaskContext {
-	tempTarget := subscription.NormalizeSubscriptionStorageTarget(task.TempTarget)
 	staging := protocol.ProviderTargetRequirement{
-		Provider:      tempTarget.Provider,
-		Folder:        tempTarget.Folder,
+		Provider:      strings.TrimSpace(task.ShareProvider),
 		NeedShareSave: true,
 		RequiredBytes: max64(task.SourceSize, 0),
 	}
-	if staging.Provider == "" {
-		staging.Provider = strings.TrimSpace(task.ShareProvider)
-	}
-	deliveryTarget := subscription.NormalizeSubscriptionStorageTarget(task.DeliveryTarget)
 	delivery := protocol.ProviderTargetRequirement{
-		Provider:      deliveryTarget.Provider,
-		Folder:        deliveryTarget.Folder,
+		Provider:      "yidong139",
 		NeedUpload:    true,
 		RequiredBytes: max64(task.SourceSize, 0),
 	}

@@ -50,8 +50,6 @@ type ClusterMediaTask struct {
 	TMDBYear              int
 	Season                int
 	Episode               int
-	TempTarget            model.SubscriptionStorageTarget
-	DeliveryTarget        model.SubscriptionStorageTarget
 	LogicalMediaRoot      string
 	LogicalTargetPath     string
 	TargetProfile         string
@@ -77,6 +75,8 @@ type ClusterInspectTask struct {
 	ShareURL             string
 	SharePasscode        string
 	ShareRefFingerprint  string
+	ObservationKey       string
+	ObservationExpected  int
 }
 
 type ClusterInspectObject struct {
@@ -85,6 +85,11 @@ type ClusterInspectObject struct {
 	Size         int64
 	Hash         string
 	ModifiedAt   time.Time
+}
+
+type ClusterInspectManifestInput struct {
+	Task    ClusterInspectTask
+	Objects []ClusterInspectObject
 }
 
 type ClusterDispatcher interface {
@@ -112,16 +117,30 @@ func currentClusterDispatcher() ClusterDispatcher {
 }
 
 func dispatchClusterInspect(ctx context.Context, sub *model.Subscription, ref ShareRef, message clusterSourceMessage) (string, error) {
+	return dispatchClusterInspectObservation(ctx, sub, ref, message, "", 1)
+}
+
+func dispatchClusterInspectObservation(ctx context.Context, sub *model.Subscription, ref ShareRef, message clusterSourceMessage, observationKey string, observationExpected int) (string, error) {
 	dispatcher := currentClusterDispatcher()
 	if dispatcher == nil {
 		return "", errors.New("cluster subscription dispatcher is not registered")
 	}
-	task := clusterInspectTask(sub, ref, message)
+	task := clusterInspectObservationTask(sub, ref, message, observationKey, observationExpected)
 	return dispatcher.DispatchSubscriptionInspect(ctx, task)
 }
 
 func clusterInspectTask(sub *model.Subscription, ref ShareRef, message clusterSourceMessage) ClusterInspectTask {
+	return clusterInspectObservationTask(sub, ref, message, "", 1)
+}
+
+func clusterInspectObservationTask(sub *model.Subscription, ref ShareRef, message clusterSourceMessage, observationKey string, observationExpected int) ClusterInspectTask {
 	fingerprint := shortHash(string(ref.Provider) + "\x00" + ref.ShareID + "\x00" + ref.Passcode)
+	if strings.TrimSpace(observationKey) == "" {
+		observationKey = hashClusterSource("observation", fmt.Sprint(sub.ID), message.ID, fingerprint)
+	}
+	if observationExpected <= 0 {
+		observationExpected = 1
+	}
 	return ClusterInspectTask{
 		IdempotencyKey: hashClusterSource("inspect", fmt.Sprint(sub.ID), string(ref.Provider), ref.ShareID, message.ID),
 		SubscriptionID: sub.ID, SubscriptionName: sub.Name,
@@ -129,40 +148,158 @@ func clusterInspectTask(sub *model.Subscription, ref ShareRef, message clusterSo
 		SourceMessageURL: message.URL, SourceMessageText: message.Text,
 		ShareProvider: string(ref.Provider), ShareURL: ref.RawURL, SharePasscode: ref.Passcode,
 		ShareRefFingerprint: fingerprint,
+		ObservationKey:      observationKey, ObservationExpected: observationExpected,
 	}
 }
 
 func ApplyClusterInspectManifest(ctx context.Context, task ClusterInspectTask, objects []ClusterInspectObject) (int, error) {
-	sub, err := db.GetSubscriptionByID(task.SubscriptionID)
+	return ApplyClusterInspectObservation(ctx, []ClusterInspectManifestInput{{Task: task, Objects: objects}})
+}
+
+type clusterInspectCandidate struct {
+	item    *model.SubscriptionItem
+	ref     ShareRef
+	message clusterSourceMessage
+}
+
+func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInspectManifestInput) (int, error) {
+	if len(manifests) == 0 {
+		return 0, nil
+	}
+	sub, err := db.GetSubscriptionByID(manifests[0].Task.SubscriptionID)
 	if err != nil {
 		return 0, err
 	}
-	ref, err := ParseShareURL(task.ShareURL)
-	if err != nil {
-		return 0, err
-	}
-	if task.SharePasscode != "" {
-		ref.Passcode = task.SharePasscode
-	}
-	message := clusterSourceMessage{ID: task.SourceMessageID, Channel: task.SourceMessageChannel, URL: task.SourceMessageURL, Text: task.SourceMessageText}
 	now := time.Now()
-	items := make([]*model.SubscriptionItem, 0, len(objects))
-	for _, object := range objects {
-		entry := TreeEntry{ID: object.FileID, Path: "/" + strings.TrimPrefix(object.RelativePath, "/"), Name: path.Base(object.RelativePath), Size: object.Size, Modified: object.ModifiedAt}
-		if !isMediaEntry(entry) || !boundShareEntryMatches(sub, entry) {
+	candidates := make([]clusterInspectCandidate, 0)
+	for _, input := range manifests {
+		task := input.Task
+		if task.SubscriptionID != sub.ID {
+			return 0, errors.New("cluster inspect observation mixes subscriptions")
+		}
+		if strings.EqualFold(strings.TrimSpace(sub.SourceType), model.SubscriptionSourceTelegram) && !subscriptionTitleMatches(sub, task.SourceMessageText) {
 			continue
 		}
-		item := clusterItemFromShareEntry(sub, ref, entry, message, now)
-		if object.Hash != "" {
-			item.FileHash = object.Hash
+		ref, err := ParseShareURL(task.ShareURL)
+		if err != nil {
+			return 0, err
 		}
-		items = append(items, item)
+		if task.SharePasscode != "" {
+			ref.Passcode = task.SharePasscode
+		}
+		message := clusterSourceMessage{ID: task.SourceMessageID, Channel: task.SourceMessageChannel, URL: task.SourceMessageURL, Text: task.SourceMessageText}
+		for _, object := range input.Objects {
+			entry := TreeEntry{ID: object.FileID, Path: "/" + strings.TrimPrefix(object.RelativePath, "/"), Name: path.Base(object.RelativePath), Size: object.Size, Modified: object.ModifiedAt}
+			if !isMediaEntry(entry) || !boundShareEntryMatches(sub, entry) {
+				continue
+			}
+			item := clusterItemFromShareEntry(sub, ref, entry, message, now)
+			if object.Hash != "" {
+				item.FileHash = object.Hash
+			}
+			candidates = append(candidates, clusterInspectCandidate{item: item, ref: ref, message: message})
+		}
+	}
+	candidates = selectClusterInspectCandidates(sub, candidates, clusterInspectTransferPriority(sub))
+	items := make([]*model.SubscriptionItem, 0, len(candidates))
+	candidateBySourceKey := make(map[string]clusterInspectCandidate, len(candidates))
+	for _, candidate := range candidates {
+		items = append(items, candidate.item)
+		candidateBySourceKey[candidate.item.SourceKey] = candidate
 	}
 	stored, _, _, err := upsertClusterItems(items)
 	if err != nil {
 		return 0, err
 	}
-	return dispatchClusterItems(ctx, sub, stored, ref, message)
+	type dispatchGroup struct {
+		ref     ShareRef
+		message clusterSourceMessage
+		items   []*model.SubscriptionItem
+	}
+	groups := make(map[string]*dispatchGroup)
+	groupOrder := make([]string, 0)
+	for _, item := range stored {
+		candidate, ok := candidateBySourceKey[item.SourceKey]
+		if !ok {
+			continue
+		}
+		key := strings.Join([]string{string(candidate.ref.Provider), candidate.ref.RawURL, candidate.ref.Passcode, candidate.message.ID}, "\x00")
+		group := groups[key]
+		if group == nil {
+			group = &dispatchGroup{ref: candidate.ref, message: candidate.message}
+			groups[key] = group
+			groupOrder = append(groupOrder, key)
+		}
+		group.items = append(group.items, item)
+	}
+	dispatched := 0
+	var firstErr error
+	for _, key := range groupOrder {
+		group := groups[key]
+		count, err := dispatchClusterItems(ctx, sub, group.items, group.ref, group.message)
+		dispatched += count
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return dispatched, firstErr
+}
+
+func selectClusterInspectCandidates(sub *model.Subscription, candidates []clusterInspectCandidate, priority []string) []clusterInspectCandidate {
+	if sub == nil || len(candidates) <= 1 || strings.EqualFold(strings.TrimSpace(sub.MediaType), "movie") {
+		return candidates
+	}
+	priority = normalizeTransferPriority(priority)
+	priorityIndex := make(map[string]int, len(priority))
+	for index, provider := range priority {
+		priorityIndex[provider] = index
+	}
+	selected := make([]clusterInspectCandidate, 0, len(candidates))
+	bestBySlot := make(map[string]clusterInspectCandidate, len(candidates))
+	slotOrder := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.item == nil || candidate.item.Episode <= 0 {
+			selected = append(selected, candidate)
+			continue
+		}
+		slot := fmt.Sprintf("%d:%d", candidate.item.Season, candidate.item.Episode)
+		existing, ok := bestBySlot[slot]
+		if !ok {
+			slotOrder = append(slotOrder, slot)
+		}
+		if !ok || betterClusterInspectCandidate(candidate, existing, priorityIndex) {
+			bestBySlot[slot] = candidate
+		}
+	}
+	for _, slot := range slotOrder {
+		selected = append(selected, bestBySlot[slot])
+	}
+	return selected
+}
+
+func betterClusterInspectCandidate(candidate, existing clusterInspectCandidate, priorityIndex map[string]int) bool {
+	if candidate.item.FileSize != existing.item.FileSize {
+		return candidate.item.FileSize > existing.item.FileSize
+	}
+	candidateProvider := normalizeSubscriptionProvider(candidate.item.SourceProvider)
+	existingProvider := normalizeSubscriptionProvider(existing.item.SourceProvider)
+	candidateRank := providerPriorityRank(candidateProvider, priorityIndex)
+	existingRank := providerPriorityRank(existingProvider, priorityIndex)
+	if candidateRank != existingRank {
+		return candidateRank < existingRank
+	}
+	candidateKey := strings.Join([]string{candidateProvider, candidate.item.FilePath, candidate.item.FileID, candidate.item.SourceKey}, "\x00")
+	existingKey := strings.Join([]string{existingProvider, existing.item.FilePath, existing.item.FileID, existing.item.SourceKey}, "\x00")
+	return candidateKey < existingKey
+}
+
+func clusterInspectTransferPriority(sub *model.Subscription) []string {
+	if sub != nil && strings.EqualFold(strings.TrimSpace(sub.SourceType), model.SubscriptionSourceTelegram) {
+		if cfg, err := parseTelegramConfig(sub.SourceConfig); err == nil {
+			return cfg.TransferPriority
+		}
+	}
+	return nil
 }
 
 type clusterSourceMessage struct {
@@ -244,8 +381,6 @@ func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref
 		SourceHash: item.FileHash, MediaItemID: mediaItemID, MediaType: sub.MediaType,
 		TMDBID: sub.TMDBID, TMDBName: sub.TMDBName, TMDBYear: sub.TMDBYear,
 		Season: item.Season, Episode: item.Episode,
-		TempTarget:        NormalizeSubscriptionStorageTarget(sub.TempTarget),
-		DeliveryTarget:    NormalizeSubscriptionStorageTarget(sub.DeliveryTarget),
 		LogicalMediaRoot:  sub.TargetRoot,
 		LogicalTargetPath: item.TargetPath,
 		WorkflowVersion:   ClusterWorkflowVersion, SealedManifestVersion: ClusterSealedManifestVersion,
@@ -303,13 +438,9 @@ func inspectClusterShare(ctx context.Context, sub *model.Subscription, cfg model
 }
 
 func sourceMessageFromTelegramRow(row telegramCommandRow) clusterSourceMessage {
-	text := strings.TrimSpace(row.Text)
-	if text == "" {
-		text = strings.TrimSpace(row.RawText)
-	}
-	if text == "" {
-		text = strings.TrimSpace(row.Caption)
-	}
+	// Preserve every title-bearing Telegram field so the downstream manifest
+	// guard evaluates the same message context as the initial dispatch gate.
+	text := strings.TrimSpace(rowText(row))
 	messageID := ""
 	if id := rowMessageID(row); id > 0 {
 		messageID = strconv.FormatInt(id, 10)

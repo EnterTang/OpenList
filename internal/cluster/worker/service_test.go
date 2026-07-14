@@ -9,6 +9,8 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/resultqueue"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/stretchr/testify/require"
 )
@@ -22,6 +24,28 @@ type fakeResultQueue struct {
 	ctxErr     error
 	claimed    bool
 	claimErr   error
+}
+
+type cleanupTestDriver struct {
+	storage model.Storage
+	cleared model.Obj
+}
+
+func (d *cleanupTestDriver) Config() driver.Config            { return driver.Config{} }
+func (d *cleanupTestDriver) GetStorage() *model.Storage       { return &d.storage }
+func (d *cleanupTestDriver) SetStorage(storage model.Storage) { d.storage = storage }
+func (d *cleanupTestDriver) GetAddition() driver.Additional   { return &struct{}{} }
+func (d *cleanupTestDriver) Init(context.Context) error       { return nil }
+func (d *cleanupTestDriver) Drop(context.Context) error       { return nil }
+func (d *cleanupTestDriver) List(context.Context, model.Obj, model.ListArgs) ([]model.Obj, error) {
+	return nil, nil
+}
+func (d *cleanupTestDriver) Link(context.Context, model.Obj, model.LinkArgs) (*model.Link, error) {
+	return nil, nil
+}
+func (d *cleanupTestDriver) ClearRecycleEntry(_ context.Context, obj model.Obj) error {
+	d.cleared = obj
+	return nil
 }
 
 type channelSender chan protocol.Envelope
@@ -144,11 +168,12 @@ func TestNewCleanupRequestUsesExactIsolatedPath(t *testing.T) {
 func TestNewCleanupRequestIncludesStagedSourceCleanupByDefault(t *testing.T) {
 	manifest := validUploadManifest(t)
 	source := resultqueue.CleanupTarget{
-		OpenListPath:     "/123/转存至移动/.openlist-cluster/job-1/media-1/Episode.mkv",
+		OpenListPath:     "/123/转存至移动/Episode.mkv",
 		StorageMountPath: "/123",
+		OwnedRootPath:    "/123/转存至移动",
 		RemoteFileID:     "staged-source",
 		Name:             "Episode.mkv",
-		EmptyRecycleBin:  true,
+		ExactFile:        true,
 	}
 
 	request, err := NewCleanupRequest(manifest, "/mobile", source)
@@ -156,6 +181,90 @@ func TestNewCleanupRequestIncludesStagedSourceCleanupByDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, request.AdditionalTargets, 1)
 	require.Equal(t, source, request.AdditionalTargets[0])
+}
+
+func TestNewSourceCleanupTargetRequiresExactRemoteID(t *testing.T) {
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/123"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
+		return d, "/转存至移动/Episode.mkv", nil
+	}
+	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
+		return &model.Object{Name: "Episode.mkv"}, nil
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+	})
+
+	manifest := validUploadManifest(t)
+	_, err := NewSourceCleanupTarget(context.Background(), manifest, "/123/转存至移动", "/123/转存至移动/Episode.mkv")
+	require.ErrorContains(t, err, "exact remote file id")
+
+	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
+		return &model.Object{ID: "source-file", Name: "Episode.mkv"}, nil
+	}
+	target, err := NewSourceCleanupTarget(context.Background(), manifest, "/123/转存至移动", "/123/转存至移动/Episode.mkv")
+	require.NoError(t, err)
+	require.Equal(t, "/123/转存至移动/Episode.mkv", target.OpenListPath)
+	require.Equal(t, "/123/转存至移动", target.OwnedRootPath)
+	require.Equal(t, "source-file", target.RemoteFileID)
+	require.True(t, target.ExactFile)
+}
+
+func TestExecuteCleanupTargetRefusesRemoteIDMismatch(t *testing.T) {
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/123"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	originalRemove := removeCleanupObjectExact
+	removed := false
+	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
+		return d, "/转存至移动/Episode.mkv", nil
+	}
+	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
+		return &model.Object{ID: "replacement-file", Name: "Episode.mkv"}, nil
+	}
+	removeCleanupObjectExact = func(context.Context, driver.Driver, string, model.Obj) error {
+		removed = true
+		return nil
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+		removeCleanupObjectExact = originalRemove
+	})
+
+	err := executeCleanupTarget(context.Background(), resultqueue.CleanupTarget{
+		OpenListPath: "/123/转存至移动/Episode.mkv", StorageMountPath: "/123",
+		OwnedRootPath: "/123/转存至移动", RemoteFileID: "source-file", Name: "Episode.mkv", ExactFile: true,
+	})
+	require.ErrorContains(t, err, "remote id changed")
+	require.False(t, removed)
+}
+
+func TestExecuteCleanupTargetClearsRecycleEntryAfterFileAlreadyRemoved(t *testing.T) {
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/mobile"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
+		return d, "/.openlist-cluster/job-1/media-1/Episode.mkv", nil
+	}
+	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
+		return nil, errs.ObjectNotFound
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+	})
+
+	err := executeCleanupTarget(context.Background(), resultqueue.CleanupTarget{
+		OpenListPath: "/mobile/.openlist-cluster/job-1/media-1/Episode.mkv", StorageMountPath: "/mobile",
+		RemoteFileID: "remote-file", Name: "Episode.mkv", EmptyRecycleBin: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, d.cleared)
+	require.Equal(t, "remote-file", d.cleared.GetID())
 }
 
 func TestCancelActiveCancelsConnectionBoundTasks(t *testing.T) {
@@ -241,12 +350,12 @@ func TestStagePermitIsRequestedJustInTime(t *testing.T) {
 }
 
 func TestResolveStagingTempRootDoesNotSubstituteConfiguredProviderRoot(t *testing.T) {
+	setWorkerSubscriptionConfig(t, model.SubscriptionConfig{})
 	oldList := listInventoryStorages
 	listInventoryStorages = func() ([]model.Storage, error) { return nil, nil }
 	t.Cleanup(func() { listInventoryStorages = oldList })
 	service := New(&fakeResultQueue{}, nil)
 	service.desiredConfig.ProviderTempRoots = map[string]string{"aliyundrive": "/ali/cluster-temp"}
-	namespace := ".openlist-cluster/job-1/media-1"
 	task := protocol.TaskContext{
 		Share: protocol.ShareTaskContext{Provider: "aliyundrive"},
 		StagingTarget: protocol.ProviderTargetRequirement{
@@ -258,7 +367,7 @@ func TestResolveStagingTempRootDoesNotSubstituteConfiguredProviderRoot(t *testin
 		SourceObjects: []protocol.SourceObject{{Provider: "aliyundrive", SourceFileID: "file-1", Size: 8 << 30}},
 	}
 
-	got, err := service.resolveStagingTempRoot(context.Background(), task, namespace)
+	got, err := service.resolveStagingTempRoot(context.Background(), task)
 	require.ErrorContains(t, err, "no compatible provider account")
 	require.Empty(t, got)
 }

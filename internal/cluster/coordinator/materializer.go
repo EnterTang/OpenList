@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
 	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
@@ -51,7 +52,10 @@ func (s *Service) materializeManifest(ctx context.Context, manifest *model.Clust
 	if manifest == nil {
 		return errors.New("cluster upload manifest is nil")
 	}
-	root := strings.TrimSpace(conf.Conf.Cluster.ETFRootPath)
+	root, notification, err := resolveClusterMaterializationSettings(conf.Conf.Cluster.ETFRootPath)
+	if err != nil {
+		return err
+	}
 	relativeRoot, err := safeRelativeMediaRoot(manifest.LogicalTargetPath)
 	if err != nil {
 		return err
@@ -127,20 +131,58 @@ func (s *Service) materializeManifest(ctx context.Context, manifest *model.Clust
 		MediaRootFileID: rootObj.GetID(),
 		MediaRootPath:   dstDir,
 		OccurredAt:      time.Now().UTC(),
-	}, etfauto.Config{
-		Enabled:                   clusterTargetNotificationStatus(conf.Conf.Cluster.TargetBaseURL) == model.ClusterNotificationStatusPending,
-		TargetBaseURL:             conf.Conf.Cluster.TargetBaseURL,
-		TargetAPIToken:            conf.Conf.Cluster.TargetAPIToken,
-		TargetSupportsIdempotency: conf.Conf.Cluster.TargetSupportsIdempotency,
-		QuietWindow:               time.Duration(conf.Conf.Cluster.QuietWindowSecond) * time.Second,
-		SharePeriodUnit:           conf.Conf.Cluster.SharePeriodUnit,
-		ShareType:                 conf.Conf.Cluster.ShareType,
-	})
+	}, notification)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	return s.completeManifestMaterialization(ctx, manifest.ID, manifest.JobID, clusterTargetNotificationStatus(conf.Conf.Cluster.TargetBaseURL), now)
+	return s.completeManifestMaterialization(ctx, manifest.ID, manifest.JobID, clusterTargetNotificationStatus(notification.TargetBaseURL), now)
+}
+
+func resolveClusterMaterializationSettings(configuredRoot string) (string, etfauto.Config, error) {
+	root := path.Clean(strings.TrimSpace(configuredRoot))
+	if root == "." || root == "/" {
+		return "", etfauto.Config{}, errors.New("cluster ETF root path must select a storage directory")
+	}
+	storage, _, err := op.GetStorageAndActualPath(root)
+	if err != nil {
+		return "", etfauto.Config{}, fmt.Errorf("resolve cluster ETF root storage: %w", err)
+	}
+	settings := driver.ETFArchiveSettings{}
+	if provider, ok := storage.(driver.ETFArchiveSettingsProvider); ok {
+		settings = provider.ETFArchiveSettings()
+	}
+	notification := etfauto.Config{
+		Enabled:                   strings.TrimSpace(conf.Conf.Cluster.TargetBaseURL) != "",
+		TargetBaseURL:             strings.TrimRight(strings.TrimSpace(conf.Conf.Cluster.TargetBaseURL), "/"),
+		TargetAPIToken:            strings.TrimSpace(conf.Conf.Cluster.TargetAPIToken),
+		TargetSupportsIdempotency: conf.Conf.Cluster.TargetSupportsIdempotency,
+		QuietWindow:               time.Duration(conf.Conf.Cluster.QuietWindowSecond) * time.Second,
+		SharePeriodUnit:           conf.Conf.Cluster.SharePeriodUnit,
+		ShareType:                 conf.Conf.Cluster.ShareType,
+	}
+	root, notification = mergeClusterMaterializationSettings(root, storage.GetStorage().MountPath, notification, settings)
+	return root, notification, nil
+}
+
+func mergeClusterMaterializationSettings(root, mountPath string, notification etfauto.Config, settings driver.ETFArchiveSettings) (string, etfauto.Config) {
+	root = path.Clean(strings.TrimSpace(root))
+	mountPath = path.Clean(strings.TrimSpace(mountPath))
+	if root == mountPath && strings.TrimSpace(settings.RelativeRoot) != "" {
+		root = path.Join(root, settings.RelativeRoot)
+	}
+	if notification.TargetBaseURL == "" && settings.AutoSubscriptionEnabled && strings.TrimSpace(settings.TargetBaseURL) != "" {
+		notification = etfauto.Config{
+			Enabled:                   true,
+			TargetBaseURL:             strings.TrimRight(strings.TrimSpace(settings.TargetBaseURL), "/"),
+			TargetAPIToken:            strings.TrimSpace(settings.TargetAPIToken),
+			TargetSupportsIdempotency: settings.TargetSupportsIdempotency,
+			QuietWindow:               time.Duration(settings.QuietWindowSeconds) * time.Second,
+			SharePeriodUnit:           settings.SharePeriodUnit,
+			ShareType:                 settings.ShareType,
+		}
+	}
+	return root, notification
 }
 
 func (s *Service) prepareArchiveRecord(ctx context.Context, candidate *model.ETFArchiveRecord) (*model.ETFArchiveRecord, bool, error) {

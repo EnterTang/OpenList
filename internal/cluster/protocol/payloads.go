@@ -285,6 +285,8 @@ type SubscriptionTaskContext struct {
 	SourceMessageURL     string `json:"source_message_url,omitempty"`
 	SourceMessageText    string `json:"source_message_text,omitempty"`
 	ShareRefFingerprint  string `json:"share_ref_fingerprint"`
+	ObservationKey       string `json:"observation_key,omitempty"`
+	ObservationExpected  int    `json:"observation_expected,omitempty"`
 }
 
 type MediaTaskContext struct {

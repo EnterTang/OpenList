@@ -43,6 +43,21 @@ type etfArchivePlan struct {
 	shareRiskCanonicalTitle string
 }
 
+func (d *Yun139) ETFArchiveSettings() driver.ETFArchiveSettings {
+	parts := append([]string(nil), d.configuredETFRootParts()...)
+	parts = append(parts, splitETFPath(d.Addition.ETFRootPath)...)
+	return driver.ETFArchiveSettings{
+		RelativeRoot:              strings.Join(parts, "/"),
+		AutoSubscriptionEnabled:   d.Addition.ETFAutoSubscriptionEnabled,
+		TargetBaseURL:             strings.TrimRight(strings.TrimSpace(d.Addition.ETFAutoSubscriptionTargetBaseURL), "/"),
+		TargetAPIToken:            strings.TrimSpace(d.Addition.ETFAutoSubscriptionTargetAPIToken),
+		TargetSupportsIdempotency: d.Addition.ETFAutoSubscriptionTargetSupportsIdempotency,
+		QuietWindowSeconds:        d.Addition.ETFAutoSubscriptionQuietSeconds,
+		SharePeriodUnit:           d.Addition.ETFAutoSubscriptionSharePeriodUnit,
+		ShareType:                 d.Addition.ETFAutoSubscriptionShareType,
+	}
+}
+
 type manualETFArchiveFile struct {
 	obj      model.Obj
 	dirPath  string

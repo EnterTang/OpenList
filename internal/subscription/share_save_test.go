@@ -138,6 +138,37 @@ func TestSaveShareToTempPreservesMatchedParentDirectories(t *testing.T) {
 	}
 }
 
+func TestSaveShareToTempFlattensMatchedFilesIntoTempRoot(t *testing.T) {
+	modified := time.Unix(1700000000, 0)
+	provider := &fakeShareSaver{
+		fakeShareTreeProvider: fakeShareTreeProvider{
+			name: ShareProviderAliyunDrive,
+			children: map[string][]ShareItem{
+				"":             {{ID: "dir-season-2", Name: "第 2季", IsDir: true, Modified: modified}},
+				"dir-season-2": {{ID: "file-2", ParentID: "dir-season-2", Name: "Show.S02E02.mkv", Size: 2048, Modified: modified}},
+			},
+		},
+		dstDirID: "tmp-dir-id",
+	}
+
+	_, err := SaveShareToTemp(context.Background(), provider, ShareRef{Provider: ShareProviderAliyunDrive}, SaveShareOptions{
+		TempRoot: "/tmp/aliyun",
+		Flatten:  true,
+		Match: func(entry TreeEntry) bool {
+			return entry.ID == "file-2"
+		},
+	})
+	if err != nil {
+		t.Fatalf("save flattened share: %v", err)
+	}
+	if got, want := provider.ensureDirCalls, []string{"/tmp/aliyun"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("ensure dir calls = %#v, want %#v", got, want)
+	}
+	if got := idsFromShareItems(provider.saved["tmp-dir-id"]); !stringSlicesEqual(got, []string{"file-2"}) {
+		t.Fatalf("saved items in temp root = %#v, want file-2", got)
+	}
+}
+
 func TestSaveShareToTempRequiresTempRoot(t *testing.T) {
 	_, err := SaveShareToTemp(context.Background(), &fakeShareSaver{}, ShareRef{}, SaveShareOptions{})
 	if err == nil {

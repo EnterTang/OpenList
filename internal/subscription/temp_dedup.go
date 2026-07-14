@@ -30,6 +30,10 @@ func filterLargestSharePairsPerSlot(sub *model.Subscription, pairs []shareTreePa
 			filtered = append(filtered, pair)
 			continue
 		}
+		if normalizeMediaType(sub.MediaType) != "movie" && item.Episode <= 0 {
+			filtered = append(filtered, pair)
+			continue
+		}
 		slot := mediaSlotKey(sub, item)
 		if slot == "" {
 			filtered = append(filtered, pair)
@@ -65,6 +69,10 @@ func filterLargestImportedFilesPerSlot(sub *model.Subscription, rootPath string,
 		}
 		item := itemFromEntry(sub, entry, time.Time{})
 		if !subscriptionEpisodeMatches(sub, item.Season, item.Episode) {
+			filtered = append(filtered, file)
+			continue
+		}
+		if normalizeMediaType(sub.MediaType) != "movie" && item.Episode <= 0 {
 			filtered = append(filtered, file)
 			continue
 		}
