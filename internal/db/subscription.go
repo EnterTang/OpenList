@@ -471,7 +471,7 @@ func DeleteSubscriptionRun(id uint) error {
 }
 
 func ClearFailedSubscriptionRuns() (int64, error) {
-	result := db.Where(subscriptionRunFailureCondition("subscription_runs"), model.SubscriptionStatusFailed, "").
+	result := db.Where(subscriptionRunFailureCondition(""), model.SubscriptionStatusFailed, "").
 		Delete(&model.SubscriptionRun{})
 	return result.RowsAffected, errors.WithStack(result.Error)
 }
@@ -543,7 +543,11 @@ func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun
 
 func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.SubscriptionEpisodeSourceDetail, error) {
 	var items []model.SubscriptionEpisodeSourceDetail
-	err := db.Table("subscription_episode_sources").
+	episodeSourceTable := modelTableName("SubscriptionEpisodeSource")
+	clusterJobTable := modelTableName("ClusterJob")
+	clusterNodeTable := modelTableName("ClusterNode")
+	clusterJobAttemptTable := modelTableName("ClusterJobAttempt")
+	err := db.Table("? AS subscription_episode_sources", clause.Table{Name: episodeSourceTable}).
 		Select(strings.Join([]string{
 			"subscription_episode_sources.id",
 			"subscription_episode_sources.created_at",
@@ -565,16 +569,18 @@ func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.Subscrip
 				"WHEN attempt_nodes.name IS NOT NULL AND attempt_nodes.name <> '' THEN attempt_nodes.name " +
 				"ELSE '未指派' END AS worker_name",
 		}, ", ")).
-		Joins("LEFT JOIN cluster_jobs ON cluster_jobs.id = subscription_episode_sources.cluster_job_id").
-		Joins("LEFT JOIN cluster_nodes AS assigned_nodes ON assigned_nodes.id = cluster_jobs.assigned_node_id").
+		Joins("LEFT JOIN ? AS cluster_jobs ON cluster_jobs.id = subscription_episode_sources.cluster_job_id", clause.Table{Name: clusterJobTable}).
+		Joins("LEFT JOIN ? AS assigned_nodes ON assigned_nodes.id = cluster_jobs.assigned_node_id", clause.Table{Name: clusterNodeTable}).
 		Joins(
-			"LEFT JOIN cluster_job_attempts AS latest_attempt ON latest_attempt.id = ("+
-				"SELECT cluster_job_attempts.id FROM cluster_job_attempts "+
-				"WHERE cluster_job_attempts.job_id = subscription_episode_sources.cluster_job_id "+
-				"ORDER BY cluster_job_attempts.generation DESC, cluster_job_attempts.id DESC LIMIT 1"+
+			"LEFT JOIN ? AS latest_attempt ON latest_attempt.id = ("+
+				"SELECT attempt_candidates.id FROM ? AS attempt_candidates "+
+				"WHERE attempt_candidates.job_id = subscription_episode_sources.cluster_job_id "+
+				"ORDER BY attempt_candidates.generation DESC, attempt_candidates.id DESC LIMIT 1"+
 				")",
+			clause.Table{Name: clusterJobAttemptTable},
+			clause.Table{Name: clusterJobAttemptTable},
 		).
-		Joins("LEFT JOIN cluster_nodes AS attempt_nodes ON attempt_nodes.id = latest_attempt.node_id").
+		Joins("LEFT JOIN ? AS attempt_nodes ON attempt_nodes.id = latest_attempt.node_id", clause.Table{Name: clusterNodeTable}).
 		Where("subscription_episode_sources.subscription_id = ?", subscriptionID).
 		Order("subscription_episode_sources.season, subscription_episode_sources.episode").
 		Scan(&items).Error
@@ -594,8 +600,11 @@ func subscriptionRunQuery(filter SubscriptionRunFilter) *gorm.DB {
 }
 
 func subscriptionRunBaseQuery(filter SubscriptionRunFilter) *gorm.DB {
+	subscriptionRunTable := modelTableName("SubscriptionRun")
+	subscriptionTable := modelTableName("Subscription")
 	query := db.Model(&model.SubscriptionRun{}).
-		Joins("JOIN subscriptions ON subscriptions.id = subscription_runs.subscription_id")
+		Table("? AS subscription_runs", clause.Table{Name: subscriptionRunTable}).
+		Joins("JOIN ? AS subscriptions ON subscriptions.id = subscription_runs.subscription_id", clause.Table{Name: subscriptionTable})
 	if filter.SubscriptionID > 0 {
 		query = query.Where("subscription_runs.subscription_id = ?", filter.SubscriptionID)
 	}
@@ -617,18 +626,29 @@ func subscriptionRunBaseQuery(filter SubscriptionRunFilter) *gorm.DB {
 
 func meaningfulSubscriptionRunCondition(table string) string {
 	return "(" +
-		table + ".status <> ? OR " +
-		table + ".added_count > 0 OR " +
-		table + ".changed_count > 0 OR " +
-		table + ".transferred_count > 0 OR " +
-		table + ".error <> ?" +
+		qualifiedColumnName(table, "status") + " <> ? OR " +
+		qualifiedColumnName(table, "added_count") + " > 0 OR " +
+		qualifiedColumnName(table, "changed_count") + " > 0 OR " +
+		qualifiedColumnName(table, "transferred_count") + " > 0 OR " +
+		qualifiedColumnName(table, "error") + " <> ?" +
 		")"
 }
 
 func subscriptionRunChangesCondition(table string) string {
-	return table + ".status = ? AND (" + table + ".added_count > 0 OR " + table + ".changed_count > 0)"
+	return qualifiedColumnName(table, "status") + " = ? AND (" + qualifiedColumnName(table, "added_count") + " > 0 OR " + qualifiedColumnName(table, "changed_count") + " > 0)"
 }
 
 func subscriptionRunFailureCondition(table string) string {
-	return "(" + table + ".status = ? OR " + table + ".error <> ?)"
+	return "(" + qualifiedColumnName(table, "status") + " = ? OR " + qualifiedColumnName(table, "error") + " <> ?)"
+}
+
+func qualifiedColumnName(table, name string) string {
+	if strings.TrimSpace(table) == "" {
+		return columnName(name)
+	}
+	return table + "." + columnName(name)
+}
+
+func modelTableName(modelName string) string {
+	return db.NamingStrategy.TableName(modelName)
 }

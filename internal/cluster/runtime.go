@@ -54,12 +54,19 @@ type Runtime struct {
 	stopEmbeddedRedis    func(context.Context, *embeddedredis.Manager) error
 	dispatchTransport    runtimeDispatchTransport
 	workerBackground     sync.WaitGroup
+	coordinatorLeaseMu   sync.Mutex
 
-	mu        sync.RWMutex
-	controlMu sync.Mutex
-	outboxMu  sync.Mutex
-	started   bool
+	mu         sync.RWMutex
+	controlMu  sync.Mutex
+	outboxMu   sync.Mutex
+	generation uint64
+	started    bool
 }
+
+const (
+	coordinatorLeaseDuration        = 45 * time.Second
+	coordinatorLeaseRenewalInterval = 15 * time.Second
+)
 
 type runtimeDispatchTransport interface {
 	ConnectedNodes() []string
@@ -168,35 +175,41 @@ func (r *Runtime) Start() error {
 		return nil
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
+	r.generation++
+	generation := r.generation
 	if r.role.RunsCoordinator() {
 		if strings.TrimSpace(conf.Conf.Cluster.EnrollmentToken) == "" {
 			r.stopLocked()
 			return errors.New("cluster.enrollment_token is required for coordinator and hybrid roles")
 		}
-		r.leaseOwner = coordinatorID() + ":" + uuid.NewString()
-		if err := r.acquireCoordinatorLease(r.ctx, time.Now().UTC()); err != nil {
+		leaseOwner := coordinatorID() + ":" + uuid.NewString()
+		r.leaseOwner = leaseOwner
+		leaseAcquiredAt := time.Now().UTC()
+		if err := r.acquireCoordinatorLease(r.ctx, leaseAcquiredAt); err != nil {
 			r.stopLocked()
 			return err
 		}
-		r.coordinatorService = coordinator.New(db.GetDb(), conf.Conf.Cluster.EnrollmentToken)
-		r.coordinatorService.SetShareInspectConsumer(consumeSubscriptionShareInspect)
+		runtimeCtx := r.ctx
+		service := coordinator.New(db.GetDb(), conf.Conf.Cluster.EnrollmentToken)
+		service.SetShareInspectConsumer(consumeSubscriptionShareInspect)
+		r.coordinatorService = service
 		r.hub = transport.NewHub(transport.HubOptions{
 			CoordinatorID:       coordinatorID(),
-			Authenticate:        r.coordinatorService.Authenticate,
-			Handler:             r.coordinatorService,
+			Authenticate:        service.Authenticate,
+			Handler:             service,
 			CheckOrigin:         clusterCheckOrigin,
 			RejectDuplicateNode: true,
 			OnConnect: func(peer transport.Peer) {
-				r.coordinatorService.OnConnect(peer)
-				if err := r.coordinatorService.ReplayOutbox(r.ctx, peer); err != nil {
+				service.OnConnect(peer)
+				if err := service.ReplayOutbox(runtimeCtx, peer); err != nil {
 					log.Errorf("replay cluster outbox for node %s: %v", peer.NodeID(), err)
 				}
 			},
-			OnDisconnect:      r.coordinatorService.OnDisconnect,
+			OnDisconnect:      service.OnDisconnect,
 			HeartbeatInterval: heartbeatInterval(),
 		})
-		go r.runManifestProcessor()
-		go r.runCoordinatorLease()
+		go r.runManifestProcessor(runtimeCtx)
+		go r.runCoordinatorLease(runtimeCtx, leaseOwner, generation, leaseAcquiredAt.Add(coordinatorLeaseDuration))
 		subscription.RegisterClusterDispatcher(subscriptionDispatcher{runtime: r})
 	}
 	if r.role.RunsWorker() {
@@ -431,30 +444,38 @@ func (r *Runtime) runReporter(ctx context.Context, workerService *clusterworker.
 	}
 }
 
-func (r *Runtime) runManifestProcessor() {
+func (r *Runtime) runManifestProcessor(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-r.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if r.coordinatorService == nil {
+			if ctx.Err() != nil {
+				return
+			}
+			service := r.coordinatorServiceSnapshot()
+			if service == nil {
 				continue
 			}
-			if _, err := r.coordinatorService.ProcessPendingManifests(r.ctx, 20); err != nil {
-				log.Errorf("process cluster ETF manifests: %v", err)
-			}
-			if _, err := r.coordinatorService.ProcessPendingShareInspects(r.ctx, 20); err != nil {
-				log.Errorf("process cluster share inspection manifests: %v", err)
-			}
-			if _, err := r.coordinatorService.SweepExpiredLeases(r.ctx, time.Now().UTC()); err != nil {
-				log.Errorf("sweep expired cluster leases: %v", err)
-			}
-			if err := r.redispatchQueuedJobs(r.ctx, 20); err != nil {
-				log.Errorf("redispatch queued cluster jobs: %v", err)
-			}
+			r.processManifestProcessorTick(ctx, service)
 		}
+	}
+}
+
+func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coordinator.Service) {
+	if _, err := service.ProcessPendingManifests(ctx, 20); err != nil {
+		log.Errorf("process cluster ETF manifests: %v", err)
+	}
+	if _, err := service.ProcessPendingShareInspects(ctx, 20); err != nil {
+		log.Errorf("process cluster share inspection manifests: %v", err)
+	}
+	if _, err := service.SweepExpiredLeases(ctx, time.Now().UTC()); err != nil {
+		log.Errorf("sweep expired cluster leases: %v", err)
+	}
+	if err := r.redispatchQueuedJobs(ctx, 20); err != nil {
+		log.Errorf("redispatch queued cluster jobs: %v", err)
 	}
 }
 
@@ -466,7 +487,7 @@ func (r *Runtime) acquireCoordinatorLease(ctx context.Context, now time.Time) er
 		var lease model.ClusterCoordinatorLease
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&lease, "name = ?", "control-plane").Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return tx.Create(&model.ClusterCoordinatorLease{Name: "control-plane", OwnerID: r.leaseOwner, LeaseUntil: now.Add(45 * time.Second)}).Error
+			return tx.Create(&model.ClusterCoordinatorLease{Name: "control-plane", OwnerID: r.leaseOwner, LeaseUntil: now.Add(coordinatorLeaseDuration)}).Error
 		}
 		if err != nil {
 			return err
@@ -474,28 +495,73 @@ func (r *Runtime) acquireCoordinatorLease(ctx context.Context, now time.Time) er
 		if lease.OwnerID != r.leaseOwner && lease.LeaseUntil.After(now) {
 			return fmt.Errorf("cluster coordinator lease is held by %s until %s", lease.OwnerID, lease.LeaseUntil.Format(time.RFC3339))
 		}
-		return tx.Model(&lease).Updates(map[string]any{"owner_id": r.leaseOwner, "lease_until": now.Add(45 * time.Second)}).Error
+		return tx.Model(&lease).Updates(map[string]any{"owner_id": r.leaseOwner, "lease_until": now.Add(coordinatorLeaseDuration)}).Error
 	})
 }
 
-func (r *Runtime) runCoordinatorLease() {
-	ticker := time.NewTicker(15 * time.Second)
+func decideCoordinatorLeaseRenewal(decisionAt, currentDeadline, renewedUntil time.Time, rowsAffected int64, renewalErr error) (time.Time, bool) {
+	if !decisionAt.Before(currentDeadline) {
+		return currentDeadline, true
+	}
+	if renewalErr != nil {
+		return currentDeadline, false
+	}
+	if rowsAffected != 1 {
+		return currentDeadline, true
+	}
+	return renewedUntil, false
+}
+
+func (r *Runtime) runCoordinatorLease(runtimeCtx context.Context, leaseOwner string, generation uint64, leaseDeadline time.Time) {
+	ticker := time.NewTicker(coordinatorLeaseRenewalInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-r.ctx.Done():
+		case <-runtimeCtx.Done():
 			return
-		case now := <-ticker.C:
-			result := db.GetDb().WithContext(r.ctx).Model(&model.ClusterCoordinatorLease{}).
-				Where("name = ? AND owner_id = ?", "control-plane", r.leaseOwner).
-				Updates(map[string]any{"lease_until": now.UTC().Add(45 * time.Second)})
-			if result.Error != nil || result.RowsAffected != 1 {
-				log.Errorf("cluster coordinator lease lost; stopping control-plane schedulers: error=%v rows=%d", result.Error, result.RowsAffected)
-				subscription.StopScheduler()
-				etfauto.StopWorker()
-				r.fenceLostCoordinator()
+		case <-ticker.C:
+			renewalStartedAt := time.Now().UTC()
+			if !renewalStartedAt.Before(leaseDeadline) {
+				if r.fenceLostCoordinatorIfCurrent(generation, leaseOwner) {
+					log.Errorf("cluster coordinator lease expired before renewal started; stopped control-plane schedulers: deadline=%s", leaseDeadline.Format(time.RFC3339Nano))
+				}
 				return
 			}
+
+			requestedDeadline := renewalStartedAt.Add(coordinatorLeaseDuration)
+			r.coordinatorLeaseMu.Lock()
+			if runtimeCtx.Err() != nil {
+				r.coordinatorLeaseMu.Unlock()
+				return
+			}
+			renewalCtx, cancel := context.WithDeadline(runtimeCtx, leaseDeadline)
+			result := db.GetDb().WithContext(renewalCtx).Model(&model.ClusterCoordinatorLease{}).
+				Where("name = ? AND owner_id = ?", "control-plane", leaseOwner).
+				Updates(map[string]any{"lease_until": requestedDeadline})
+			cancel()
+			r.coordinatorLeaseMu.Unlock()
+			if runtimeCtx.Err() != nil {
+				return
+			}
+			decisionAt := time.Now().UTC()
+			nextDeadline, shouldFence := decideCoordinatorLeaseRenewal(
+				decisionAt,
+				leaseDeadline,
+				requestedDeadline,
+				result.RowsAffected,
+				result.Error,
+			)
+			if result.Error != nil && !shouldFence {
+				log.Warnf("cluster coordinator lease renewal failed before deadline; retrying: error=%v deadline=%s", result.Error, leaseDeadline.Format(time.RFC3339))
+				continue
+			}
+			if shouldFence {
+				if r.fenceLostCoordinatorIfCurrent(generation, leaseOwner) {
+					log.Errorf("cluster coordinator lease lost; stopped control-plane schedulers: error=%v rows=%d", result.Error, result.RowsAffected)
+				}
+				return
+			}
+			leaseDeadline = nextDeadline
 		}
 	}
 }
@@ -503,6 +569,22 @@ func (r *Runtime) runCoordinatorLease() {
 func (r *Runtime) fenceLostCoordinator() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.fenceLostCoordinatorLocked()
+}
+
+func (r *Runtime) fenceLostCoordinatorIfCurrent(generation uint64, leaseOwner string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.generation != generation || r.leaseOwner != leaseOwner {
+		return false
+	}
+	subscription.StopScheduler()
+	etfauto.StopWorker()
+	r.fenceLostCoordinatorLocked()
+	return true
+}
+
+func (r *Runtime) fenceLostCoordinatorLocked() {
 	if r.cancel != nil {
 		r.cancel()
 	}
@@ -512,6 +594,7 @@ func (r *Runtime) fenceLostCoordinator() {
 	if r.workerClient != nil {
 		_ = r.workerClient.Close()
 	}
+	r.workerBackground.Wait()
 	if err := r.cleanupWorkerRedisLocked(); err != nil {
 		log.Errorf("cleanup cluster worker Redis after coordinator fence: %v", err)
 	}
@@ -719,9 +802,11 @@ func (r *Runtime) stopLocked() {
 		log.Errorf("cleanup cluster worker Redis during runtime stop: %v", err)
 	}
 	if r.leaseOwner != "" && db.GetDb() != nil {
+		r.coordinatorLeaseMu.Lock()
 		_ = db.GetDb().Model(&model.ClusterCoordinatorLease{}).
 			Where("name = ? AND owner_id = ?", "control-plane", r.leaseOwner).
 			Update("lease_until", time.Now().UTC()).Error
+		r.coordinatorLeaseMu.Unlock()
 	}
 	r.leaseOwner = ""
 	clusterworker.SetDefaultService(nil)
@@ -778,6 +863,10 @@ func (r *Runtime) WebSocketHandler() http.Handler {
 }
 
 func (r *Runtime) CoordinatorService() *coordinator.Service {
+	return r.coordinatorServiceSnapshot()
+}
+
+func (r *Runtime) coordinatorServiceSnapshot() *coordinator.Service {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.coordinatorService
