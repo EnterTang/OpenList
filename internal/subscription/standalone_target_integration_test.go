@@ -143,8 +143,12 @@ func runStandaloneTargetWorkflowResult(t *testing.T, fileSize int64) ([]resolved
 		}
 		return &TreeSnapshot{Hash: "standalone-target", Entries: []TreeEntry{entry}}, nil
 	}
+	var expectedSubscriptionID uint
 	transfers := []string{}
-	applySubscriptionItemTransfer = func(_ context.Context, item *model.SubscriptionItem, _ bool) (*model.SubscriptionItem, int, error) {
+	applySubscriptionItemTransfer = func(_ context.Context, sourceSub *model.Subscription, item *model.SubscriptionItem, _ bool) (*model.SubscriptionItem, int, error) {
+		if sourceSub == nil || sourceSub.ID != expectedSubscriptionID {
+			t.Fatalf("source subscription = %#v, want subscription %d", sourceSub, expectedSubscriptionID)
+		}
 		transfers = append(transfers, item.TargetPath)
 		return item, 1, nil
 	}
@@ -168,6 +172,7 @@ func runStandaloneTargetWorkflowResult(t *testing.T, fileSize int64) ([]resolved
 	if err := db.CreateSubscription(sub); err != nil {
 		t.Fatalf("create subscription: %v", err)
 	}
+	expectedSubscriptionID = sub.ID
 	result, err := Run(context.Background(), sub.ID, true)
 	return observations, &ensured, &transfers, result, err
 }

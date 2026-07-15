@@ -1,7 +1,9 @@
 package db
 
 import (
+	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
@@ -19,9 +21,27 @@ type SubscriptionFilter struct {
 
 type SubscriptionRunFilter struct {
 	SubscriptionID uint
+	View           string
+	Keyword        string
+	SourceType     string
 	Status         string
 	Page           int
 	PerPage        int
+}
+
+var ErrStaleSubscriptionTerminalCallback = errors.New("stale subscription terminal callback")
+
+type SubscriptionTerminalItemRequest struct {
+	ItemID               uint
+	SubscriptionID       uint
+	SourceKey            string
+	ExpectedFileHash     string
+	ExpectedStatus       string
+	ExpectedClusterJobID *string
+	TerminalStatus       string
+	TerminalLastError    string
+	TerminalClusterJobID *string
+	RecoverySource       *model.SubscriptionEpisodeSource
 }
 
 func CreateSubscription(item *model.Subscription) error {
@@ -35,9 +55,50 @@ func UpdateSubscription(item *model.Subscription) error {
 	return errors.WithStack(db.Save(item).Error)
 }
 
+func UpdateSubscriptionTMDBEpisodeEnd(snapshot *model.Subscription, discoveredTMDBID *int64, episodeEnd int, syncedAt time.Time) (bool, error) {
+	if snapshot == nil || snapshot.ID == 0 {
+		return false, errors.New("subscription snapshot is required")
+	}
+	serializedSeasons, err := json.Marshal(snapshot.Seasons)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	updates := map[string]any{
+		"latest_season_episode_end": episodeEnd,
+		"tmdb_episode_synced_at":    syncedAt,
+		"updated_at":                syncedAt,
+	}
+	if discoveredTMDBID != nil {
+		updates["tmdb_id"] = *discoveredTMDBID
+	}
+	query := db.Model(&model.Subscription{}).
+		Where(
+			"id = ? AND tmdb_id = ? AND tmdb_name = ? AND tmdb_year = ? AND media_type = ? AND season = ? AND latest_season_episode_start = ? AND latest_season_episode_end = ? AND updated_at = ?",
+			snapshot.ID,
+			snapshot.TMDBID,
+			snapshot.TMDBName,
+			snapshot.TMDBYear,
+			snapshot.MediaType,
+			snapshot.Season,
+			snapshot.LatestSeasonEpisodeStart,
+			snapshot.LatestSeasonEpisodeEnd,
+			snapshot.UpdatedAt,
+		)
+	if snapshot.Seasons == nil {
+		query = query.Where("seasons IS NULL")
+	} else {
+		query = query.Where("seasons = ?", string(serializedSeasons))
+	}
+	result := query.Updates(updates)
+	return result.RowsAffected > 0, errors.WithStack(result.Error)
+}
+
 func DeleteSubscription(id uint) error {
 	return errors.WithStack(db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.SubscriptionItem{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.SubscriptionEpisodeSource{}).Error; err != nil {
 			return err
 		}
 		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.SubscriptionRun{}).Error; err != nil {
@@ -56,20 +117,7 @@ func GetSubscriptionByID(id uint) (*model.Subscription, error) {
 }
 
 func ListSubscriptions(filter SubscriptionFilter) ([]model.Subscription, int64, error) {
-	query := db.Model(&model.Subscription{})
-	if keyword := strings.TrimSpace(filter.Keyword); keyword != "" {
-		like := "%" + keyword + "%"
-		query = query.Where(
-			columnName("name")+" LIKE ? OR "+columnName("tmdb_name")+" LIKE ? OR "+columnName("target_root")+" LIKE ?",
-			like, like, like,
-		)
-	}
-	if sourceType := strings.TrimSpace(filter.SourceType); sourceType != "" {
-		query = query.Where(columnName("source_type")+" = ?", sourceType)
-	}
-	if filter.Active != nil {
-		query = query.Where(columnName("active")+" = ?", *filter.Active)
-	}
+	query := subscriptionListQuery(filter)
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, errors.WithStack(err)
@@ -89,6 +137,32 @@ func ListSubscriptions(filter SubscriptionFilter) ([]model.Subscription, int64, 
 	return items, total, nil
 }
 
+func ListAllSubscriptions(filter SubscriptionFilter) ([]model.Subscription, error) {
+	var items []model.Subscription
+	if err := subscriptionListQuery(filter).Order(columnName("updated_at") + " DESC").Find(&items).Error; err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return items, nil
+}
+
+func subscriptionListQuery(filter SubscriptionFilter) *gorm.DB {
+	query := db.Model(&model.Subscription{})
+	if keyword := strings.TrimSpace(filter.Keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		query = query.Where(
+			columnName("name")+" LIKE ? OR "+columnName("tmdb_name")+" LIKE ? OR "+columnName("target_root")+" LIKE ?",
+			like, like, like,
+		)
+	}
+	if sourceType := strings.TrimSpace(filter.SourceType); sourceType != "" {
+		query = query.Where(columnName("source_type")+" = ?", sourceType)
+	}
+	if filter.Active != nil {
+		query = query.Where(columnName("active")+" = ?", *filter.Active)
+	}
+	return query
+}
+
 func ListActiveSubscriptions() ([]model.Subscription, error) {
 	var items []model.Subscription
 	err := db.Where(columnName("active")+" = ?", true).Find(&items).Error
@@ -96,11 +170,15 @@ func ListActiveSubscriptions() ([]model.Subscription, error) {
 }
 
 func UpsertSubscriptionItem(item *model.SubscriptionItem) (*model.SubscriptionItem, bool, error) {
+	return upsertSubscriptionItem(db, item)
+}
+
+func upsertSubscriptionItem(tx *gorm.DB, item *model.SubscriptionItem) (*model.SubscriptionItem, bool, error) {
 	if item == nil {
 		return nil, false, errors.New("subscription item is nil")
 	}
 	var existing model.SubscriptionItem
-	err := db.Where(columnName("subscription_id")+" = ? AND "+columnName("source_key")+" = ?", item.SubscriptionID, item.SourceKey).First(&existing).Error
+	err := tx.Where(columnName("subscription_id")+" = ? AND "+columnName("source_key")+" = ?", item.SubscriptionID, item.SourceKey).First(&existing).Error
 	isNew := false
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		isNew = true
@@ -124,7 +202,7 @@ func UpsertSubscriptionItem(item *model.SubscriptionItem) (*model.SubscriptionIt
 			item.LastError = existing.LastError
 		}
 	}
-	err = db.Clauses(clause.OnConflict{
+	err = tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "subscription_id"}, {Name: "source_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"source_provider",
@@ -154,13 +232,17 @@ func UpsertSubscriptionItem(item *model.SubscriptionItem) (*model.SubscriptionIt
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
-	saved, err := GetSubscriptionItem(item.SubscriptionID, item.SourceKey)
+	saved, err := getSubscriptionItem(tx, item.SubscriptionID, item.SourceKey)
 	return saved, isNew, err
 }
 
 func GetSubscriptionItem(subscriptionID uint, sourceKey string) (*model.SubscriptionItem, error) {
+	return getSubscriptionItem(db, subscriptionID, sourceKey)
+}
+
+func getSubscriptionItem(tx *gorm.DB, subscriptionID uint, sourceKey string) (*model.SubscriptionItem, error) {
 	var item model.SubscriptionItem
-	err := db.Where(columnName("subscription_id")+" = ? AND "+columnName("source_key")+" = ?", subscriptionID, sourceKey).First(&item).Error
+	err := tx.Where(columnName("subscription_id")+" = ? AND "+columnName("source_key")+" = ?", subscriptionID, sourceKey).First(&item).Error
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -171,6 +253,207 @@ func ListSubscriptionItems(subscriptionID uint) ([]model.SubscriptionItem, error
 	var items []model.SubscriptionItem
 	err := db.Where(columnName("subscription_id")+" = ?", subscriptionID).
 		Order(columnName("season") + ", " + columnName("episode") + ", " + columnName("file_path")).
+		Find(&items).Error
+	return items, errors.WithStack(err)
+}
+
+func ListSubscriptionItemsBySubscriptionIDs(subscriptionIDs []uint) ([]model.SubscriptionItem, error) {
+	if len(subscriptionIDs) == 0 {
+		return nil, nil
+	}
+	var items []model.SubscriptionItem
+	err := db.Where(columnName("subscription_id")+" IN ?", subscriptionIDs).
+		Order(columnName("subscription_id") + ", " + columnName("season") + ", " + columnName("episode") + ", " + columnName("file_path")).
+		Find(&items).Error
+	return items, errors.WithStack(err)
+}
+
+func UpsertSubscriptionEpisodeSource(item *model.SubscriptionEpisodeSource) (*model.SubscriptionEpisodeSource, error) {
+	return upsertSubscriptionEpisodeSource(db, item)
+}
+
+func upsertSubscriptionEpisodeSource(tx *gorm.DB, item *model.SubscriptionEpisodeSource) (*model.SubscriptionEpisodeSource, error) {
+	if item == nil {
+		return nil, errors.New("subscription episode source is nil")
+	}
+	if item.SelectedAt.IsZero() {
+		item.SelectedAt = time.Now()
+	}
+	err := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "subscription_id"}, {Name: "season"}, {Name: "episode"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"source_item_id",
+			"source_type",
+			"source_provider",
+			"share_url",
+			"file_name",
+			"file_hash",
+			"status",
+			"cluster_job_id",
+			"selected_at",
+			"updated_at",
+		}),
+	}).Create(item).Error
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	var saved model.SubscriptionEpisodeSource
+	err = tx.Where(
+		columnName("subscription_id")+" = ? AND "+columnName("season")+" = ? AND "+columnName("episode")+" = ?",
+		item.SubscriptionID,
+		item.Season,
+		item.Episode,
+	).First(&saved).Error
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &saved, nil
+}
+
+func PersistAcceptedSubscriptionItemAndEpisodeSource(item *model.SubscriptionItem, source *model.SubscriptionEpisodeSource) (*model.SubscriptionItem, *model.SubscriptionEpisodeSource, error) {
+	if item == nil {
+		return nil, nil, errors.New("subscription item is nil")
+	}
+	if source == nil {
+		return nil, nil, errors.New("subscription episode source is nil")
+	}
+	var savedItem *model.SubscriptionItem
+	var savedSource *model.SubscriptionEpisodeSource
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		savedItem, _, err = upsertSubscriptionItem(tx, item)
+		if err != nil {
+			return err
+		}
+		source.SourceItemID = savedItem.ID
+		source.FileHash = savedItem.FileHash
+		source.Status = savedItem.Status
+		savedSource, err = upsertSubscriptionEpisodeSource(tx, source)
+		return err
+	})
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	return savedItem, savedSource, nil
+}
+
+func PersistSubscriptionTerminalItem(request SubscriptionTerminalItemRequest) (*model.SubscriptionItem, error) {
+	if request.ItemID == 0 {
+		return nil, errors.New("subscription item id is required")
+	}
+	if request.SubscriptionID == 0 {
+		return nil, errors.New("subscription id is required")
+	}
+	if request.SourceKey == "" {
+		return nil, errors.New("subscription source key is required")
+	}
+	if request.ExpectedStatus == "" {
+		return nil, errors.New("expected subscription item status is required")
+	}
+	if request.TerminalStatus == "" {
+		return nil, errors.New("terminal subscription item status is required")
+	}
+	var savedItem *model.SubscriptionItem
+	err := db.Transaction(func(tx *gorm.DB) error {
+		identity := subscriptionTerminalItemIdentityQuery(tx, request)
+		if request.RecoverySource != nil {
+			var current model.SubscriptionItem
+			if err := identity.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrStaleSubscriptionTerminalCallback
+				}
+				return errors.WithStack(err)
+			}
+			source := request.RecoverySource
+			if source.SelectedAt.IsZero() {
+				source.SelectedAt = time.Now()
+			}
+			source.SourceItemID = request.ItemID
+			source.FileHash = request.ExpectedFileHash
+			source.Status = request.TerminalStatus
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "subscription_id"}, {Name: "season"}, {Name: "episode"}},
+				DoNothing: true,
+			}).Create(source).Error; err != nil {
+				return errors.WithStack(err)
+			}
+		}
+		updatedAt := time.Now()
+		updates := map[string]any{
+			"status":     request.TerminalStatus,
+			"last_error": request.TerminalLastError,
+			"updated_at": updatedAt,
+		}
+		if request.TerminalClusterJobID != nil {
+			updates["cluster_job_id"] = *request.TerminalClusterJobID
+		}
+		result := subscriptionTerminalItemIdentityQuery(tx, request).Updates(updates)
+		if result.Error != nil {
+			return errors.WithStack(result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return ErrStaleSubscriptionTerminalCallback
+		}
+		if err := tx.Model(&model.SubscriptionEpisodeSource{}).
+			Where(
+				columnName("source_item_id")+" = ? AND "+columnName("file_hash")+" = ?",
+				request.ItemID,
+				request.ExpectedFileHash,
+			).
+			Updates(map[string]any{
+				"status":     request.TerminalStatus,
+				"updated_at": updatedAt,
+			}).Error; err != nil {
+			return errors.WithStack(err)
+		}
+		var err error
+		savedItem, err = getSubscriptionItem(tx, request.SubscriptionID, request.SourceKey)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, ErrStaleSubscriptionTerminalCallback) {
+			return nil, ErrStaleSubscriptionTerminalCallback
+		}
+		return nil, errors.WithStack(err)
+	}
+	return savedItem, nil
+}
+
+func subscriptionTerminalItemIdentityQuery(tx *gorm.DB, request SubscriptionTerminalItemRequest) *gorm.DB {
+	query := tx.Model(&model.SubscriptionItem{}).Where(
+		"id = ? AND "+columnName("subscription_id")+" = ? AND "+columnName("source_key")+" = ? AND "+columnName("file_hash")+" = ? AND "+columnName("status")+" = ?",
+		request.ItemID,
+		request.SubscriptionID,
+		request.SourceKey,
+		request.ExpectedFileHash,
+		request.ExpectedStatus,
+	)
+	if request.ExpectedClusterJobID != nil {
+		query = query.Where(columnName("cluster_job_id")+" = ?", *request.ExpectedClusterJobID)
+	}
+	return query
+}
+
+func RecoverSubscriptionEpisodeSourceAndTerminalItem(item *model.SubscriptionItem, source *model.SubscriptionEpisodeSource) (*model.SubscriptionItem, error) {
+	if item == nil {
+		return nil, errors.New("subscription item is nil")
+	}
+	return PersistSubscriptionTerminalItem(SubscriptionTerminalItemRequest{
+		ItemID:            item.ID,
+		SubscriptionID:    item.SubscriptionID,
+		SourceKey:         item.SourceKey,
+		ExpectedFileHash:  item.FileHash,
+		ExpectedStatus:    model.SubscriptionItemStatusPending,
+		TerminalStatus:    item.Status,
+		TerminalLastError: item.LastError,
+		RecoverySource:    source,
+	})
+}
+
+func ListSubscriptionEpisodeSources(subscriptionID uint) ([]model.SubscriptionEpisodeSource, error) {
+	var items []model.SubscriptionEpisodeSource
+	err := db.Where(columnName("subscription_id")+" = ?", subscriptionID).
+		Order(columnName("season") + ", " + columnName("episode")).
 		Find(&items).Error
 	return items, errors.WithStack(err)
 }
@@ -188,23 +471,55 @@ func DeleteSubscriptionRun(id uint) error {
 }
 
 func ClearFailedSubscriptionRuns() (int64, error) {
-	result := db.Where(
-		columnName("status")+" = ? OR "+columnName("error")+" <> ?",
-		model.SubscriptionStatusFailed,
-		"",
-	).Delete(&model.SubscriptionRun{})
+	result := db.Where(subscriptionRunFailureCondition("subscription_runs"), model.SubscriptionStatusFailed, "").
+		Delete(&model.SubscriptionRun{})
 	return result.RowsAffected, errors.WithStack(result.Error)
 }
 
-func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun, int64, error) {
-	query := db.Model(&model.SubscriptionRun{})
+func GetSubscriptionBoard(filter SubscriptionRunFilter) (*model.SubscriptionBoard, error) {
+	board := &model.SubscriptionBoard{}
+	subscriptionQuery := subscriptionListQuery(SubscriptionFilter{
+		Keyword:    filter.Keyword,
+		SourceType: filter.SourceType,
+	})
 	if filter.SubscriptionID > 0 {
-		query = query.Where(columnName("subscription_id")+" = ?", filter.SubscriptionID)
+		subscriptionQuery = subscriptionQuery.Where(columnName("id")+" = ?", filter.SubscriptionID)
 	}
-	if status := strings.TrimSpace(filter.Status); status != "" {
-		query = query.Where(columnName("status")+" = ?", status)
+	if err := subscriptionQuery.Count(&board.SubscriptionCount).Error; err != nil {
+		return nil, errors.WithStack(err)
 	}
-	query = query.Where(meaningfulSubscriptionRunCondition(), model.SubscriptionStatusSuccess, "")
+
+	var changedResult struct {
+		ChangedRunCount int64
+		AddedCount      int64
+		ChangedCount    int64
+	}
+	changedQuery := subscriptionRunBaseQuery(filter).
+		Where(subscriptionRunChangesCondition("subscription_runs"), model.SubscriptionStatusSuccess)
+	if err := changedQuery.Select(
+		"COUNT(*) AS changed_run_count, COALESCE(SUM(added_count), 0) AS added_count, COALESCE(SUM(changed_count), 0) AS changed_count",
+	).Scan(&changedResult).Error; err != nil {
+		return nil, errors.WithStack(err)
+	}
+	board.ChangedRunCount = changedResult.ChangedRunCount
+	board.AddedCount = changedResult.AddedCount
+	board.ChangedCount = changedResult.ChangedCount
+
+	var failureResult struct {
+		FailureCount int64
+	}
+	if err := subscriptionRunBaseQuery(filter).
+		Where(subscriptionRunFailureCondition("subscription_runs"), model.SubscriptionStatusFailed, "").
+		Select("COUNT(*) AS failure_count").
+		Scan(&failureResult).Error; err != nil {
+		return nil, errors.WithStack(err)
+	}
+	board.FailureCount = failureResult.FailureCount
+	return board, nil
+}
+
+func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun, int64, error) {
+	query := subscriptionRunQuery(filter)
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, errors.WithStack(err)
@@ -218,19 +533,102 @@ func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun
 		perPage = 20
 	}
 	var items []model.SubscriptionRun
-	err := query.Order(columnName("started_at") + " DESC").
+	err := query.Select("subscription_runs.*, subscriptions.name AS subscription_name, subscriptions.source_type AS subscription_source_type").
+		Order("subscription_runs.started_at DESC").
 		Offset((page - 1) * perPage).
 		Limit(perPage).
 		Find(&items).Error
 	return items, total, errors.WithStack(err)
 }
 
-func meaningfulSubscriptionRunCondition() string {
+func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.SubscriptionEpisodeSourceDetail, error) {
+	var items []model.SubscriptionEpisodeSourceDetail
+	err := db.Table("subscription_episode_sources").
+		Select(strings.Join([]string{
+			"subscription_episode_sources.id",
+			"subscription_episode_sources.created_at",
+			"subscription_episode_sources.updated_at",
+			"subscription_episode_sources.subscription_id",
+			"subscription_episode_sources.season",
+			"subscription_episode_sources.episode",
+			"subscription_episode_sources.source_item_id",
+			"subscription_episode_sources.source_type",
+			"subscription_episode_sources.source_provider",
+			"subscription_episode_sources.share_url",
+			"subscription_episode_sources.file_name",
+			"subscription_episode_sources.cluster_job_id",
+			"subscription_episode_sources.selected_at",
+			"subscription_episode_sources.status",
+			"CASE " +
+				"WHEN subscription_episode_sources.cluster_job_id = '' OR subscription_episode_sources.cluster_job_id IS NULL THEN '本机' " +
+				"WHEN assigned_nodes.name IS NOT NULL AND assigned_nodes.name <> '' THEN assigned_nodes.name " +
+				"WHEN attempt_nodes.name IS NOT NULL AND attempt_nodes.name <> '' THEN attempt_nodes.name " +
+				"ELSE '未指派' END AS worker_name",
+		}, ", ")).
+		Joins("LEFT JOIN cluster_jobs ON cluster_jobs.id = subscription_episode_sources.cluster_job_id").
+		Joins("LEFT JOIN cluster_nodes AS assigned_nodes ON assigned_nodes.id = cluster_jobs.assigned_node_id").
+		Joins(
+			"LEFT JOIN cluster_job_attempts AS latest_attempt ON latest_attempt.id = ("+
+				"SELECT cluster_job_attempts.id FROM cluster_job_attempts "+
+				"WHERE cluster_job_attempts.job_id = subscription_episode_sources.cluster_job_id "+
+				"ORDER BY cluster_job_attempts.generation DESC, cluster_job_attempts.id DESC LIMIT 1"+
+				")",
+		).
+		Joins("LEFT JOIN cluster_nodes AS attempt_nodes ON attempt_nodes.id = latest_attempt.node_id").
+		Where("subscription_episode_sources.subscription_id = ?", subscriptionID).
+		Order("subscription_episode_sources.season, subscription_episode_sources.episode").
+		Scan(&items).Error
+	return items, errors.WithStack(err)
+}
+
+func subscriptionRunQuery(filter SubscriptionRunFilter) *gorm.DB {
+	query := subscriptionRunBaseQuery(filter)
+	switch strings.TrimSpace(filter.View) {
+	case model.SubscriptionRunViewChanges:
+		return query.Where(subscriptionRunChangesCondition("subscription_runs"), model.SubscriptionStatusSuccess)
+	case model.SubscriptionRunViewFailures:
+		return query.Where(subscriptionRunFailureCondition("subscription_runs"), model.SubscriptionStatusFailed, "")
+	default:
+		return query.Where(meaningfulSubscriptionRunCondition("subscription_runs"), model.SubscriptionStatusSuccess, "")
+	}
+}
+
+func subscriptionRunBaseQuery(filter SubscriptionRunFilter) *gorm.DB {
+	query := db.Model(&model.SubscriptionRun{}).
+		Joins("JOIN subscriptions ON subscriptions.id = subscription_runs.subscription_id")
+	if filter.SubscriptionID > 0 {
+		query = query.Where("subscription_runs.subscription_id = ?", filter.SubscriptionID)
+	}
+	if keyword := strings.TrimSpace(filter.Keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		query = query.Where(
+			"subscriptions.name LIKE ? OR subscriptions.tmdb_name LIKE ? OR subscriptions.target_root LIKE ?",
+			like, like, like,
+		)
+	}
+	if sourceType := strings.TrimSpace(filter.SourceType); sourceType != "" {
+		query = query.Where("subscriptions.source_type = ?", sourceType)
+	}
+	if status := strings.TrimSpace(filter.Status); status != "" {
+		query = query.Where("subscription_runs.status = ?", status)
+	}
+	return query
+}
+
+func meaningfulSubscriptionRunCondition(table string) string {
 	return "(" +
-		columnName("status") + " <> ? OR " +
-		columnName("added_count") + " > 0 OR " +
-		columnName("changed_count") + " > 0 OR " +
-		columnName("transferred_count") + " > 0 OR " +
-		columnName("error") + " <> ?" +
+		table + ".status <> ? OR " +
+		table + ".added_count > 0 OR " +
+		table + ".changed_count > 0 OR " +
+		table + ".transferred_count > 0 OR " +
+		table + ".error <> ?" +
 		")"
+}
+
+func subscriptionRunChangesCondition(table string) string {
+	return table + ".status = ? AND (" + table + ".added_count > 0 OR " + table + ".changed_count > 0)"
+}
+
+func subscriptionRunFailureCondition(table string) string {
+	return "(" + table + ".status = ? OR " + table + ".error <> ?)"
 }

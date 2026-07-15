@@ -12,11 +12,18 @@ const (
 	SubscriptionStatusSuccess = "success"
 	SubscriptionStatusFailed  = "failed"
 
+	SubscriptionRunViewChanges  = "changes"
+	SubscriptionRunViewFailures = "failures"
+
 	SubscriptionItemStatusPending      = "pending"
 	SubscriptionItemStatusTransferring = "transferring"
 	SubscriptionItemStatusTransferred  = "transferred"
 	SubscriptionItemStatusSkipped      = "skipped"
 	SubscriptionItemStatusFailed       = "failed"
+
+	SubscriptionArchiveStatusOngoing   = "ongoing"
+	SubscriptionArchiveStatusCompleted = "completed"
+	SubscriptionArchiveStatusStalled   = "stalled"
 )
 
 type Subscription struct {
@@ -41,11 +48,26 @@ type Subscription struct {
 	Seasons                  []int                     `json:"seasons" gorm:"serializer:json"`
 	LatestSeasonEpisodeStart int                       `json:"latest_season_episode_start"`
 	LatestSeasonEpisodeEnd   int                       `json:"latest_season_episode_end"`
+	TMDBEpisodeSyncedAt      *time.Time                `json:"tmdb_episode_synced_at,omitempty"`
 	LastCheckedAt            *time.Time                `json:"last_checked_at"`
 	LastCursor               string                    `json:"last_cursor"`
 	LastTreeHash             string                    `json:"last_tree_hash"`
 	LastStatus               string                    `json:"last_status" gorm:"index"`
 	LastError                string                    `json:"last_error" gorm:"type:text"`
+	Progress                 SubscriptionProgress      `json:"progress" gorm:"-"`
+}
+
+// SubscriptionProgress is calculated from subscription items when a
+// subscription is listed. It is deliberately not persisted: a late-arriving
+// episode should make a previously stalled subscription visible again.
+type SubscriptionProgress struct {
+	ArchiveStatus      string     `json:"archive_status"`
+	LatestSeason       int        `json:"latest_season,omitempty"`
+	LatestEpisode      int        `json:"latest_episode,omitempty"`
+	MissingEpisodes    []int      `json:"missing_episodes"`
+	CompletedEpisodes  int        `json:"completed_episodes"`
+	ExpectedEpisodes   int        `json:"expected_episodes,omitempty"`
+	LastEpisodeAddedAt *time.Time `json:"last_episode_added_at,omitempty"`
 }
 
 type SubscriptionItem struct {
@@ -77,20 +99,66 @@ type SubscriptionItem struct {
 	LastError            string    `json:"last_error" gorm:"type:text"`
 }
 
+type SubscriptionEpisodeSource struct {
+	ID             uint      `json:"id" gorm:"primarykey"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	SubscriptionID uint      `json:"subscription_id" gorm:"uniqueIndex:idx_subscription_episode_source;index"`
+	Season         int       `json:"season" gorm:"uniqueIndex:idx_subscription_episode_source;index"`
+	Episode        int       `json:"episode" gorm:"uniqueIndex:idx_subscription_episode_source;index"`
+	SourceItemID   uint      `json:"source_item_id" gorm:"index"`
+	SourceType     string    `json:"source_type" gorm:"index"`
+	SourceProvider string    `json:"source_provider" gorm:"index"`
+	ShareURL       string    `json:"share_url" gorm:"type:text"`
+	FileName       string    `json:"file_name"`
+	FileHash       string    `json:"-" gorm:"index"`
+	Status         string    `json:"status" gorm:"index"`
+	ClusterJobID   string    `json:"cluster_job_id" gorm:"size:64;index"`
+	SelectedAt     time.Time `json:"selected_at" gorm:"index"`
+}
+
 type SubscriptionRun struct {
-	ID               uint       `json:"id" gorm:"primarykey"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	SubscriptionID   uint       `json:"subscription_id" gorm:"index"`
-	StartedAt        time.Time  `json:"started_at"`
-	FinishedAt       *time.Time `json:"finished_at"`
-	Status           string     `json:"status" gorm:"index"`
-	PreviousTreeHash string     `json:"previous_tree_hash"`
-	CurrentTreeHash  string     `json:"current_tree_hash"`
-	AddedCount       int        `json:"added_count"`
-	ChangedCount     int        `json:"changed_count"`
-	TransferredCount int        `json:"transferred_count"`
-	Error            string     `json:"error" gorm:"type:text"`
+	ID                     uint       `json:"id" gorm:"primarykey"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
+	SubscriptionID         uint       `json:"subscription_id" gorm:"index"`
+	StartedAt              time.Time  `json:"started_at"`
+	FinishedAt             *time.Time `json:"finished_at"`
+	Status                 string     `json:"status" gorm:"index"`
+	PreviousTreeHash       string     `json:"previous_tree_hash"`
+	CurrentTreeHash        string     `json:"current_tree_hash"`
+	AddedCount             int        `json:"added_count"`
+	ChangedCount           int        `json:"changed_count"`
+	TransferredCount       int        `json:"transferred_count"`
+	Error                  string     `json:"error" gorm:"type:text"`
+	SubscriptionName       string     `json:"subscription_name" gorm:"->;-:migration;column:subscription_name"`
+	SubscriptionSourceType string     `json:"subscription_source_type" gorm:"->;-:migration;column:subscription_source_type"`
+}
+
+type SubscriptionBoard struct {
+	SubscriptionCount int64 `json:"subscription_count"`
+	ChangedRunCount   int64 `json:"changed_run_count"`
+	AddedCount        int64 `json:"added_count"`
+	ChangedCount      int64 `json:"changed_count"`
+	FailureCount      int64 `json:"failure_count"`
+}
+
+type SubscriptionEpisodeSourceDetail struct {
+	ID             uint      `json:"id"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	SubscriptionID uint      `json:"subscription_id"`
+	Season         int       `json:"season"`
+	Episode        int       `json:"episode"`
+	SourceItemID   uint      `json:"source_item_id"`
+	SourceType     string    `json:"source_type"`
+	SourceProvider string    `json:"source_provider"`
+	ShareURL       string    `json:"share_url"`
+	FileName       string    `json:"file_name"`
+	ClusterJobID   string    `json:"cluster_job_id"`
+	SelectedAt     time.Time `json:"selected_at"`
+	Status         string    `json:"status"`
+	WorkerName     string    `json:"worker_name"`
 }
 
 type SubscriptionStorageTarget struct {

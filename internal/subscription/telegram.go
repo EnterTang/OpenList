@@ -30,7 +30,9 @@ var (
 	telegramANSIEscapePattern     = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	telegramCloudLinkPattern      = regexp.MustCompile(`https?://[^\s'"<>，,;\]）]+`)
 	telegramAccessCodePattern     = regexp.MustCompile(`(?i)(?:访问码|提取码|密码|access(?:\s*code)?|pwd|pass(?:word)?|passcode)[？?:：\s]*([A-Za-z0-9]{4,8})`)
-	applySubscriptionItemTransfer = applyItemTransfer
+	applySubscriptionItemTransfer = func(ctx context.Context, sourceSub *model.Subscription, item *model.SubscriptionItem, deleteSourceAfter bool) (*model.SubscriptionItem, int, error) {
+		return applyItemTransfer(ctx, sourceSub, item, deleteSourceAfter, persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot)
+	}
 )
 
 type telegramCommandEnvelope struct {
@@ -469,7 +471,7 @@ func applyTelegramTempTransferCandidates(ctx context.Context, sub *model.Subscri
 			}
 			stored = syncSubscriptionItemPaths(stored, runtimeSub, candidate.Entry, seenAt)
 			var delta int
-			stored, delta, err = applySubscriptionItemTransfer(ctx, stored, candidate.Source.Config.DeleteSourceAfter)
+			stored, delta, err = applySubscriptionItemTransfer(ctx, sub, stored, candidate.Source.Config.DeleteSourceAfter)
 			if err != nil {
 				return saved, resultHash, added, changed, transferred, err
 			}

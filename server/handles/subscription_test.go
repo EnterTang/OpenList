@@ -1,11 +1,268 @@
 package handles
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"testing"
+	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
+
+func setupSubscriptionHandleDB(t *testing.T) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	database, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig("data")
+	db.Init(database)
+	t.Cleanup(func() {
+		sqlDB, err := database.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+}
+
+func newSubscriptionHandleContext(t *testing.T, method, target string) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(method, target, nil)
+	return c, recorder
+}
+
+func decodeHandleResp[T any](t *testing.T, recorder *httptest.ResponseRecorder) common.Resp[T] {
+	t.Helper()
+	var resp common.Resp[T]
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, recorder.Body.String())
+	}
+	return resp
+}
+
+type subscriptionEpisodeSourcesData struct {
+	Content []model.SubscriptionEpisodeSourceDetail `json:"content"`
+}
+
+func TestResolveSubscriptionArchiveStatusDefaultsToAll(t *testing.T) {
+	for _, test := range []struct {
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{value: "", want: "all"},
+		{value: "all", want: "all"},
+		{value: "ongoing", want: model.SubscriptionArchiveStatusOngoing},
+		{value: "completed", want: model.SubscriptionArchiveStatusCompleted},
+		{value: "stalled", want: model.SubscriptionArchiveStatusStalled},
+		{value: "unknown", wantErr: true},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			got, err := resolveSubscriptionArchiveStatus(test.value)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("archive status = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSubscriptionEpisodeEndFromTMDBCandidatesUsesLatestSelectedSeason(t *testing.T) {
+	end := subscriptionEpisodeEndFromTMDBCandidates(&model.Subscription{
+		TMDBID:  123,
+		Seasons: []int{1, 2},
+	}, []model.ETFArchiveTMDBCandidate{
+		{TMDBID: 123, MediaType: "movie", SeasonMap: map[int]int{2: 99}},
+		{TMDBID: 123, MediaType: "tv", SeasonMap: map[int]int{1: 8, 2: 12}},
+	})
+	if end != 12 {
+		t.Fatalf("episode end = %d, want 12", end)
+	}
+}
+
+func TestSubscriptionEpisodeEndFromTMDBCandidatesMatchesLegacyTitleAndYear(t *testing.T) {
+	end := subscriptionEpisodeEndFromTMDBCandidates(&model.Subscription{
+		TMDBName: "Example Show",
+		TMDBYear: 2026,
+		Seasons:  []int{1},
+	}, []model.ETFArchiveTMDBCandidate{
+		{TMDBID: 456, Name: "Different Show", Year: 2026, MediaType: "tv", SeasonMap: map[int]int{1: 8}},
+		{TMDBID: 789, Name: "Example Show", Year: 2026, MediaType: "tv", SeasonMap: map[int]int{1: 10}},
+	})
+	if end != 10 {
+		t.Fatalf("episode end = %d, want 10", end)
+	}
+}
+
+func TestShouldHydrateSubscriptionEpisodeEndRefreshesTMDBDataDaily(t *testing.T) {
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-12 * time.Hour)
+	if shouldHydrateSubscriptionEpisodeEnd(&model.Subscription{
+		MediaType:              "tv",
+		TMDBID:                 123,
+		LatestSeasonEpisodeEnd: 8,
+		TMDBEpisodeSyncedAt:    &recent,
+	}, now) {
+		t.Fatal("recently synchronized subscription should not refresh TMDB again")
+	}
+	if !shouldHydrateSubscriptionEpisodeEnd(&model.Subscription{
+		MediaType:              "tv",
+		TMDBID:                 123,
+		LatestSeasonEpisodeEnd: 8,
+	}, now) {
+		t.Fatal("subscription without a synchronization timestamp should refresh TMDB")
+	}
+}
+
+func TestListSubscriptionRunsRejectsInvalidView(t *testing.T) {
+	c, recorder := newSubscriptionHandleContext(t, http.MethodGet, "/admin/subscription/runs?view=invalid")
+
+	ListSubscriptionRuns(c)
+
+	resp := decodeHandleResp[any](t, recorder)
+	if resp.Code != 400 {
+		t.Fatalf("code = %d, want 400: %s", resp.Code, recorder.Body.String())
+	}
+}
+
+func TestListSubscriptionBoardReturnsFilteredTotals(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Board handler subscription",
+		TMDBName:   "Board handler subscription",
+		SourceType: model.SubscriptionSourceTelegram,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	other := &model.Subscription{
+		Name:       "Other board subscription",
+		TMDBName:   "Other board subscription",
+		SourceType: model.SubscriptionSourceManual,
+	}
+	if err := db.CreateSubscription(other); err != nil {
+		t.Fatalf("create other subscription: %v", err)
+	}
+
+	for _, run := range []*model.SubscriptionRun{
+		{SubscriptionID: sub.ID, Status: model.SubscriptionStatusSuccess, AddedCount: 3, ChangedCount: 2, StartedAt: time.Now().UTC()},
+		{SubscriptionID: sub.ID, Status: model.SubscriptionStatusFailed, Error: "handler failure", StartedAt: time.Now().UTC()},
+		{SubscriptionID: other.ID, Status: model.SubscriptionStatusSuccess, AddedCount: 99, ChangedCount: 99, StartedAt: time.Now().UTC()},
+	} {
+		if err := db.CreateSubscriptionRun(run); err != nil {
+			t.Fatalf("create subscription run: %v", err)
+		}
+	}
+
+	c, recorder := newSubscriptionHandleContext(
+		t,
+		http.MethodGet,
+		"/admin/subscription/board?subscription_id="+strconv.Itoa(int(sub.ID)),
+	)
+	ListSubscriptionBoard(c)
+
+	resp := decodeHandleResp[model.SubscriptionBoard](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200: %s", resp.Code, recorder.Body.String())
+	}
+	want := model.SubscriptionBoard{
+		SubscriptionCount: 1,
+		ChangedRunCount:   1,
+		AddedCount:        3,
+		ChangedCount:      2,
+		FailureCount:      1,
+	}
+	if resp.Data != want {
+		t.Fatalf("board = %#v, want %#v", resp.Data, want)
+	}
+}
+
+func TestListSubscriptionEpisodeSourcesValidatesSubscriptionIDAndWorkerPrecedence(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Handler subscription",
+		TMDBName:   "Handler subscription",
+		SourceType: model.SubscriptionSourceTelegram,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	item, _, err := db.UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: sub.ID,
+		SourceKey:      "handler-item",
+		Season:         1,
+		Episode:        1,
+		Status:         model.SubscriptionItemStatusTransferred,
+		LastSeenAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create subscription item: %v", err)
+	}
+	database := db.GetDb()
+	if err := database.Create(&model.ClusterNode{ID: "node-assigned", Name: "处理节点"}).Error; err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	if err := database.Create(&model.ClusterJob{ID: "job-handler", SubscriptionID: sub.ID, SubscriptionItemID: item.ID, AssignedNodeID: "node-assigned"}).Error; err != nil {
+		t.Fatalf("create cluster job: %v", err)
+	}
+	if _, err := db.UpsertSubscriptionEpisodeSource(&model.SubscriptionEpisodeSource{
+		SubscriptionID: sub.ID,
+		Season:         1,
+		Episode:        1,
+		SourceItemID:   item.ID,
+		SourceType:     model.SubscriptionSourceTelegram,
+		SourceProvider: "quark",
+		FileName:       "handler.mkv",
+		Status:         model.SubscriptionItemStatusTransferred,
+		ClusterJobID:   "job-handler",
+	}); err != nil {
+		t.Fatalf("create episode source snapshot: %v", err)
+	}
+
+	for _, target := range []string{
+		"/admin/subscription/episode_sources",
+		"/admin/subscription/episode_sources?subscription_id=0",
+		"/admin/subscription/episode_sources?subscription_id=bad",
+	} {
+		c, recorder := newSubscriptionHandleContext(t, http.MethodGet, target)
+		ListSubscriptionEpisodeSources(c)
+		resp := decodeHandleResp[any](t, recorder)
+		if resp.Code != 400 {
+			t.Fatalf("%s code = %d, want 400", target, resp.Code)
+		}
+	}
+
+	c, recorder := newSubscriptionHandleContext(t, http.MethodGet, "/admin/subscription/episode_sources?subscription_id="+strconv.Itoa(int(sub.ID)))
+	ListSubscriptionEpisodeSources(c)
+
+	resp := decodeHandleResp[subscriptionEpisodeSourcesData](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200: %s", resp.Code, recorder.Body.String())
+	}
+	if len(resp.Data.Content) != 1 {
+		t.Fatalf("content len = %d, want 1: %#v", len(resp.Data.Content), resp.Data.Content)
+	}
+	if resp.Data.Content[0].WorkerName != "处理节点" || resp.Data.Content[0].Status != model.SubscriptionItemStatusTransferred {
+		t.Fatalf("episode source detail = %#v", resp.Data.Content[0])
+	}
+}
 
 func TestFilterDisplayedSubscriptionItems(t *testing.T) {
 	items := []model.SubscriptionItem{

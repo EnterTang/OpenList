@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 type recordingClusterDispatcher struct {
 	inspectTasks []ClusterInspectTask
 	tasks        []ClusterMediaTask
+	results      []ClusterDispatchResult
 	err          error
 }
 
@@ -28,6 +30,9 @@ func (d *recordingClusterDispatcher) DispatchSubscriptionMedia(_ context.Context
 	d.tasks = append(d.tasks, tasks...)
 	if d.err != nil {
 		return nil, d.err
+	}
+	if d.results != nil {
+		return append([]ClusterDispatchResult(nil), d.results...), nil
 	}
 	results := make([]ClusterDispatchResult, 0, len(tasks))
 	for _, task := range tasks {
@@ -231,7 +236,7 @@ func TestClusterDispatchPersistsContextAndTransitionsStatus(t *testing.T) {
 	RegisterClusterDispatcher(dispatcher)
 	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
 
-	sub := &model.Subscription{ID: 41, Name: "Example", TransferEnabled: true, TMDBID: 123, TMDBName: "Example", TMDBYear: 2026, MediaType: "tv", TargetRoot: "/TV"}
+	sub := &model.Subscription{ID: 41, Name: "Example", SourceType: model.SubscriptionSourceTelegram, TransferEnabled: true, TMDBID: 123, TMDBName: "Example", TMDBYear: 2026, MediaType: "tv", TargetRoot: "/TV"}
 	ref := ShareRef{Provider: ShareProviderAliyunDrive, RawURL: "https://www.alipan.com/s/example", ShareID: "example", Passcode: "1234"}
 	message := clusterSourceMessage{ID: "9001", Channel: "shows", URL: "https://t.me/shows/9001", Text: "Example S01E02"}
 	item := clusterItemFromShareEntry(sub, ref, TreeEntry{Path: "/Example.S01E02.mkv", Name: "Example.S01E02.mkv", ID: "file-2", Size: 2048, Modified: time.Unix(100, 0)}, message, time.Now())
@@ -260,12 +265,314 @@ func TestClusterDispatchPersistsContextAndTransitionsStatus(t *testing.T) {
 	if got.Status != model.SubscriptionItemStatusTransferring || got.ClusterJobID == "" {
 		t.Fatalf("item status/job = %q/%q", got.Status, got.ClusterJobID)
 	}
+	sources, err := db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil {
+		t.Fatalf("list episode sources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("episode sources len = %d, want 1: %#v", len(sources), sources)
+	}
+	source := sources[0]
+	if source.SourceItemID != got.ID ||
+		source.SourceType != model.SubscriptionSourceTelegram ||
+		source.SourceProvider != string(ShareProviderAliyunDrive) ||
+		source.ShareURL != ref.RawURL ||
+		source.FileName != item.FileName ||
+		source.ClusterJobID != got.ClusterJobID ||
+		source.Season != 1 ||
+		source.Episode != 2 ||
+		source.SelectedAt.IsZero() {
+		t.Fatalf("episode source = %#v", source)
+	}
 	if err := CompleteClusterTransfer(sub.ID, item.SourceKey, got.ClusterJobID); err != nil {
 		t.Fatalf("complete transfer: %v", err)
 	}
 	got, _ = db.GetSubscriptionItem(sub.ID, item.SourceKey)
 	if got.Status != model.SubscriptionItemStatusTransferred {
 		t.Fatalf("completed status = %q", got.Status)
+	}
+}
+
+func TestClusterDispatchReplacesMovieSnapshotAtMovieSlot(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{ID: 46, Name: "Movie", SourceType: model.SubscriptionSourceTelegram, TransferEnabled: true, TMDBID: 456, TMDBName: "Movie", TMDBYear: 2026, MediaType: "movie", TargetRoot: "/Movies"}
+	ref := ShareRef{Provider: ShareProviderAliyunDrive, RawURL: "https://www.alipan.com/s/movie", ShareID: "movie", Passcode: "1234"}
+	message := clusterSourceMessage{ID: "9002", Channel: "movies", URL: "https://t.me/movies/9002", Text: "Movie"}
+	item := clusterItemFromShareEntry(sub, ref, TreeEntry{Path: "/Movie.mkv", Name: "Movie.mkv", ID: "movie-file", Size: 2048, Modified: time.Unix(101, 0)}, message, time.Now())
+	item.Season = 1
+	item.Episode = 8
+	stored, _, _, err := upsertClusterItems([]*model.SubscriptionItem{item})
+	if err != nil {
+		t.Fatalf("upsert cluster item: %v", err)
+	}
+	_, err = db.UpsertSubscriptionEpisodeSource(&model.SubscriptionEpisodeSource{
+		SubscriptionID: sub.ID,
+		Season:         0,
+		Episode:        0,
+		SourceItemID:   999,
+		SourceType:     model.SubscriptionSourceManual,
+		SourceProvider: "old-provider",
+		ShareURL:       "https://old.example/s/movie",
+		FileName:       "Old.Movie.mkv",
+		SelectedAt:     time.Unix(100, 0),
+	})
+	if err != nil {
+		t.Fatalf("seed movie source snapshot: %v", err)
+	}
+
+	count, err := dispatchClusterItems(context.Background(), sub, stored, ref, message)
+	if err != nil || count != 1 {
+		t.Fatalf("dispatch count=%d err=%v", count, err)
+	}
+	sources, err := db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil {
+		t.Fatalf("list episode sources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("episode sources len = %d, want 1: %#v", len(sources), sources)
+	}
+	source := sources[0]
+	if source.Season != 0 ||
+		source.Episode != 0 ||
+		source.SourceItemID != stored[0].ID ||
+		source.SourceType != model.SubscriptionSourceTelegram ||
+		source.SourceProvider != string(ShareProviderAliyunDrive) ||
+		source.ShareURL != ref.RawURL ||
+		source.FileName != item.FileName ||
+		source.ClusterJobID == "" {
+		t.Fatalf("replaced movie source = %#v", source)
+	}
+}
+
+func TestClusterDispatchRecoversSnapshotWhenAcceptedStatePersistenceFails(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	oldPersist := persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot
+	persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot = func(sourceSub *model.Subscription, item *model.SubscriptionItem) error {
+		if sourceSub == nil || item == nil {
+			t.Fatalf("snapshot input = %#v/%#v", sourceSub, item)
+		}
+		return errors.New("forced source snapshot persistence failure")
+	}
+	t.Cleanup(func() { persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot = oldPersist })
+
+	sub := &model.Subscription{ID: 47, Name: "Movie", SourceType: model.SubscriptionSourceTelegram, TransferEnabled: true, TMDBID: 123, TMDBName: "Movie", TMDBYear: 2026, MediaType: "movie", TargetRoot: "/Movies"}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	ref := ShareRef{Provider: ShareProviderAliyunDrive, RawURL: "https://www.alipan.com/s/movie", ShareID: "movie", Passcode: "1234"}
+	message := clusterSourceMessage{ID: "9003", Channel: "movies", URL: "https://t.me/movies/9003", Text: "Movie"}
+	item := clusterItemFromShareEntry(sub, ref, TreeEntry{Path: "/Movie.mkv", Name: "Movie.mkv", ID: "file-3", Size: 2048, Modified: time.Unix(102, 0)}, message, time.Now())
+	item.Season = 1
+	item.Episode = 10
+	stored, _, _, err := upsertClusterItems([]*model.SubscriptionItem{item})
+	if err != nil {
+		t.Fatalf("upsert cluster item: %v", err)
+	}
+
+	count, err := dispatchClusterItems(context.Background(), sub, stored, ref, message)
+	if err == nil || err.Error() != "forced source snapshot persistence failure" {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("dispatch count = %d, want 0", count)
+	}
+	if len(dispatcher.tasks) != 1 {
+		t.Fatalf("external dispatch tasks = %d, want 1", len(dispatcher.tasks))
+	}
+	persisted, err := db.GetSubscriptionItem(sub.ID, item.SourceKey)
+	if err != nil {
+		t.Fatalf("get persisted item: %v", err)
+	}
+	if persisted.Status != model.SubscriptionItemStatusPending || persisted.ClusterJobID != "" {
+		t.Fatalf("persisted item = %#v, want retryable pending item", persisted)
+	}
+	sources, err := db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil {
+		t.Fatalf("list episode sources: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("episode sources after snapshot failure = %#v, want none", sources)
+	}
+
+	persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot = oldPersist
+	jobID := "job-" + item.SourceKey
+	if err := db.GetDb().Create(&model.ClusterJob{
+		ID:                 jobID,
+		Type:               model.ClusterJobTypeMediaTransfer,
+		Status:             model.ClusterJobStatusRunning,
+		SubscriptionID:     sub.ID,
+		SubscriptionItemID: persisted.ID + 1,
+		MediaItemID:        clusterMediaTask(sub, persisted, ref, message).MediaItemID,
+	}).Error; err != nil {
+		t.Fatalf("create mismatched cluster job: %v", err)
+	}
+	if err := FailClusterTransfer(sub.ID, item.SourceKey, jobID, errors.New("cluster transfer failed")); err == nil {
+		t.Fatal("mismatched cluster job unexpectedly recovered pending item")
+	}
+	persisted, err = db.GetSubscriptionItem(sub.ID, item.SourceKey)
+	if err != nil {
+		t.Fatalf("get rejected item: %v", err)
+	}
+	if persisted.Status != model.SubscriptionItemStatusPending {
+		t.Fatalf("rejected item status = %q, want pending", persisted.Status)
+	}
+	if err := db.GetDb().Model(&model.ClusterJob{}).Where("id = ?", jobID).Update("subscription_item_id", persisted.ID).Error; err != nil {
+		t.Fatalf("correct cluster job item id: %v", err)
+	}
+	if err := FailClusterTransfer(sub.ID, item.SourceKey, jobID, errors.New("cluster transfer failed")); err != nil {
+		t.Fatalf("recover failed cluster transfer: %v", err)
+	}
+	persisted, err = db.GetSubscriptionItem(sub.ID, item.SourceKey)
+	if err != nil {
+		t.Fatalf("get recovered item: %v", err)
+	}
+	if persisted.Status != model.SubscriptionItemStatusFailed || persisted.ClusterJobID != jobID || persisted.LastError != "cluster transfer failed" {
+		t.Fatalf("recovered item = %#v", persisted)
+	}
+	sources, err = db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil {
+		t.Fatalf("list recovered episode sources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("recovered episode sources = %#v, want one", sources)
+	}
+	source := sources[0]
+	if source.SourceItemID != persisted.ID ||
+		source.SourceType != model.SubscriptionSourceTelegram ||
+		source.SourceProvider != string(ShareProviderAliyunDrive) ||
+		source.ShareURL != ref.RawURL ||
+		source.FileName != item.FileName ||
+		source.ClusterJobID != jobID ||
+		source.Season != 0 ||
+		source.Episode != 0 {
+		t.Fatalf("recovered episode source = %#v", source)
+	}
+}
+
+func TestClusterCallbackRejectsStaleFileHash(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+
+	sub := &model.Subscription{Name: "Stale cluster callback", SourceType: model.SubscriptionSourceTelegram, MediaType: "movie"}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	accepted, _, err := db.PersistAcceptedSubscriptionItemAndEpisodeSource(&model.SubscriptionItem{
+		SubscriptionID: sub.ID,
+		SourceKey:      "stale-cluster",
+		SourceProvider: string(ShareProviderAliyunDrive),
+		SourceURL:      "https://www.alipan.com/s/old",
+		FileName:       "Movie.mkv",
+		FileHash:       "hash-old",
+		Season:         1,
+		Episode:        14,
+		TargetDir:      "/movies",
+		TargetName:     "Movie.mkv",
+		TargetPath:     "/movies/Movie.mkv",
+		ClusterJobID:   "old-job",
+		Status:         model.SubscriptionItemStatusTransferring,
+	}, &model.SubscriptionEpisodeSource{
+		SubscriptionID: sub.ID,
+		Season:         0,
+		Episode:        0,
+		SourceType:     model.SubscriptionSourceTelegram,
+		SourceProvider: string(ShareProviderAliyunDrive),
+		ShareURL:       "https://www.alipan.com/s/old",
+		FileName:       "Movie.mkv",
+		ClusterJobID:   "old-job",
+	})
+	if err != nil {
+		t.Fatalf("persist accepted item: %v", err)
+	}
+	oldMediaID := clusterMediaTask(sub, accepted, ShareRef{}, clusterSourceMessage{}).MediaItemID
+	if err := db.GetDb().Create(&model.ClusterJob{
+		ID:                 "old-job",
+		Type:               model.ClusterJobTypeMediaTransfer,
+		Status:             model.ClusterJobStatusRunning,
+		SubscriptionID:     sub.ID,
+		SubscriptionItemID: accepted.ID,
+		MediaItemID:        oldMediaID,
+	}).Error; err != nil {
+		t.Fatalf("create accepted cluster job: %v", err)
+	}
+	newer := *accepted
+	newer.FileHash = "hash-new"
+	newer.Status = model.SubscriptionItemStatusPending
+	if _, _, err := db.UpsertSubscriptionItem(&newer); err != nil {
+		t.Fatalf("replace item with newer file hash: %v", err)
+	}
+	sourcesBefore, err := db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil || len(sourcesBefore) != 1 {
+		t.Fatalf("source before stale callback = %#v err=%v", sourcesBefore, err)
+	}
+
+	if err := CompleteClusterTransfer(sub.ID, accepted.SourceKey, "old-job"); err == nil {
+		t.Fatal("stale cluster callback unexpectedly finalized newer item")
+	}
+	item, err := db.GetSubscriptionItem(sub.ID, accepted.SourceKey)
+	if err != nil {
+		t.Fatalf("get newer item: %v", err)
+	}
+	if item.Status != model.SubscriptionItemStatusPending || item.FileHash != "hash-new" {
+		t.Fatalf("newer item = %#v, want pending hash-new", item)
+	}
+	sources, err := db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources after stale callback = %#v err=%v", sources, err)
+	}
+	if got := sources[0]; got.SourceItemID != sourcesBefore[0].SourceItemID ||
+		got.SourceProvider != sourcesBefore[0].SourceProvider ||
+		got.ShareURL != sourcesBefore[0].ShareURL ||
+		got.ClusterJobID != sourcesBefore[0].ClusterJobID ||
+		got.Season != 0 ||
+		got.Episode != 0 {
+		t.Fatalf("source changed by stale callback = %#v", got)
+	}
+}
+
+func TestClusterCallbackRequiresMatchingActiveJobID(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+
+	item, _, err := db.UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: 1,
+		SourceKey:      "active-cluster-job",
+		ClusterJobID:   "active-job",
+		Status:         model.SubscriptionItemStatusTransferring,
+	})
+	if err != nil {
+		t.Fatalf("upsert transferring item: %v", err)
+	}
+	if err := CompleteClusterTransfer(item.SubscriptionID, item.SourceKey, "stale-job"); err == nil {
+		t.Fatal("stale job unexpectedly completed active transfer")
+	}
+	persisted, err := db.GetSubscriptionItem(item.SubscriptionID, item.SourceKey)
+	if err != nil {
+		t.Fatalf("get item after stale callback: %v", err)
+	}
+	if persisted.Status != model.SubscriptionItemStatusTransferring || persisted.ClusterJobID != "active-job" {
+		t.Fatalf("item after stale callback = %#v", persisted)
+	}
+
+	persisted.ClusterJobID = ""
+	if _, _, err := db.UpsertSubscriptionItem(persisted); err != nil {
+		t.Fatalf("clear active job id: %v", err)
+	}
+	if err := FailClusterTransfer(item.SubscriptionID, item.SourceKey, "active-job", errors.New("late failure")); err == nil {
+		t.Fatal("callback unexpectedly failed item without an active job id")
+	}
+	persisted, err = db.GetSubscriptionItem(item.SubscriptionID, item.SourceKey)
+	if err != nil {
+		t.Fatalf("get item after missing job callback: %v", err)
+	}
+	if persisted.Status != model.SubscriptionItemStatusTransferring || persisted.ClusterJobID != "" {
+		t.Fatalf("item after missing job callback = %#v", persisted)
 	}
 }
 
@@ -395,5 +702,49 @@ func TestClusterDispatchFailureMarksItemFailed(t *testing.T) {
 	got, _ := db.GetSubscriptionItem(sub.ID, item.SourceKey)
 	if got.Status != model.SubscriptionItemStatusFailed || got.LastError != "no worker" {
 		t.Fatalf("failed item = %#v", got)
+	}
+	sources, err := db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil {
+		t.Fatalf("list episode sources: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("episode sources after dispatch failure = %#v, want none", sources)
+	}
+}
+
+func TestClusterDispatchEmptyJobIDDoesNotSnapshot(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{ID: 45, SourceType: model.SubscriptionSourceTelegram, TransferEnabled: true, TMDBName: "Movie", MediaType: "movie", TargetRoot: "/Movies"}
+	ref := ShareRef{Provider: ShareProviderQuark, RawURL: "https://pan.quark.cn/s/example", ShareID: "example"}
+	item := clusterItemFromShareEntry(sub, ref, TreeEntry{Path: "/Movie.mkv", Name: "Movie.mkv", ID: "movie", Size: 100}, clusterSourceMessage{}, time.Now())
+	RegisterClusterDispatcher(&recordingClusterDispatcher{
+		results: []ClusterDispatchResult{{SourceKey: item.SourceKey, JobID: ""}},
+	})
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+	stored, _, _, err := upsertClusterItems([]*model.SubscriptionItem{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := dispatchClusterItems(context.Background(), sub, stored, ref, clusterSourceMessage{})
+	if err == nil || !strings.Contains(err.Error(), "empty job id") {
+		t.Fatalf("dispatch error = %v, want empty job id error", err)
+	}
+	if count != 0 {
+		t.Fatalf("dispatch count = %d, want 0", count)
+	}
+	got, err := db.GetSubscriptionItem(sub.ID, item.SourceKey)
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	if got.Status != model.SubscriptionItemStatusFailed || !strings.Contains(got.LastError, "empty job id") {
+		t.Fatalf("failed item = %#v", got)
+	}
+	sources, err := db.ListSubscriptionEpisodeSources(sub.ID)
+	if err != nil {
+		t.Fatalf("list episode sources: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("episode sources after empty job id = %#v, want none", sources)
 	}
 }

@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	stdpath "path"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -13,14 +14,17 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type TransferFinalizePayload struct {
-	SubscriptionID uint
-	SourceKey      string
-	TargetDir      string
-	FileName       string
-	TargetName     string
+	SubscriptionID     uint
+	SubscriptionItemID uint
+	SourceKey          string
+	FileHash           string
+	TargetDir          string
+	FileName           string
+	TargetName         string
 }
 
 func RegisterTransferTaskHooks() {
@@ -86,9 +90,12 @@ func markSubscriptionTransferSucceeded(payload TransferFinalizePayload) {
 	if err != nil || item == nil {
 		return
 	}
-	item.Status = model.SubscriptionItemStatusTransferred
-	item.LastError = ""
-	_, _, _ = db.UpsertSubscriptionItem(item)
+	if !transferPayloadMatchesItem(payload, item) {
+		return
+	}
+	if err := persistStandaloneTerminalSubscriptionItem(item, model.SubscriptionItemStatusTransferred, ""); err != nil && !errors.Is(err, db.ErrStaleSubscriptionTerminalCallback) {
+		logrus.WithError(err).WithField("subscription_item_id", item.ID).Error("failed to persist subscription transfer completion")
+	}
 }
 
 func markSubscriptionTransferFailed(payload TransferFinalizePayload, err error) {
@@ -96,11 +103,16 @@ func markSubscriptionTransferFailed(payload TransferFinalizePayload, err error) 
 	if getErr != nil || item == nil {
 		return
 	}
-	item.Status = model.SubscriptionItemStatusFailed
-	if err != nil {
-		item.LastError = err.Error()
+	if !transferPayloadMatchesItem(payload, item) {
+		return
 	}
-	_, _, _ = db.UpsertSubscriptionItem(item)
+	lastError := item.LastError
+	if err != nil {
+		lastError = err.Error()
+	}
+	if persistErr := persistStandaloneTerminalSubscriptionItem(item, model.SubscriptionItemStatusFailed, lastError); persistErr != nil && !errors.Is(persistErr, db.ErrStaleSubscriptionTerminalCallback) {
+		logrus.WithError(persistErr).WithField("subscription_item_id", item.ID).Error("failed to persist subscription transfer failure")
+	}
 }
 
 func transferItem(ctx context.Context, item *model.SubscriptionItem, deleteSourceAfter bool) error {
@@ -115,11 +127,13 @@ func transferItem(ctx context.Context, item *model.SubscriptionItem, deleteSourc
 		return err
 	}
 	payload := TransferFinalizePayload{
-		SubscriptionID: item.SubscriptionID,
-		SourceKey:      item.SourceKey,
-		TargetDir:      targetDir,
-		FileName:       item.FileName,
-		TargetName:     item.TargetName,
+		SubscriptionID:     item.SubscriptionID,
+		SubscriptionItemID: item.ID,
+		SourceKey:          item.SourceKey,
+		FileHash:           item.FileHash,
+		TargetDir:          targetDir,
+		FileName:           item.FileName,
+		TargetName:         item.TargetName,
 	}
 	taskCtx := context.WithValue(ctx, conf.ForceTaskKey, struct{}{})
 	taskCtx = context.WithValue(taskCtx, conf.TransferTaskPayloadKey, payload)
@@ -135,7 +149,80 @@ func transferItem(ctx context.Context, item *model.SubscriptionItem, deleteSourc
 	return nil
 }
 
-func applyItemTransfer(ctx context.Context, stored *model.SubscriptionItem, deleteSourceAfter bool) (*model.SubscriptionItem, int, error) {
+func subscriptionEpisodeSourceSnapshot(sourceSub *model.Subscription, item *model.SubscriptionItem) (*model.SubscriptionEpisodeSource, error) {
+	if sourceSub == nil {
+		return nil, errors.New("source subscription is nil")
+	}
+	if item == nil {
+		return nil, errors.New("subscription item is nil")
+	}
+	season, episode := item.Season, item.Episode
+	if normalizeMediaType(sourceSub.MediaType) == "movie" {
+		season, episode = 0, 0
+	}
+	return &model.SubscriptionEpisodeSource{
+		SubscriptionID: item.SubscriptionID,
+		Season:         season,
+		Episode:        episode,
+		SourceItemID:   item.ID,
+		SourceType:     sourceSub.SourceType,
+		SourceProvider: item.SourceProvider,
+		ShareURL:       item.SourceURL,
+		FileName:       item.FileName,
+		FileHash:       item.FileHash,
+		Status:         item.Status,
+		ClusterJobID:   item.ClusterJobID,
+		SelectedAt:     time.Now(),
+	}, nil
+}
+
+var persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot = func(sourceSub *model.Subscription, item *model.SubscriptionItem) error {
+	source, err := subscriptionEpisodeSourceSnapshot(sourceSub, item)
+	if err != nil {
+		return err
+	}
+	_, _, err = db.PersistAcceptedSubscriptionItemAndEpisodeSource(item, source)
+	return err
+}
+
+var persistSubscriptionTerminalItem = db.PersistSubscriptionTerminalItem
+
+func persistStandaloneTerminalSubscriptionItem(item *model.SubscriptionItem, status, lastError string) error {
+	request := db.SubscriptionTerminalItemRequest{
+		ItemID:            item.ID,
+		SubscriptionID:    item.SubscriptionID,
+		SourceKey:         item.SourceKey,
+		ExpectedFileHash:  item.FileHash,
+		ExpectedStatus:    item.Status,
+		TerminalStatus:    status,
+		TerminalLastError: lastError,
+	}
+	if item.Status == model.SubscriptionItemStatusPending {
+		subscription, err := db.GetSubscriptionByID(item.SubscriptionID)
+		if err != nil {
+			return err
+		}
+		source, err := subscriptionEpisodeSourceSnapshot(subscription, item)
+		if err != nil {
+			return err
+		}
+		request.RecoverySource = source
+	}
+	_, err := persistSubscriptionTerminalItem(request)
+	return err
+}
+
+func transferPayloadMatchesItem(payload TransferFinalizePayload, item *model.SubscriptionItem) bool {
+	return item != nil &&
+		payload.SubscriptionItemID != 0 &&
+		payload.SubscriptionItemID == item.ID &&
+		payload.FileHash == item.FileHash &&
+		utils.FixAndCleanPath(payload.TargetDir) == utils.FixAndCleanPath(item.TargetDir) &&
+		payload.FileName == item.FileName &&
+		payload.TargetName == item.TargetName
+}
+
+func applyItemTransfer(ctx context.Context, sourceSub *model.Subscription, stored *model.SubscriptionItem, deleteSourceAfter bool, onAccepted func(*model.Subscription, *model.SubscriptionItem) error) (*model.SubscriptionItem, int, error) {
 	if stored == nil {
 		return nil, 0, errors.New("subscription item is nil")
 	}
@@ -147,9 +234,11 @@ func applyItemTransfer(ctx context.Context, stored *model.SubscriptionItem, dele
 	}
 	stored.Status = model.SubscriptionItemStatusTransferring
 	stored.LastError = ""
-	updated, _, err := db.UpsertSubscriptionItem(stored)
-	if err != nil {
-		return updated, 0, err
+	if onAccepted == nil {
+		return stored, 0, errors.New("accepted subscription item persister is nil")
 	}
-	return updated, 1, nil
+	if err := onAccepted(sourceSub, stored); err != nil {
+		return stored, 0, err
+	}
+	return stored, 1, nil
 }

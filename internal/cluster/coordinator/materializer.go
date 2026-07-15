@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"gorm.io/gorm"
 )
+
+var seasonFolderPattern = regexp.MustCompile(`(?i)^season\s+0*[1-9]\d*$`)
 
 func (s *Service) ProcessPendingManifests(ctx context.Context, limit int) (int, error) {
 	materializeETF := strings.TrimSpace(conf.Conf.Cluster.ETFRootPath) != ""
@@ -56,11 +59,16 @@ func (s *Service) materializeManifest(ctx context.Context, manifest *model.Clust
 	if err != nil {
 		return err
 	}
-	relativeRoot, err := safeRelativeMediaRoot(manifest.LogicalTargetPath)
+	relativeArchiveDir, err := safeRelativeArchiveDirectory(manifest.LogicalTargetPath)
 	if err != nil {
 		return err
 	}
-	dstDir := path.Join(root, relativeRoot)
+	relativeMediaRoot, err := safeRelativeMediaRoot(manifest.LogicalTargetPath)
+	if err != nil {
+		return err
+	}
+	dstDir := path.Join(root, relativeArchiveDir)
+	mediaRootPath := path.Join(root, relativeMediaRoot)
 	if err := fs.MakeDir(ctx, dstDir); err != nil {
 		return fmt.Errorf("create cluster ETF directory: %w", err)
 	}
@@ -76,7 +84,7 @@ func (s *Service) materializeManifest(ctx context.Context, manifest *model.Clust
 	}
 	etfName := etfmeta.FileName(manifest.Name)
 	archivePath := path.Join(dstDir, etfName)
-	storage, actualDir, err := op.GetStorageAndActualPath(dstDir)
+	storage, _, err := op.GetStorageAndActualPath(dstDir)
 	if err != nil {
 		return fmt.Errorf("resolve cluster ETF storage: %w", err)
 	}
@@ -121,15 +129,19 @@ func (s *Service) materializeManifest(ctx context.Context, manifest *model.Clust
 		}
 	}
 	record = existing
-	rootObj, err := op.Get(ctx, storage, actualDir)
+	mediaRootStorage, actualMediaRootDir, err := op.GetStorageAndActualPath(mediaRootPath)
 	if err != nil {
-		return fmt.Errorf("read cluster ETF directory: %w", err)
+		return fmt.Errorf("resolve cluster ETF media root: %w", err)
+	}
+	rootObj, err := op.Get(ctx, mediaRootStorage, actualMediaRootDir)
+	if err != nil {
+		return fmt.Errorf("read cluster ETF media root: %w", err)
 	}
 	_, err = etfauto.RecordArchiveEvent(ctx, etfauto.ArchiveEvent{
 		Record:          record,
 		ClusterJobID:    manifest.JobID,
 		MediaRootFileID: rootObj.GetID(),
-		MediaRootPath:   dstDir,
+		MediaRootPath:   mediaRootPath,
 		OccurredAt:      time.Now().UTC(),
 	}, notification)
 	if err != nil {
@@ -287,13 +299,27 @@ func clusterTargetNotificationStatus(targetBaseURL string) string {
 }
 
 func safeRelativeMediaRoot(logicalTargetPath string) (string, error) {
+	dir, err := safeRelativeArchiveDirectory(logicalTargetPath)
+	if err != nil {
+		return "", err
+	}
+	if seasonFolderPattern.MatchString(path.Base(dir)) {
+		dir = path.Dir(dir)
+	}
+	if dir == "" || dir == "." || strings.HasPrefix(dir, "../") {
+		return "", errors.New("logical target path has no safe media root")
+	}
+	return dir, nil
+}
+
+func safeRelativeArchiveDirectory(logicalTargetPath string) (string, error) {
 	cleaned := path.Clean("/" + strings.TrimSpace(logicalTargetPath))
 	if cleaned == "/" || cleaned == "." {
 		return "", errors.New("logical target path is empty")
 	}
 	dir := strings.TrimPrefix(path.Dir(cleaned), "/")
 	if dir == "" || dir == "." || strings.HasPrefix(dir, "../") {
-		return "", errors.New("logical target path has no safe media root")
+		return "", errors.New("logical target path has no safe archive directory")
 	}
 	return dir, nil
 }

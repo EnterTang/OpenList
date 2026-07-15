@@ -1,12 +1,17 @@
 package handles
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/tmdb"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -14,16 +19,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	tmdbEpisodeRefreshInterval = 24 * time.Hour
+	tmdbEpisodeRefreshWorkers  = 4
+)
+
 type listSubscriptionsReq struct {
 	model.PageReq
-	Keyword    string `form:"keyword" json:"keyword"`
-	SourceType string `form:"source_type" json:"source_type"`
-	Active     string `form:"active" json:"active"`
+	Keyword       string `form:"keyword" json:"keyword"`
+	SourceType    string `form:"source_type" json:"source_type"`
+	Active        string `form:"active" json:"active"`
+	ArchiveStatus string `form:"archive_status" json:"archive_status"`
 }
 
 type listSubscriptionRunsReq struct {
 	model.PageReq
 	SubscriptionID uint   `form:"subscription_id" json:"subscription_id"`
+	View           string `form:"view" json:"view"`
+	Keyword        string `form:"keyword" json:"keyword"`
+	SourceType     string `form:"source_type" json:"source_type"`
 	Status         string `form:"status" json:"status"`
 }
 
@@ -43,18 +57,158 @@ func ListSubscriptions(c *gin.Context) {
 		}
 		active = &value
 	}
-	items, total, err := db.ListSubscriptions(db.SubscriptionFilter{
+	archiveStatus, err := resolveSubscriptionArchiveStatus(req.ArchiveStatus)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	filter := db.SubscriptionFilter{
 		Keyword:    req.Keyword,
 		SourceType: strings.TrimSpace(req.SourceType),
 		Active:     active,
 		Page:       req.Page,
 		PerPage:    req.PerPage,
-	})
+	}
+	hydrateSubscriptionEpisodeEnds(c.Request.Context(), filter)
+	items, total, err := subscription.ListSubscriptionsWithProgress(filter, archiveStatus, time.Now())
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
 	common.SuccessResp(c, common.PageResp{Content: items, Total: total})
+}
+
+func resolveSubscriptionArchiveStatus(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "all", nil
+	}
+	if err := subscription.ValidateSubscriptionArchiveStatus(value); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func hydrateSubscriptionEpisodeEnds(ctx context.Context, filter db.SubscriptionFilter) {
+	apiKey := etfArchiveSettingValue(conf.TMDBApiKey)
+	if apiKey == "" {
+		return
+	}
+	items, err := db.ListAllSubscriptions(filter)
+	if err != nil {
+		return
+	}
+	config := tmdb.Config{
+		APIKey:        apiKey,
+		BaseURL:       etfArchiveSettingValue(conf.TMDBApiBaseURL),
+		Language:      etfArchiveSettingValue(conf.TMDBLanguage),
+		CategoryRules: etfArchiveSettingValue(conf.MediaCategoryRules),
+	}
+	now := time.Now()
+	sem := make(chan struct{}, tmdbEpisodeRefreshWorkers)
+	var group sync.WaitGroup
+	for i := range items {
+		item := &items[i]
+		if !shouldHydrateSubscriptionEpisodeEnd(item, now) {
+			continue
+		}
+		group.Add(1)
+		sem <- struct{}{}
+		go func(item *model.Subscription) {
+			defer group.Done()
+			defer func() { <-sem }()
+			query := strings.TrimSpace(item.TMDBName)
+			if item.TMDBID > 0 {
+				query = strconv.FormatInt(item.TMDBID, 10)
+			}
+			candidates, err := tmdb.SearchCandidates(ctx, config, query)
+			if err != nil {
+				return
+			}
+			episodeEnd := item.LatestSeasonEpisodeEnd
+			var discoveredTMDBID *int64
+			if candidate := subscriptionTMDBCandidate(item, candidates); candidate != nil {
+				if item.TMDBID == 0 && candidate.TMDBID > 0 {
+					tmdbID := candidate.TMDBID
+					discoveredTMDBID = &tmdbID
+				}
+				if end := subscriptionEpisodeEndFromTMDBCandidate(item, candidate); end > 0 {
+					episodeEnd = end
+				}
+			}
+			checkedAt := now
+			_, _ = db.UpdateSubscriptionTMDBEpisodeEnd(item, discoveredTMDBID, episodeEnd, checkedAt)
+		}(item)
+	}
+	group.Wait()
+}
+
+func shouldHydrateSubscriptionEpisodeEnd(item *model.Subscription, now time.Time) bool {
+	if item == nil || item.MediaType != "tv" {
+		return false
+	}
+	if item.TMDBID <= 0 && strings.TrimSpace(item.TMDBName) == "" {
+		return false
+	}
+	return item.TMDBEpisodeSyncedAt == nil || now.Sub(*item.TMDBEpisodeSyncedAt) >= tmdbEpisodeRefreshInterval
+}
+
+func subscriptionEpisodeEndFromTMDBCandidates(item *model.Subscription, candidates []model.ETFArchiveTMDBCandidate) int {
+	return subscriptionEpisodeEndFromTMDBCandidate(item, subscriptionTMDBCandidate(item, candidates))
+}
+
+func subscriptionTMDBCandidate(item *model.Subscription, candidates []model.ETFArchiveTMDBCandidate) *model.ETFArchiveTMDBCandidate {
+	if item == nil {
+		return nil
+	}
+	name := strings.TrimSpace(item.TMDBName)
+	if name == "" {
+		name = strings.TrimSpace(item.Name)
+	}
+	for i := range candidates {
+		candidate := &candidates[i]
+		if candidate.MediaType != "tv" {
+			continue
+		}
+		if item.TMDBID > 0 {
+			if candidate.TMDBID == item.TMDBID {
+				return candidate
+			}
+			continue
+		}
+		if !strings.EqualFold(candidate.Name, name) && !strings.EqualFold(candidate.OriginalName, name) {
+			continue
+		}
+		if item.TMDBYear > 0 && candidate.Year != item.TMDBYear {
+			continue
+		}
+		return candidate
+	}
+	return nil
+}
+
+func subscriptionEpisodeEndFromTMDBCandidate(item *model.Subscription, candidate *model.ETFArchiveTMDBCandidate) int {
+	if item == nil || candidate == nil {
+		return 0
+	}
+	latestSeason := item.Season
+	for _, season := range item.Seasons {
+		if season > latestSeason {
+			latestSeason = season
+		}
+	}
+	if latestSeason <= 0 {
+		return 0
+	}
+	if end := candidate.SeasonMap[latestSeason]; end > 0 {
+		return end
+	}
+	for _, season := range candidate.Seasons {
+		if season.SeasonNumber == latestSeason && season.EpisodeCount > 0 {
+			return season.EpisodeCount
+		}
+	}
+	return 0
 }
 
 func GetSubscription(c *gin.Context) {
@@ -192,9 +346,17 @@ func ListSubscriptionRuns(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
+	view, err := resolveSubscriptionRunView(req.View)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
 	req.Validate()
 	items, total, err := db.ListSubscriptionRuns(db.SubscriptionRunFilter{
 		SubscriptionID: req.SubscriptionID,
+		View:           view,
+		Keyword:        req.Keyword,
+		SourceType:     strings.TrimSpace(req.SourceType),
 		Status:         strings.TrimSpace(req.Status),
 		Page:           req.Page,
 		PerPage:        req.PerPage,
@@ -204,6 +366,43 @@ func ListSubscriptionRuns(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, common.PageResp{Content: items, Total: total})
+}
+
+func ListSubscriptionBoard(c *gin.Context) {
+	var req listSubscriptionRunsReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if _, err := resolveSubscriptionRunView(req.View); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	board, err := db.GetSubscriptionBoard(db.SubscriptionRunFilter{
+		SubscriptionID: req.SubscriptionID,
+		Keyword:        req.Keyword,
+		SourceType:     strings.TrimSpace(req.SourceType),
+		Status:         strings.TrimSpace(req.Status),
+	})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, board)
+}
+
+func ListSubscriptionEpisodeSources(c *gin.Context) {
+	subscriptionID, err := requiredUintQuery(c, "subscription_id")
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	items, err := db.ListSubscriptionEpisodeSourceDetails(subscriptionID)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, gin.H{"content": items})
 }
 
 func DeleteSubscriptionRun(c *gin.Context) {
@@ -228,6 +427,30 @@ func ClearFailedSubscriptionRuns(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, gin.H{"deleted": deleted})
+}
+
+func resolveSubscriptionRunView(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "":
+		return "", nil
+	case model.SubscriptionRunViewChanges, model.SubscriptionRunViewFailures:
+		return value, nil
+	default:
+		return "", errors.New("view must be changes or failures")
+	}
+}
+
+func requiredUintQuery(c *gin.Context, key string) (uint, error) {
+	value := strings.TrimSpace(c.Query(key))
+	if value == "" {
+		return 0, errors.New(key + " is required")
+	}
+	id, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || id == 0 {
+		return 0, errors.New(key + " is required")
+	}
+	return uint(id), nil
 }
 
 func SearchSubscriptionResources(c *gin.Context) {

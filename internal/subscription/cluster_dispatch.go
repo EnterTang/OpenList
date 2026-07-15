@@ -354,10 +354,30 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 				firstErr = result.Error
 			}
 		} else {
+			jobID := strings.TrimSpace(result.JobID)
+			if jobID == "" {
+				err := errors.New("cluster dispatch returned empty job id")
+				item.Status = model.SubscriptionItemStatusFailed
+				item.LastError = err.Error()
+				if firstErr == nil {
+					firstErr = err
+				}
+				if _, _, upsertErr := db.UpsertSubscriptionItem(item); upsertErr != nil && firstErr == nil {
+					firstErr = upsertErr
+				}
+				continue
+			}
 			item.Status = model.SubscriptionItemStatusTransferring
-			item.ClusterJobID = strings.TrimSpace(result.JobID)
+			item.ClusterJobID = jobID
 			item.LastError = ""
+			if err := persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot(sub, item); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
 			dispatched++
+			continue
 		}
 		if _, _, err := db.UpsertSubscriptionItem(item); err != nil && firstErr == nil {
 			firstErr = err
@@ -368,7 +388,7 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 
 func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref ShareRef, message clusterSourceMessage) ClusterMediaTask {
 	shareFingerprint := shortHash(string(ref.Provider) + "\x00" + strings.TrimSpace(ref.RawURL) + "\x00" + ref.Passcode)
-	mediaItemID := shortHash(fmt.Sprintf("%d\x00%s\x00%s", sub.ID, item.SourceKey, item.FileHash))
+	mediaItemID := clusterMediaItemID(sub.ID, item.SourceKey, item.FileHash)
 	idempotency := hashClusterSource(fmt.Sprint(sub.ID), string(ref.Provider), ref.ShareID, item.FileID, item.FileHash, item.TargetPath)
 	return ClusterMediaTask{
 		IdempotencyKey: idempotency, SubscriptionID: sub.ID, SubscriptionItemID: item.ID,
@@ -385,6 +405,10 @@ func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref
 		LogicalTargetPath: item.TargetPath,
 		WorkflowVersion:   ClusterWorkflowVersion, SealedManifestVersion: ClusterSealedManifestVersion,
 	}
+}
+
+func clusterMediaItemID(subscriptionID uint, sourceKey, fileHash string) string {
+	return shortHash(fmt.Sprintf("%d\x00%s\x00%s", subscriptionID, sourceKey, fileHash))
 }
 
 func clusterItemFromShareEntry(sub *model.Subscription, ref ShareRef, entry TreeEntry, message clusterSourceMessage, seenAt time.Time) *model.SubscriptionItem {
@@ -466,35 +490,93 @@ func clusterItemsHash(items []*model.SubscriptionItem) string {
 // surface used by the Coordinator after ETF materialization succeeds or a job
 // reaches a terminal failure.
 func CompleteClusterTransfer(subscriptionID uint, sourceKey, jobID string) error {
-	item, err := db.GetSubscriptionItem(subscriptionID, sourceKey)
-	if err != nil {
-		return err
-	}
-	if jobID != "" && item.ClusterJobID != "" && item.ClusterJobID != jobID {
-		return errors.New("cluster job does not match the active subscription item transfer")
-	}
-	item.Status = model.SubscriptionItemStatusTransferred
-	item.LastError = ""
-	if jobID != "" {
-		item.ClusterJobID = jobID
-	}
-	_, _, err = db.UpsertSubscriptionItem(item)
-	return err
+	return completeClusterTransfer(subscriptionID, sourceKey, jobID, model.SubscriptionItemStatusTransferred, "")
 }
 
 func FailClusterTransfer(subscriptionID uint, sourceKey, jobID string, cause error) error {
+	lastError := ""
+	if cause != nil {
+		lastError = cause.Error()
+	}
+	return completeClusterTransfer(subscriptionID, sourceKey, jobID, model.SubscriptionItemStatusFailed, lastError)
+}
+
+func completeClusterTransfer(subscriptionID uint, sourceKey, jobID, status, lastError string) error {
 	item, err := db.GetSubscriptionItem(subscriptionID, sourceKey)
 	if err != nil {
 		return err
 	}
-	if jobID != "" && item.ClusterJobID != "" && item.ClusterJobID != jobID {
+	if item.Status == model.SubscriptionItemStatusPending {
+		return recoverPendingClusterTerminalItem(item, jobID, status, lastError)
+	}
+	if item.Status != model.SubscriptionItemStatusTransferring || item.ClusterJobID == "" || item.ClusterJobID != jobID {
 		return errors.New("cluster job does not match the active subscription item transfer")
 	}
-	item.Status = model.SubscriptionItemStatusFailed
-	if cause != nil {
-		item.LastError = cause.Error()
+	expectedJobID := jobID
+	terminalJobID := jobID
+	terminalLastError := item.LastError
+	if status == model.SubscriptionItemStatusTransferred {
+		terminalLastError = ""
+	} else if lastError != "" {
+		terminalLastError = lastError
 	}
-	_, _, err = db.UpsertSubscriptionItem(item)
+	_, err = persistSubscriptionTerminalItem(db.SubscriptionTerminalItemRequest{
+		ItemID:               item.ID,
+		SubscriptionID:       item.SubscriptionID,
+		SourceKey:            item.SourceKey,
+		ExpectedFileHash:     item.FileHash,
+		ExpectedStatus:       model.SubscriptionItemStatusTransferring,
+		ExpectedClusterJobID: &expectedJobID,
+		TerminalStatus:       status,
+		TerminalLastError:    terminalLastError,
+		TerminalClusterJobID: &terminalJobID,
+	})
+	return err
+}
+
+func recoverPendingClusterTerminalItem(item *model.SubscriptionItem, jobID, status, lastError string) error {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("cluster job is required to recover a pending subscription item")
+	}
+	var job model.ClusterJob
+	if err := db.GetDb().First(&job, "id = ?", jobID).Error; err != nil {
+		return errors.WithStack(err)
+	}
+	if job.Type != model.ClusterJobTypeMediaTransfer ||
+		job.SubscriptionID != item.SubscriptionID ||
+		job.SubscriptionItemID != item.ID ||
+		job.MediaItemID != clusterMediaItemID(item.SubscriptionID, item.SourceKey, item.FileHash) {
+		return errors.New("cluster callback does not match an accepted pending subscription item")
+	}
+	subscription, err := db.GetSubscriptionByID(item.SubscriptionID)
+	if err != nil {
+		return err
+	}
+	terminalLastError := item.LastError
+	if status == model.SubscriptionItemStatusTransferred {
+		terminalLastError = ""
+	} else if lastError != "" {
+		terminalLastError = lastError
+	}
+	recoveryItem := *item
+	recoveryItem.ClusterJobID = jobID
+	source, err := subscriptionEpisodeSourceSnapshot(subscription, &recoveryItem)
+	if err != nil {
+		return err
+	}
+	terminalJobID := jobID
+	_, err = persistSubscriptionTerminalItem(db.SubscriptionTerminalItemRequest{
+		ItemID:               item.ID,
+		SubscriptionID:       item.SubscriptionID,
+		SourceKey:            item.SourceKey,
+		ExpectedFileHash:     item.FileHash,
+		ExpectedStatus:       model.SubscriptionItemStatusPending,
+		TerminalStatus:       status,
+		TerminalLastError:    terminalLastError,
+		TerminalClusterJobID: &terminalJobID,
+		RecoverySource:       source,
+	})
 	return err
 }
 

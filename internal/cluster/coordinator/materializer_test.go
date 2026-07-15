@@ -59,15 +59,43 @@ func TestProcessPendingManifestsCompletesWithoutETFRootPath(t *testing.T) {
 }
 
 func TestSafeRelativeMediaRoot(t *testing.T) {
-	got, err := safeRelativeMediaRoot("/TV/Example/Season 01/episode.mkv")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "TV/Example/Season 01" {
-		t.Fatalf("root = %q", got)
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{path: "/TV/Example/Season 1/episode.mkv", want: "TV/Example"},
+		{path: "/TV/Example/Season 01/episode.mkv", want: "TV/Example"},
+		{path: "/movie/Example/movie.mkv", want: "movie/Example"},
+	} {
+		got, err := safeRelativeMediaRoot(test.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != test.want {
+			t.Fatalf("root = %q, want %q", got, test.want)
+		}
 	}
 	if _, err := safeRelativeMediaRoot("episode.mkv"); err == nil {
 		t.Fatal("rootless path should be rejected")
+	}
+}
+
+func TestSafeRelativeArchiveDirectoryPreservesSeasonDirectory(t *testing.T) {
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{path: "/TV/Example/Season 1/episode.mkv", want: "TV/Example/Season 1"},
+		{path: "/TV/Example/Season 01/episode.mkv", want: "TV/Example/Season 01"},
+		{path: "/movie/Example/movie.mkv", want: "movie/Example"},
+	} {
+		got, err := safeRelativeArchiveDirectory(test.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != test.want {
+			t.Fatalf("archive directory = %q, want %q", got, test.want)
+		}
 	}
 }
 
