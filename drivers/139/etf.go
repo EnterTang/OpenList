@@ -28,6 +28,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/media/tmdb"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
 )
 
 const etfVideoLinkType = "etf_video"
@@ -143,7 +144,13 @@ func (d *Yun139) afterPersonalUploadETF(ctx context.Context, dstDir model.Obj, s
 		if uploadedObj == nil {
 			return fmt.Errorf("cluster upload result is missing remote object")
 		}
-		manifest.Name = sourceName
+		finalName := clusterUploadTargetName(ctx, sourceName)
+		if finalName != sourceName {
+			if err := d.Rename(ctx, uploadedObj, finalName); err != nil {
+				return fmt.Errorf("rename cluster upload to final target name: %w", err)
+			}
+		}
+		manifest.Name = finalName
 		manifest.Size = size
 		manifest.SHA256 = strings.ToUpper(strings.TrimSpace(sha256))
 		if manifest.HashSource == "" {
@@ -151,7 +158,7 @@ func (d *Yun139) afterPersonalUploadETF(ctx context.Context, dstDir model.Obj, s
 		}
 		manifest.RemoteFileID = uploadedObj.GetID()
 		manifest.RemoteParentID = dstDir.GetID()
-		manifest.RemotePath = d.fullETFPath(dstDir.GetPath(), sourceName)
+		manifest.RemotePath = d.fullETFPath(dstDir.GetPath(), finalName)
 		if manifest.UploadReceipt == "" {
 			manifest.UploadReceipt = uploadedObj.GetID()
 		}
@@ -186,6 +193,13 @@ func (d *Yun139) afterPersonalUploadETF(ctx context.Context, dstDir model.Obj, s
 		return d.removePersonalAndClean(ctx, uploadedObj)
 	}
 	return nil
+}
+
+func clusterUploadTargetName(ctx context.Context, sourceName string) string {
+	if finalize, found := task_group.TransferFinalizePayloadFromContext(ctx); found && strings.TrimSpace(finalize.TargetName) != "" {
+		return strings.TrimSpace(finalize.TargetName)
+	}
+	return sourceName
 }
 
 // ClearRecycleEntry is intentionally available only for a dedicated cluster

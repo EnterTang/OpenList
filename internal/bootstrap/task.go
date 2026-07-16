@@ -1,6 +1,8 @@
 package bootstrap
 
 import (
+	"encoding/json"
+
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
@@ -17,6 +19,64 @@ func taskFilterNegative(num int) int64 {
 	return int64(num)
 }
 
+func newMoveTaskManager(extra ...tache.Option) *tache.Manager[*fs.FileTransferTask] {
+	load := db.GetTaskDataFunc("move", conf.Conf.Tasks.Move.TaskPersistant)
+	save := db.UpdateTaskDataFunc("move", conf.Conf.Tasks.Move.TaskPersistant)
+	if conf.Conf.Tasks.Move.TaskPersistant {
+		load = filterOrdinaryMoveTaskLoad(load)
+		save = filterOrdinaryMoveTaskSave(save)
+	}
+	options := []tache.Option{
+		tache.WithWorks(setting.GetInt(conf.TaskMoveThreadsNum, conf.Conf.Tasks.Move.Workers)),
+		tache.WithPersistFunction(load, save),
+		tache.WithMaxRetry(conf.Conf.Tasks.Move.MaxRetry),
+	}
+	options = append(options, extra...)
+	return tache.NewManager[*fs.FileTransferTask](options...)
+}
+
+func filterOrdinaryMoveTaskData(data []byte) ([]byte, error) {
+	var tasks []*fs.FileTransferTask
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &tasks); err != nil {
+			return nil, err
+		}
+	}
+	ordinaryTasks := tasks[:0]
+	for _, task := range tasks {
+		if task != nil && task.ClusterBinding == nil {
+			ordinaryTasks = append(ordinaryTasks, task)
+		}
+	}
+	return json.Marshal(ordinaryTasks)
+}
+
+func filterOrdinaryMoveTaskLoad(load func() ([]byte, error)) func() ([]byte, error) {
+	if load == nil {
+		return nil
+	}
+	return func() ([]byte, error) {
+		data, err := load()
+		if err != nil {
+			return nil, err
+		}
+		return filterOrdinaryMoveTaskData(data)
+	}
+}
+
+func filterOrdinaryMoveTaskSave(save func([]byte) error) func([]byte) error {
+	if save == nil {
+		return nil
+	}
+	return func(data []byte) error {
+		filtered, err := filterOrdinaryMoveTaskData(data)
+		if err != nil {
+			return err
+		}
+		return save(filtered)
+	}
+}
+
 func InitTaskManager() {
 	fs.UploadTaskManager = tache.NewManager[*fs.UploadTask](tache.WithWorks(setting.GetInt(conf.TaskUploadThreadsNum, conf.Conf.Tasks.Upload.Workers)), tache.WithMaxRetry(conf.Conf.Tasks.Upload.MaxRetry)) //upload will not support persist
 	op.RegisterSettingChangingCallback(func() {
@@ -26,7 +86,10 @@ func InitTaskManager() {
 	op.RegisterSettingChangingCallback(func() {
 		fs.CopyTaskManager.SetWorkersNumActive(taskFilterNegative(setting.GetInt(conf.TaskCopyThreadsNum, conf.Conf.Tasks.Copy.Workers)))
 	})
-	fs.MoveTaskManager = tache.NewManager[*fs.FileTransferTask](tache.WithWorks(setting.GetInt(conf.TaskMoveThreadsNum, conf.Conf.Tasks.Move.Workers)), tache.WithPersistFunction(db.GetTaskDataFunc("move", conf.Conf.Tasks.Move.TaskPersistant), db.UpdateTaskDataFunc("move", conf.Conf.Tasks.Move.TaskPersistant)), tache.WithMaxRetry(conf.Conf.Tasks.Move.MaxRetry))
+	// Cluster bindings contain attempt-scoped credentials and require a live
+	// worker lease, so they are intentionally excluded from restart recovery.
+	// Ordinary Move persistence continues to follow the existing setting.
+	fs.MoveTaskManager = newMoveTaskManager()
 	op.RegisterSettingChangingCallback(func() {
 		fs.MoveTaskManager.SetWorkersNumActive(taskFilterNegative(setting.GetInt(conf.TaskMoveThreadsNum, conf.Conf.Tasks.Move.Workers)))
 	})

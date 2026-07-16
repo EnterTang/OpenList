@@ -39,7 +39,8 @@ func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context,
 			WorkflowVersion: ClusterInspectWorkflowVersion, SealedManifestVersion: clusterInspectManifestVersion,
 			Subscription: protocol.SubscriptionTaskContext{
 				SubscriptionID: task.SubscriptionID, SubscriptionName: task.SubscriptionName,
-				SourceMessageID: task.SourceMessageID, SourceMessageChannel: task.SourceMessageChannel,
+				PreferredWorkerNodeID: task.PreferredWorkerNodeID,
+				SourceMessageID:       task.SourceMessageID, SourceMessageChannel: task.SourceMessageChannel,
 				SourceMessageURL: task.SourceMessageURL, SourceMessageText: task.SourceMessageText,
 				ShareRefFingerprint: task.ShareRefFingerprint,
 				ObservationKey:      task.ObservationKey, ObservationExpected: task.ObservationExpected,
@@ -92,7 +93,8 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 		}
 		task := subscription.ClusterInspectTask{
 			SubscriptionID: taskContext.Subscription.SubscriptionID, SubscriptionName: taskContext.Subscription.SubscriptionName,
-			SourceMessageID: taskContext.Subscription.SourceMessageID, SourceMessageChannel: taskContext.Subscription.SourceMessageChannel,
+			PreferredWorkerNodeID: taskContext.Subscription.PreferredWorkerNodeID,
+			SourceMessageID:       taskContext.Subscription.SourceMessageID, SourceMessageChannel: taskContext.Subscription.SourceMessageChannel,
 			SourceMessageURL: taskContext.Subscription.SourceMessageURL, SourceMessageText: taskContext.Subscription.SourceMessageText,
 			ShareProvider: taskContext.Share.Provider, ShareURL: taskContext.Share.URL, SharePasscode: taskContext.Share.Passcode,
 			ShareRefFingerprint: taskContext.Subscription.ShareRefFingerprint,
@@ -204,7 +206,7 @@ func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProf
 		SealedManifestVersion: task.SealedManifestVersion, TargetProfile: targetProfile,
 		Subscription: protocol.SubscriptionTaskContext{
 			SubscriptionID: task.SubscriptionID, SubscriptionItemID: task.SubscriptionItemID,
-			SubscriptionName: task.SubscriptionName, SourceKey: task.SourceKey,
+			SubscriptionName: task.SubscriptionName, PreferredWorkerNodeID: task.PreferredWorkerNodeID, SourceKey: task.SourceKey,
 			SourceMessageID: task.SourceMessageID, ShareRefFingerprint: task.ShareRefFingerprint,
 		},
 		Share: protocol.ShareTaskContext{Provider: task.ShareProvider, URL: task.ShareURL, Passcode: task.SharePasscode},
@@ -316,6 +318,14 @@ func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchT
 	}
 	if len(eligible) == 0 {
 		return nil
+	}
+	preferredNodeID := strings.TrimSpace(task.PreferredWorkerNodeID)
+	if preferredNodeID != "" {
+		for _, target := range eligible {
+			if target.nodeID == preferredNodeID {
+				return target
+			}
+		}
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
 		left, right := eligible[i].match, eligible[j].match

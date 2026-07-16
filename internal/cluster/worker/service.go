@@ -23,7 +23,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
+	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/OpenListTeam/tache"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -486,13 +488,7 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		if offer.JobType == "share.inspect" {
 			result, err = s.executeShareInspect(jobCtx, offer)
 		} else {
-			release, capacityErr := s.acquireTargetCapacity(jobCtx, offer.TaskContext.TargetProfile)
-			if capacityErr != nil {
-				err = capacityErr
-			} else {
-				defer release()
-				err = s.executeMediaTransfer(jobCtx, offer)
-			}
+			err = s.executeMediaTransfer(jobCtx, offer)
 		}
 		resultCtx, cancelResult := context.WithTimeout(jobCtx, 10*time.Second)
 		defer cancelResult()
@@ -501,28 +497,6 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		}
 	}()
 	return nil
-}
-
-func (s *Service) acquireTargetCapacity(ctx context.Context, targetProfile string) (func(), error) {
-	_, _, gate := s.resolveTargetBinding(targetProfile)
-	release, err := gate.Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for {
-		backlog, err := s.queue.CleanupBacklog(ctx)
-		if err != nil {
-			release()
-			return nil, err
-		}
-		if backlog == 0 {
-			return release, nil
-		}
-		if !sleepContext(ctx, 2*time.Second) {
-			release()
-			return nil, ctx.Err()
-		}
-	}
 }
 
 func (s *Service) maintainLease(ctx context.Context, cancel context.CancelCauseFunc, offer protocol.JobOffer) {
@@ -662,20 +636,12 @@ func detachedFinalizationContext(ctx context.Context) (context.Context, context.
 	return context.WithTimeout(ctx, 2*time.Minute)
 }
 
-func clusterTaskNamespace(jobID, mediaItemID string) string {
-	return path.Join(".openlist-cluster", safeClusterPathSegment(jobID), safeClusterPathSegment(mediaItemID))
-}
-
 func NewCleanupRequest(manifest protocol.UploadETFManifest, storageMountPath string, additionalTargets ...resultqueue.CleanupTarget) (resultqueue.CleanupRequest, error) {
-	targetRoot := strings.TrimSpace(manifest.WorkerTargetRoot)
-	if targetRoot == "" {
-		targetRoot = manifest.TargetProfile
-	}
 	request := resultqueue.CleanupRequest{
 		Version:          "v1",
 		JobID:            safeClusterPathSegment(manifest.JobID),
 		MediaItemID:      safeClusterPathSegment(manifest.MediaItemID),
-		OpenListPath:     path.Join(targetRoot, clusterTaskNamespace(manifest.JobID, manifest.MediaItemID), manifest.Name),
+		OpenListPath:     path.Clean(strings.TrimSpace(manifest.RemotePath)),
 		StorageMountPath: path.Clean(storageMountPath),
 		RemoteFileID:     manifest.RemoteFileID,
 		Name:             manifest.Name,
@@ -715,14 +681,115 @@ func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFMani
 	target.RemoteFileID = obj.GetID()
 	probe := resultqueue.CleanupRequest{
 		Version: "v1", JobID: safeClusterPathSegment(manifest.JobID), MediaItemID: safeClusterPathSegment(manifest.MediaItemID),
-		OpenListPath:     path.Join(target.StorageMountPath, clusterTaskNamespace(manifest.JobID, manifest.MediaItemID), target.Name),
-		StorageMountPath: target.StorageMountPath, Name: target.Name, CreatedAt: time.Now().UTC(),
+		OpenListPath:     path.Join(target.StorageMountPath, "cleanup-validation", target.Name),
+		StorageMountPath: target.StorageMountPath, RemoteFileID: target.RemoteFileID, Name: target.Name, CreatedAt: time.Now().UTC(),
 		AdditionalTargets: []resultqueue.CleanupTarget{target},
 	}
 	if err := probe.Validate(); err != nil {
 		return resultqueue.CleanupTarget{}, err
 	}
 	return target, nil
+}
+
+func mapClusterDeliveryPath(deliveryRoot, logicalMediaRoot, logicalTargetPath string) (string, error) {
+	deliveryRoot = path.Clean(strings.TrimSpace(deliveryRoot))
+	logicalMediaRoot = strings.TrimSpace(logicalMediaRoot)
+	if logicalMediaRoot == "" {
+		logicalMediaRoot = "/"
+	} else {
+		logicalMediaRoot = path.Clean(logicalMediaRoot)
+	}
+	logicalTargetPath = path.Clean(strings.TrimSpace(logicalTargetPath))
+	if !strings.HasPrefix(deliveryRoot, "/") || deliveryRoot == "/" {
+		return "", errors.New("cluster delivery root must be an absolute non-root path")
+	}
+	if !strings.HasPrefix(logicalMediaRoot, "/") || !strings.HasPrefix(logicalTargetPath, "/") {
+		return "", errors.New("cluster logical media paths must be absolute")
+	}
+	if strings.Contains(logicalMediaRoot, `\`) || strings.Contains(logicalTargetPath, `\`) {
+		return "", errors.New("cluster logical media paths must use slash separators")
+	}
+	prefix := strings.TrimSuffix(logicalMediaRoot, "/") + "/"
+	if logicalMediaRoot == "/" {
+		prefix = "/"
+	}
+	if logicalTargetPath == logicalMediaRoot || !strings.HasPrefix(logicalTargetPath, prefix) {
+		return "", errors.New("cluster logical target must be a file below the logical media root")
+	}
+	relativeTarget := strings.TrimPrefix(logicalTargetPath, prefix)
+	mapped := path.Join(deliveryRoot, relativeTarget)
+	if mapped == deliveryRoot || !strings.HasPrefix(mapped, strings.TrimSuffix(deliveryRoot, "/")+"/") {
+		return "", errors.New("cluster delivery target escapes the worker delivery root")
+	}
+	return mapped, nil
+}
+
+func trustedSourceSHA256(source protocol.SourceObject) (string, bool) {
+	hash := strings.ToUpper(strings.TrimSpace(source.ContentSHA256))
+	decoded, err := hex.DecodeString(hash)
+	if err != nil || len(decoded) != sha256.Size || source.Size <= 0 {
+		return "", false
+	}
+	return hash, true
+}
+
+func clusterMoveContext(ctx context.Context, binding task_group.ClusterTransferBinding, creator *model.User) context.Context {
+	ctx = task_group.WithClusterTransferBinding(ctx, binding)
+	ctx = context.WithValue(ctx, conf.ForceTaskKey, struct{}{})
+	if creator != nil {
+		ctx = context.WithValue(ctx, conf.UserKey, creator)
+	}
+	return ctx
+}
+
+type nativeTransferTask interface {
+	GetID() string
+	GetState() tache.State
+	GetErr() error
+}
+
+var cancelNativeMoveTask = func(id string) {
+	if fs.MoveTaskManager != nil && strings.TrimSpace(id) != "" {
+		fs.MoveTaskManager.Cancel(id)
+	}
+}
+
+func waitNativeTransferTask(ctx context.Context, transfer nativeTransferTask) error {
+	if transfer == nil {
+		return errors.New("native cluster move task was not created")
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	done := ctx.Done()
+	var canceled error
+	var cancelDeadline <-chan time.Time
+	for {
+		switch transfer.GetState() {
+		case tache.StateSucceeded:
+			return nil
+		case tache.StateFailed, tache.StateCanceled:
+			if canceled != nil {
+				return canceled
+			}
+			if err := transfer.GetErr(); err != nil {
+				return err
+			}
+			return fmt.Errorf("native cluster move task ended in state %d", transfer.GetState())
+		}
+		select {
+		case <-done:
+			canceled = context.Cause(ctx)
+			if canceled == nil {
+				canceled = ctx.Err()
+			}
+			cancelNativeMoveTask(transfer.GetID())
+			done = nil
+			cancelDeadline = time.After(10 * time.Second)
+		case <-cancelDeadline:
+			return fmt.Errorf("cancel native cluster move task %s: terminal state timeout: %w", transfer.GetID(), canceled)
+		case <-ticker.C:
+		}
+	}
 }
 
 func safeClusterPathSegment(value string) string {
@@ -776,9 +843,11 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if primary.SourceFileID == "" {
 		return errors.New("cluster media task has no source object")
 	}
-	namespace := clusterTaskNamespace(offer.JobID, offer.TaskContext.MediaItemID)
 	if _, err := s.requestStagePermit(ctx, offer, model.ClusterStageSavingShare); err != nil {
 		return err
+	}
+	if err := s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusRunning, ""); err != nil {
+		return fmt.Errorf("mark cluster share-save stage running: %w", err)
 	}
 	requestedTempRoot, err := s.resolveStagingTempRoot(ctx, offer.TaskContext)
 	if err != nil {
@@ -794,28 +863,29 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return fmt.Errorf("resolve cluster staging account: %w", err)
 	}
 	s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
-	releaseDownload, err := s.acquireDownloadCapacity(ctx)
-	if err != nil {
-		return err
-	}
 	saved, err := subscription.SaveClusterShareSelection(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, []string{primary.SourceFileID})
-	releaseDownload()
 	if err != nil {
+		_ = s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
 		return fmt.Errorf("save cluster share selection: %w", err)
 	}
 	if len(saved) != 1 {
-		return fmt.Errorf("cluster media task saved %d files, want 1", len(saved))
+		err := fmt.Errorf("cluster media task saved %d files, want 1", len(saved))
+		_ = s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
+		return err
+	}
+	if err := s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, ""); err != nil {
+		return fmt.Errorf("mark cluster share-save stage succeeded: %w", err)
 	}
 	stagedSource := saved[0]
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	releaseUpload, err := s.acquireUploadCapacity(ctx)
+	targetFilePath, err := mapClusterDeliveryPath(targetRootBase, offer.TaskContext.Media.LogicalMediaRoot, offer.TaskContext.Media.LogicalTargetPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("map cluster delivery target: %w", err)
 	}
-	defer releaseUpload()
-	targetRoot := path.Join(targetRootBase, namespace)
+	targetRoot := path.Dir(targetFilePath)
+	targetName := path.Base(targetFilePath)
 	if err := fs.MakeDir(ctx, targetRoot); err != nil {
 		return fmt.Errorf("create cluster mobile target: %w", err)
 	}
@@ -849,7 +919,6 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err != nil {
 		return fmt.Errorf("build cluster source cleanup request: %w", err)
 	}
-	targetFilePath := path.Join(targetRoot, path.Base(stagedSource))
 	existing, getErr := fs.Get(ctx, targetFilePath, &fs.GetArgs{NoLog: true})
 	if getErr != nil && !errs.IsNotFoundError(getErr) {
 		return fmt.Errorf("inspect cluster upload reconciliation target: %w", getErr)
@@ -859,14 +928,11 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		if existingSHA256 == "" {
 			return errors.New("cluster target already contains an owned media object without SHA256 metadata; manual reconciliation is required")
 		}
-		expectedSHA256 := strings.ToUpper(strings.TrimSpace(primary.Hash))
-		if decoded, decodeErr := hex.DecodeString(expectedSHA256); decodeErr != nil || len(decoded) != sha256.Size || primary.Size <= 0 {
+		expectedSHA256, trusted := trustedSourceSHA256(primary)
+		if !trusted {
 			return errors.New("cluster source object lacks a trusted size/SHA256 fingerprint; existing target requires manual reconciliation")
 		}
-		expectedName := path.Base(primary.SourceRelativePath)
-		if expectedName == "." || expectedName == "" {
-			expectedName = path.Base(stagedSource)
-		}
+		expectedName := targetName
 		if existing.GetName() != expectedName || existing.GetSize() != primary.Size || !strings.EqualFold(existingSHA256, expectedSHA256) {
 			return errors.New("cluster target object does not match the source name, size, and SHA256; refusing automatic adoption")
 		}
@@ -881,19 +947,62 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		if cleanupErr != nil {
 			return cleanupErr
 		}
+		if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, ""); err != nil {
+			return fmt.Errorf("mark reconciled cluster upload stage running: %w", err)
+		}
 		if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
+			_ = s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, enqueueErr.Error())
 			return fmt.Errorf("reconcile existing cluster upload: %w", enqueueErr)
+		}
+		if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, ""); err != nil {
+			return fmt.Errorf("mark reconciled cluster upload stage succeeded: %w", err)
 		}
 		return nil
 	}
-	taskCtx := WithUploadManifest(ctx, manifest)
-	taskCtx = WithAdditionalCleanupTargets(taskCtx, sourceCleanup)
-	taskCtx = context.WithValue(taskCtx, conf.NoTaskKey, struct{}{})
-	taskCtx = context.WithValue(taskCtx, conf.ForceTaskKey, struct{}{})
-	if _, err := fs.Copy(taskCtx, stagedSource, targetRoot, true); err != nil {
+	finalizePayload := task_group.TransferFinalizePayload{
+		SubscriptionID: offer.TaskContext.Subscription.SubscriptionID, SubscriptionItemID: offer.TaskContext.Subscription.SubscriptionItemID,
+		SourceKey: offer.TaskContext.Subscription.SourceKey, FileHash: primary.Hash,
+		TargetDir: targetRoot, FileName: path.Base(stagedSource), TargetName: targetName,
+	}
+	binding := task_group.ClusterTransferBinding{
+		UploadManifest: &manifest, AdditionalCleanupTargets: []resultqueue.CleanupTarget{sourceCleanup}, FinalizePayload: &finalizePayload,
+	}
+	creator, err := op.GetAdmin()
+	if err != nil {
+		return fmt.Errorf("resolve cluster move task creator: %w", err)
+	}
+	if creator == nil {
+		return errors.New("resolve cluster move task creator: admin user is unavailable")
+	}
+	taskCtx := clusterMoveContext(ctx, binding, creator)
+	if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, ""); err != nil {
+		return fmt.Errorf("mark cluster upload stage running: %w", err)
+	}
+	transferTask, err := fs.Move(taskCtx, stagedSource, targetRoot, true)
+	if err != nil {
+		_ = s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
 		return fmt.Errorf("transfer cluster media: %w", err)
 	}
+	if err := waitNativeTransferTask(ctx, transferTask); err != nil {
+		_ = s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
+		return fmt.Errorf("native cluster move task: %w", err)
+	}
+	if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, ""); err != nil {
+		return fmt.Errorf("mark cluster upload stage succeeded: %w", err)
+	}
 	return nil
+}
+
+func (s *Service) sendStageStatus(ctx context.Context, offer protocol.JobOffer, stage, status, stageError string) error {
+	update := protocol.StageStatusUpdate{AttemptRef: offer.AttemptRef, Stage: stage, Status: status, Error: stageError}
+	if status == model.ClusterStageStatusSucceeded || status == model.ClusterStageStatusFailed {
+		update.FinishedAt = time.Now().UTC()
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageStageStatus, update)
+	if err != nil {
+		return err
+	}
+	return s.sender.Send(ctx, *message)
 }
 
 func (s *Service) requestStagePermit(ctx context.Context, offer protocol.JobOffer, stage string) (protocol.StagePermit, error) {

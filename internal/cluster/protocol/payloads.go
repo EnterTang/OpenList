@@ -244,6 +244,14 @@ type StagePermitRequest struct {
 	OperationKey string `json:"operation_key"`
 }
 
+type StageStatusUpdate struct {
+	AttemptRef
+	Stage      string    `json:"stage"`
+	Status     string    `json:"status"`
+	Error      string    `json:"error,omitempty"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+}
+
 type ProviderTargetRequirement struct {
 	Provider           string `json:"provider,omitempty"`
 	Folder             string `json:"folder,omitempty"`
@@ -276,17 +284,18 @@ type ShareTaskContext struct {
 }
 
 type SubscriptionTaskContext struct {
-	SubscriptionID       uint   `json:"subscription_id"`
-	SubscriptionItemID   uint   `json:"subscription_item_id"`
-	SubscriptionName     string `json:"subscription_name"`
-	SourceKey            string `json:"source_key"`
-	SourceMessageID      string `json:"source_message_id,omitempty"`
-	SourceMessageChannel string `json:"source_message_channel,omitempty"`
-	SourceMessageURL     string `json:"source_message_url,omitempty"`
-	SourceMessageText    string `json:"source_message_text,omitempty"`
-	ShareRefFingerprint  string `json:"share_ref_fingerprint"`
-	ObservationKey       string `json:"observation_key,omitempty"`
-	ObservationExpected  int    `json:"observation_expected,omitempty"`
+	SubscriptionID        uint   `json:"subscription_id"`
+	SubscriptionItemID    uint   `json:"subscription_item_id"`
+	SubscriptionName      string `json:"subscription_name"`
+	PreferredWorkerNodeID string `json:"preferred_worker_node_id,omitempty"`
+	SourceKey             string `json:"source_key"`
+	SourceMessageID       string `json:"source_message_id,omitempty"`
+	SourceMessageChannel  string `json:"source_message_channel,omitempty"`
+	SourceMessageURL      string `json:"source_message_url,omitempty"`
+	SourceMessageText     string `json:"source_message_text,omitempty"`
+	ShareRefFingerprint   string `json:"share_ref_fingerprint"`
+	ObservationKey        string `json:"observation_key,omitempty"`
+	ObservationExpected   int    `json:"observation_expected,omitempty"`
 }
 
 type MediaTaskContext struct {
@@ -304,6 +313,7 @@ type SourceObject struct {
 	SourceRelativePath string    `json:"source_relative_path"`
 	Size               int64     `json:"size,omitempty"`
 	Hash               string    `json:"hash,omitempty"`
+	ContentSHA256      string    `json:"content_sha256,omitempty"`
 	ModifiedAt         time.Time `json:"modified_at,omitempty"`
 }
 

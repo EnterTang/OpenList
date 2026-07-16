@@ -38,6 +38,7 @@ type Subscription struct {
 	TargetRoot               string                    `json:"target_root,omitempty"`
 	TempTarget               SubscriptionStorageTarget `json:"temp_target,omitempty" gorm:"serializer:json"`
 	DeliveryTarget           SubscriptionStorageTarget `json:"delivery_target,omitempty" gorm:"serializer:json"`
+	PreferredWorkerNodeID    string                    `json:"preferred_worker_node_id,omitempty" gorm:"size:64"`
 	TransferEnabled          bool                      `json:"transfer_enabled"`
 	TMDBID                   int64                     `json:"tmdb_id" gorm:"index"`
 	TMDBName                 string                    `json:"tmdb_name"`

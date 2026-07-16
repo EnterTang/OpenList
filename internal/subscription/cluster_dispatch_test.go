@@ -230,6 +230,40 @@ func TestApplyClusterInspectObservationSelectsLargestEpisodeAcrossShares(t *test
 	}
 }
 
+func TestClusterTasksPreservePreferredWorkerWithoutChangingMediaIdempotency(t *testing.T) {
+	sub := &model.Subscription{
+		ID: 41, Name: "Example", PreferredWorkerNodeID: "worker-139",
+		TMDBID: 123, TMDBName: "Example", TMDBYear: 2026, MediaType: "tv", TargetRoot: "/TV",
+	}
+	item := &model.SubscriptionItem{
+		ID: 52, SourceKey: "source-1", FileID: "file-1", FilePath: "/Example.S01E01.mkv",
+		FileHash: "hash-1", FileSize: 1024, Season: 1, Episode: 1,
+		TargetPath: "/TV/Example/Season 1/Example.S01E01.mkv",
+	}
+	ref := ShareRef{Provider: ShareProviderPan123, RawURL: "https://www.123pan.com/s/example", ShareID: "example"}
+	message := clusterSourceMessage{ID: "message-1"}
+
+	inspect := clusterInspectTask(sub, ref, message)
+	media := clusterMediaTask(sub, item, ref, message)
+	withoutPreference := *sub
+	withoutPreference.PreferredWorkerNodeID = ""
+	automaticInspect := clusterInspectTask(&withoutPreference, ref, message)
+	automatic := clusterMediaTask(&withoutPreference, item, ref, message)
+
+	if inspect.PreferredWorkerNodeID != "worker-139" {
+		t.Fatalf("inspect preferred worker = %q", inspect.PreferredWorkerNodeID)
+	}
+	if media.PreferredWorkerNodeID != "worker-139" {
+		t.Fatalf("media preferred worker = %q", media.PreferredWorkerNodeID)
+	}
+	if inspect.IdempotencyKey != automaticInspect.IdempotencyKey {
+		t.Fatalf("worker preference changed inspect idempotency: preferred=%q automatic=%q", inspect.IdempotencyKey, automaticInspect.IdempotencyKey)
+	}
+	if media.IdempotencyKey != automatic.IdempotencyKey || media.MediaItemID != automatic.MediaItemID {
+		t.Fatalf("worker preference changed media identity: preferred=%#v automatic=%#v", media, automatic)
+	}
+}
+
 func TestClusterDispatchPersistsContextAndTransitionsStatus(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	dispatcher := &recordingClusterDispatcher{}

@@ -392,6 +392,25 @@ func TestNormalizeSubscriptionPreservesEmptyLegacyTargetRoot(t *testing.T) {
 	}
 }
 
+func TestNormalizeSubscriptionTrimsPreferredWorkerNodeID(t *testing.T) {
+	item := &model.Subscription{PreferredWorkerNodeID: "  worker-139  "}
+
+	normalizeSubscription(item)
+
+	if item.PreferredWorkerNodeID != "worker-139" {
+		t.Fatalf("preferred worker node id = %q, want trimmed value", item.PreferredWorkerNodeID)
+	}
+}
+
+func TestValidateSubscriptionPreferredWorkerNodeIDLength(t *testing.T) {
+	if err := validateSubscriptionPreferredWorkerNodeID(&model.Subscription{PreferredWorkerNodeID: strings.Repeat("a", 64)}); err != nil {
+		t.Fatalf("64-byte worker id rejected: %v", err)
+	}
+	if err := validateSubscriptionPreferredWorkerNodeID(&model.Subscription{PreferredWorkerNodeID: strings.Repeat("a", 65)}); err == nil {
+		t.Fatal("65-byte worker id was accepted")
+	}
+}
+
 func TestValidateSubscriptionEpisodeRange(t *testing.T) {
 	tests := []struct {
 		name    string

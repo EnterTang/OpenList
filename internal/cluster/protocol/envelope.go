@@ -33,6 +33,7 @@ const (
 	MessageLeaseRenew           MessageType = "lease.renew"
 	MessageStagePermitRequest   MessageType = "stage.permit_request"
 	MessageStagePermit          MessageType = "stage.permit"
+	MessageStageStatus          MessageType = "stage.status"
 	MessageUploadETFManifest    MessageType = "upload.etf_manifest"
 	MessageUploadETFManifestAck MessageType = "upload.etf_manifest_ack"
 	MessageResultQueueStats     MessageType = "result.queue.stats"

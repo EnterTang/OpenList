@@ -493,6 +493,55 @@ func TestStagePermitRequiresCurrentLeasedAttempt(t *testing.T) {
 	}
 }
 
+func TestStageStatusUpdatesCurrentAttemptAndRejectsStaleAttempt(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	taskContext := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(taskContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(taskContext, contextHash, model.ClusterAttemptStatusAccepted)
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	stage := model.ClusterJobStage{ID: "stage-save", JobID: job.ID, AttemptID: attempt.ID, Name: model.ClusterStageSavingShare, Status: model.ClusterStageStatusPermitted}
+	if err := database.Create(&stage).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := New(database, "token")
+	running, err := protocol.NewEnvelope(protocol.MessageStageStatus, protocol.StageStatusUpdate{
+		AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: attempt.Generation, LeaseToken: "lease"},
+		Stage:      model.ClusterStageSavingShare, Status: model.ClusterStageStatusRunning,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running.Seq = 1
+	if err := service.HandleMessage(context.Background(), &testPeer{}, *running); err != nil {
+		t.Fatal(err)
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageStageStatus, protocol.StageStatusUpdate{AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: attempt.Generation, LeaseToken: "lease"}, Stage: model.ClusterStageSavingShare, Status: model.ClusterStageStatusSucceeded})
+	if err != nil { t.Fatal(err) }
+	message.Seq = 2
+	if err := service.HandleMessage(context.Background(), &testPeer{}, *message); err != nil { t.Fatal(err) }
+	if err := database.First(&stage, "id = ?", stage.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusSucceeded || stage.FinishedAt == nil {
+		t.Fatalf("updated stage=%#v", stage)
+	}
+	stale := *message
+	stale.MessageID = "stale-stage-status"
+	stale.Payload, _ = json.Marshal(protocol.StageStatusUpdate{AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: "old-attempt", Generation: 1, LeaseToken: "lease"}, Stage: model.ClusterStageSavingShare, Status: model.ClusterStageStatusFailed, Error: "stale"})
+	stale.Seq = 3
+	if err := service.HandleMessage(context.Background(), &testPeer{}, stale); err == nil {
+		t.Fatal("stale stage status unexpectedly accepted")
+	}
+}
+
 func TestArchiveAndRetryFailedJobs(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	job := model.ClusterJob{ID: "failed-job", IdempotencyKey: "failed-job", Status: model.ClusterJobStatusFailed}

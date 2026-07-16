@@ -19,6 +19,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
 	"github.com/glebarez/sqlite"
 	"github.com/go-resty/resty/v2"
 	"gorm.io/gorm"
@@ -358,6 +359,14 @@ func TestAfterPersonalUploadETFUploadsMetadataFile(t *testing.T) {
 	}
 	if createdName != "Movie.mkv.etf" {
 		t.Fatalf("created name = %q, want Movie.mkv.etf", createdName)
+	}
+}
+
+func TestClusterUploadTargetNameUsesFinalTransferBinding(t *testing.T) {
+	binding := task_group.ClusterTransferBinding{FinalizePayload: &task_group.TransferFinalizePayload{TargetName: "Show.S01E01.mkv"}}
+	ctx := task_group.WithClusterTransferBinding(context.Background(), binding)
+	if got := clusterUploadTargetName(ctx, "generated-name.mkv"); got != "Show.S01E01.mkv" {
+		t.Fatalf("cluster target name = %q, want final target name", got)
 	}
 }
 

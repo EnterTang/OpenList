@@ -92,21 +92,24 @@ func (r CleanupRequest) Validate() error {
 	if strings.TrimSpace(r.JobID) == "" || strings.TrimSpace(r.MediaItemID) == "" {
 		return errors.New("cleanup request job and media item are required")
 	}
-	if err := validateCleanupTarget(r.JobID, r.MediaItemID, CleanupTarget{
+	if strings.TrimSpace(r.RemoteFileID) == "" {
+		return errors.New("cleanup request requires an exact remote file id")
+	}
+	if err := validateCleanupTarget(CleanupTarget{
 		OpenListPath: r.OpenListPath, StorageMountPath: r.StorageMountPath, RemoteFileID: r.RemoteFileID,
 		Name: r.Name, EmptyRecycleBin: r.EmptyRecycleBin,
 	}); err != nil {
 		return err
 	}
 	for i, target := range r.AdditionalTargets {
-		if err := validateCleanupTarget(r.JobID, r.MediaItemID, target); err != nil {
+		if err := validateCleanupTarget(target); err != nil {
 			return fmt.Errorf("additional cleanup target %d: %w", i, err)
 		}
 	}
 	return nil
 }
 
-func validateCleanupTarget(jobID, mediaItemID string, target CleanupTarget) error {
+func validateCleanupTarget(target CleanupTarget) error {
 	cleanPath := path.Clean(strings.TrimSpace(target.OpenListPath))
 	mountPath := path.Clean(strings.TrimSpace(target.StorageMountPath))
 	if !strings.HasPrefix(cleanPath, "/") || mountPath == "." || !strings.HasPrefix(mountPath, "/") {
@@ -133,18 +136,6 @@ func validateCleanupTarget(jobID, mediaItemID string, target CleanupTarget) erro
 			return errors.New("exact cleanup request must target a direct file in its owned root")
 		}
 		return nil
-	}
-	relative := strings.TrimPrefix(cleanPath, strings.TrimSuffix(mountPath, "/"))
-	parts := strings.Split(strings.TrimPrefix(relative, "/"), "/")
-	namespaceIndex := -1
-	for i, part := range parts {
-		if part == ".openlist-cluster" {
-			namespaceIndex = i
-			break
-		}
-	}
-	if namespaceIndex < 0 || len(parts) < namespaceIndex+4 || parts[namespaceIndex+1] != jobID || parts[namespaceIndex+2] != mediaItemID {
-		return errors.New("cleanup request must target its .openlist-cluster job/media namespace")
 	}
 	return nil
 }

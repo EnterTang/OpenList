@@ -69,6 +69,38 @@ func TestVerifyAndRemoveAcceptsGeneratedETFAsDestination(t *testing.T) {
 	}
 }
 
+func TestVerifyAndRemoveTreatsAlreadyCleanedSourceAsSuccess(t *testing.T) {
+	setupTaskGroupTestDB(t)
+
+	srcRoot := filepath.Join(t.TempDir(), "src")
+	dstRoot := filepath.Join(t.TempDir(), "dst")
+	if err := os.MkdirAll(srcRoot, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.MkdirAll(dstRoot, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	srcMount := "/" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "_src"
+	dstMount := "/" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "_dst"
+	if _, err := op.CreateStorage(context.Background(), model.Storage{Driver: "Local", MountPath: srcMount, Addition: fmt.Sprintf(`{"root_folder_path":%q}`, srcRoot)}); err != nil {
+		t.Fatalf("create src storage: %v", err)
+	}
+	if _, err := op.CreateStorage(context.Background(), model.Storage{Driver: "Local", MountPath: dstMount, Addition: fmt.Sprintf(`{"root_folder_path":%q}`, dstRoot)}); err != nil {
+		t.Fatalf("create dst storage: %v", err)
+	}
+	srcStorage, srcActualPath, err := op.GetStorageAndActualPath(srcMount + "/already-cleaned.mkv")
+	if err != nil {
+		t.Fatalf("get src storage: %v", err)
+	}
+	dstStorage, dstActualPath, err := op.GetStorageAndActualPath(dstMount)
+	if err != nil {
+		t.Fatalf("get dst storage: %v", err)
+	}
+	if err := verifyAndRemove(context.Background(), srcStorage, dstStorage, srcActualPath, dstActualPath); err != nil {
+		t.Fatalf("already-cleaned source should be accepted: %v", err)
+	}
+}
+
 func setupTaskGroupTestDB(t *testing.T) {
 	t.Helper()
 	dsn := "file:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "?mode=memory&cache=shared"

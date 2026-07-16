@@ -54,6 +54,7 @@ func TestSubscriptionMediaTaskContextUsesWorkerManagedProviderTargets(t *testing
 		Episode:               1,
 		LogicalMediaRoot:      "/139_60t/港台剧",
 		LogicalTargetPath:     "/139_60t/港台剧/Example/Season 01/Example.S01E01.mkv",
+		PreferredWorkerNodeID: "worker-139",
 		WorkflowVersion:       "workflow-1",
 		SealedManifestVersion: "manifest-1",
 	}
@@ -67,6 +68,9 @@ func TestSubscriptionMediaTaskContextUsesWorkerManagedProviderTargets(t *testing
 	}
 	if !context.StagingTarget.NeedShareSave || !context.DeliveryTarget.NeedUpload {
 		t.Fatalf("target flags = staging:%#v delivery:%#v", context.StagingTarget, context.DeliveryTarget)
+	}
+	if context.Subscription.PreferredWorkerNodeID != "worker-139" {
+		t.Fatalf("wire preferred worker = %q", context.Subscription.PreferredWorkerNodeID)
 	}
 }
 

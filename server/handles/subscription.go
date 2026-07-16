@@ -241,6 +241,10 @@ func CreateSubscription(c *gin.Context) {
 		return
 	}
 	normalizeSubscription(&req)
+	if err := validateSubscriptionPreferredWorkerNodeID(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
 	if err := validateSubscriptionEpisodeRange(&req); err != nil {
 		common.ErrorResp(c, err, 400)
 		return
@@ -280,6 +284,10 @@ func UpdateSubscription(c *gin.Context) {
 		return
 	}
 	normalizeSubscription(&req)
+	if err := validateSubscriptionPreferredWorkerNodeID(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
 	if err := validateSubscriptionEpisodeRange(&req); err != nil {
 		common.ErrorResp(c, err, 400)
 		return
@@ -538,6 +546,7 @@ func normalizeSubscription(item *model.Subscription) {
 		item.SourceType = model.SubscriptionSourceTelegram
 	}
 	item.TargetRoot = strings.TrimSpace(item.TargetRoot)
+	item.PreferredWorkerNodeID = strings.TrimSpace(item.PreferredWorkerNodeID)
 	if item.TargetRoot != "" {
 		item.TargetRoot = utils.FixAndCleanPath(item.TargetRoot)
 	}
@@ -564,6 +573,13 @@ func normalizeSubscription(item *model.Subscription) {
 	if item.LastStatus == "" {
 		item.LastStatus = model.SubscriptionStatusIdle
 	}
+}
+
+func validateSubscriptionPreferredWorkerNodeID(item *model.Subscription) error {
+	if item != nil && len(item.PreferredWorkerNodeID) > 64 {
+		return errors.New("preferred_worker_node_id cannot exceed 64 bytes")
+	}
+	return nil
 }
 
 func filterDisplayedSubscriptionItems(items []model.SubscriptionItem) []model.SubscriptionItem {

@@ -43,8 +43,16 @@ const (
 
 type FileTransferTask struct {
 	TaskData
-	TaskType taskType
-	groupID  string
+	TaskType       taskType
+	ClusterBinding *task_group.ClusterTransferBinding `json:"cluster_binding,omitempty"`
+	groupID        string
+}
+
+func (t *FileTransferTask) SetCtx(ctx context.Context) {
+	if t.ClusterBinding != nil {
+		ctx = task_group.WithClusterTransferBinding(ctx, *t.ClusterBinding)
+	}
+	t.TaskData.TaskExtension.SetCtx(ctx)
 }
 
 func (t *FileTransferTask) GetName() string {
@@ -95,7 +103,7 @@ func (t *FileTransferTask) SetRetry(retry int, maxRetry int) {
 		t.groupID = stdpath.Join(t.DstStorageMp, t.DstActualPath)
 		var payload any
 		if t.TaskType == move {
-			payload = task_group.SrcPathToRemove(stdpath.Join(t.SrcStorageMp, t.SrcActualPath))
+			task_group.TransferCoordinator.AppendPayload(t.groupID, task_group.SrcPathToRemove(stdpath.Join(t.SrcStorageMp, t.SrcActualPath)))
 		}
 		task_group.TransferCoordinator.AddTask(t.groupID, payload)
 	}
@@ -139,6 +147,9 @@ func transfer(ctx context.Context, taskType taskType, srcObjPath, dstDirPath str
 			DstStorageMp:  dstStorage.GetStorage().MountPath,
 		},
 		TaskType: taskType,
+	}
+	if binding, ok := task_group.ClusterTransferBindingFromContext(ctx); ok {
+		t.ClusterBinding = &binding
 	}
 
 	t.groupID = stdpath.Join(t.DstStorageMp, t.DstActualPath)
@@ -235,7 +246,8 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 					SrcStorageMp:  t.SrcStorageMp,
 					DstStorageMp:  t.DstStorageMp,
 				},
-				groupID: t.groupID,
+				ClusterBinding: t.ClusterBinding,
+				groupID:        t.groupID,
 			})
 			if err != nil {
 				return err

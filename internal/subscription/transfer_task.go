@@ -17,15 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type TransferFinalizePayload struct {
-	SubscriptionID     uint
-	SubscriptionItemID uint
-	SourceKey          string
-	FileHash           string
-	TargetDir          string
-	FileName           string
-	TargetName         string
-}
+type TransferFinalizePayload = task_group.TransferFinalizePayload
 
 func RegisterTransferTaskHooks() {
 	task_group.RegisterPayloadHandler(handleTransferPayload)

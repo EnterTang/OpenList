@@ -450,6 +450,12 @@ func (s *Service) HandleMessage(ctx context.Context, peer transport.Peer, messag
 			return err
 		}
 		return s.handleStagePermitRequest(ctx, peer, message, payload)
+	case protocol.MessageStageStatus:
+		payload, err := protocol.DecodePayload[protocol.StageStatusUpdate](message)
+		if err != nil {
+			return err
+		}
+		return s.handleStageStatus(ctx, peer, message, payload)
 	case protocol.MessageConfigObserved:
 		payload, err := protocol.DecodePayload[protocol.ConfigObserved](message)
 		if err != nil {
@@ -471,6 +477,70 @@ func (s *Service) HandleMessage(ctx context.Context, peer transport.Peer, messag
 	default:
 		return s.recordInbox(ctx, peer, message, model.ClusterMessageStatusProcessed, "")
 	}
+}
+
+func (s *Service) handleStageStatus(ctx context.Context, peer transport.Peer, message protocol.Envelope, update protocol.StageStatusUpdate) error {
+	if update.Stage != model.ClusterStageSavingShare && update.Stage != model.ClusterStageUploadingMobile {
+		return fmt.Errorf("cluster stage %q cannot receive status updates", update.Stage)
+	}
+	if update.Status != model.ClusterStageStatusRunning && update.Status != model.ClusterStageStatusSucceeded && update.Status != model.ClusterStageStatusFailed {
+		return fmt.Errorf("cluster stage status %q is invalid", update.Status)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		duplicate, err := s.claimInboxTx(tx, peer, message)
+		if err != nil || duplicate {
+			return err
+		}
+		var job model.ClusterJob
+		if err := tx.First(&job, "id = ?", update.JobID).Error; err != nil {
+			return err
+		}
+		if job.CurrentAttemptID != update.AttemptID || job.CurrentGeneration != update.Generation || job.AssignedNodeID != peer.NodeID() {
+			return errors.New("cluster stage status is stale")
+		}
+		attempt, err := loadAndValidateAttempt(tx, peer, update.AttemptRef)
+		if err != nil {
+			return err
+		}
+		var stage model.ClusterJobStage
+		if err := tx.Where("attempt_id = ? AND name = ?", attempt.ID, update.Stage).First(&stage).Error; err != nil {
+			return err
+		}
+		switch stage.Status {
+		case model.ClusterStageStatusPermitted:
+			if update.Status != model.ClusterStageStatusRunning {
+				return fmt.Errorf("cluster stage transition %s -> %s is invalid", stage.Status, update.Status)
+			}
+		case model.ClusterStageStatusRunning:
+			if update.Status != model.ClusterStageStatusSucceeded && update.Status != model.ClusterStageStatusFailed {
+				return fmt.Errorf("cluster stage transition %s -> %s is invalid", stage.Status, update.Status)
+			}
+		case model.ClusterStageStatusSucceeded, model.ClusterStageStatusFailed:
+			if update.Status != stage.Status {
+				return fmt.Errorf("cluster terminal stage %s cannot transition to %s", stage.Status, update.Status)
+			}
+			return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
+		default:
+			return fmt.Errorf("cluster stage current status %q is invalid", stage.Status)
+		}
+		now := time.Now().UTC()
+		updates := map[string]any{"status": update.Status}
+		if update.Status == model.ClusterStageStatusRunning && stage.StartedAt == nil {
+			updates["started_at"] = now
+		}
+		if update.Status == model.ClusterStageStatusSucceeded || update.Status == model.ClusterStageStatusFailed {
+			updates["finished_at"] = now
+			if update.Status == model.ClusterStageStatusFailed {
+				updates["error"] = update.Error
+			} else {
+				updates["error"] = ""
+			}
+		}
+		if err := tx.Model(&model.ClusterJobStage{}).Where("id = ? AND attempt_id = ?", stage.ID, attempt.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
+	})
 }
 
 func (s *Service) handleStagePermitRequest(ctx context.Context, peer transport.Peer, message protocol.Envelope, request protocol.StagePermitRequest) error {

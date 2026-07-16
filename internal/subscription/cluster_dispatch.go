@@ -30,6 +30,7 @@ type ClusterMediaTask struct {
 	SubscriptionID        uint
 	SubscriptionItemID    uint
 	SubscriptionName      string
+	PreferredWorkerNodeID string
 	SourceKey             string
 	SourceMessageID       string
 	SourceMessageChannel  string
@@ -64,19 +65,20 @@ type ClusterDispatchResult struct {
 }
 
 type ClusterInspectTask struct {
-	IdempotencyKey       string
-	SubscriptionID       uint
-	SubscriptionName     string
-	SourceMessageID      string
-	SourceMessageChannel string
-	SourceMessageURL     string
-	SourceMessageText    string
-	ShareProvider        string
-	ShareURL             string
-	SharePasscode        string
-	ShareRefFingerprint  string
-	ObservationKey       string
-	ObservationExpected  int
+	IdempotencyKey        string
+	SubscriptionID        uint
+	SubscriptionName      string
+	PreferredWorkerNodeID string
+	SourceMessageID       string
+	SourceMessageChannel  string
+	SourceMessageURL      string
+	SourceMessageText     string
+	ShareProvider         string
+	ShareURL              string
+	SharePasscode         string
+	ShareRefFingerprint   string
+	ObservationKey        string
+	ObservationExpected   int
 }
 
 type ClusterInspectObject struct {
@@ -143,7 +145,7 @@ func clusterInspectObservationTask(sub *model.Subscription, ref ShareRef, messag
 	}
 	return ClusterInspectTask{
 		IdempotencyKey: hashClusterSource("inspect", fmt.Sprint(sub.ID), string(ref.Provider), ref.ShareID, message.ID),
-		SubscriptionID: sub.ID, SubscriptionName: sub.Name,
+		SubscriptionID: sub.ID, SubscriptionName: sub.Name, PreferredWorkerNodeID: sub.PreferredWorkerNodeID,
 		SourceMessageID: message.ID, SourceMessageChannel: message.Channel,
 		SourceMessageURL: message.URL, SourceMessageText: message.Text,
 		ShareProvider: string(ref.Provider), ShareURL: ref.RawURL, SharePasscode: ref.Passcode,
@@ -392,7 +394,7 @@ func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref
 	idempotency := hashClusterSource(fmt.Sprint(sub.ID), string(ref.Provider), ref.ShareID, item.FileID, item.FileHash, item.TargetPath)
 	return ClusterMediaTask{
 		IdempotencyKey: idempotency, SubscriptionID: sub.ID, SubscriptionItemID: item.ID,
-		SubscriptionName: sub.Name, SourceKey: item.SourceKey,
+		SubscriptionName: sub.Name, PreferredWorkerNodeID: sub.PreferredWorkerNodeID, SourceKey: item.SourceKey,
 		SourceMessageID: message.ID, SourceMessageChannel: message.Channel,
 		SourceMessageURL: message.URL, SourceMessageText: message.Text,
 		ShareProvider: string(ref.Provider), ShareURL: ref.RawURL, SharePasscode: ref.Passcode,

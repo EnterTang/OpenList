@@ -7,10 +7,8 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/resultqueue"
+	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
 )
-
-type uploadManifestContextKey struct{}
-type additionalCleanupContextKey struct{}
 
 var defaultService struct {
 	sync.RWMutex
@@ -18,27 +16,23 @@ var defaultService struct {
 }
 
 func WithUploadManifest(ctx context.Context, manifest protocol.UploadETFManifest) context.Context {
-	return context.WithValue(ctx, uploadManifestContextKey{}, manifest)
+	binding, _ := task_group.ClusterTransferBindingFromContext(ctx)
+	binding.UploadManifest = &manifest
+	return task_group.WithClusterTransferBinding(ctx, binding)
 }
 
 func UploadManifestFromContext(ctx context.Context) (protocol.UploadETFManifest, bool) {
-	if ctx == nil {
-		return protocol.UploadETFManifest{}, false
-	}
-	manifest, ok := ctx.Value(uploadManifestContextKey{}).(protocol.UploadETFManifest)
-	return manifest, ok
+	return task_group.UploadManifestFromContext(ctx)
 }
 
 func WithAdditionalCleanupTargets(ctx context.Context, targets ...resultqueue.CleanupTarget) context.Context {
-	return context.WithValue(ctx, additionalCleanupContextKey{}, append([]resultqueue.CleanupTarget(nil), targets...))
+	binding, _ := task_group.ClusterTransferBindingFromContext(ctx)
+	binding.AdditionalCleanupTargets = append([]resultqueue.CleanupTarget(nil), targets...)
+	return task_group.WithClusterTransferBinding(ctx, binding)
 }
 
 func AdditionalCleanupTargetsFromContext(ctx context.Context) []resultqueue.CleanupTarget {
-	if ctx == nil {
-		return nil
-	}
-	targets, _ := ctx.Value(additionalCleanupContextKey{}).([]resultqueue.CleanupTarget)
-	return append([]resultqueue.CleanupTarget(nil), targets...)
+	return task_group.AdditionalCleanupTargetsFromContext(ctx)
 }
 
 func SetDefaultService(service *Service) {

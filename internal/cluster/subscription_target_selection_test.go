@@ -97,3 +97,98 @@ func TestChooseDispatchTargetIgnoresLegacySubscriptionDeliveryProvider(t *testin
 		t.Fatal("expected target selection to use the worker's yidong139 account")
 	}
 }
+
+func TestChooseDispatchTargetAppliesPreferredWorkerAfterEligibility(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	configureProviderPipelineDB(t, database)
+	createProviderPipelineInventory(t, database, "worker-auto", preferredWorkerTestAccounts(500))
+	createProviderPipelineInventory(t, database, "worker-preferred", preferredWorkerTestAccounts(100))
+
+	runtime := &Runtime{}
+	targets := []*dispatchTarget{{nodeID: "worker-auto"}, {nodeID: "worker-preferred"}}
+	automaticTask := subscription.ClusterMediaTask{ShareProvider: "pan123", SourceSize: 1 << 30}
+	automatic := runtime.chooseDispatchTarget(context.Background(), targets, automaticTask)
+	if automatic == nil || automatic.nodeID != "worker-auto" {
+		t.Fatalf("automatic target = %#v, want highest-scoring worker-auto", automatic)
+	}
+
+	preferredTask := automaticTask
+	preferredTask.PreferredWorkerNodeID = "worker-preferred"
+	preferred := runtime.chooseDispatchTarget(context.Background(), targets, preferredTask)
+	if preferred == nil || preferred.nodeID != "worker-preferred" {
+		t.Fatalf("preferred target = %#v, want eligible worker-preferred", preferred)
+	}
+}
+
+func TestChooseDispatchTargetFallsBackWhenPreferredWorkerIsUnavailableOrIncompatible(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	configureProviderPipelineDB(t, database)
+	createProviderPipelineInventory(t, database, "worker-auto", preferredWorkerTestAccounts(500))
+	createProviderPipelineInventory(t, database, "worker-incompatible", []protocol.ProviderAccountInventory{
+		{Provider: "pan123", Status: "work", SupportsShareSave: true, SupportsDownload: true, FreeBytes: 100 << 30},
+	})
+
+	runtime := &Runtime{}
+	task := subscription.ClusterMediaTask{
+		ShareProvider: "pan123", SourceSize: 1 << 30, PreferredWorkerNodeID: "worker-offline",
+	}
+	target := runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-auto"}}, task)
+	if target == nil || target.nodeID != "worker-auto" {
+		t.Fatalf("offline preferred fallback = %#v, want worker-auto", target)
+	}
+
+	task.PreferredWorkerNodeID = "worker-incompatible"
+	target = runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-auto"}, {nodeID: "worker-incompatible"}}, task)
+	if target == nil || target.nodeID != "worker-auto" {
+		t.Fatalf("incompatible preferred fallback = %#v, want worker-auto", target)
+	}
+}
+
+func TestSubscriptionDispatchTargetsFallsBackFromDrainingOrDisabledPreferredWorker(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		updates map[string]any
+	}{
+		{name: "draining", updates: map[string]any{"drain": true}},
+		{name: "disabled", updates: map[string]any{"disabled": true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			database := openClusterRuntimeTestDB(t)
+			configureProviderPipelineDB(t, database)
+			createProviderPipelineInventory(t, database, "worker-auto", preferredWorkerTestAccounts(500))
+			createProviderPipelineInventory(t, database, "worker-preferred", preferredWorkerTestAccounts(100))
+			if err := database.Model(&model.ClusterNode{}).Where("id = ?", "worker-preferred").Updates(tt.updates).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			runtime := &Runtime{dispatchTransport: &providerPipelineTransport{nodes: []string{"worker-auto", "worker-preferred"}}}
+			targets, err := runtime.subscriptionDispatchTargets(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := runtime.chooseDispatchTarget(t.Context(), targets, subscription.ClusterMediaTask{
+				ShareProvider: "pan123", SourceSize: 1 << 30, PreferredWorkerNodeID: "worker-preferred",
+			})
+			if target == nil || target.nodeID != "worker-auto" {
+				t.Fatalf("%s preferred fallback = %#v, want worker-auto", tt.name, target)
+			}
+		})
+	}
+}
+
+func TestSelectRedispatchNodeIDRetainsSoftPreference(t *testing.T) {
+	context := protocol.TaskContext{Subscription: protocol.SubscriptionTaskContext{PreferredWorkerNodeID: "worker-preferred"}}
+	if got := selectRedispatchNodeID([]string{"worker-auto", "worker-preferred"}, context, 0); got != "worker-preferred" {
+		t.Fatalf("redispatch target = %q, want preferred worker", got)
+	}
+	if got := selectRedispatchNodeID([]string{"worker-auto", "worker-other"}, context, 1); got != "worker-other" {
+		t.Fatalf("fallback redispatch target = %q, want existing offset selection", got)
+	}
+}
+
+func preferredWorkerTestAccounts(weight int) []protocol.ProviderAccountInventory {
+	return []protocol.ProviderAccountInventory{
+		{Provider: "pan123", Status: "work", MembershipWeight: weight, SupportsShareSave: true, SupportsDownload: true, FreeBytes: 100 << 30},
+		{Provider: "yidong139", Status: "work", MembershipWeight: weight, SupportsUpload: true, SupportsETF: true, MaxSingleUploadBytes: 500 << 30, FreeBytes: 100 << 30},
+	}
+}

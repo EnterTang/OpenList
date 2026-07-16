@@ -9,9 +9,13 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/resultqueue"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
+	"github.com/OpenListTeam/tache"
 	"github.com/stretchr/testify/require"
 )
 
@@ -156,13 +160,96 @@ func TestEnqueueThenCleanupKeepsMediaWhenResultPersistenceFails(t *testing.T) {
 	require.ErrorIs(t, err, resultqueue.ErrUnavailable)
 }
 
-func TestNewCleanupRequestUsesExactIsolatedPath(t *testing.T) {
+func TestNewCleanupRequestUsesExactFinalPath(t *testing.T) {
 	manifest := validUploadManifest(t)
 	request, err := NewCleanupRequest(manifest, "/mobile")
 	require.NoError(t, err)
-	require.Equal(t, "/mobile/.openlist-cluster/job-1/media-1/Episode.mkv", request.OpenListPath)
+	require.Equal(t, "/mobile/upload/tv/国产剧/Show/Season 1/Show.S01E01.mkv", request.OpenListPath)
 	require.Equal(t, "remote-1", request.RemoteFileID)
 	require.True(t, request.EmptyRecycleBin)
+}
+
+func TestMapClusterDeliveryPathPreservesLogicalRelativeTarget(t *testing.T) {
+	got, err := mapClusterDeliveryPath(
+		"/worker-139/upload",
+		"/139_60t/上传中转",
+		"/139_60t/上传中转/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.2026.S01E01.第1集.mkv",
+	)
+	require.NoError(t, err)
+	require.Equal(t, "/worker-139/upload/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.2026.S01E01.第1集.mkv", got)
+	require.NotContains(t, got, ".openlist-cluster")
+}
+
+func TestMapClusterDeliveryPathTreatsEmptyLogicalRootAsWorkerRoot(t *testing.T) {
+	got, err := mapClusterDeliveryPath(
+		"/worker-139/upload",
+		"",
+		"/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.S01E01.mkv",
+	)
+	require.NoError(t, err)
+	require.Equal(t, "/worker-139/upload/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.S01E01.mkv", got)
+}
+
+func TestTrustedSourceSHA256DoesNotTreatIdentityHashAsContent(t *testing.T) {
+	identity := protocol.SourceObject{SourceFileID: "file-1", Hash: "file-1:1024:2026-07-16T00:00:00Z", Size: 1024}
+	if got, ok := trustedSourceSHA256(identity); ok || got != "" {
+		t.Fatalf("identity fingerprint was accepted as content SHA256: %q, %v", got, ok)
+	}
+	content := protocol.SourceObject{SourceFileID: "file-1", ContentSHA256: strings.Repeat("a", 64), Size: 1024}
+	got, ok := trustedSourceSHA256(content)
+	require.True(t, ok)
+	require.Equal(t, strings.Repeat("A", 64), got)
+}
+
+func TestClusterMoveContextForcesNativeTaskAndCarriesAdminCreator(t *testing.T) {
+	creator := &model.User{ID: 1, Username: "admin", Role: model.ADMIN}
+	manifest := validUploadManifest(t)
+	payload := task_group.TransferFinalizePayload{TargetDir: "/mobile/upload", FileName: "raw.mkv", TargetName: "Show.S01E01.mkv"}
+	binding := task_group.ClusterTransferBinding{UploadManifest: &manifest, FinalizePayload: &payload}
+
+	ctx := clusterMoveContext(context.Background(), binding, creator)
+	require.NotNil(t, ctx.Value(conf.ForceTaskKey))
+	require.Nil(t, ctx.Value(conf.NoTaskKey))
+	require.Same(t, creator, ctx.Value(conf.UserKey))
+	got, ok := task_group.ClusterTransferBindingFromContext(ctx)
+	require.True(t, ok)
+	require.Equal(t, payload.TargetName, got.FinalizePayload.TargetName)
+}
+
+func TestWaitNativeTransferTaskReturnsTerminalFailure(t *testing.T) {
+	task := &fs.FileTransferTask{}
+	task.SetState(tache.StateFailed)
+	task.SetErr(errors.New("upload failed"))
+	err := waitNativeTransferTask(context.Background(), task)
+	require.ErrorContains(t, err, "upload failed")
+}
+
+func TestWaitNativeTransferTaskCancelsManagerTaskBeforeReturning(t *testing.T) {
+	task := &fs.FileTransferTask{}
+	task.SetID("move-1")
+	task.SetState(tache.StateRunning)
+	oldCancel := cancelNativeMoveTask
+	cancelNativeMoveTask = func(id string) {
+		require.Equal(t, "move-1", id)
+		task.SetState(tache.StateCanceled)
+		task.SetErr(context.Canceled)
+	}
+	t.Cleanup(func() { cancelNativeMoveTask = oldCancel })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, waitNativeTransferTask(ctx, task), context.Canceled)
+	require.Equal(t, tache.StateCanceled, task.GetState())
+}
+
+func TestMapClusterDeliveryPathRejectsLogicalEscape(t *testing.T) {
+	for _, target := range []string{
+		"/139_60t/other/Episode.mkv",
+		"/139_60t/上传中转/../other/Episode.mkv",
+		"relative/Episode.mkv",
+	} {
+		_, err := mapClusterDeliveryPath("/worker-139/upload", "/139_60t/上传中转", target)
+		require.Error(t, err, target)
+	}
 }
 
 func TestNewCleanupRequestIncludesStagedSourceCleanupByDefault(t *testing.T) {
@@ -282,14 +369,6 @@ func TestCancelActiveCancelsConnectionBoundTasks(t *testing.T) {
 	require.ErrorIs(t, context.Cause(ctx), want)
 }
 
-func TestClusterTaskNamespaceIsolatedAndPathSafe(t *testing.T) {
-	require.Equal(t, ".openlist-cluster/job-1/media-1", clusterTaskNamespace("job-1", "media-1"))
-	namespace := clusterTaskNamespace("../job", "season/episode")
-	require.NotContains(t, namespace, "..")
-	require.NotContains(t, namespace, "season/episode")
-	require.True(t, strings.HasPrefix(namespace, ".openlist-cluster/id-"))
-}
-
 func TestLeaseRenewWaitsForCoordinatorAck(t *testing.T) {
 	sender := make(channelSender, 1)
 	service := New(&fakeResultQueue{}, sender)
@@ -387,7 +466,8 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 		Share: protocol.ShareTaskContext{Provider: "aliyundrive", URL: "https://example.com/share"},
 		Media: protocol.MediaTaskContext{
 			MediaType:         "tv",
-			LogicalTargetPath: "/TV/Show/Season 01/Episode.mkv",
+			LogicalMediaRoot:  "/139_60t/上传中转",
+			LogicalTargetPath: "/139_60t/上传中转/tv/国产剧/Show/Season 1/Show.S01E01.mkv",
 		},
 		SourceObjects: []protocol.SourceObject{{Provider: "aliyundrive", SourceFileID: "file-1"}},
 		TargetProfile: "/mobile",
@@ -410,8 +490,8 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 		SourceObjects:         taskContext.SourceObjects,
 		MobileAccountBinding:  "/mobile",
 		RemoteFileID:          "remote-1",
-		RemotePath:            "/mobile/.openlist-cluster/job-1/media-1/Episode.mkv",
-		Name:                  "Episode.mkv",
+		RemotePath:            "/mobile/upload/tv/国产剧/Show/Season 1/Show.S01E01.mkv",
+		Name:                  "Show.S01E01.mkv",
 		Size:                  1024,
 		SHA256:                strings.Repeat("A", 64),
 		HashSource:            "mobile_provider_response",

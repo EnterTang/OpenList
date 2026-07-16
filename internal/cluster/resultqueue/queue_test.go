@@ -105,7 +105,7 @@ func TestCleanupBacklogTracksUnfinishedCleanup(t *testing.T) {
 	cleanup := CleanupRequest{
 		Version: "v1", JobID: "job-1", MediaItemID: "media-1",
 		OpenListPath:     "/mobile/.openlist-cluster/job-1/media-1/episode.mkv",
-		StorageMountPath: "/mobile", Name: "episode.mkv", CreatedAt: time.Now().UTC(),
+		StorageMountPath: "/mobile", RemoteFileID: "mobile-file", Name: "episode.mkv", CreatedAt: time.Now().UTC(),
 	}
 	_, cleanupID, err := q.EnqueueResultAndCleanupDurably(ctx, map[string]string{"sha256": "abc"}, cleanup)
 	require.NoError(t, err)
@@ -139,7 +139,7 @@ func TestCleanupRequestRejectsFlatExactTargetOutsideOwnedRoot(t *testing.T) {
 	request := CleanupRequest{
 		Version: "v1", JobID: "job-1", MediaItemID: "media-1",
 		OpenListPath:     "/mobile/.openlist-cluster/job-1/media-1/episode.mkv",
-		StorageMountPath: "/mobile", Name: "episode.mkv",
+		StorageMountPath: "/mobile", RemoteFileID: "mobile-file", Name: "episode.mkv",
 		AdditionalTargets: []CleanupTarget{{
 			OpenListPath: "/aliyun/other/episode.mkv", StorageMountPath: "/aliyun",
 			OwnedRootPath: "/aliyun/transfer", RemoteFileID: "source-file", Name: "episode.mkv", ExactFile: true,
@@ -185,5 +185,15 @@ func TestCleanupRequestRejectsPathOutsideTaskNamespace(t *testing.T) {
 		StorageMountPath: "/mobile",
 		Name:             "Episode.mkv",
 	}
-	require.Error(t, request.Validate())
+	require.ErrorContains(t, request.Validate(), "remote file id")
+}
+
+func TestCleanupRequestAllowsExactFinalPathOutsideLegacyNamespace(t *testing.T) {
+	request := CleanupRequest{
+		Version: "v1", JobID: "job-1", MediaItemID: "media-1",
+		OpenListPath:     "/mobile/upload/tv/国产剧/Show/Season 1/Show.S01E01.mkv",
+		StorageMountPath: "/mobile", RemoteFileID: "mobile-file", Name: "Show.S01E01.mkv",
+		EmptyRecycleBin: true,
+	}
+	require.NoError(t, request.Validate())
 }

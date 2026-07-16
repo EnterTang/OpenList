@@ -675,7 +675,12 @@ func (r *Runtime) redispatchQueuedJobs(ctx context.Context, limit int) error {
 			}).Error
 			continue
 		}
-		nodeID := available[i%len(available)]
+		var taskContext protocol.TaskContext
+		if err := json.Unmarshal([]byte(jobs[i].TaskContextJSON), &taskContext); err != nil {
+			log.Errorf("decode cluster job %s task context for redispatch: %v", jobs[i].ID, err)
+			continue
+		}
+		nodeID := selectRedispatchNodeID(available, taskContext, i)
 		if err := r.redispatchJob(ctx, hub, &jobs[i], nodeID); err != nil && !errors.Is(err, transport.ErrNotConnected) {
 			log.Errorf("redispatch cluster job %s: %v", jobs[i].ID, err)
 		}
@@ -708,6 +713,21 @@ func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.Cl
 		}
 	}
 	return matched, nil
+}
+
+func selectRedispatchNodeID(available []string, taskContext protocol.TaskContext, offset int) string {
+	preferredNodeID := strings.TrimSpace(taskContext.Subscription.PreferredWorkerNodeID)
+	if preferredNodeID != "" {
+		for _, nodeID := range available {
+			if nodeID == preferredNodeID {
+				return nodeID
+			}
+		}
+	}
+	if len(available) == 0 {
+		return ""
+	}
+	return available[offset%len(available)]
 }
 
 func nodeInventorySupports(ctx context.Context, nodeID string, taskContext protocol.TaskContext, required []string, expectedBytes int64) (bool, error) {
@@ -1355,7 +1375,7 @@ func (r *Runtime) selectCompatibleNode(ctx context.Context, req DispatchMediaJob
 	if len(matched) == 0 {
 		return "", errors.New("no compatible cluster worker is connected")
 	}
-	return matched[offset%len(matched)], nil
+	return selectRedispatchNodeID(matched, req.TaskContext, offset), nil
 }
 
 func coordinatorID() string {
