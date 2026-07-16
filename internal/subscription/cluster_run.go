@@ -181,6 +181,17 @@ func upsertClusterItems(items []*model.SubscriptionItem) ([]*model.SubscriptionI
 				return stored, added, changed, err
 			}
 			changed++
+		} else if saved.Status == model.SubscriptionItemStatusSkipped {
+			// Re-selected by a later inspect observation; allow reconcile to
+			// compare it again and dispatch if it is now the episode winner.
+			saved.Status = model.SubscriptionItemStatusPending
+			saved.ClusterJobID = ""
+			saved.LastError = ""
+			saved, _, err = db.UpsertSubscriptionItem(saved)
+			if err != nil {
+				return stored, added, changed, err
+			}
+			changed++
 		}
 		stored = append(stored, saved)
 	}

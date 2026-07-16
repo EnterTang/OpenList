@@ -193,12 +193,9 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	added := 0
 	changed := 0
 	transferred := 0
-	snapshotRoots := append([]string(nil), cfg.Paths...)
-	tempRootSources := map[string]telegramPanSubscriptionSource{}
-	tempRootBoundNames := map[string]map[string]struct{}{}
-	tempRootBoundPaths := map[string]map[string]struct{}{}
 	var shareCfg model.SubscriptionTelegramSourceConfig
-	if len(cfg.Links) > 0 {
+	var inspected []shareTransferCandidate
+	if len(cfg.Links) > 0 || strings.TrimSpace(cfg.ImportsText) != "" {
 		globalCfg, err := GetConfig()
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, transferred, err
@@ -207,20 +204,16 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	}
 
 	for _, link := range cfg.Links {
-		source, handled, saveErr := trySaveShareLinkToTemp(ctx, sub, shareCfg, link)
-		if source.Name != "" && handled {
-			root := strings.TrimSpace(source.Config.TempTransferRoot)
-			if root != "" {
-				snapshotRoots = appendPathOnce(snapshotRoots, root)
-				tempRootSources[root] = source
-				tempRootBoundNames[root] = mergeStringSet(tempRootBoundNames[root], source.BoundShareNames)
-				tempRootBoundPaths[root] = mergeStringSet(tempRootBoundPaths[root], source.BoundSharePaths)
-			}
+		source, candidates, handled, inspectErr := inspectShareLinkCandidatesFn(ctx, sub, shareCfg, link, now)
+		if handled {
+			inspected = append(inspected, candidates...)
 			continue
 		}
 		item := manualLinkItem(sub, link, now)
-		if saveErr != nil {
-			item.LastError = "share URL transfer failed: " + saveErr.Error()
+		if inspectErr != nil {
+			item.LastError = "share URL inspect failed: " + inspectErr.Error()
+		} else if source.Name != "" {
+			item.LastError = "share URL provider is not ready for temp transfer"
 		}
 		stored, isNew, err := db.UpsertSubscriptionItem(item)
 		if err != nil {
@@ -237,13 +230,9 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, transferred, err
 		}
-		globalCfg, err := GetConfig()
-		if err != nil {
-			return saved, sub.LastTreeHash, added, changed, transferred, err
-		}
 		panCfg, err := telegramPanSourceConfigWithStorageFallback(
 			ShareProviderPan123,
-			normalizeTelegramPanConfig(globalCfg.Telegram.Pan123),
+			normalizeTelegramPanConfig(shareCfg.Pan123),
 		)
 		if err != nil {
 			return saved, sub.LastTreeHash, added, changed, transferred, err
@@ -254,65 +243,60 @@ func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 		if strings.TrimSpace(panCfg.AccessToken) == "" {
 			return saved, sub.LastTreeHash, added, changed, transferred, fmt.Errorf("pan123 access_token is required for manual imports; configure a 123Pan storage so the token can be loaded automatically")
 		}
-		provider, err := newShareSaverForProvider(ShareProviderPan123, panCfg)
-		if err != nil {
-			return saved, sub.LastTreeHash, added, changed, transferred, err
-		}
-		selected, err := saveImportedFilesToTemp(ctx, provider, "manual_import://pan123", files, SaveShareOptions{
-			TempRoot:     panCfg.TempTransferRoot,
-			Subscription: sub,
-			Match: func(entry TreeEntry) bool {
-				return boundShareEntryMatches(sub, entry)
-			},
-		})
-		if err != nil {
-			return saved, sub.LastTreeHash, added, changed, transferred, err
-		}
-		snapshotRoots = appendPathOnce(snapshotRoots, panCfg.TempTransferRoot)
-		tempRootSources[panCfg.TempTransferRoot] = telegramPanSubscriptionSource{
-			Name:   string(ShareProviderPan123),
-			Config: panCfg,
-		}
-		tempRootBoundNames[panCfg.TempTransferRoot], tempRootBoundPaths[panCfg.TempTransferRoot] = mergeBoundShareMarkers(
-			tempRootBoundNames[panCfg.TempTransferRoot],
-			tempRootBoundPaths[panCfg.TempTransferRoot],
-			selected,
-		)
+		source := telegramPanSubscriptionSource{Name: string(ShareProviderPan123), Config: panCfg}
+		inspected = append(inspected, importFilesToShareTransferCandidates(sub, source, "manual_import://pan123", files, now)...)
 	}
 
-	snapshot, err := snapshotPaths(ctx, snapshotRoots)
-	if err != nil {
-		return saved, sub.LastTreeHash, added, changed, transferred, err
+	selected := selectShareTransferCandidates(sub, inspected, shareCfg.TransferPriority)
+	hashParts := make([]string, 0, 2)
+	if len(selected) > 0 {
+		tempItems, _, tempAdded, tempChanged, tempTransferred, err := transferSelectedShareCandidates(ctx, sub, selected, transfer, now, "")
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		saved = append(saved, tempItems...)
+		added += tempAdded
+		changed += tempChanged
+		transferred += tempTransferred
 	}
-	var candidates []telegramTempCandidate
-	for _, entry := range MediaFiles(snapshot.Entries) {
-		root := cleanConfigPath(entry.RootPath)
-		if names, ok := tempRootBoundNames[root]; ok {
-			if !entryMatchesSubscriptionOrBoundShare(sub, entry, names, tempRootBoundPaths[root]) {
+
+	if len(cfg.Paths) > 0 {
+		snapshot, err := snapshotPaths(ctx, cfg.Paths)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		var pathCandidates []telegramTempCandidate
+		for _, entry := range MediaFiles(snapshot.Entries) {
+			if !subscriptionEntryMatches(sub, entry) {
 				continue
 			}
+			pathCandidates = append(pathCandidates, telegramTempCandidate{
+				Entry: entry,
+				Item:  itemFromEntry(sub, entry, now),
+			})
 		}
-		source := tempRootSources[root]
-		candidates = append(candidates, telegramTempCandidate{
-			Source: source,
-			Entry:  entry,
-			Item:   itemFromEntry(sub, entry, now),
-		})
+		tempItems, _, tempAdded, tempChanged, tempTransferred, err := finalizeTempTransferCandidates(ctx, sub, pathCandidates, shareCfg.TransferPriority, transfer, now, snapshot.Hash)
+		if err != nil {
+			return saved, snapshot.Hash, added, changed, transferred, err
+		}
+		saved = append(saved, tempItems...)
+		added += tempAdded
+		changed += tempChanged
+		transferred += tempTransferred
+		hashParts = append(hashParts, snapshot.Hash)
 	}
-	tempItems, _, tempAdded, tempChanged, tempTransferred, err := finalizeTempTransferCandidates(ctx, sub, candidates, shareCfg.TransferPriority, transfer, now, snapshot.Hash)
-	if err != nil {
-		return saved, snapshot.Hash, added, changed, transferred, err
+	hash := ""
+	if len(hashParts) > 0 {
+		hash = combinedHash("manual", hashParts)
 	}
-	saved = append(saved, tempItems...)
-	added += tempAdded
-	changed += tempChanged
-	transferred += tempTransferred
-	hash := snapshot.Hash
 	if len(cfg.Links) > 0 {
 		hash = combinedHash(hash, cfg.Links)
 	}
 	if cfg.ImportsText != "" {
 		hash = combinedHash(hash, []string{cfg.ImportsText})
+	}
+	if hash == "" {
+		hash = sub.LastTreeHash
 	}
 	return saved, hash, added, changed, transferred, nil
 }
@@ -349,30 +333,23 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	added := 0
 	changed := 0
 	transferred := 0
-	snapshotRoots := []string{}
-	tempRootSources := map[string]telegramPanSubscriptionSource{}
-	tempRootBoundNames := map[string]map[string]struct{}{}
-	tempRootBoundPaths := map[string]map[string]struct{}{}
 	globalCfg, err := GetConfig()
 	if err != nil {
 		return saved, sub.LastTreeHash, added, changed, transferred, err
 	}
+	var inspected []shareTransferCandidate
 	for _, result := range results {
 		for _, link := range result.Links {
-			source, handled, saveErr := trySaveShareLinkToTemp(ctx, sub, globalCfg.Telegram, link.URL)
-			if source.Name != "" && handled {
-				root := strings.TrimSpace(source.Config.TempTransferRoot)
-				if root != "" {
-					snapshotRoots = appendPathOnce(snapshotRoots, root)
-					tempRootSources[root] = source
-					tempRootBoundNames[root] = mergeStringSet(tempRootBoundNames[root], source.BoundShareNames)
-					tempRootBoundPaths[root] = mergeStringSet(tempRootBoundPaths[root], source.BoundSharePaths)
-				}
+			source, candidates, handled, inspectErr := inspectShareLinkCandidatesFn(ctx, sub, globalCfg.Telegram, link.URL, now)
+			if handled {
+				inspected = append(inspected, candidates...)
 				continue
 			}
 			item := panSouLinkItem(sub, result, link, now)
-			if saveErr != nil {
-				item.LastError = "pansou share URL transfer failed: " + saveErr.Error()
+			if inspectErr != nil {
+				item.LastError = "pansou share URL inspect failed: " + inspectErr.Error()
+			} else if source.Name != "" {
+				item.LastError = "pansou share URL provider is not ready for temp transfer"
 			}
 			stored, isNew, err := db.UpsertSubscriptionItem(item)
 			if err != nil {
@@ -384,32 +361,23 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 			saved = append(saved, *stored)
 		}
 	}
-	snapshot, err := snapshotPaths(ctx, snapshotRoots)
-	if err != nil {
-		return saved, sub.LastTreeHash, added, changed, transferred, err
-	}
-	var candidates []telegramTempCandidate
-	for _, entry := range MediaFiles(snapshot.Entries) {
-		root := cleanConfigPath(entry.RootPath)
-		if !entryMatchesSubscriptionOrBoundShare(sub, entry, tempRootBoundNames[root], tempRootBoundPaths[root]) {
-			continue
-		}
-		candidates = append(candidates, telegramTempCandidate{
-			Source: tempRootSources[root],
-			Entry:  entry,
-			Item:   itemFromEntry(sub, entry, now),
-		})
-	}
-	tempItems, _, tempAdded, tempChanged, tempTransferred, err := finalizeTempTransferCandidates(ctx, sub, candidates, globalCfg.Telegram.TransferPriority, transfer, now, snapshot.Hash)
-	if err != nil {
-		return saved, snapshot.Hash, added, changed, transferred, err
-	}
-	saved = append(saved, tempItems...)
-	added += tempAdded
-	changed += tempChanged
-	transferred += tempTransferred
+	selected := selectShareTransferCandidates(sub, inspected, globalCfg.Telegram.TransferPriority)
 	links := panSouResultLinks(results)
-	return saved, combinedHash(snapshot.Hash, links), added, changed, transferred, nil
+	hash := combinedHash("", links)
+	if len(selected) > 0 {
+		tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := transferSelectedShareCandidates(ctx, sub, selected, transfer, now, hash)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		saved = append(saved, tempItems...)
+		added += tempAdded
+		changed += tempChanged
+		transferred += tempTransferred
+		if tempHash != "" {
+			hash = tempHash
+		}
+	}
+	return saved, hash, added, changed, transferred, nil
 }
 
 func parsePanSouConfig(raw string) (model.SubscriptionPanSouSourceConfig, error) {

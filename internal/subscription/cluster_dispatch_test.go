@@ -230,6 +230,94 @@ func TestApplyClusterInspectObservationSelectsLargestEpisodeAcrossShares(t *test
 	}
 }
 
+func TestApplyClusterInspectObservationDedupesAcrossSeparateObservations(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		Name: "Example", TMDBName: "Example", SourceType: model.SubscriptionSourceManual,
+		TransferEnabled: true, MediaType: "tv", TargetRoot: "/tv",
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	small := ClusterInspectManifestInput{
+		Task: ClusterInspectTask{
+			SubscriptionID: sub.ID, ShareProvider: string(ShareProviderQuark),
+			ShareURL: "https://pan.quark.cn/s/small", SourceMessageID: "1",
+		},
+		Objects: []ClusterInspectObject{{FileID: "small", RelativePath: "Example.S01E01.small.mkv", Size: 600}},
+	}
+	large := ClusterInspectManifestInput{
+		Task: ClusterInspectTask{
+			SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan123),
+			ShareURL: "https://www.123pan.com/s/large", SourceMessageID: "2",
+		},
+		Objects: []ClusterInspectObject{{FileID: "large", RelativePath: "Example.S01E01.large.mkv", Size: 900}},
+	}
+
+	count, err := ApplyClusterInspectObservation(context.Background(), []ClusterInspectManifestInput{small})
+	if err != nil {
+		t.Fatalf("apply small observation: %v", err)
+	}
+	if count != 1 || len(dispatcher.tasks) != 1 || dispatcher.tasks[0].SourceFileID != "small" {
+		t.Fatalf("small observation dispatched=%d tasks=%#v", count, dispatcher.tasks)
+	}
+
+	count, err = ApplyClusterInspectObservation(context.Background(), []ClusterInspectManifestInput{large})
+	if err != nil {
+		t.Fatalf("apply large observation: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("large observation dispatched=%d, want 1", count)
+	}
+	if len(dispatcher.tasks) != 2 || dispatcher.tasks[1].SourceFileID != "large" {
+		t.Fatalf("tasks after large = %#v, want large appended", dispatcher.tasks)
+	}
+
+	items, err := db.ListSubscriptionItems(sub.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	var smallItem, largeItem *model.SubscriptionItem
+	for i := range items {
+		switch items[i].FileID {
+		case "small":
+			smallItem = &items[i]
+		case "large":
+			largeItem = &items[i]
+		}
+	}
+	if smallItem == nil || largeItem == nil {
+		t.Fatalf("items = %#v, want both small and large", items)
+	}
+	if smallItem.Status != model.SubscriptionItemStatusSkipped {
+		t.Fatalf("small status = %q, want skipped after larger candidate arrived", smallItem.Status)
+	}
+	if largeItem.Status != model.SubscriptionItemStatusTransferring {
+		t.Fatalf("large status = %q, want transferring", largeItem.Status)
+	}
+
+	tiny := ClusterInspectManifestInput{
+		Task: ClusterInspectTask{
+			SubscriptionID: sub.ID, ShareProvider: string(ShareProviderQuark),
+			ShareURL: "https://pan.quark.cn/s/tiny", SourceMessageID: "3",
+		},
+		Objects: []ClusterInspectObject{{FileID: "tiny", RelativePath: "Example.S01E01.tiny.mkv", Size: 100}},
+	}
+	before := len(dispatcher.tasks)
+	count, err = ApplyClusterInspectObservation(context.Background(), []ClusterInspectManifestInput{tiny})
+	if err != nil {
+		t.Fatalf("apply tiny observation: %v", err)
+	}
+	if count != 0 || len(dispatcher.tasks) != before {
+		t.Fatalf("tiny observation should not dispatch: count=%d tasks=%d", count, len(dispatcher.tasks))
+	}
+}
+
 func TestClusterTasksPreservePreferredWorkerWithoutChangingMediaIdempotency(t *testing.T) {
 	sub := &model.Subscription{
 		ID: 41, Name: "Example", PreferredWorkerNodeID: "worker-139",

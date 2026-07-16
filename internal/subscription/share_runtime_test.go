@@ -591,58 +591,59 @@ func TestRunManualShareProviderSavesTempRoot(t *testing.T) {
 		t.Fatalf("save config: %v", err)
 	}
 
-	oldFactory := newShareSaverForProvider
-	oldSave := saveShareToTemp
-	oldSnapshot := snapshotPaths
+	oldInspect := inspectShareLinkCandidatesFn
+	oldSave := saveShareTransferCandidatesFn
 	defer func() {
-		newShareSaverForProvider = oldFactory
-		saveShareToTemp = oldSave
-		snapshotPaths = oldSnapshot
+		inspectShareLinkCandidatesFn = oldInspect
+		saveShareTransferCandidatesFn = oldSave
 	}()
 
-	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
-		if provider != ShareProviderQuark {
-			t.Fatalf("provider = %s, want quark", provider)
-		}
-		if cfg.Cookie != "cookie" || cfg.TempTransferRoot != "/tmp/quark" {
-			t.Fatalf("cfg = %#v, want quark credentials and temp root", cfg)
-		}
-		return &fakeShareSaver{}, nil
-	}
-	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
-		if ref.ShareID != "bc18e4ea5fb8" || opts.TempRoot != "/tmp/quark" {
-			t.Fatalf("save ref/root = %#v %q", ref, opts.TempRoot)
-		}
-		if !opts.Match(TreeEntry{Name: "Some.Show.S01E01.mkv", Path: "/Some.Show.S01E01.mkv"}) {
-			t.Fatal("expected manual provider save match to accept subscription media")
-		}
-		return nil, nil
-	}
-	snapshotPaths = func(ctx context.Context, roots []string) (*TreeSnapshot, error) {
-		if got, want := roots, []string{"/tmp/quark"}; !stringSlicesEqual(got, want) {
-			t.Fatalf("snapshot roots = %#v, want %#v", got, want)
-		}
-		return &TreeSnapshot{
-			Hash: "temp-hash",
-			Entries: []TreeEntry{{
-				RootPath: "/tmp/quark",
-				Path:     "/Some.Show.S01E01.mkv",
-				Name:     "Some.Show.S01E01.mkv",
-				ID:       "file-1",
-				Size:     1024,
-				Modified: time.Unix(1700000000, 0),
-			}},
-		}, nil
-	}
-
-	items, _, added, _, _, err := runManual(context.Background(), &model.Subscription{
+	sub := &model.Subscription{
 		ID:           1,
 		SourceConfig: `{"links":["https://pan.quark.cn/s/bc18e4ea5fb8"]}`,
 		TMDBName:     "Some Show",
 		TargetRoot:   "/target",
 		MediaType:    "tv",
 		Category:     "test",
-	}, false)
+	}
+	inspectShareLinkCandidatesFn = func(ctx context.Context, gotSub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig, rawLink string, seenAt time.Time) (telegramPanSubscriptionSource, []shareTransferCandidate, bool, error) {
+		if rawLink != "https://pan.quark.cn/s/bc18e4ea5fb8" {
+			t.Fatalf("raw link = %q", rawLink)
+		}
+		source := telegramPanSubscriptionSource{
+			Name: string(ShareProviderQuark),
+			Config: model.SubscriptionTelegramPanConfig{
+				TempTransferRoot: "/tmp/quark",
+				Cookie:           "cookie",
+			},
+		}
+		entry := TreeEntry{
+			RootPath: rawLink,
+			Path:     "/Some.Show.S01E01.mkv",
+			Name:     "Some.Show.S01E01.mkv",
+			ID:       "file-1",
+			Size:     1024,
+			Modified: time.Unix(1700000000, 0),
+		}
+		item := itemFromEntry(gotSub, entry, seenAt)
+		item.SourceProvider = string(ShareProviderQuark)
+		return source, []shareTransferCandidate{{
+			Source: source,
+			Ref:    ShareRef{Provider: ShareProviderQuark, RawURL: rawLink, ShareID: "bc18e4ea5fb8"},
+			Pair:   shareTreePair{entry: entry, item: ShareItem{ID: "file-1", Name: entry.Name, Size: entry.Size}},
+			Entry:  entry,
+			Item:   item,
+		}}, true, nil
+	}
+	saveShareTransferCandidatesFn = func(ctx context.Context, selected []shareTransferCandidate) ([]shareTransferCandidate, error) {
+		if len(selected) != 1 {
+			t.Fatalf("selected = %#v, want 1", selected)
+		}
+		selected[0].Entry.RootPath = "/tmp/quark"
+		return selected, nil
+	}
+
+	items, _, added, _, _, err := runManual(context.Background(), sub, false)
 	if err != nil {
 		t.Fatalf("run manual: %v", err)
 	}
@@ -651,9 +652,6 @@ func TestRunManualShareProviderSavesTempRoot(t *testing.T) {
 	}
 	if items[0].Status != model.SubscriptionItemStatusPending || items[0].SourcePath != "/tmp/quark/Some.Show.S01E01.mkv" {
 		t.Fatalf("item = %#v, want pending temp file item", items[0])
-	}
-	if items[0].SourceURL != "" {
-		t.Fatalf("source URL = %q, want provider-handled link not recorded as skipped", items[0].SourceURL)
 	}
 }
 
@@ -673,11 +671,9 @@ func TestRunManualImportsTextSavesMatchingPan123Files(t *testing.T) {
 
 	oldFactory := newShareSaverForProvider
 	oldSaveImported := saveImportedFilesToTemp
-	oldSnapshot := snapshotPaths
 	defer func() {
 		newShareSaverForProvider = oldFactory
 		saveImportedFilesToTemp = oldSaveImported
-		snapshotPaths = oldSnapshot
 	}()
 
 	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
@@ -697,27 +693,14 @@ func TestRunManualImportsTextSavesMatchingPan123Files(t *testing.T) {
 		if opts.TempRoot != "/tmp/pan123" {
 			t.Fatalf("temp root = %q, want /tmp/pan123", opts.TempRoot)
 		}
-		if !opts.Match(TreeEntry{Name: "达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv", Path: "/达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv"}) {
-			t.Fatal("expected match function to accept matching entry")
+		if opts.Subscription != nil || opts.Match != nil {
+			t.Fatal("preselected import saves must not re-match or re-filter by subscription")
 		}
 		return []TreeEntry{{
 			RootPath: "/tmp/pan123",
 			Path:     "/达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
 			Name:     "达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
 		}}, nil
-	}
-	snapshotPaths = func(ctx context.Context, roots []string) (*TreeSnapshot, error) {
-		if got, want := roots, []string{"/tmp/pan123"}; !stringSlicesEqual(got, want) {
-			t.Fatalf("snapshot roots = %#v, want %#v", got, want)
-		}
-		return &TreeSnapshot{
-			Hash: "temp-hash-import",
-			Entries: []TreeEntry{{
-				RootPath: "/tmp/pan123",
-				Path:     "/达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
-				Name:     "达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
-			}},
-		}, nil
 	}
 
 	items, _, added, _, _, err := runManual(context.Background(), &model.Subscription{

@@ -213,6 +213,9 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}
+	if _, err := telegramPanSourcesForTransfer(cfg, nil); err != nil {
+		return nil, sub.LastTreeHash, 0, 0, 0, err
+	}
 	rows, err := runTelegramSearch(ctx, sub, cfg)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
@@ -224,7 +227,7 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	changed := 0
 	transferred := 0
 	var saved []model.SubscriptionItem
-	triggeredSources := map[string]telegramPanSubscriptionSource{}
+	var inspected []shareTransferCandidate
 	for _, row := range rows {
 		msgID := rowMessageID(row)
 		if msgID > 0 {
@@ -237,27 +240,39 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 			continue
 		}
 		links, sources := rowLinksForTelegramPanSources(row, cfg)
-		for _, source := range sources {
-			triggeredSources[source.Name] = mergeBoundShareSource(triggeredSources[source.Name], source)
-		}
 		accessCode := rowAccessCode(row)
+		message := sourceMessageFromTelegramRow(row)
 		for _, link := range links {
-			var saveErr error
+			rawLink := normalizeTelegramLinkWithAccessCode(link, accessCode)
 			if len(sources) > 0 {
-				var source telegramPanSubscriptionSource
-				var handled bool
-				source, handled, saveErr = trySaveShareLinkToTemp(ctx, sub, cfg, normalizeTelegramLinkWithAccessCode(link, accessCode))
-				if source.Name != "" {
-					triggeredSources[source.Name] = mergeBoundShareSource(triggeredSources[source.Name], source)
-				}
+				source, candidates, handled, inspectErr := inspectShareLinkCandidatesFn(ctx, sub, cfg, rawLink, now)
 				if handled {
+					for i := range candidates {
+						candidates[i].Item.SourceMessageID = message.ID
+						candidates[i].Item.SourceMessageChannel = message.Channel
+						candidates[i].Item.SourceMessageURL = message.URL
+						candidates[i].Item.SourceMessageText = message.Text
+					}
+					inspected = append(inspected, candidates...)
+					continue
+				}
+				if source.Name == "" && inspectErr == nil {
+					// Provider not configured for this link; fall through.
+				} else if inspectErr != nil {
+					item := telegramLinkItem(sub, row, link, now)
+					item.LastError = "telegram share URL inspect failed: " + inspectErr.Error()
+					stored, isNew, err := db.UpsertSubscriptionItem(item)
+					if err != nil {
+						return saved, sub.LastTreeHash, added, changed, transferred, err
+					}
+					if isNew {
+						added++
+					}
+					saved = append(saved, *stored)
 					continue
 				}
 			}
 			item := telegramLinkItem(sub, row, link, now)
-			if saveErr != nil {
-				item.LastError = "telegram share URL transfer failed: " + saveErr.Error()
-			}
 			stored, isNew, err := db.UpsertSubscriptionItem(item)
 			if err != nil {
 				return saved, sub.LastTreeHash, added, changed, transferred, err
@@ -268,26 +283,25 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 			saved = append(saved, *stored)
 		}
 	}
-	transferSources, err := telegramPanSourcesForTransfer(cfg, triggeredSources)
-	if err != nil {
-		return saved, sub.LastTreeHash, added, changed, transferred, err
+	selected := selectShareTransferCandidates(sub, inspected, cfg.TransferPriority)
+	resultHash := telegramRowsHash(rows)
+	if len(selected) > 0 {
+		tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := transferSelectedShareCandidates(ctx, sub, selected, transfer, now, resultHash)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		saved = append(saved, tempItems...)
+		added += tempAdded
+		changed += tempChanged
+		transferred += tempTransferred
+		if tempHash != "" {
+			resultHash = tempHash
+		}
 	}
-	tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := runTelegramTempTransfers(ctx, sub, transferSources, cfg, transfer, now)
-	if err != nil {
-		return saved, sub.LastTreeHash, added, changed, transferred, err
-	}
-	saved = append(saved, tempItems...)
-	added += tempAdded
-	changed += tempChanged
-	transferred += tempTransferred
 	if formatted := formatTelegramCursor(nextCursor); formatted != strings.TrimSpace(sub.LastCursor) {
 		sub.LastCursor = formatted
 	}
-	hash := telegramRowsHash(rows)
-	if tempHash != "" {
-		hash = combinedHash(hash, []string{tempHash})
-	}
-	return saved, hash, added, changed, transferred, nil
+	return saved, resultHash, added, changed, transferred, nil
 }
 
 func TelegramAuth(ctx context.Context, subscriptionID uint, action string, req model.SubscriptionTelegramAuthReq) (model.SubscriptionTelegramAuthResp, error) {

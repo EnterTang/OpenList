@@ -17,32 +17,9 @@ var (
 )
 
 func trySaveShareLinkToTemp(ctx context.Context, sub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig, rawLink string) (telegramPanSubscriptionSource, bool, error) {
-	ref, err := ParseShareURL(rawLink)
-	if err != nil {
-		if provider, ok := DetectShareProvider(rawLink); ok {
-			source, _ := telegramPanSourceForProvider(cfg, provider)
-			return source, false, err
-		}
-		return telegramPanSubscriptionSource{}, false, nil
-	}
-	source, ok := telegramPanSourceForProvider(cfg, ref.Provider)
-	if !ok {
-		return telegramPanSubscriptionSource{}, false, nil
-	}
-	if sub != nil && sub.TempTarget.Provider != "" {
-		tempTarget := NormalizeSubscriptionStorageTarget(sub.TempTarget)
-		if tempTarget.Provider != providerTargetNameForShareProvider(ref.Provider) {
-			return source, false, nil
-		}
-		source.Config.TempTransferTarget = tempTarget
-	}
-	source.Config, err = telegramPanSourceConfigWithStorageFallback(ref.Provider, source.Config)
-	if err != nil {
+	source, ref, ok, err := resolveShareLinkSource(sub, cfg, rawLink)
+	if err != nil || !ok {
 		return source, false, err
-	}
-	source.runtimeConfigResolved = true
-	if !telegramPanSourceCanSave(ref.Provider, source.Config) {
-		return source, false, nil
 	}
 	provider, err := newShareSaverForProvider(ref.Provider, source.Config)
 	if err != nil {

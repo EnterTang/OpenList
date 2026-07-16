@@ -37,10 +37,6 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 	if tempRoot == "" || tempRoot == "/" {
 		return nil, fmt.Errorf("share temp root is required")
 	}
-	dstDirID, err := provider.EnsureDir(ctx, tempRoot)
-	if err != nil {
-		return nil, err
-	}
 	pairs, err := collectShareTreePairs(ctx, provider, ref)
 	if err != nil {
 		return nil, err
@@ -58,11 +54,32 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 	if opts.Subscription != nil {
 		matched = filterLargestSharePairsPerSlot(opts.Subscription, matched)
 	}
-	selected := make([]TreeEntry, 0, len(matched))
+	return saveSharePairsToTemp(ctx, provider, ref, matched, opts)
+}
+
+// saveSharePairsToTemp persists already-selected share tree pairs into the
+// provider temp root. Callers that inspected metadata first should filter to
+// the largest file per episode before invoking this.
+func saveSharePairsToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, pairs []shareTreePair, opts SaveShareOptions) ([]TreeEntry, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("share provider is nil")
+	}
+	tempRoot := cleanConfigPath(opts.TempRoot)
+	if tempRoot == "" || tempRoot == "/" {
+		return nil, fmt.Errorf("share temp root is required")
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	dstDirID, err := provider.EnsureDir(ctx, tempRoot)
+	if err != nil {
+		return nil, err
+	}
+	selected := make([]TreeEntry, 0, len(pairs))
 	dirIDs := map[string]string{"": dstDirID}
 	grouped := map[shareSaveGroup][]ShareItem{}
 	groupOrder := make([]shareSaveGroup, 0)
-	for _, pair := range matched {
+	for _, pair := range pairs {
 		dirPath := importedParentPath(pair.entry.Path)
 		if opts.Flatten {
 			dirPath = ""

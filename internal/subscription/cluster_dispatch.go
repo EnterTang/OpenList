@@ -104,6 +104,15 @@ var clusterDispatcherRegistry struct {
 	dispatcher ClusterDispatcher
 }
 
+var clusterInspectApplyLocks sync.Map // subscriptionID -> *sync.Mutex
+
+func lockClusterInspectApply(subscriptionID uint) func() {
+	value, _ := clusterInspectApplyLocks.LoadOrStore(subscriptionID, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 // RegisterClusterDispatcher installs the coordinator-side adapter. Passing
 // nil unregisters it, which is useful during shutdown and in tests.
 func RegisterClusterDispatcher(dispatcher ClusterDispatcher) {
@@ -168,6 +177,8 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 	if len(manifests) == 0 {
 		return 0, nil
 	}
+	unlock := lockClusterInspectApply(manifests[0].Task.SubscriptionID)
+	defer unlock()
 	sub, err := db.GetSubscriptionByID(manifests[0].Task.SubscriptionID)
 	if err != nil {
 		return 0, err
@@ -202,7 +213,8 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 			candidates = append(candidates, clusterInspectCandidate{item: item, ref: ref, message: message})
 		}
 	}
-	candidates = selectClusterInspectCandidates(sub, candidates, clusterInspectTransferPriority(sub))
+	priority := clusterInspectTransferPriority(sub)
+	candidates = selectClusterInspectCandidates(sub, candidates, priority)
 	items := make([]*model.SubscriptionItem, 0, len(candidates))
 	candidateBySourceKey := make(map[string]clusterInspectCandidate, len(candidates))
 	for _, candidate := range candidates {
@@ -210,6 +222,13 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 		candidateBySourceKey[candidate.item.SourceKey] = candidate
 	}
 	stored, _, _, err := upsertClusterItems(items)
+	if err != nil {
+		return 0, err
+	}
+	// Cross-observation dedupe: Telegram (and other sources) inspect each share
+	// independently. Keep only the largest file per episode before dispatching
+	// worker temp-save/transfer jobs, matching non-cluster behavior.
+	stored, err = reconcileClusterEpisodeSlots(sub, stored, priority)
 	if err != nil {
 		return 0, err
 	}
@@ -221,6 +240,9 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 	groups := make(map[string]*dispatchGroup)
 	groupOrder := make([]string, 0)
 	for _, item := range stored {
+		if item == nil || item.Status != model.SubscriptionItemStatusPending {
+			continue
+		}
 		candidate, ok := candidateBySourceKey[item.SourceKey]
 		if !ok {
 			continue
@@ -248,7 +270,7 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 }
 
 func selectClusterInspectCandidates(sub *model.Subscription, candidates []clusterInspectCandidate, priority []string) []clusterInspectCandidate {
-	if sub == nil || len(candidates) <= 1 || strings.EqualFold(strings.TrimSpace(sub.MediaType), "movie") {
+	if sub == nil || len(candidates) <= 1 || normalizeMediaType(sub.MediaType) == "movie" {
 		return candidates
 	}
 	priority = normalizeTransferPriority(priority)
@@ -260,11 +282,14 @@ func selectClusterInspectCandidates(sub *model.Subscription, candidates []cluste
 	bestBySlot := make(map[string]clusterInspectCandidate, len(candidates))
 	slotOrder := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.item == nil || candidate.item.Episode <= 0 {
+		if candidate.item == nil {
+			continue
+		}
+		slot := mediaSlotKey(sub, candidate.item)
+		if slot == "" || (normalizeMediaType(sub.MediaType) != "movie" && candidate.item.Episode <= 0) {
 			selected = append(selected, candidate)
 			continue
 		}
-		slot := fmt.Sprintf("%d:%d", candidate.item.Season, candidate.item.Episode)
 		existing, ok := bestBySlot[slot]
 		if !ok {
 			slotOrder = append(slotOrder, slot)
@@ -280,6 +305,12 @@ func selectClusterInspectCandidates(sub *model.Subscription, candidates []cluste
 }
 
 func betterClusterInspectCandidate(candidate, existing clusterInspectCandidate, priorityIndex map[string]int) bool {
+	if candidate.item == nil {
+		return false
+	}
+	if existing.item == nil {
+		return true
+	}
 	if candidate.item.FileSize != existing.item.FileSize {
 		return candidate.item.FileSize > existing.item.FileSize
 	}
@@ -293,6 +324,169 @@ func betterClusterInspectCandidate(candidate, existing clusterInspectCandidate, 
 	candidateKey := strings.Join([]string{candidateProvider, candidate.item.FilePath, candidate.item.FileID, candidate.item.SourceKey}, "\x00")
 	existingKey := strings.Join([]string{existingProvider, existing.item.FilePath, existing.item.FileID, existing.item.SourceKey}, "\x00")
 	return candidateKey < existingKey
+}
+
+const clusterSkippedDuplicateEpisodeReason = "skipped: larger or preferred file selected for the same episode"
+
+// reconcileClusterEpisodeSlots keeps one active transfer candidate per TV episode
+// across independently inspected shares/messages. Non-winners that are still
+// pending or transferring are marked skipped so workers never temp-save them.
+func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.SubscriptionItem, priority []string) ([]*model.SubscriptionItem, error) {
+	if sub == nil || normalizeMediaType(sub.MediaType) == "movie" || len(stored) == 0 {
+		return stored, nil
+	}
+	priority = normalizeTransferPriority(priority)
+	priorityIndex := make(map[string]int, len(priority))
+	for index, provider := range priority {
+		priorityIndex[provider] = index
+	}
+
+	touchedSlots := make(map[string]struct{}, len(stored))
+	storedByKey := make(map[string]*model.SubscriptionItem, len(stored))
+	for _, item := range stored {
+		if item == nil {
+			continue
+		}
+		storedByKey[item.SourceKey] = item
+		if slot := mediaSlotKey(sub, item); slot != "" && item.Episode > 0 {
+			touchedSlots[slot] = struct{}{}
+		}
+	}
+	if len(touchedSlots) == 0 {
+		return stored, nil
+	}
+
+	existing, err := db.ListSubscriptionItems(sub.ID)
+	if err != nil {
+		return stored, err
+	}
+
+	competitorsBySlot := make(map[string][]*model.SubscriptionItem, len(touchedSlots))
+	for i := range existing {
+		item := &existing[i]
+		slot := mediaSlotKey(sub, item)
+		if _, ok := touchedSlots[slot]; !ok {
+			continue
+		}
+		if !clusterItemCompetesForEpisodeSlot(item) {
+			continue
+		}
+		if refreshed, ok := storedByKey[item.SourceKey]; ok {
+			item = refreshed
+		}
+		competitorsBySlot[slot] = append(competitorsBySlot[slot], item)
+	}
+	for _, item := range stored {
+		if item == nil {
+			continue
+		}
+		slot := mediaSlotKey(sub, item)
+		if _, ok := touchedSlots[slot]; !ok || item.Episode <= 0 {
+			continue
+		}
+		if !clusterItemCompetesForEpisodeSlot(item) {
+			continue
+		}
+		found := false
+		for _, existingItem := range competitorsBySlot[slot] {
+			if existingItem.SourceKey == item.SourceKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			competitorsBySlot[slot] = append(competitorsBySlot[slot], item)
+		}
+	}
+
+	winnerBySlot := make(map[string]*model.SubscriptionItem, len(competitorsBySlot))
+	for slot, competitors := range competitorsBySlot {
+		var winner *model.SubscriptionItem
+		for _, item := range competitors {
+			if winner == nil || betterClusterInspectCandidate(clusterInspectCandidate{item: item}, clusterInspectCandidate{item: winner}, priorityIndex) {
+				winner = item
+			}
+		}
+		if winner != nil {
+			winnerBySlot[slot] = winner
+		}
+	}
+
+	dispatchable := make([]*model.SubscriptionItem, 0, len(stored))
+	for _, item := range stored {
+		if item == nil {
+			continue
+		}
+		slot := mediaSlotKey(sub, item)
+		if slot == "" || item.Episode <= 0 {
+			dispatchable = append(dispatchable, item)
+			continue
+		}
+		winner := winnerBySlot[slot]
+		if winner != nil && winner.SourceKey == item.SourceKey {
+			if winner.Status == model.SubscriptionItemStatusTransferred ||
+				winner.Status == model.SubscriptionItemStatusTransferring {
+				// Already accepted for this slot; do not redispatch.
+				continue
+			}
+			dispatchable = append(dispatchable, item)
+			continue
+		}
+		if err := skipClusterDuplicateEpisodeItem(item); err != nil {
+			return stored, err
+		}
+	}
+
+	for slot, competitors := range competitorsBySlot {
+		winner := winnerBySlot[slot]
+		if winner == nil {
+			continue
+		}
+		for _, item := range competitors {
+			if item.SourceKey == winner.SourceKey {
+				continue
+			}
+			if _, fromObservation := storedByKey[item.SourceKey]; fromObservation {
+				continue // already handled above
+			}
+			if err := skipClusterDuplicateEpisodeItem(item); err != nil {
+				return stored, err
+			}
+		}
+	}
+	return dispatchable, nil
+}
+
+func clusterItemCompetesForEpisodeSlot(item *model.SubscriptionItem) bool {
+	if item == nil || item.Episode <= 0 {
+		return false
+	}
+	switch item.Status {
+	case model.SubscriptionItemStatusPending, model.SubscriptionItemStatusTransferring, model.SubscriptionItemStatusTransferred:
+		return true
+	default:
+		return false
+	}
+}
+
+func skipClusterDuplicateEpisodeItem(item *model.SubscriptionItem) error {
+	if item == nil {
+		return nil
+	}
+	switch item.Status {
+	case model.SubscriptionItemStatusPending, model.SubscriptionItemStatusTransferring, model.SubscriptionItemStatusFailed:
+		// continue
+	default:
+		return nil
+	}
+	if item.Status == model.SubscriptionItemStatusSkipped && item.LastError == clusterSkippedDuplicateEpisodeReason {
+		return nil
+	}
+	item.Status = model.SubscriptionItemStatusSkipped
+	item.LastError = clusterSkippedDuplicateEpisodeReason
+	// Keep ClusterJobID so a late worker callback can still match and no-op.
+	_, _, err := db.UpsertSubscriptionItem(item)
+	return err
 }
 
 func clusterInspectTransferPriority(sub *model.Subscription) []string {
@@ -507,6 +701,10 @@ func completeClusterTransfer(subscriptionID uint, sourceKey, jobID, status, last
 	item, err := db.GetSubscriptionItem(subscriptionID, sourceKey)
 	if err != nil {
 		return err
+	}
+	if item.Status == model.SubscriptionItemStatusSkipped {
+		// Superseded by a larger/preferred episode candidate after dispatch.
+		return nil
 	}
 	if item.Status == model.SubscriptionItemStatusPending {
 		return recoverPendingClusterTerminalItem(item, jobID, status, lastError)
