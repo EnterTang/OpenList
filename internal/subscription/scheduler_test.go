@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
 func resetStoragesLoadSignalForTest(t *testing.T) {
@@ -54,12 +55,14 @@ func TestSchedulerStorageWaitStops(t *testing.T) {
 	}
 }
 
-func TestClusterCoordinatorSchedulerDoesNotTransferLocally(t *testing.T) {
-	if !schedulerTransfersLocally("standalone") {
-		t.Fatal("standalone scheduler should keep local transfer behavior")
+func TestSubscriptionExecutionTransfersLocallyOnlyForStandaloneRole(t *testing.T) {
+	for _, role := range []string{"", model.ClusterRoleStandalone, " STANDALONE "} {
+		if !subscriptionTransfersLocally(role) {
+			t.Fatalf("role %q should keep local transfer behavior", role)
+		}
 	}
-	for _, role := range []string{"coordinator", "worker", "hybrid"} {
-		if schedulerTransfersLocally(role) {
+	for _, role := range []string{model.ClusterRoleCoordinator, model.ClusterRoleWorker, model.ClusterRoleHybrid} {
+		if subscriptionTransfersLocally(role) {
 			t.Fatalf("%s scheduler must not bypass cluster dispatch with a local transfer", role)
 		}
 	}

@@ -15,6 +15,7 @@
 - Modify `internal/subscription/service.go`: own role-aware execution.
 - Modify `internal/subscription/scheduler.go`: use the shared entry point.
 - Modify `internal/subscription/scheduler_test.go`: cover role classification.
+- Modify `internal/subscription/standalone_target_integration_test.go`: prove the standalone `transfer` flag is preserved.
 - Modify `server/handles/subscription.go`: route manual checks by role.
 - Modify `server/handles/subscription_test.go`: prove Hybrid manual checks dispatch to the cluster.
 
@@ -96,6 +97,7 @@ Expected: FAIL because the handler calls local `subscription.Run`; the request e
 - Modify: `internal/subscription/service.go`
 - Modify: `internal/subscription/scheduler.go`
 - Modify: `internal/subscription/scheduler_test.go`
+- Modify: `internal/subscription/standalone_target_integration_test.go`
 - Modify: `server/handles/subscription.go`
 
 - [ ] **Step 1: Add the shared entry point**
@@ -160,13 +162,17 @@ func TestSubscriptionExecutionTransfersLocallyOnlyForStandaloneRole(t *testing.T
 
 Add the `internal/model` import to `scheduler_test.go`.
 
-- [ ] **Step 5: Format and verify GREEN**
+- [ ] **Step 5: Prove standalone preserves `transfer=false`**
+
+Add an integration test that invokes `RunForRole` with `model.ClusterRoleStandalone` and `transfer=false`, then asserts the subscription is discovered without folder-ensure or transfer side effects. Mutation-check the test by temporarily forcing the local branch to pass `true`; the test must fail before restoring the correct implementation.
+
+- [ ] **Step 6: Format and verify GREEN**
 
 Run:
 
 ```bash
-gofmt -w internal/subscription/service.go internal/subscription/scheduler.go internal/subscription/scheduler_test.go server/handles/subscription.go server/handles/subscription_test.go
-go test ./internal/subscription ./server/handles -run 'TestSubscriptionExecutionTransfersLocallyOnlyForStandaloneRole|TestCheckSubscriptionUsesClusterDispatchForHybridRole' -count=1 -v
+gofmt -w internal/subscription/service.go internal/subscription/scheduler.go internal/subscription/scheduler_test.go internal/subscription/standalone_target_integration_test.go server/handles/subscription.go server/handles/subscription_test.go
+go test ./internal/subscription ./server/handles -run 'TestRunForRolePreservesStandaloneTransferFlag|TestSubscriptionExecutionTransfersLocallyOnlyForStandaloneRole|TestCheckSubscriptionUsesClusterDispatchForHybridRole' -count=1 -v
 ```
 
 Expected: both tests PASS and the handler test records one cluster inspection.

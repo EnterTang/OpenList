@@ -332,7 +332,7 @@ func CheckSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	result, err := subscription.Run(c.Request.Context(), req.ID, req.Transfer)
+	result, err := subscription.RunForRole(c.Request.Context(), req.ID, req.Transfer, conf.Conf.Cluster.Role)
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return

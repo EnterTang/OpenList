@@ -2,13 +2,11 @@ package subscription
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
-	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -100,22 +98,12 @@ func (s *scheduler) tick() {
 		}
 		go func(id uint) {
 			defer s.markDone(id)
-			var err error
-			if schedulerTransfersLocally(conf.Conf.Cluster.Role) {
-				_, err = Run(context.Background(), id, true)
-			} else {
-				_, err = RunCluster(context.Background(), id)
-			}
+			_, err := RunForRole(context.Background(), id, true, conf.Conf.Cluster.Role)
 			if err != nil {
 				log.Errorf("subscription %d run failed: %+v", id, err)
 			}
 		}(item.ID)
 	}
-}
-
-func schedulerTransfersLocally(role string) bool {
-	role = strings.ToLower(strings.TrimSpace(role))
-	return role == "" || role == model.ClusterRoleStandalone
 }
 
 func (s *scheduler) markRunning(id uint) bool {

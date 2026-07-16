@@ -22,6 +22,20 @@ func Run(ctx context.Context, subscriptionID uint, transfer bool) (*model.Subscr
 	return run(ctx, subscriptionID, transfer, false)
 }
 
+// RunForRole selects the same subscription execution path for manual and
+// scheduled runs. Only standalone deployments may enqueue local transfers.
+func RunForRole(ctx context.Context, subscriptionID uint, transfer bool, role string) (*model.SubscriptionRunResult, error) {
+	if subscriptionTransfersLocally(role) {
+		return Run(ctx, subscriptionID, transfer)
+	}
+	return RunCluster(ctx, subscriptionID)
+}
+
+func subscriptionTransfersLocally(role string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	return role == "" || role == model.ClusterRoleStandalone
+}
+
 // RunCluster performs discovery and planning on a Coordinator, then hands
 // media children to the registered cluster dispatcher instead of invoking the
 // local OpenList copy/move pipeline.

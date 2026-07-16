@@ -53,6 +53,28 @@ func TestStandalone139OversizeRejectsBeforeEnsureOrTransfer(t *testing.T) {
 	}
 }
 
+func TestRunForRolePreservesStandaloneTransferFlag(t *testing.T) {
+	const fileSize = int64(1024)
+	_, ensured, transfers, result, err := runStandaloneTargetWorkflowResultForRole(
+		t,
+		fileSize,
+		false,
+		model.ClusterRoleStandalone,
+	)
+	if err != nil {
+		t.Fatalf("run standalone discovery: %v", err)
+	}
+	if result == nil || result.Run.TransferredCount != 0 {
+		t.Fatalf("result = %#v, want discovery without transfer", result)
+	}
+	if len(*ensured) != 0 {
+		t.Fatalf("ensure side effects = %#v, want none", *ensured)
+	}
+	if len(*transfers) != 0 {
+		t.Fatalf("transfer side effects = %#v, want none", *transfers)
+	}
+}
+
 func TestTempTargetRuntimePrefersHigherMembershipPan123Account(t *testing.T) {
 	oldList := listProviderTargetStorages
 	oldFree := storageFreeBytesForMountPath
@@ -88,6 +110,10 @@ func runStandaloneTargetWorkflow(t *testing.T, fileSize int64) ([]resolvedTarget
 }
 
 func runStandaloneTargetWorkflowResult(t *testing.T, fileSize int64) ([]resolvedTargetObservation, *[]string, *[]string, *model.SubscriptionRunResult, error) {
+	return runStandaloneTargetWorkflowResultForRole(t, fileSize, true, "")
+}
+
+func runStandaloneTargetWorkflowResultForRole(t *testing.T, fileSize int64, transfer bool, role string) ([]resolvedTargetObservation, *[]string, *[]string, *model.SubscriptionRunResult, error) {
 	t.Helper()
 	setupSubscriptionRuntimeDB(t)
 
@@ -173,7 +199,7 @@ func runStandaloneTargetWorkflowResult(t *testing.T, fileSize int64) ([]resolved
 		t.Fatalf("create subscription: %v", err)
 	}
 	expectedSubscriptionID = sub.ID
-	result, err := Run(context.Background(), sub.ID, true)
+	result, err := RunForRole(context.Background(), sub.ID, transfer, role)
 	return observations, &ensured, &transfers, result, err
 }
 

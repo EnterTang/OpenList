@@ -1,17 +1,20 @@
 package handles
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -54,6 +57,58 @@ func decodeHandleResp[T any](t *testing.T, recorder *httptest.ResponseRecorder) 
 
 type subscriptionEpisodeSourcesData struct {
 	Content []model.SubscriptionEpisodeSourceDetail `json:"content"`
+}
+
+type recordingSubscriptionDispatcher struct {
+	inspectTasks []subscription.ClusterInspectTask
+}
+
+func (d *recordingSubscriptionDispatcher) DispatchSubscriptionInspect(_ context.Context, task subscription.ClusterInspectTask) (string, error) {
+	d.inspectTasks = append(d.inspectTasks, task)
+	return "handler-inspect-job", nil
+}
+
+func (d *recordingSubscriptionDispatcher) DispatchSubscriptionMedia(context.Context, []subscription.ClusterMediaTask) ([]subscription.ClusterDispatchResult, error) {
+	return nil, nil
+}
+
+func TestCheckSubscriptionUsesClusterDispatchForHybridRole(t *testing.T) {
+	oldConf := conf.Conf
+	t.Cleanup(func() { conf.Conf = oldConf })
+	setupSubscriptionHandleDB(t)
+	conf.Conf.Cluster.Role = model.ClusterRoleHybrid
+	dispatcher := &recordingSubscriptionDispatcher{}
+	subscription.RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { subscription.RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		Name:            "Hybrid manual check",
+		SourceType:      model.SubscriptionSourceManual,
+		SourceConfig:    `{"links":["https://www.123pan.com/s/example"]}`,
+		TransferEnabled: true,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/admin/subscription/check",
+		strings.NewReader(`{"id":`+strconv.Itoa(int(sub.ID))+`,"transfer":true}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	CheckSubscription(c)
+
+	resp := decodeHandleResp[model.SubscriptionRunResult](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200: %s", resp.Code, recorder.Body.String())
+	}
+	if len(dispatcher.inspectTasks) != 1 {
+		t.Fatalf("inspect tasks = %#v, want one cluster inspection", dispatcher.inspectTasks)
+	}
 }
 
 func TestResolveSubscriptionArchiveStatusDefaultsToAll(t *testing.T) {
