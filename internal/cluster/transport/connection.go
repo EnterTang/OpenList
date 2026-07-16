@@ -14,11 +14,13 @@ import (
 const (
 	defaultWriteTimeout      = 10 * time.Second
 	defaultHeartbeatInterval = 20 * time.Second
-	defaultReadTimeout       = 60 * time.Second
-	defaultLeaseDuration     = 60 * time.Second
-	defaultMaxMessageBytes   = 1 << 20
-	defaultSendQueueSize     = 128
-	closeSessionSuperseded   = 4001
+	// ReadTimeout must stay well above HeartbeatInterval so transient stalls
+	// (e.g. worker busy with large media moves) do not drop the session.
+	defaultReadTimeout     = 5 * time.Minute
+	defaultLeaseDuration   = 60 * time.Second
+	defaultMaxMessageBytes = 1 << 20
+	defaultSendQueueSize   = 128
+	closeSessionSuperseded = 4001
 )
 
 type connectionOptions struct {

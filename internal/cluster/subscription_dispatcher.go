@@ -154,6 +154,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			NodeID:         target.nodeID,
 			IdempotencyKey: task.IdempotencyKey,
 			ExpectedBytes:  task.SourceSize,
+			LeaseDuration:  mediaJobLeaseDuration,
 			RequiredCapabilities: []string{
 				"share.save", "mobile.upload", "result.report",
 			},
@@ -329,17 +330,18 @@ func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchT
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
 		left, right := eligible[i].match, eligible[j].match
-		if left.MembershipWeight != right.MembershipWeight {
-			return left.MembershipWeight > right.MembershipWeight
-		}
-		if left.FreeBytes != right.FreeBytes {
-			return left.FreeBytes > right.FreeBytes
-		}
+		// Prefer spreading a batch across workers by current load first.
 		if left.ActiveJobs != right.ActiveJobs {
 			return left.ActiveJobs < right.ActiveJobs
 		}
 		if left.NodeActiveJobs != right.NodeActiveJobs {
 			return left.NodeActiveJobs < right.NodeActiveJobs
+		}
+		if left.MembershipWeight != right.MembershipWeight {
+			return left.MembershipWeight > right.MembershipWeight
+		}
+		if left.FreeBytes != right.FreeBytes {
+			return left.FreeBytes > right.FreeBytes
 		}
 		if eligible[i].nodeID != eligible[j].nodeID {
 			return eligible[i].nodeID < eligible[j].nodeID

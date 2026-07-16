@@ -212,8 +212,8 @@ func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig,
 	if revision > s.observedRevision {
 		s.observedRevision = revision
 	}
-	s.downloadGate.SetLimit(desired.DownloadConcurrency)
-	s.uploadGate.SetLimit(desired.UploadConcurrency)
+	s.downloadGate.SetLimit(effectiveConcurrency(desired.DownloadConcurrency))
+	s.uploadGate.SetLimit(effectiveConcurrency(desired.UploadConcurrency))
 	for name, binding := range desired.TargetBindings {
 		gate := s.targetGates[name]
 		if gate == nil {
@@ -223,6 +223,13 @@ func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig,
 			gate.SetLimit(defaultTargetConcurrency(binding.MaxConcurrency))
 		}
 	}
+}
+
+func effectiveConcurrency(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	return defaultMediaConcurrency()
 }
 
 func (s *Service) handleStorageApply(ctx context.Context, message protocol.Envelope) error {

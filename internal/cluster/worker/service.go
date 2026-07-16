@@ -76,6 +76,7 @@ func getFreshCleanupObject(ctx context.Context, storage driver.Driver, actualPat
 
 type activeTask struct {
 	attempt       protocol.AttemptRef
+	offer         protocol.JobOffer
 	ctx           context.Context
 	cancel        context.CancelCauseFunc
 	stagingMount  string
@@ -112,12 +113,20 @@ type resolvedMediaTransferTargets struct {
 }
 
 func New(queue resultQueue, sender Sender) *Service {
+	concurrency := defaultMediaConcurrency()
 	return &Service{
 		queue: queue, sender: sender,
 		pending: make(map[string]resultqueue.Result), active: make(map[string]*activeTask), control: make(map[string]chan error), permits: make(map[string]chan protocol.StagePermit),
 		storageOperator: openListStorageOperator{}, storageObserved: make(map[string]observedState),
-		downloadGate: newLimitGate(0), uploadGate: newLimitGate(0), targetGates: make(map[string]*limitGate),
+		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), targetGates: make(map[string]*limitGate),
 	}
+}
+
+func defaultMediaConcurrency() int {
+	if conf.Conf != nil && conf.Conf.Tasks.Move.Workers > 0 {
+		return conf.Conf.Tasks.Move.Workers
+	}
+	return 5
 }
 
 // EnqueueUploadResult is the deletion barrier for Worker media. Callers may
@@ -450,8 +459,11 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 	if !claimed {
 		return s.sendJobAccept(ctx, offer)
 	}
-	jobCtx, cancelCause := context.WithCancelCause(ctx)
-	current := &activeTask{attempt: offer.AttemptRef, ctx: jobCtx, cancel: cancelCause}
+	// Detach execution from the websocket session context so transport loss
+	// cannot cancel an in-flight share-save / move. Explicit job.cancel and
+	// generation supersession still cancel via cancelCause.
+	jobCtx, cancelCause := context.WithCancelCause(context.WithoutCancel(ctx))
+	current := &activeTask{attempt: offer.AttemptRef, offer: offer, ctx: jobCtx, cancel: cancelCause}
 
 	s.mu.Lock()
 	if running, exists := s.active[offer.JobID]; exists {
@@ -490,9 +502,9 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		} else {
 			err = s.executeMediaTransfer(jobCtx, offer)
 		}
-		resultCtx, cancelResult := context.WithTimeout(jobCtx, 10*time.Second)
+		resultCtx, cancelResult := context.WithTimeout(context.WithoutCancel(jobCtx), 30*time.Second)
 		defer cancelResult()
-		if resultErr := s.sendJobResult(resultCtx, offer, result, err); resultErr != nil && jobCtx.Err() == nil {
+		if resultErr := s.sendJobResult(resultCtx, offer, result, err); resultErr != nil {
 			log.Errorf("send cluster job %s result: %v", offer.JobID, resultErr)
 		}
 	}()
@@ -500,12 +512,10 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 }
 
 func (s *Service) maintainLease(ctx context.Context, cancel context.CancelCauseFunc, offer protocol.JobOffer) {
-	initialRemaining := time.Until(offer.LeaseUntil)
-	if initialRemaining <= 0 {
-		cancel(errors.New("cluster job lease expired"))
-		return
+	leaseWindow := time.Until(offer.LeaseUntil)
+	if leaseWindow < time.Minute {
+		leaseWindow = time.Minute
 	}
-	leaseWindow := initialRemaining
 	if leaseWindow > 25*time.Minute {
 		leaseWindow = 25 * time.Minute
 	}
@@ -513,32 +523,42 @@ func (s *Service) maintainLease(ctx context.Context, cancel context.CancelCauseF
 	if renewEvery < 5*time.Second {
 		renewEvery = 5 * time.Second
 	}
+	tryRenew := func() bool {
+		requestedUntil := time.Now().UTC().Add(leaseWindow)
+		if err := s.sendLeaseRenew(context.WithoutCancel(ctx), offer, requestedUntil); err != nil {
+			if isLeaseReassigned(err) {
+				cancel(fmt.Errorf("renew cluster job lease: %w", err))
+				return false
+			}
+			// Transport blips must not cancel the move. Keep executing and
+			// retry renewal; OnTransportReconnected also forces a renew.
+			log.Warnf("cluster job %s lease renew deferred: %v", offer.JobID, err)
+		}
+		return true
+	}
+	if !tryRenew() {
+		return
+	}
 	ticker := time.NewTicker(renewEvery)
 	defer ticker.Stop()
-	expires := time.NewTimer(initialRemaining)
-	defer expires.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-expires.C:
-			cancel(errors.New("cluster job lease expired before renewal"))
-			return
 		case <-ticker.C:
-			requestedUntil := time.Now().UTC().Add(leaseWindow)
-			if err := s.sendLeaseRenew(ctx, offer, requestedUntil); err != nil {
-				cancel(fmt.Errorf("renew cluster job lease: %w", err))
+			if !tryRenew() {
 				return
 			}
-			if !expires.Stop() {
-				select {
-				case <-expires.C:
-				default:
-				}
-			}
-			expires.Reset(time.Until(requestedUntil))
 		}
 	}
+}
+
+func isLeaseReassigned(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "stale_lease") || strings.Contains(msg, "reassigned") || strings.Contains(msg, "superseded")
 }
 
 func (s *Service) sendLeaseRenew(ctx context.Context, offer protocol.JobOffer, requestedUntil time.Time) error {
@@ -576,9 +596,9 @@ func executionAttemptKey(ref protocol.AttemptRef) string {
 	return fmt.Sprintf("%s:%s:%d", safeClusterPathSegment(ref.JobID), safeClusterPathSegment(ref.AttemptID), ref.Generation)
 }
 
-// CancelActive cancels every task bound to the current Worker connection.
-// Runtime calls this when the WebSocket disconnects so stale leased work
-// cannot continue consuming bandwidth after reconnect or reassignment.
+// CancelActive explicitly aborts every active worker job. It is reserved for
+// coordinator-driven cancellation paths and tests. Transport disconnect must
+// NOT call this — media moves continue offline and renew after reconnect.
 func (s *Service) CancelActive(cause error) {
 	if cause == nil {
 		cause = transport.ErrSessionClosed
@@ -591,6 +611,31 @@ func (s *Service) CancelActive(cause error) {
 	s.mu.Unlock()
 	for _, task := range tasks {
 		task.cancel(cause)
+	}
+}
+
+// OnTransportReconnected renews leases for jobs that kept running while the
+// websocket was down so the coordinator does not sweep them as lease_expired.
+func (s *Service) OnTransportReconnected(ctx context.Context) {
+	s.mu.Lock()
+	tasks := make([]*activeTask, 0, len(s.active))
+	for _, task := range s.active {
+		if task == nil || task.ctx.Err() != nil {
+			continue
+		}
+		copied := *task
+		tasks = append(tasks, &copied)
+	}
+	s.mu.Unlock()
+	if len(tasks) == 0 {
+		return
+	}
+	log.Infof("cluster worker reconnected with %d active transfer(s); renewing leases", len(tasks))
+	for _, task := range tasks {
+		requestedUntil := time.Now().UTC().Add(25 * time.Minute)
+		if err := s.sendLeaseRenew(ctx, task.offer, requestedUntil); err != nil {
+			log.Warnf("cluster job %s post-reconnect lease renew failed: %v", task.offer.JobID, err)
+		}
 	}
 }
 
@@ -818,6 +863,11 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if offer.JobType != "media.transfer" {
 		return fmt.Errorf("unsupported cluster job type %q", offer.JobType)
 	}
+	releaseExec, err := s.acquireDownloadCapacity(ctx)
+	if err != nil {
+		return fmt.Errorf("wait for cluster media concurrency slot: %w", err)
+	}
+	defer releaseExec()
 	targetProfileRef := strings.TrimSpace(offer.TaskContext.TargetProfile)
 	if strings.TrimSpace(offer.TaskContext.DeliveryTarget.Provider) == "" && (targetProfileRef == "" || targetProfileRef == "/") {
 		return errors.New("cluster target profile must be a mounted destination path")
@@ -843,12 +893,10 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if primary.SourceFileID == "" {
 		return errors.New("cluster media task has no source object")
 	}
-	if _, err := s.requestStagePermit(ctx, offer, model.ClusterStageSavingShare); err != nil {
+	if _, err := s.requestStagePermitWithRetry(ctx, offer, model.ClusterStageSavingShare); err != nil {
 		return err
 	}
-	if err := s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusRunning, ""); err != nil {
-		return fmt.Errorf("mark cluster share-save stage running: %w", err)
-	}
+	s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusRunning, "")
 	requestedTempRoot, err := s.resolveStagingTempRoot(ctx, offer.TaskContext)
 	if err != nil {
 		return fmt.Errorf("resolve cluster staging temp root: %w", err)
@@ -863,20 +911,32 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return fmt.Errorf("resolve cluster staging account: %w", err)
 	}
 	s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
-	saved, err := subscription.SaveClusterShareSelection(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, []string{primary.SourceFileID})
-	if err != nil {
-		_ = s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
-		return fmt.Errorf("save cluster share selection: %w", err)
+	stagedSource, reused := findExistingStagedSource(ctx, requestedTempRoot, primary)
+	if !reused {
+		saved, saveErr := subscription.SaveClusterShareSelection(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, []string{primary.SourceFileID})
+		if saveErr != nil {
+			// A previous cancelled attempt may have left the object in staging.
+			if fallback, ok := findExistingStagedSource(ctx, requestedTempRoot, primary); ok {
+				stagedSource = fallback
+				reused = true
+				log.Warnf("cluster job %s share-save reported %v; reusing existing staged object %s", offer.JobID, saveErr, stagedSource)
+			} else {
+				s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, saveErr.Error())
+				return fmt.Errorf("save cluster share selection: %w", saveErr)
+			}
+		} else {
+			if len(saved) != 1 {
+				err := fmt.Errorf("cluster media task saved %d files, want 1", len(saved))
+				s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
+				return err
+			}
+			stagedSource = saved[0]
+		}
 	}
-	if len(saved) != 1 {
-		err := fmt.Errorf("cluster media task saved %d files, want 1", len(saved))
-		_ = s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
-		return err
+	s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, "")
+	if reused {
+		log.Infof("cluster job %s continuing with existing staged source %s", offer.JobID, stagedSource)
 	}
-	if err := s.sendStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, ""); err != nil {
-		return fmt.Errorf("mark cluster share-save stage succeeded: %w", err)
-	}
-	stagedSource := saved[0]
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -892,7 +952,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	uploadPermit, err := s.requestStagePermit(ctx, offer, model.ClusterStageUploadingMobile)
+	uploadPermit, err := s.requestStagePermitWithRetry(ctx, offer, model.ClusterStageUploadingMobile)
 	if err != nil {
 		return err
 	}
@@ -947,16 +1007,12 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		if cleanupErr != nil {
 			return cleanupErr
 		}
-		if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, ""); err != nil {
-			return fmt.Errorf("mark reconciled cluster upload stage running: %w", err)
-		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
 		if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
-			_ = s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, enqueueErr.Error())
+			s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, enqueueErr.Error())
 			return fmt.Errorf("reconcile existing cluster upload: %w", enqueueErr)
 		}
-		if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, ""); err != nil {
-			return fmt.Errorf("mark reconciled cluster upload stage succeeded: %w", err)
-		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, "")
 		return nil
 	}
 	finalizePayload := task_group.TransferFinalizePayload{
@@ -975,22 +1031,40 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return errors.New("resolve cluster move task creator: admin user is unavailable")
 	}
 	taskCtx := clusterMoveContext(ctx, binding, creator)
-	if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, ""); err != nil {
-		return fmt.Errorf("mark cluster upload stage running: %w", err)
-	}
+	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
 	transferTask, err := fs.Move(taskCtx, stagedSource, targetRoot, true)
 	if err != nil {
-		_ = s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
+		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
 		return fmt.Errorf("transfer cluster media: %w", err)
 	}
 	if err := waitNativeTransferTask(ctx, transferTask); err != nil {
-		_ = s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
+		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
 		return fmt.Errorf("native cluster move task: %w", err)
 	}
-	if err := s.sendStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, ""); err != nil {
-		return fmt.Errorf("mark cluster upload stage succeeded: %w", err)
-	}
+	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, "")
 	return nil
+}
+
+func findExistingStagedSource(ctx context.Context, tempRoot string, primary protocol.SourceObject) (string, bool) {
+	name := path.Base(strings.TrimSpace(primary.SourceRelativePath))
+	if name == "" || name == "." || name == "/" {
+		return "", false
+	}
+	candidate := path.Join(tempRoot, name)
+	existing, err := fs.Get(ctx, candidate, &fs.GetArgs{NoLog: true})
+	if err != nil || existing == nil || existing.IsDir() {
+		return "", false
+	}
+	if primary.Size > 0 && existing.GetSize() > 0 && existing.GetSize() != primary.Size {
+		return "", false
+	}
+	return candidate, true
+}
+
+func (s *Service) reportStageStatus(ctx context.Context, offer protocol.JobOffer, stage, status, stageError string) {
+	if err := s.sendStageStatus(ctx, offer, stage, status, stageError); err != nil {
+		log.Warnf("cluster job %s stage %s/%s notify failed: %v", offer.JobID, stage, status, err)
+	}
 }
 
 func (s *Service) sendStageStatus(ctx context.Context, offer protocol.JobOffer, stage, status, stageError string) error {
@@ -1003,6 +1077,38 @@ func (s *Service) sendStageStatus(ctx context.Context, offer protocol.JobOffer, 
 		return err
 	}
 	return s.sender.Send(ctx, *message)
+}
+
+func (s *Service) requestStagePermitWithRetry(ctx context.Context, offer protocol.JobOffer, stage string) (protocol.StagePermit, error) {
+	backoff := time.Second
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return protocol.StagePermit{}, fmt.Errorf("%w (last permit error: %v)", err, lastErr)
+			}
+			return protocol.StagePermit{}, err
+		}
+		permit, err := s.requestStagePermit(ctx, offer, stage)
+		if err == nil {
+			return permit, nil
+		}
+		lastErr = err
+		if isLeaseReassigned(err) {
+			return protocol.StagePermit{}, err
+		}
+		log.Warnf("cluster job %s stage %s permit deferred: %v", offer.JobID, stage, err)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return protocol.StagePermit{}, ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 func (s *Service) requestStagePermit(ctx context.Context, offer protocol.JobOffer, stage string) (protocol.StagePermit, error) {

@@ -65,6 +65,10 @@ type Runtime struct {
 
 const (
 	coordinatorLeaseDuration        = 45 * time.Second
+	// mediaJobLeaseDuration covers slow share-save + cross-cloud move. Workers
+	// renew while connected; they keep executing across short disconnects.
+	mediaJobLeaseDuration = 2 * time.Hour
+	clusterWSReadTimeout  = 5 * time.Minute
 	coordinatorLeaseRenewalInterval = 15 * time.Second
 )
 
@@ -212,6 +216,8 @@ func (r *Runtime) Start() error {
 			},
 			OnDisconnect:      service.OnDisconnect,
 			HeartbeatInterval: heartbeatInterval(),
+			ReadTimeout:       clusterWSReadTimeout,
+			LeaseDuration:     mediaJobLeaseDuration,
 		})
 		go r.runManifestProcessor(runtimeCtx)
 		go r.runHeartbeatTimeoutSweep()
@@ -291,6 +297,7 @@ func (r *Runtime) startWorkerLocked() error {
 		EnrollmentToken:   conf.Conf.Cluster.EnrollmentToken,
 		Handler:           handler,
 		HeartbeatInterval: heartbeatInterval(),
+		ReadTimeout:       clusterWSReadTimeout,
 		ReconnectMinDelay: reconnectInterval(),
 		HelloControlState: func() (*protocol.NodeKeyAgreement, uint64) {
 			if workerService != nil {
@@ -299,14 +306,21 @@ func (r *Runtime) startWorkerLocked() error {
 			return &protocol.NodeKeyAgreement{Algorithm: protocol.KeyAgreementX25519, KeyID: keyPair.KeyID(), PublicKey: keyPair.PublicKey()}, 0
 		},
 		OnConnect: func(_ transport.Peer, _ protocol.Welcome) {
+			if workerService != nil {
+				workerService.OnTransportReconnected(workerCtx)
+			}
 			if err := reportWorkerInventory(workerCtx, nodeID, workerService, queue); err != nil {
 				log.Errorf("report cluster worker inventory: %v", err)
 			}
 		},
 		OnDisconnect: func(cause error) {
-			if workerService != nil {
-				workerService.CancelActive(cause)
+			// Keep in-flight media moves running across transport loss. Results
+			// are journaled to Redis; leases are renewed after reconnect.
+			if cause == nil {
+				log.Warn("cluster worker websocket disconnected; continuing active media transfers offline")
+				return
 			}
+			log.Warnf("cluster worker websocket disconnected (%v); continuing active media transfers offline", cause)
 		},
 	})
 	if err != nil {
@@ -760,7 +774,11 @@ func (r *Runtime) redispatchJob(ctx context.Context, hub *transport.Hub, job *mo
 		}
 	}
 	now := time.Now().UTC()
-	leaseUntil := now.Add(time.Minute)
+	leaseFor := time.Minute
+	if job.Type == model.ClusterJobTypeMediaTransfer {
+		leaseFor = mediaJobLeaseDuration
+	}
+	leaseUntil := now.Add(leaseFor)
 	attemptID := uuid.NewString()
 	leaseToken := uuid.NewString()
 	generation := job.CurrentGeneration + 1
@@ -1160,7 +1178,7 @@ func (r *Runtime) DispatchMediaJob(ctx context.Context, req DispatchMediaJobRequ
 	leaseToken := uuid.NewString()
 	leaseDuration := req.LeaseDuration
 	if leaseDuration <= 0 {
-		leaseDuration = time.Minute
+		leaseDuration = mediaJobLeaseDuration
 	}
 	now := time.Now().UTC()
 	leaseUntil := now.Add(leaseDuration)

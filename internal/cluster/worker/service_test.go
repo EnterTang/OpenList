@@ -359,6 +359,7 @@ func TestCancelActiveCancelsConnectionBoundTasks(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	service.active["job-1"] = &activeTask{
 		attempt: protocol.AttemptRef{JobID: "job-1", AttemptID: "attempt-1", Generation: 1, LeaseToken: "lease"},
+		offer:   protocol.JobOffer{AttemptRef: protocol.AttemptRef{JobID: "job-1", AttemptID: "attempt-1", Generation: 1, LeaseToken: "lease"}},
 		ctx:     ctx,
 		cancel:  cancel,
 	}
@@ -367,6 +368,57 @@ func TestCancelActiveCancelsConnectionBoundTasks(t *testing.T) {
 	service.CancelActive(want)
 
 	require.ErrorIs(t, context.Cause(ctx), want)
+}
+
+func TestMaintainLeaseKeepsRunningWhenRenewTransportFails(t *testing.T) {
+	service := New(&fakeResultQueue{}, failSender{})
+	offer := protocol.JobOffer{
+		AttemptRef: protocol.AttemptRef{JobID: "job-1", AttemptID: "attempt-1", Generation: 1, LeaseToken: "lease"},
+		LeaseUntil: time.Now().Add(time.Hour),
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.maintainLease(ctx, cancel, offer)
+	}()
+
+	select {
+	case <-ctx.Done():
+		t.Fatalf("transport renew failure cancelled job: %v", context.Cause(ctx))
+	case <-time.After(200 * time.Millisecond):
+	}
+	cancel(nil)
+	<-done
+}
+
+type failSender struct{}
+
+func (failSender) Send(context.Context, protocol.Envelope) error {
+	return errors.New("websocket closed")
+}
+
+func TestOnTransportReconnectedRenewsActiveLeases(t *testing.T) {
+	sender := make(channelSender, 1)
+	service := New(&fakeResultQueue{}, sender)
+	offer := protocol.JobOffer{AttemptRef: protocol.AttemptRef{JobID: "job-1", AttemptID: "attempt-1", Generation: 1, LeaseToken: "lease"}}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	service.active["job-1"] = &activeTask{attempt: offer.AttemptRef, offer: offer, ctx: ctx, cancel: cancel}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.OnTransportReconnected(context.Background())
+	}()
+	message := <-sender
+	require.Equal(t, protocol.MessageLeaseRenew, message.Type)
+	ack, err := protocol.NewEnvelope(protocol.MessageAck, protocol.Ack{MessageID: message.MessageID})
+	require.NoError(t, err)
+	ack.CorrelationID = message.MessageID
+	require.NoError(t, service.HandleMessage(context.Background(), nil, *ack))
+	<-done
 }
 
 func TestLeaseRenewWaitsForCoordinatorAck(t *testing.T) {

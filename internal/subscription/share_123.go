@@ -130,7 +130,7 @@ func (p *pan123ShareProvider) SaveShareItems(ctx context.Context, ref ShareRef, 
 				"parentFileId": dstDirID,
 				"size":         size,
 				"type":         0,
-				"duplicate":    0,
+				"duplicate":    2, // overwrite existing same-name file on retry
 			}).
 			Post(p.apiURL + "/file/upload_request")
 		if err != nil {
