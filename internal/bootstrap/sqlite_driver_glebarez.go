@@ -3,14 +3,17 @@
 package bootstrap
 
 import (
+	"net/url"
+
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
 
-func sqliteDSN(path string) string {
-	return path + "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=auto_vacuum(incremental)"
-}
-
-func openSQLite(dsn string) gorm.Dialector {
-	return sqlite.Open(dsn)
+func openSQLite(target string) gorm.Dialector {
+	pragmas := url.Values{}
+	pragmas.Add("_pragma", "journal_mode(WAL)")
+	pragmas.Add("_pragma", "busy_timeout(5000)")
+	pragmas.Add("_pragma", "auto_vacuum(incremental)")
+	pragmas.Set("_txlock", "immediate")
+	return sqlite.Open(sqliteDSN(target, pragmas))
 }
