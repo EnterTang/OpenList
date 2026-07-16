@@ -179,6 +179,11 @@ func (r *Runtime) Start() error {
 			return err
 		}
 		r.coordinatorService = coordinator.New(db.GetDb(), conf.Conf.Cluster.EnrollmentToken)
+		r.coordinatorService.SetHeartbeatInterval(heartbeatInterval())
+		if _, err := r.coordinatorService.ReconcileNodeSessions(r.ctx, time.Now().UTC()); err != nil {
+			r.stopLocked()
+			return fmt.Errorf("reconcile stale cluster sessions: %w", err)
+		}
 		r.coordinatorService.SetShareInspectConsumer(consumeSubscriptionShareInspect)
 		r.hub = transport.NewHub(transport.HubOptions{
 			CoordinatorID:       coordinatorID(),
@@ -196,6 +201,7 @@ func (r *Runtime) Start() error {
 			HeartbeatInterval: heartbeatInterval(),
 		})
 		go r.runManifestProcessor()
+		go r.runHeartbeatTimeoutSweep()
 		go r.runCoordinatorLease()
 		subscription.RegisterClusterDispatcher(subscriptionDispatcher{runtime: r})
 	}
@@ -427,6 +433,31 @@ func (r *Runtime) runReporter(ctx context.Context, workerService *clusterworker.
 		}
 		if !waitContext(ctx, 3*time.Second) {
 			return
+		}
+	}
+}
+
+func (r *Runtime) runHeartbeatTimeoutSweep() {
+	var interval time.Duration
+	if r.coordinatorService != nil {
+		interval = r.coordinatorService.HeartbeatInterval()
+	}
+	if interval <= 0 {
+		interval = heartbeatInterval()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case now := <-ticker.C:
+			if r.coordinatorService == nil {
+				continue
+			}
+			if _, err := r.coordinatorService.SweepExpiredHeartbeats(r.ctx, now.UTC(), 0); err != nil {
+				log.Warnf("sweep expired cluster heartbeats: %v", err)
+			}
 		}
 	}
 }

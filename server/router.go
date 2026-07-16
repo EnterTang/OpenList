@@ -124,6 +124,7 @@ func admin(g *gin.RouterGroup) {
 	clusterAdmin.GET("/config", handles.GetClusterConfig)
 	clusterAdmin.POST("/config", handles.SaveClusterConfig)
 	clusterAdmin.GET("/nodes", handles.ListClusterNodes)
+	clusterAdmin.POST("/nodes/:id/delete", handles.DeleteClusterNode)
 	clusterAdmin.POST("/nodes/:id/inventory/query", handles.QueryClusterNodeInventory)
 	clusterAdmin.POST("/nodes/:id/state", handles.SetClusterNodeState)
 	clusterAdmin.POST("/nodes/:id/config", handles.ApplyClusterNodeConfig)

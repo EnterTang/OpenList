@@ -21,12 +21,19 @@ import (
 )
 
 type Service struct {
-	db               *gorm.DB
-	enrollmentToken  string
-	inspectMu        sync.RWMutex
-	inspectProcessMu sync.Mutex
-	inspectConsumer  ShareInspectConsumer
+	db                *gorm.DB
+	enrollmentToken   string
+	heartbeatInterval time.Duration
+	inspectMu         sync.RWMutex
+	inspectProcessMu  sync.Mutex
+	inspectConsumer   ShareInspectConsumer
 }
+
+const (
+	defaultHeartbeatInterval    = 15 * time.Second
+	defaultHeartbeatTimeout     = time.Minute
+	defaultStaleOfflineDuration = 7 * 24 * time.Hour
+)
 
 type NodeInventorySummary struct {
 	CollectedAt      *time.Time                          `json:"collected_at,omitempty"`
@@ -49,7 +56,75 @@ type ShareInspectConsumer func(context.Context, model.ClusterShareInspectManifes
 var ErrShareInspectObservationIncomplete = errors.New("cluster share inspect observation is incomplete")
 
 func New(database *gorm.DB, enrollmentToken string) *Service {
-	return &Service{db: database, enrollmentToken: strings.TrimSpace(enrollmentToken)}
+	return &Service{db: database, enrollmentToken: strings.TrimSpace(enrollmentToken), heartbeatInterval: defaultHeartbeatInterval}
+}
+
+func (s *Service) SetHeartbeatInterval(interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	s.heartbeatInterval = interval
+}
+
+func (s *Service) HeartbeatInterval() time.Duration {
+	interval := s.heartbeatInterval
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	return interval
+}
+
+func (s *Service) heartbeatTimeout() time.Duration {
+	interval := s.heartbeatInterval
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	timeout := interval * 3
+	if timeout < defaultHeartbeatTimeout {
+		return defaultHeartbeatTimeout
+	}
+	return timeout
+}
+
+func nodeReferenceTime(node model.ClusterNode) time.Time {
+	if node.LastHeartbeatAt != nil && !node.LastHeartbeatAt.IsZero() {
+		return node.LastHeartbeatAt.UTC()
+	}
+	if !node.UpdatedAt.IsZero() {
+		return node.UpdatedAt.UTC()
+	}
+	return node.CreatedAt.UTC()
+}
+
+func effectiveNodeStatus(node model.ClusterNode, now time.Time, heartbeatTimeout time.Duration) string {
+	switch node.Status {
+	case model.ClusterNodeStatusDisabled, model.ClusterNodeStatusRevoked, model.ClusterNodeStatusDraining:
+		return node.Status
+	case model.ClusterNodeStatusOnline:
+		if now.IsZero() || node.LastHeartbeatAt == nil || node.LastHeartbeatAt.IsZero() {
+			return node.Status
+		}
+		if heartbeatTimeout <= 0 {
+			heartbeatTimeout = defaultHeartbeatTimeout
+		}
+		if node.LastHeartbeatAt.UTC().Before(now.Add(-heartbeatTimeout)) {
+			return model.ClusterNodeStatusOffline
+		}
+	}
+	return node.Status
+}
+
+func isStaleOfflineNode(node model.ClusterNode, now time.Time, staleAfter, heartbeatTimeout time.Duration) bool {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if staleAfter <= 0 {
+		staleAfter = defaultStaleOfflineDuration
+	}
+	if effectiveNodeStatus(node, now, heartbeatTimeout) != model.ClusterNodeStatusOffline {
+		return false
+	}
+	return nodeReferenceTime(node).Before(now.Add(-staleAfter))
 }
 
 func (s *Service) SetShareInspectConsumer(consumer ShareInspectConsumer) {
@@ -245,6 +320,87 @@ func (s *Service) OnDisconnect(peer transport.Peer, cause error) {
 	}
 	_ = s.db.Model(&model.ClusterNodeSession{}).Where("id = ?", peer.SessionID()).Updates(updates).Error
 	_ = s.db.Model(&model.ClusterNode{}).Where("id = ? AND last_session_id = ?", peer.NodeID(), peer.SessionID()).Updates(map[string]any{"status": model.ClusterNodeStatusOffline}).Error
+}
+
+func (s *Service) ReconcileNodeSessions(ctx context.Context, now time.Time) (int64, error) {
+	if s.db == nil {
+		return 0, errors.New("cluster database is unavailable")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var affected int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		sessionResult := tx.Model(&model.ClusterNodeSession{}).
+			Where("status = ?", model.ClusterSessionStatusConnected).
+			Updates(map[string]any{
+				"status":           model.ClusterSessionStatusDisconnected,
+				"disconnected_at":  now,
+				"disconnect_error": "startup reconciliation",
+			})
+		if sessionResult.Error != nil {
+			return sessionResult.Error
+		}
+		affected += sessionResult.RowsAffected
+
+		nodeResult := tx.Model(&model.ClusterNode{}).
+			Where("status = ?", model.ClusterNodeStatusOnline).
+			Updates(map[string]any{"status": model.ClusterNodeStatusOffline, "updated_at": now})
+		if nodeResult.Error != nil {
+			return nodeResult.Error
+		}
+		affected += nodeResult.RowsAffected
+		return nil
+	})
+	return affected, err
+}
+
+func (s *Service) SweepExpiredHeartbeats(ctx context.Context, now time.Time, timeout time.Duration) (int64, error) {
+	if s.db == nil {
+		return 0, errors.New("cluster database is unavailable")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if timeout <= 0 {
+		timeout = s.heartbeatTimeout()
+	}
+	cutoff := now.Add(-timeout)
+	var nodes []model.ClusterNode
+	if err := s.db.WithContext(ctx).
+		Where("status = ? AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at < ?", model.ClusterNodeStatusOnline, cutoff).
+		Find(&nodes).Error; err != nil {
+		return 0, err
+	}
+	var affected int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, node := range nodes {
+			if node.Disabled || node.Status == model.ClusterNodeStatusRevoked {
+				continue
+			}
+			result := tx.Model(&model.ClusterNode{}).
+				Where("id = ? AND status = ?", node.ID, model.ClusterNodeStatusOnline).
+				Updates(map[string]any{"status": model.ClusterNodeStatusOffline, "updated_at": now})
+			if result.Error != nil {
+				return result.Error
+			}
+			affected += result.RowsAffected
+			if strings.TrimSpace(node.LastSessionID) == "" {
+				continue
+			}
+			if err := tx.Model(&model.ClusterNodeSession{}).
+				Where("id = ? AND status = ?", node.LastSessionID, model.ClusterSessionStatusConnected).
+				Updates(map[string]any{
+					"status":           model.ClusterSessionStatusDisconnected,
+					"disconnected_at":  now,
+					"disconnect_error": "heartbeat timeout",
+				}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return affected, err
 }
 
 func (s *Service) HandleMessage(ctx context.Context, peer transport.Peer, message protocol.Envelope) error {
@@ -1080,7 +1236,7 @@ func (s *Service) finishInboxTx(tx *gorm.DB, peer transport.Peer, message protoc
 	return tx.Model(&model.ClusterNodeSession{}).Where("id = ?", peer.SessionID()).Updates(updates).Error
 }
 
-func (s *Service) ListNodes(ctx context.Context) ([]NodeSummary, error) {
+func (s *Service) ListNodes(ctx context.Context, includeStale bool, now time.Time) ([]NodeSummary, error) {
 	var nodes []model.ClusterNode
 	if err := s.db.WithContext(ctx).Order("name ASC, id ASC").Find(&nodes).Error; err != nil {
 		return nil, err
@@ -1088,8 +1244,23 @@ func (s *Service) ListNodes(ctx context.Context) ([]NodeSummary, error) {
 	if len(nodes) == 0 {
 		return []NodeSummary{}, nil
 	}
-	nodeIDs := make([]string, 0, len(nodes))
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	heartbeatTimeout := s.heartbeatTimeout()
+	filtered := make([]model.ClusterNode, 0, len(nodes))
 	for _, node := range nodes {
+		node.Status = effectiveNodeStatus(node, now, heartbeatTimeout)
+		if !includeStale && isStaleOfflineNode(node, now, defaultStaleOfflineDuration, heartbeatTimeout) {
+			continue
+		}
+		filtered = append(filtered, node)
+	}
+	if len(filtered) == 0 {
+		return []NodeSummary{}, nil
+	}
+	nodeIDs := make([]string, 0, len(filtered))
+	for _, node := range filtered {
 		nodeIDs = append(nodeIDs, node.ID)
 	}
 	var inventories []model.ClusterNodeInventory
@@ -1102,8 +1273,8 @@ func (s *Service) ListNodes(ctx context.Context) ([]NodeSummary, error) {
 			latestByNode[inventory.NodeID] = inventory
 		}
 	}
-	result := make([]NodeSummary, 0, len(nodes))
-	for _, node := range nodes {
+	result := make([]NodeSummary, 0, len(filtered))
+	for _, node := range filtered {
 		summary := NodeSummary{ClusterNode: node}
 		if inventory, ok := latestByNode[node.ID]; ok {
 			view := NodeInventorySummary{CollectedAt: &inventory.CollectedAt, InventoryHash: inventory.InventoryHash}
@@ -1129,6 +1300,49 @@ func (s *Service) ListNodes(ctx context.Context) ([]NodeSummary, error) {
 		result = append(result, summary)
 	}
 	return result, nil
+}
+
+func (s *Service) DeleteStaleNode(ctx context.Context, nodeID string, now time.Time, staleAfter time.Duration) error {
+	if s.db == nil {
+		return errors.New("cluster database is unavailable")
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return errors.New("cluster node id is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	heartbeatTimeout := s.heartbeatTimeout()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var node model.ClusterNode
+		if err := tx.First(&node, "id = ?", nodeID).Error; err != nil {
+			return err
+		}
+		status := effectiveNodeStatus(node, now, heartbeatTimeout)
+		switch status {
+		case model.ClusterNodeStatusOnline:
+			return errors.New("connected cluster node cannot be removed")
+		case model.ClusterNodeStatusDisabled, model.ClusterNodeStatusRevoked, model.ClusterNodeStatusDraining:
+			return fmt.Errorf("cluster node in state %s cannot be removed", status)
+		}
+		if !isStaleOfflineNode(node, now, staleAfter, heartbeatTimeout) {
+			return errors.New("cluster node is not stale offline")
+		}
+		if err := tx.Where("node_id = ?", nodeID).Delete(&model.ClusterNodeSession{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("node_id = ?", nodeID).Delete(&model.ClusterNodeInventory{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("node_id = ?", nodeID).Delete(&model.ClusterNodeDesiredConfig{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("node_id = ?", nodeID).Delete(&model.ClusterStorageProfile{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&model.ClusterNode{}, "id = ?", nodeID).Error
+	})
 }
 
 func (s *Service) ListUploadManifests(ctx context.Context, limit int) ([]model.ClusterUploadManifest, error) {

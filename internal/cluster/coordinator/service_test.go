@@ -519,13 +519,210 @@ func TestArchiveAndRetryFailedJobs(t *testing.T) {
 	}
 }
 
+func TestReconcileNodeSessionsMarksConnectedSessionsAndOnlineNodesOffline(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	now := time.Unix(1721110000, 0).UTC()
+	heartbeat := now.Add(-2 * time.Minute)
+	if err := database.Create(&model.ClusterNode{
+		ID: "ghost-1", Name: "ghost-1", Role: model.ClusterRoleWorker,
+		Status: model.ClusterNodeStatusOnline, LastSessionID: "session-1", LastHeartbeatAt: &heartbeat,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeSession{
+		ID: "session-1", NodeID: "ghost-1", Status: model.ClusterSessionStatusConnected,
+		ConnectedAt: now.Add(-10 * time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNode{ID: "disabled-1", Status: model.ClusterNodeStatusDisabled, Disabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := New(database, "secret")
+	affected, err := service.ReconcileNodeSessions(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 2 {
+		t.Fatalf("affected = %d", affected)
+	}
+	var node model.ClusterNode
+	if err := database.First(&node, "id = ?", "ghost-1").Error; err != nil {
+		t.Fatal(err)
+	}
+	if node.Status != model.ClusterNodeStatusOffline {
+		t.Fatalf("node status = %q", node.Status)
+	}
+	var session model.ClusterNodeSession
+	if err := database.First(&session, "id = ?", "session-1").Error; err != nil {
+		t.Fatal(err)
+	}
+	if session.Status != model.ClusterSessionStatusDisconnected || session.DisconnectedAt == nil || !strings.Contains(session.DisconnectError, "startup reconciliation") {
+		t.Fatalf("session = %#v", session)
+	}
+	var disabledNode model.ClusterNode
+	if err := database.First(&disabledNode, "id = ?", "disabled-1").Error; err != nil {
+		t.Fatal(err)
+	}
+	if disabledNode.Status != model.ClusterNodeStatusDisabled {
+		t.Fatalf("disabled node status = %q", disabledNode.Status)
+	}
+}
+
+func TestSweepExpiredHeartbeatsMarksTimedOutNodesOffline(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	service := New(database, "secret")
+	now := time.Unix(1721111000, 0).UTC()
+	stale := now.Add(-2 * time.Minute)
+	fresh := now.Add(-20 * time.Second)
+	if err := database.Create(&model.ClusterNode{
+		ID: "timed-out", Status: model.ClusterNodeStatusOnline,
+		LastSessionID: "session-timeout", LastHeartbeatAt: &stale,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeSession{
+		ID: "session-timeout", NodeID: "timed-out", Status: model.ClusterSessionStatusConnected,
+		ConnectedAt: now.Add(-5 * time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNode{
+		ID: "fresh", Status: model.ClusterNodeStatusOnline,
+		LastSessionID: "session-fresh", LastHeartbeatAt: &fresh,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	affected, err := service.SweepExpiredHeartbeats(context.Background(), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Fatalf("affected = %d", affected)
+	}
+	var timedOut model.ClusterNode
+	if err := database.First(&timedOut, "id = ?", "timed-out").Error; err != nil {
+		t.Fatal(err)
+	}
+	if timedOut.Status != model.ClusterNodeStatusOffline {
+		t.Fatalf("timed out node status = %q", timedOut.Status)
+	}
+	var timedOutSession model.ClusterNodeSession
+	if err := database.First(&timedOutSession, "id = ?", "session-timeout").Error; err != nil {
+		t.Fatal(err)
+	}
+	if timedOutSession.Status != model.ClusterSessionStatusDisconnected || timedOutSession.DisconnectedAt == nil || timedOutSession.DisconnectError != "heartbeat timeout" {
+		t.Fatalf("timed out session = %#v", timedOutSession)
+	}
+	var freshNode model.ClusterNode
+	if err := database.First(&freshNode, "id = ?", "fresh").Error; err != nil {
+		t.Fatal(err)
+	}
+	if freshNode.Status != model.ClusterNodeStatusOnline {
+		t.Fatalf("fresh node status = %q", freshNode.Status)
+	}
+}
+
+func TestListNodesHidesStaleOfflineByDefaultAndShowsTimedOutNodeOffline(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	service := New(database, "secret")
+	now := time.Unix(1721112000, 0).UTC()
+	service.SetHeartbeatInterval(15 * time.Second)
+	staleHeartbeat := now.Add(-8 * 24 * time.Hour)
+	timedOutHeartbeat := now.Add(-2 * time.Minute)
+	if err := database.Create(&model.ClusterNode{ID: "stale-offline", Status: model.ClusterNodeStatusOffline, LastHeartbeatAt: &staleHeartbeat}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNode{ID: "timed-out-online", Status: model.ClusterNodeStatusOnline, LastHeartbeatAt: &timedOutHeartbeat}).Error; err != nil {
+		t.Fatal(err)
+	}
+	defaultList, err := service.ListNodes(context.Background(), false, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defaultList) != 1 {
+		t.Fatalf("default list len = %d", len(defaultList))
+	}
+	if defaultList[0].ID != "timed-out-online" || defaultList[0].Status != model.ClusterNodeStatusOffline {
+		t.Fatalf("default list = %#v", defaultList)
+	}
+	fullList, err := service.ListNodes(context.Background(), true, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullList) != 2 {
+		t.Fatalf("full list len = %d", len(fullList))
+	}
+}
+
+func TestDeleteStaleNodeRemovesNodeOwnedMetadataButPreservesJobs(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	service := New(database, "secret")
+	now := time.Unix(1721113000, 0).UTC()
+	staleHeartbeat := now.Add(-8 * 24 * time.Hour)
+	if err := database.Create(&model.ClusterNode{ID: "stale-delete", Status: model.ClusterNodeStatusOffline, LastHeartbeatAt: &staleHeartbeat}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeSession{ID: "session-delete", NodeID: "stale-delete", Status: model.ClusterSessionStatusDisconnected}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeInventory{ID: "inventory-delete", NodeID: "stale-delete", Revision: 1, CollectedAt: staleHeartbeat}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeDesiredConfig{NodeID: "stale-delete", Status: model.ClusterDesiredStatusApplied}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterStorageProfile{ID: "profile-delete", NodeID: "stale-delete", MountPath: "/stale-delete"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterJob{ID: "job-delete", IdempotencyKey: "job-delete", AssignedNodeID: "stale-delete", Status: model.ClusterJobStatusQueued}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeleteStaleNode(context.Background(), "stale-delete", now, 7*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := database.Model(&model.ClusterNode{}).Where("id = ?", "stale-delete").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("node count = %d", count)
+	}
+	if err := database.Model(&model.ClusterJob{}).Where("id = ?", "job-delete").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("job count = %d", count)
+	}
+}
+
+func TestDeleteStaleNodeRejectsOnlineAndFreshOfflineNodes(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	service := New(database, "secret")
+	now := time.Unix(1721114000, 0).UTC()
+	freshHeartbeat := now.Add(-24 * time.Hour)
+	onlineHeartbeat := now.Add(-10 * time.Second)
+	if err := database.Create(&model.ClusterNode{ID: "fresh-offline", Status: model.ClusterNodeStatusOffline, LastHeartbeatAt: &freshHeartbeat}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNode{ID: "online-node", Status: model.ClusterNodeStatusOnline, LastHeartbeatAt: &onlineHeartbeat}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeleteStaleNode(context.Background(), "fresh-offline", now, 7*24*time.Hour); err == nil || !strings.Contains(err.Error(), "not stale offline") {
+		t.Fatalf("fresh offline err = %v", err)
+	}
+	if err := service.DeleteStaleNode(context.Background(), "online-node", now, 7*24*time.Hour); err == nil || !strings.Contains(err.Error(), "cannot be removed") {
+		t.Fatalf("online node err = %v", err)
+	}
+}
+
 func openCoordinatorTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	database, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.AutoMigrate(&model.ClusterNode{}, &model.ClusterNodeSession{}, &model.ClusterJob{}, &model.ClusterJobAttempt{}, &model.ClusterJobStage{}, &model.ClusterUploadManifest{}, &model.ClusterShareInspectManifest{}, &model.ClusterInbox{}, &model.ClusterOutbox{}); err != nil {
+	if err := database.AutoMigrate(&model.ClusterNode{}, &model.ClusterNodeSession{}, &model.ClusterNodeInventory{}, &model.ClusterNodeDesiredConfig{}, &model.ClusterStorageProfile{}, &model.ClusterJob{}, &model.ClusterJobAttempt{}, &model.ClusterJobStage{}, &model.ClusterUploadManifest{}, &model.ClusterShareInspectManifest{}, &model.ClusterInbox{}, &model.ClusterOutbox{}); err != nil {
 		t.Fatal(err)
 	}
 	return database

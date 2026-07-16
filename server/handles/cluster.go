@@ -2,6 +2,7 @@ package handles
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
@@ -48,12 +49,26 @@ func ListClusterNodes(c *gin.Context) {
 		common.ErrorStrResp(c, "cluster coordinator is disabled", 400)
 		return
 	}
-	nodes, err := service.ListNodes(c.Request.Context())
+	includeStale := c.Query("include_stale") == "true"
+	nodes, err := service.ListNodes(c.Request.Context(), includeStale, time.Now().UTC())
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
 	common.SuccessResp(c, nodes)
+}
+
+func DeleteClusterNode(c *gin.Context) {
+	service := cluster.CoordinatorService()
+	if service == nil {
+		common.ErrorStrResp(c, "cluster coordinator is disabled", 400)
+		return
+	}
+	if err := service.DeleteStaleNode(c.Request.Context(), c.Param("id"), time.Now().UTC(), 7*24*time.Hour); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, gin.H{"deleted": true})
 }
 
 func ListClusterUploadResults(c *gin.Context) {

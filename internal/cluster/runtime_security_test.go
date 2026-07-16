@@ -3,10 +3,12 @@ package cluster
 import (
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -87,6 +89,53 @@ func TestCoordinatorStartAllowsMissingETFRootPath(t *testing.T) {
 	t.Cleanup(runtime.Stop)
 	if runtime.CoordinatorService() == nil {
 		t.Fatal("coordinator service was not initialized")
+	}
+}
+
+func TestRuntimeStartReconcilesCoordinatorSessionsBeforeServing(t *testing.T) {
+	original := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = original })
+
+	database, err := gorm.Open(sqlite.Open("file:runtime_reconcile?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AutoMigrate(&model.ClusterNode{}, &model.ClusterNodeSession{}, &model.ClusterCoordinatorLease{}); err != nil {
+		t.Fatal(err)
+	}
+	db.Init(database)
+	staleHeartbeat := time.Now().UTC().Add(-5 * time.Minute)
+	if err := database.Create(&model.ClusterNode{ID: "ghost-1", Status: model.ClusterNodeStatusOnline, LastSessionID: "session-1", LastHeartbeatAt: &staleHeartbeat}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeSession{ID: "session-1", NodeID: "ghost-1", Status: model.ClusterSessionStatusConnected, ConnectedAt: time.Now().UTC().Add(-10 * time.Minute)}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	conf.Conf.Cluster.Role = string(RoleCoordinator)
+	conf.Conf.Cluster.EnrollmentToken = "enrollment-secret"
+	conf.Conf.Cluster.WebSocketPath = "/api/cluster/ws"
+
+	runtime := &Runtime{}
+	if err := runtime.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runtime.Stop)
+
+	var node model.ClusterNode
+	if err := database.First(&node, "id = ?", "ghost-1").Error; err != nil {
+		t.Fatal(err)
+	}
+	if node.Status != model.ClusterNodeStatusOffline {
+		t.Fatalf("node status = %q", node.Status)
+	}
+	var session model.ClusterNodeSession
+	if err := database.First(&session, "id = ?", "session-1").Error; err != nil {
+		t.Fatal(err)
+	}
+	if session.Status != model.ClusterSessionStatusDisconnected || session.DisconnectedAt == nil {
+		t.Fatalf("session = %#v", session)
 	}
 }
 
