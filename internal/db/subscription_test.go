@@ -3,12 +3,36 @@ package db
 import (
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
+
+func setupPrefixedSubscriptionDB(t *testing.T) {
+	t.Helper()
+	previousConf := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	database, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "subscriptions.db")), &gorm.Config{
+		NamingStrategy: schema.NamingStrategy{TablePrefix: conf.Conf.Database.TablePrefix},
+	})
+	if err != nil {
+		t.Fatalf("open prefixed sqlite: %v", err)
+	}
+	Init(database)
+	t.Cleanup(func() {
+		conf.Conf = previousConf
+		sqlDB, err := database.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+}
 
 func seedSubscriptionRunBoardFixture(t *testing.T) (model.Subscription, model.Subscription, model.Subscription, []model.SubscriptionRun) {
 	t.Helper()
@@ -89,6 +113,58 @@ func seedSubscriptionRunBoardFixture(t *testing.T) (model.Subscription, model.Su
 		}
 	}
 	return subscriptions[0], subscriptions[1], subscriptions[2], runs
+}
+
+func TestSubscriptionTaskBoardHonorsConfiguredTablePrefix(t *testing.T) {
+	setupPrefixedSubscriptionDB(t)
+
+	alpha, _, _, _ := seedSubscriptionRunBoardFixture(t)
+	board, err := GetSubscriptionBoard(SubscriptionRunFilter{SubscriptionID: alpha.ID})
+	if err != nil {
+		t.Fatalf("get prefixed subscription board: %v", err)
+	}
+	if board.SubscriptionCount != 1 || board.ChangedRunCount != 2 || board.AddedCount != 2 || board.ChangedCount != 3 || board.FailureCount != 2 {
+		t.Fatalf("prefixed subscription board = %#v", board)
+	}
+
+	runs, total, err := ListSubscriptionRuns(SubscriptionRunFilter{
+		SubscriptionID: alpha.ID,
+		View:           model.SubscriptionRunViewChanges,
+		Page:           1,
+		PerPage:        20,
+	})
+	if err != nil {
+		t.Fatalf("list prefixed subscription runs: %v", err)
+	}
+	if total != 2 || len(runs) != 2 || runs[0].SubscriptionName != alpha.Name {
+		t.Fatalf("prefixed subscription runs = total %d items %#v", total, runs)
+	}
+
+	if _, err := UpsertSubscriptionEpisodeSource(&model.SubscriptionEpisodeSource{
+		SubscriptionID: alpha.ID,
+		Season:         1,
+		Episode:        1,
+		SourceType:     model.SubscriptionSourceManual,
+		FileName:       "prefixed.mkv",
+		Status:         model.SubscriptionItemStatusTransferred,
+	}); err != nil {
+		t.Fatalf("create prefixed episode source: %v", err)
+	}
+	details, err := ListSubscriptionEpisodeSourceDetails(alpha.ID)
+	if err != nil {
+		t.Fatalf("list prefixed episode source details: %v", err)
+	}
+	if len(details) != 1 || details[0].WorkerName != "本机" {
+		t.Fatalf("prefixed episode source details = %#v", details)
+	}
+
+	deleted, err := ClearFailedSubscriptionRuns()
+	if err != nil {
+		t.Fatalf("clear prefixed failed runs: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("cleared prefixed failed runs = %d, want 2", deleted)
+	}
 }
 
 func TestUpsertSubscriptionItemPreservesTransferredStatusOnUnchangedScan(t *testing.T) {
