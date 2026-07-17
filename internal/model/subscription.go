@@ -222,6 +222,8 @@ type SubscriptionConfig struct {
 	DefaultTransferEnabled      bool                             `json:"default_transfer_enabled,omitempty"`
 	DefaultMediaType            string                           `json:"default_media_type,omitempty"`
 	DefaultCategory             string                           `json:"default_category,omitempty"`
+	EpisodeEarlyCloseMinBytes   *int64                           `json:"episode_early_close_min_bytes,omitempty"`
+	MovieEarlyCloseMinBytes     *int64                           `json:"movie_early_close_min_bytes,omitempty"`
 	Telegram                    SubscriptionTelegramSourceConfig `json:"telegram"`
 	PanSou                      SubscriptionPanSouSourceConfig   `json:"pansou"`
 }

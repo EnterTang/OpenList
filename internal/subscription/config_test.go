@@ -306,6 +306,24 @@ func TestSaveConfigRejectsInvalidTargetRoles(t *testing.T) {
 	}
 }
 
+func TestSubscriptionConfigEarlyCloseDefaults(t *testing.T) {
+	cfg := model.SubscriptionConfig{}
+	normalized := normalizeConfig(cfg)
+	if normalized.EpisodeEarlyCloseMinBytes == nil || *normalized.EpisodeEarlyCloseMinBytes != 1<<30 {
+		t.Fatalf("episode default = %v, want 1GiB", normalized.EpisodeEarlyCloseMinBytes)
+	}
+	if normalized.MovieEarlyCloseMinBytes == nil || *normalized.MovieEarlyCloseMinBytes != 20<<30 {
+		t.Fatalf("movie default = %v, want 20GiB", normalized.MovieEarlyCloseMinBytes)
+	}
+	zero := int64(0)
+	cfg.EpisodeEarlyCloseMinBytes = &zero
+	cfg.MovieEarlyCloseMinBytes = &zero
+	normalized = normalizeConfig(cfg)
+	if *normalized.EpisodeEarlyCloseMinBytes != 0 || *normalized.MovieEarlyCloseMinBytes != 0 {
+		t.Fatalf("zero must remain disabled: %#v", normalized)
+	}
+}
+
 func TestNormalizeConfigDefaultsTelegramTransferPriority(t *testing.T) {
 	cfg := normalizeConfig(model.SubscriptionConfig{})
 	if got, want := cfg.Telegram.TransferPriority, []string{"pan123", "pan115", "quark", "aliyun_drive"}; !stringSlicesEqual(got, want) {
