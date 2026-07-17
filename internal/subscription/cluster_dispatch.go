@@ -362,13 +362,14 @@ func betterClusterInspectCandidate(candidate, existing clusterInspectCandidate, 
 }
 
 // filterObservationDispatchCandidates narrows the winners reconcileClusterEpisodeSlots
-// resolved down to the subset allowed to dispatch this round. Movie items and TV
-// items without a recognized episode slot pass through unchanged (they never
-// waited on sibling inspects). Recognized TV episode slots only dispatch once
-// decideSlotClose says the slot is closed, unless the whole observation is
-// already fully terminal, in which case every remaining winner is force-closed.
+// resolved down to the subset allowed to dispatch this round. TV items without a
+// recognized episode slot pass through unchanged (they never waited on sibling
+// inspects). Movie items and recognized TV episode slots only dispatch once
+// decideSlotClose says the slot is closed (priority-closed or size-floor, using
+// MovieEarlyCloseMinBytes for movies), unless the whole observation is already
+// fully terminal, in which case every remaining winner is force-closed.
 func filterObservationDispatchCandidates(sub *model.Subscription, items []*model.SubscriptionItem, state ObservationCloseState, priority []string) ([]*model.SubscriptionItem, error) {
-	if sub == nil || normalizeMediaType(sub.MediaType) == "movie" || state.AllTerminal {
+	if sub == nil || state.AllTerminal {
 		return items, nil
 	}
 	cfg, err := GetConfig()
@@ -377,12 +378,17 @@ func filterObservationDispatchCandidates(sub *model.Subscription, items []*model
 	}
 	episodeMinBytes := earlyCloseMinBytes(cfg.EpisodeEarlyCloseMinBytes, 1<<30)
 	movieMinBytes := earlyCloseMinBytes(cfg.MovieEarlyCloseMinBytes, 20<<30)
+	isMovie := normalizeMediaType(sub.MediaType) == "movie"
 	eligible := make([]*model.SubscriptionItem, 0, len(items))
 	for _, item := range items {
 		if item == nil {
 			continue
 		}
-		if item.Episode <= 0 || mediaSlotKey(sub, item) == "" {
+		if !isMovie && item.Episode <= 0 {
+			eligible = append(eligible, item)
+			continue
+		}
+		if mediaSlotKey(sub, item) == "" {
 			eligible = append(eligible, item)
 			continue
 		}

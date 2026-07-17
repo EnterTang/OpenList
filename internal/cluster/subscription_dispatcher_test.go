@@ -240,6 +240,122 @@ func TestConsumeSubscriptionShareInspectDispatchesWhenPriorityClosed(t *testing.
 	}
 }
 
+func TestConsumeSubscriptionShareInspectMovieWaitsForHigherPrioritySibling(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+	db.Init(database)
+	dispatcher := &inspectObservationDispatcher{}
+	subscription.RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { subscription.RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{Name: "Movie", TMDBName: "Movie", SourceType: model.SubscriptionSourceManual, TransferEnabled: true, MediaType: "movie", TargetRoot: "/movies"}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	const observationKey = "observation-movie-priority"
+	makeTask := func(provider, shareURL string) protocol.TaskContext {
+		return protocol.TaskContext{
+			Subscription: protocol.SubscriptionTaskContext{
+				SubscriptionID: sub.ID, SubscriptionName: sub.Name,
+				ObservationKey: observationKey, ObservationExpected: 2,
+			},
+			Share: protocol.ShareTaskContext{Provider: provider, URL: shareURL},
+		}
+	}
+	createJob := func(jobID string, task protocol.TaskContext) {
+		taskJSON, _ := json.Marshal(task)
+		if err := database.Create(&model.ClusterJob{ID: jobID, IdempotencyKey: jobID, Type: model.ClusterJobTypeShareInspect, SubscriptionID: sub.ID, TaskContextJSON: string(taskJSON)}).Error; err != nil {
+			t.Fatalf("create job: %v", err)
+		}
+	}
+	// The aliyun child reports first with a small file, well below the movie
+	// size floor. The pan123 sibling job is dispatched but still
+	// non-terminal, and pan123 outranks aliyun in the default priority list,
+	// so the movie slot must keep waiting instead of dispatching aliyun's file.
+	createJob("inspect-aliyun", makeTask("aliyun_drive", "https://www.alipan.com/s/example"))
+	createJob("inspect-pan123", makeTask("pan123", "https://www.123pan.com/s/example"))
+
+	manifest := protocol.ShareInspectManifest{
+		Objects: []protocol.SourceObject{{Provider: "aliyun_drive", SourceFileID: "aliyun-movie", SourceRelativePath: "Movie.mkv", Size: 2 << 30}},
+	}
+	payload, _ := json.Marshal(manifest)
+	record := model.ClusterShareInspectManifest{
+		ID: "record-aliyun", JobID: "inspect-aliyun", SubscriptionID: sub.ID,
+		ObservationKey: observationKey, ObservationExpected: 2,
+		PayloadJSON: string(payload), Status: model.ClusterShareInspectStatusPending, InspectedAt: time.Now().UTC(),
+	}
+	if err := database.Create(&record).Error; err != nil {
+		t.Fatalf("create record: %v", err)
+	}
+
+	if err := consumeSubscriptionShareInspect(context.Background(), record, manifest); !errors.Is(err, coordinator.ErrShareInspectObservationIncomplete) {
+		t.Fatalf("consume error = %v, want incomplete observation", err)
+	}
+	if len(dispatcher.tasks) != 0 {
+		t.Fatalf("dispatched tasks = %#v, want none while higher-priority movie sibling is pending", dispatcher.tasks)
+	}
+}
+
+func TestConsumeSubscriptionShareInspectMovieDispatchesAtSizeFloor(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+	db.Init(database)
+	dispatcher := &inspectObservationDispatcher{}
+	subscription.RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { subscription.RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{Name: "Movie", TMDBName: "Movie", SourceType: model.SubscriptionSourceManual, TransferEnabled: true, MediaType: "movie", TargetRoot: "/movies"}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	const observationKey = "observation-movie-floor"
+	makeTask := func(provider, shareURL string) protocol.TaskContext {
+		return protocol.TaskContext{
+			Subscription: protocol.SubscriptionTaskContext{
+				SubscriptionID: sub.ID, SubscriptionName: sub.Name,
+				ObservationKey: observationKey, ObservationExpected: 2,
+			},
+			Share: protocol.ShareTaskContext{Provider: provider, URL: shareURL},
+		}
+	}
+	createJob := func(jobID string, task protocol.TaskContext) {
+		taskJSON, _ := json.Marshal(task)
+		if err := database.Create(&model.ClusterJob{ID: jobID, IdempotencyKey: jobID, Type: model.ClusterJobTypeShareInspect, SubscriptionID: sub.ID, TaskContextJSON: string(taskJSON)}).Error; err != nil {
+			t.Fatalf("create job: %v", err)
+		}
+	}
+	// pan123 reports first with a file at (or above) the 20GiB movie floor.
+	// The quark sibling job is dispatched but still non-terminal; the size
+	// floor must close the slot immediately regardless of that pending
+	// sibling.
+	createJob("inspect-pan123", makeTask("pan123", "https://www.123pan.com/s/example"))
+	createJob("inspect-quark", makeTask("quark", "https://pan.quark.cn/s/bc18e4ea5fb8"))
+
+	manifest := protocol.ShareInspectManifest{
+		Objects: []protocol.SourceObject{{Provider: "pan123", SourceFileID: "pan123-movie", SourceRelativePath: "Movie.mkv", Size: 21 << 30}},
+	}
+	payload, _ := json.Marshal(manifest)
+	record := model.ClusterShareInspectManifest{
+		ID: "record-pan123", JobID: "inspect-pan123", SubscriptionID: sub.ID,
+		ObservationKey: observationKey, ObservationExpected: 2,
+		PayloadJSON: string(payload), Status: model.ClusterShareInspectStatusPending, InspectedAt: time.Now().UTC(),
+	}
+	if err := database.Create(&record).Error; err != nil {
+		t.Fatalf("create record: %v", err)
+	}
+
+	if err := consumeSubscriptionShareInspect(context.Background(), record, manifest); !errors.Is(err, coordinator.ErrShareInspectObservationIncomplete) {
+		t.Fatalf("consume error = %v, want incomplete observation", err)
+	}
+	if len(dispatcher.tasks) != 1 || dispatcher.tasks[0].SourceFileID != "pan123-movie" || dispatcher.tasks[0].ShareProvider != "pan123" {
+		t.Fatalf("dispatched tasks = %#v, want size-floor-closed pan123 movie dispatch", dispatcher.tasks)
+	}
+}
+
 func TestConsumeSubscriptionShareInspectWaitsSameProviderBelowFloor(t *testing.T) {
 	database := openClusterRuntimeTestDB(t)
 	originalConfig := conf.Conf

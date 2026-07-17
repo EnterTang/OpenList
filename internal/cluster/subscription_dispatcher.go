@@ -101,7 +101,7 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 	}
 	closeState := subscription.ObservationCloseState{AllTerminal: complete}
 	if !complete {
-		pendingProviders, err := pendingShareInspectProviders(ctx, record.SubscriptionID, progress.ObservationKey)
+		pendingProviders, err := pendingShareInspectProviders(ctx, record.SubscriptionID, progress.ObservationKey, records)
 		if err != nil {
 			return err
 		}
@@ -144,8 +144,10 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 // share.inspect jobs for the same observation that have neither reported a
 // manifest nor reached a terminal status yet. decideSlotClose uses this list
 // to decide whether a currently winning candidate can be safely dispatched
-// before the rest of the observation finishes.
-func pendingShareInspectProviders(ctx context.Context, subscriptionID uint, observationKey string) ([]string, error) {
+// before the rest of the observation finishes. manifests is the set already
+// loaded for this observation (e.g. via loadShareInspectObservationProgress),
+// reused here to avoid a redundant query.
+func pendingShareInspectProviders(ctx context.Context, subscriptionID uint, observationKey string, manifests []model.ClusterShareInspectManifest) ([]string, error) {
 	observationKey = strings.TrimSpace(observationKey)
 	var jobs []model.ClusterJob
 	if err := db.GetDb().WithContext(ctx).
@@ -162,12 +164,6 @@ func pendingShareInspectProviders(ctx context.Context, subscriptionID uint, obse
 	if len(jobs) == 0 {
 		return nil, nil
 	}
-	var manifests []model.ClusterShareInspectManifest
-	if err := db.GetDb().WithContext(ctx).
-		Where("subscription_id = ? AND observation_key = ?", subscriptionID, observationKey).
-		Find(&manifests).Error; err != nil {
-		return nil, err
-	}
 	reported := make(map[string]struct{}, len(manifests))
 	for _, item := range manifests {
 		reported[item.JobID] = struct{}{}
@@ -182,7 +178,7 @@ func pendingShareInspectProviders(ctx context.Context, subscriptionID uint, obse
 		}
 		taskContext, err := decodeShareInspectTaskContext(job)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		key := strings.TrimSpace(taskContext.Subscription.ObservationKey)
 		if key == "" {
