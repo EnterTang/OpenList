@@ -38,3 +38,6 @@ output/
 *.tgz
 /internal/embeddedredis/assets/generated/*
 !/internal/embeddedredis/assets/generated/.gitkeep
+
+# Local agent brainstorm / companion sessions
+.superpowers/
