@@ -8,6 +8,7 @@ import (
 	"fmt"
 	stdpath "path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -17,6 +18,15 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/pkg/errors"
 )
+
+var subscriptionRunLocks sync.Map // subscriptionID -> *sync.Mutex
+
+func lockSubscriptionRun(subscriptionID uint) func() {
+	value, _ := subscriptionRunLocks.LoadOrStore(subscriptionID, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
 
 func Run(ctx context.Context, subscriptionID uint, transfer bool) (*model.SubscriptionRunResult, error) {
 	return run(ctx, subscriptionID, transfer, false)
@@ -44,6 +54,8 @@ func RunCluster(ctx context.Context, subscriptionID uint) (*model.SubscriptionRu
 }
 
 func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch bool) (*model.SubscriptionRunResult, error) {
+	unlock := lockSubscriptionRun(subscriptionID)
+	defer unlock()
 	sub, err := db.GetSubscriptionByID(subscriptionID)
 	if err != nil {
 		return nil, err

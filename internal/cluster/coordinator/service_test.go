@@ -340,6 +340,54 @@ func TestShareInspectResultRejectsInvalidObjectHash(t *testing.T) {
 	}
 }
 
+func TestShareInspectFailurePersistsEmptyManifest(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := protocol.TaskContext{
+		WorkflowVersion: "subscription-share-inspect/v1", SealedManifestVersion: "share-inspect/v1",
+		Subscription: protocol.SubscriptionTaskContext{SubscriptionID: 42, ObservationKey: "obs-1", ObservationExpected: 2},
+		Share:        protocol.ShareTaskContext{Provider: "quark", URL: "https://pan.quark.cn/s/dead"},
+	}
+	contextHash, err := protocol.HashTaskContext(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, contextHash, model.ClusterAttemptStatusAccepted)
+	job.Type = model.ClusterJobTypeShareInspect
+	taskJSON, _ := json.Marshal(task)
+	job.TaskContextJSON = string(taskJSON)
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, _ := protocol.NewEnvelope(protocol.MessageJobResult, protocol.JobResult{
+		AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: 1, LeaseToken: "lease"},
+		Status:     "failed", Error: "分享地址已失效", FinishedAt: time.Now().UTC(),
+	})
+	result.Seq = 1
+	service := New(database, "")
+	if err := service.HandleMessage(context.Background(), &testPeer{}, *result); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := service.ShareInspectManifest(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != model.ClusterShareInspectStatusPending || stored.LastError != "分享地址已失效" {
+		t.Fatalf("stored failed inspect manifest = %#v", stored)
+	}
+	if stored.ObjectHash == "" || stored.PayloadJSON == "" {
+		t.Fatalf("stored failed inspect manifest payload = %#v", stored)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusFailed {
+		t.Fatalf("inspect job status = %q", job.Status)
+	}
+}
+
 func TestReplayOutboxAndAck(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	now := time.Now().UTC()

@@ -113,13 +113,30 @@ type resolvedMediaTransferTargets struct {
 }
 
 func New(queue resultQueue, sender Sender) *Service {
-	concurrency := defaultMediaConcurrency()
+	concurrency := effectiveMediaConcurrency()
 	return &Service{
 		queue: queue, sender: sender,
 		pending: make(map[string]resultqueue.Result), active: make(map[string]*activeTask), control: make(map[string]chan error), permits: make(map[string]chan protocol.StagePermit),
 		storageOperator: openListStorageOperator{}, storageObserved: make(map[string]observedState),
 		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), targetGates: make(map[string]*limitGate),
 	}
+}
+
+const inspectConcurrencyReserve = 2
+
+func inspectConcurrencyReserveSlots() int {
+	if inspectConcurrencyReserve < 0 {
+		return 0
+	}
+	return inspectConcurrencyReserve
+}
+
+func effectiveMediaConcurrency() int {
+	limit := defaultMediaConcurrency() - inspectConcurrencyReserveSlots()
+	if limit < 1 {
+		return 1
+	}
+	return limit
 }
 
 func defaultMediaConcurrency() int {
@@ -434,6 +451,20 @@ func (s *Service) handleControlResponse(message protocol.Envelope) error {
 	return nil
 }
 
+func (s *Service) cleanupBacklogBlocksOffer(ctx context.Context, offer protocol.JobOffer) error {
+	if offer.JobType == model.ClusterJobTypeShareInspect {
+		return nil
+	}
+	cleanupBacklog, err := s.queue.CleanupBacklog(ctx)
+	if err != nil {
+		return fmt.Errorf("read worker cleanup backlog: %w", err)
+	}
+	if cleanupBacklog > 0 {
+		return fmt.Errorf("worker has %d pending media cleanup request(s); refusing a new upload until capacity is reclaimed", cleanupBacklog)
+	}
+	return nil
+}
+
 func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -444,12 +475,8 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 	if err := s.queue.ValidateDurability(ctx); err != nil {
 		return fmt.Errorf("worker result queue is not durable: %w", err)
 	}
-	cleanupBacklog, err := s.queue.CleanupBacklog(ctx)
-	if err != nil {
-		return fmt.Errorf("read worker cleanup backlog: %w", err)
-	}
-	if cleanupBacklog > 0 {
-		return fmt.Errorf("worker has %d pending media cleanup request(s); refusing a new upload until capacity is reclaimed", cleanupBacklog)
+	if err := s.cleanupBacklogBlocksOffer(ctx, offer); err != nil {
+		return err
 	}
 	attemptKey := executionAttemptKey(offer.AttemptRef)
 	claimed, err := s.queue.ClaimAttempt(ctx, attemptKey, 7*24*time.Hour)

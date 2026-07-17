@@ -145,7 +145,7 @@ func clusterInspectTask(sub *model.Subscription, ref ShareRef, message clusterSo
 }
 
 func clusterInspectObservationTask(sub *model.Subscription, ref ShareRef, message clusterSourceMessage, observationKey string, observationExpected int) ClusterInspectTask {
-	fingerprint := shortHash(string(ref.Provider) + "\x00" + ref.ShareID + "\x00" + ref.Passcode)
+	fingerprint := shortHash(strings.Join([]string{string(ref.Provider), ref.ShareID, ref.ParentID, ref.Passcode}, "\x00"))
 	if strings.TrimSpace(observationKey) == "" {
 		observationKey = hashClusterSource("observation", fmt.Sprint(sub.ID), message.ID, fingerprint)
 	}
@@ -153,7 +153,10 @@ func clusterInspectObservationTask(sub *model.Subscription, ref ShareRef, messag
 		observationExpected = 1
 	}
 	return ClusterInspectTask{
-		IdempotencyKey: hashClusterSource("inspect", fmt.Sprint(sub.ID), string(ref.Provider), ref.ShareID, message.ID),
+		IdempotencyKey: hashClusterSource(
+			"inspect", fmt.Sprint(sub.ID), observationKey, fingerprint,
+			message.ID, message.Channel, message.URL, message.Text,
+		),
 		SubscriptionID: sub.ID, SubscriptionName: sub.Name, PreferredWorkerNodeID: sub.PreferredWorkerNodeID,
 		SourceMessageID: message.ID, SourceMessageChannel: message.Channel,
 		SourceMessageURL: message.URL, SourceMessageText: message.Text,
@@ -225,9 +228,8 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 	if err != nil {
 		return 0, err
 	}
-	// Cross-observation dedupe: Telegram (and other sources) inspect each share
-	// independently. Keep only the largest file per episode before dispatching
-	// worker temp-save/transfer jobs, matching non-cluster behavior.
+	// Cross-observation dedupe keeps one active file per episode before worker
+	// dispatch, preferring the configured provider and then the largest version.
 	stored, err = reconcileClusterEpisodeSlots(sub, stored, priority)
 	if err != nil {
 		return 0, err
@@ -311,15 +313,15 @@ func betterClusterInspectCandidate(candidate, existing clusterInspectCandidate, 
 	if existing.item == nil {
 		return true
 	}
-	if candidate.item.FileSize != existing.item.FileSize {
-		return candidate.item.FileSize > existing.item.FileSize
-	}
 	candidateProvider := normalizeSubscriptionProvider(candidate.item.SourceProvider)
 	existingProvider := normalizeSubscriptionProvider(existing.item.SourceProvider)
 	candidateRank := providerPriorityRank(candidateProvider, priorityIndex)
 	existingRank := providerPriorityRank(existingProvider, priorityIndex)
 	if candidateRank != existingRank {
 		return candidateRank < existingRank
+	}
+	if candidate.item.FileSize != existing.item.FileSize {
+		return candidate.item.FileSize > existing.item.FileSize
 	}
 	candidateKey := strings.Join([]string{candidateProvider, candidate.item.FilePath, candidate.item.FileID, candidate.item.SourceKey}, "\x00")
 	existingKey := strings.Join([]string{existingProvider, existing.item.FilePath, existing.item.FileID, existing.item.SourceKey}, "\x00")
@@ -401,10 +403,12 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 
 	winnerBySlot := make(map[string]*model.SubscriptionItem, len(competitorsBySlot))
 	for slot, competitors := range competitorsBySlot {
-		var winner *model.SubscriptionItem
-		for _, item := range competitors {
-			if winner == nil || betterClusterInspectCandidate(clusterInspectCandidate{item: item}, clusterInspectCandidate{item: winner}, priorityIndex) {
-				winner = item
+		winner := acceptedClusterEpisodeWinner(competitors)
+		if winner == nil {
+			for _, item := range competitors {
+				if winner == nil || betterClusterInspectCandidate(clusterInspectCandidate{item: item}, clusterInspectCandidate{item: winner}, priorityIndex) {
+					winner = item
+				}
 			}
 		}
 		if winner != nil {
@@ -457,6 +461,24 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 	return dispatchable, nil
 }
 
+func acceptedClusterEpisodeWinner(items []*model.SubscriptionItem) *model.SubscriptionItem {
+	var winner *model.SubscriptionItem
+	for _, item := range items {
+		if !subscriptionItemHasAcceptedTransfer(item) {
+			continue
+		}
+		if winner == nil || item.CreatedAt.Before(winner.CreatedAt) ||
+			(item.CreatedAt.Equal(winner.CreatedAt) && item.ID < winner.ID) {
+			winner = item
+		}
+	}
+	return winner
+}
+
+func subscriptionItemHasAcceptedTransfer(item *model.SubscriptionItem) bool {
+	return item != nil && (item.Status == model.SubscriptionItemStatusTransferring || item.Status == model.SubscriptionItemStatusTransferred)
+}
+
 func clusterItemCompetesForEpisodeSlot(item *model.SubscriptionItem) bool {
 	if item == nil || item.Episode <= 0 {
 		return false
@@ -490,9 +512,17 @@ func skipClusterDuplicateEpisodeItem(item *model.SubscriptionItem) error {
 }
 
 func clusterInspectTransferPriority(sub *model.Subscription) []string {
-	if sub != nil && strings.EqualFold(strings.TrimSpace(sub.SourceType), model.SubscriptionSourceTelegram) {
+	if sub == nil {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(sub.SourceType)) {
+	case model.SubscriptionSourceTelegram:
 		if cfg, err := parseTelegramConfig(sub.SourceConfig); err == nil {
 			return cfg.TransferPriority
+		}
+	case model.SubscriptionSourcePanSou:
+		if cfg, err := GetConfig(); err == nil {
+			return cfg.Telegram.TransferPriority
 		}
 	}
 	return nil

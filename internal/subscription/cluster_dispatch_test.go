@@ -2,7 +2,10 @@ package subscription
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -77,17 +80,23 @@ func TestRunTelegramClusterSkipsMessagesWithoutSubscriptionTitle(t *testing.T) {
 	}
 }
 
-func TestRunTelegramClusterGroupsAllMessageLinksIntoOneObservation(t *testing.T) {
+func TestRunTelegramClusterGroupsAllMatchingMessagesIntoOneObservation(t *testing.T) {
 	dispatcher := &recordingClusterDispatcher{}
 	RegisterClusterDispatcher(dispatcher)
 	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
 
 	oldSearch := builtinTelegramSearch
 	builtinTelegramSearch = func(context.Context, *model.Subscription, model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
-		return []telegramCommandRow{{
-			MsgID: int64(20001), Channel: "@shows",
-			Text: "小芳.2026.S01E04 https://pan.quark.cn/s/bc18e4ea5fb8 https://www.123pan.com/s/example",
-		}}, nil
+		return []telegramCommandRow{
+			{
+				MsgID: int64(20001), Channel: "@shows",
+				Text: "小芳.2026.S01E04 https://pan.quark.cn/s/bc18e4ea5fb8",
+			},
+			{
+				MsgID: int64(20002), Channel: "@shows",
+				Text: "小芳.2026.S01E04 https://www.123pan.com/s/example",
+			},
+		}, nil
 	}
 	t.Cleanup(func() { builtinTelegramSearch = oldSearch })
 
@@ -95,6 +104,69 @@ func TestRunTelegramClusterGroupsAllMessageLinksIntoOneObservation(t *testing.T)
 	_, _, _, _, dispatched, err := runTelegramCluster(context.Background(), sub)
 	if err != nil {
 		t.Fatalf("run Telegram cluster: %v", err)
+	}
+	if dispatched != 2 || len(dispatcher.inspectTasks) != 2 {
+		t.Fatalf("dispatched=%d tasks=%#v, want two inspections", dispatched, dispatcher.inspectTasks)
+	}
+	if dispatcher.inspectTasks[0].ObservationKey == "" || dispatcher.inspectTasks[0].ObservationKey != dispatcher.inspectTasks[1].ObservationKey {
+		t.Fatalf("observation keys = %q/%q", dispatcher.inspectTasks[0].ObservationKey, dispatcher.inspectTasks[1].ObservationKey)
+	}
+	for _, task := range dispatcher.inspectTasks {
+		if task.ObservationExpected != 2 {
+			t.Fatalf("observation expected = %d, want 2", task.ObservationExpected)
+		}
+	}
+}
+
+func TestClusterInspectTransferPriorityUsesGlobalPriorityForPanSou(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if _, err := SaveConfig(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			TransferPriority: []string{"quark", "pan123", "pan115", "aliyun_drive"},
+		},
+	}); err != nil {
+		t.Fatalf("save subscription config: %v", err)
+	}
+
+	got := clusterInspectTransferPriority(&model.Subscription{SourceType: model.SubscriptionSourcePanSou})
+	want := []string{"quark", "pan123", "pan115", "aliyun_drive"}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("PanSou cluster priority = %#v, want %#v", got, want)
+	}
+}
+
+func TestRunPanSouClusterGroupsAllResultsIntoOneObservation(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"data": []map[string]any{
+			{
+				"title": "Example S01E01 Quark",
+				"links": []map[string]any{{"url": "https://pan.quark.cn/s/bc18e4ea5fb8"}},
+			},
+			{
+				"title": "Example S01E01 123",
+				"links": []map[string]any{{"url": "https://www.123pan.com/s/example"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+	config, err := json.Marshal(model.SubscriptionPanSouSourceConfig{BaseURL: server.URL, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+	sub := &model.Subscription{ID: 90, Name: "Example", TMDBName: "Example", SourceType: model.SubscriptionSourcePanSou, SourceConfig: string(config)}
+	_, _, _, _, dispatched, err := runPanSouCluster(context.Background(), sub)
+	if err != nil {
+		t.Fatalf("run PanSou cluster: %v", err)
 	}
 	if dispatched != 2 || len(dispatcher.inspectTasks) != 2 {
 		t.Fatalf("dispatched=%d tasks=%#v, want two inspections", dispatched, dispatcher.inspectTasks)
@@ -173,7 +245,7 @@ func TestApplyClusterInspectManifestRequiresTelegramMessageTitleButAllowsEpisode
 	}
 }
 
-func TestApplyClusterInspectObservationSelectsLargestEpisodeAcrossShares(t *testing.T) {
+func TestApplyClusterInspectObservationPrefersProviderPriorityAcrossShares(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	dispatcher := &recordingClusterDispatcher{}
 	RegisterClusterDispatcher(dispatcher)
@@ -188,9 +260,15 @@ func TestApplyClusterInspectObservationSelectsLargestEpisodeAcrossShares(t *test
 	}
 	inputs := []ClusterInspectManifestInput{
 		{
+			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderAliyunDrive), ShareURL: "https://www.alipan.com/s/example"},
+			Objects: []ClusterInspectObject{
+				{FileID: "aliyun-largest", RelativePath: "Example.S01E01.aliyun.mkv", Size: 1200},
+			},
+		},
+		{
 			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderQuark), ShareURL: "https://pan.quark.cn/s/bc18e4ea5fb8"},
 			Objects: []ClusterInspectObject{
-				{FileID: "quark-small", RelativePath: "Example.S01E01.small.mkv", Size: 600},
+				{FileID: "quark-large", RelativePath: "Example.S01E01.large.mkv", Size: 900},
 				{FileID: "quark-season-two", RelativePath: "Example.S02E01.mkv", Size: 700},
 				{FileID: "quark-special-a", RelativePath: "Example.Special.A.mkv", Size: 100},
 			},
@@ -198,8 +276,14 @@ func TestApplyClusterInspectObservationSelectsLargestEpisodeAcrossShares(t *test
 		{
 			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan123), ShareURL: "https://www.123pan.com/s/example"},
 			Objects: []ClusterInspectObject{
-				{FileID: "pan123-large", RelativePath: "Example.S01E01.large.mkv", Size: 900},
+				{FileID: "pan123-small", RelativePath: "Example.S01E01.small.mkv", Size: 600},
 				{FileID: "pan123-special-b", RelativePath: "Example.Special.B.mkv", Size: 110},
+			},
+		},
+		{
+			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan115), ShareURL: "https://115.com/s/swssal13zrk?password=t58d"},
+			Objects: []ClusterInspectObject{
+				{FileID: "pan115-larger", RelativePath: "Example.S01E01.pan115.mkv", Size: 1000},
 			},
 		},
 	}
@@ -222,15 +306,15 @@ func TestApplyClusterInspectObservationSelectsLargestEpisodeAcrossShares(t *test
 			unknown++
 		}
 	}
-	if seasonOne == nil || seasonOne.SourceFileID != "pan123-large" || seasonOne.SourceSize != 900 {
-		t.Fatalf("season one winner = %#v, want largest pan123 file", seasonOne)
+	if seasonOne == nil || seasonOne.ShareProvider != string(ShareProviderPan123) || seasonOne.SourceFileID != "pan123-small" || seasonOne.SourceSize != 600 {
+		t.Fatalf("season one winner = %#v, want preferred pan123 file", seasonOne)
 	}
 	if unknown != 2 {
 		t.Fatalf("unknown episode tasks = %d, want 2", unknown)
 	}
 }
 
-func TestApplyClusterInspectObservationDedupesAcrossSeparateObservations(t *testing.T) {
+func TestApplyClusterInspectObservationDoesNotRedispatchAcceptedEpisode(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	dispatcher := &recordingClusterDispatcher{}
 	RegisterClusterDispatcher(dispatcher)
@@ -271,11 +355,11 @@ func TestApplyClusterInspectObservationDedupesAcrossSeparateObservations(t *test
 	if err != nil {
 		t.Fatalf("apply large observation: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("large observation dispatched=%d, want 1", count)
+	if count != 0 {
+		t.Fatalf("large observation dispatched=%d, want accepted episode to stay locked", count)
 	}
-	if len(dispatcher.tasks) != 2 || dispatcher.tasks[1].SourceFileID != "large" {
-		t.Fatalf("tasks after large = %#v, want large appended", dispatcher.tasks)
+	if len(dispatcher.tasks) != 1 || dispatcher.tasks[0].SourceFileID != "small" {
+		t.Fatalf("tasks after large = %#v, want only the already accepted task", dispatcher.tasks)
 	}
 
 	items, err := db.ListSubscriptionItems(sub.ID)
@@ -294,11 +378,11 @@ func TestApplyClusterInspectObservationDedupesAcrossSeparateObservations(t *test
 	if smallItem == nil || largeItem == nil {
 		t.Fatalf("items = %#v, want both small and large", items)
 	}
-	if smallItem.Status != model.SubscriptionItemStatusSkipped {
-		t.Fatalf("small status = %q, want skipped after larger candidate arrived", smallItem.Status)
+	if smallItem.Status != model.SubscriptionItemStatusTransferring {
+		t.Fatalf("small status = %q, want accepted transfer to remain active", smallItem.Status)
 	}
-	if largeItem.Status != model.SubscriptionItemStatusTransferring {
-		t.Fatalf("large status = %q, want transferring", largeItem.Status)
+	if largeItem.Status != model.SubscriptionItemStatusSkipped {
+		t.Fatalf("large status = %q, want later duplicate skipped", largeItem.Status)
 	}
 
 	tiny := ClusterInspectManifestInput{
@@ -349,6 +433,71 @@ func TestClusterTasksPreservePreferredWorkerWithoutChangingMediaIdempotency(t *t
 	}
 	if media.IdempotencyKey != automatic.IdempotencyKey || media.MediaItemID != automatic.MediaItemID {
 		t.Fatalf("worker preference changed media identity: preferred=%#v automatic=%#v", media, automatic)
+	}
+}
+
+func TestClusterInspectObservationTaskScopesIdempotencyToObservation(t *testing.T) {
+	sub := &model.Subscription{ID: 41, Name: "Example"}
+	ref := ShareRef{Provider: ShareProviderPan123, RawURL: "https://www.123pan.com/s/example", ShareID: "example"}
+	message := clusterSourceMessage{ID: "message-1", Channel: "shows"}
+
+	first := clusterInspectObservationTask(sub, ref, message, "observation-1", 2)
+	retry := clusterInspectObservationTask(sub, ref, message, "observation-1", 2)
+	changedBatch := clusterInspectObservationTask(sub, ref, message, "observation-2", 3)
+	if first.IdempotencyKey != retry.IdempotencyKey {
+		t.Fatalf("same observation changed idempotency: %q != %q", first.IdempotencyKey, retry.IdempotencyKey)
+	}
+	if first.IdempotencyKey == changedBatch.IdempotencyKey {
+		t.Fatalf("different observations reused inspect idempotency %q", first.IdempotencyKey)
+	}
+}
+
+func TestApplyClusterInspectObservationKeepsAcceptedSourceVersionLocked(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		Name: "Example", TMDBName: "Example", SourceType: model.SubscriptionSourceManual,
+		TransferEnabled: true, MediaType: "tv", TargetRoot: "/tv",
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	manifest := func(size int64) ClusterInspectManifestInput {
+		return ClusterInspectManifestInput{
+			Task: ClusterInspectTask{
+				SubscriptionID: sub.ID, ShareProvider: string(ShareProviderQuark),
+				ShareURL: "https://pan.quark.cn/s/example", SourceMessageID: "1",
+			},
+			Objects: []ClusterInspectObject{{FileID: "same-file", RelativePath: "Example.S01E01.mkv", Size: size}},
+		}
+	}
+
+	count, err := ApplyClusterInspectObservation(context.Background(), []ClusterInspectManifestInput{manifest(600)})
+	if err != nil || count != 1 || len(dispatcher.tasks) != 1 {
+		t.Fatalf("initial observation count=%d tasks=%d err=%v", count, len(dispatcher.tasks), err)
+	}
+	accepted, err := db.GetSubscriptionItem(sub.ID, dispatcher.tasks[0].SourceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedHash, acceptedJobID := accepted.FileHash, accepted.ClusterJobID
+
+	count, err = ApplyClusterInspectObservation(context.Background(), []ClusterInspectManifestInput{manifest(900)})
+	if err != nil {
+		t.Fatalf("apply updated source version: %v", err)
+	}
+	if count != 0 || len(dispatcher.tasks) != 1 {
+		t.Fatalf("updated accepted source dispatched=%d tasks=%d, want no second task", count, len(dispatcher.tasks))
+	}
+	locked, err := db.GetSubscriptionItem(sub.ID, accepted.SourceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locked.Status != model.SubscriptionItemStatusTransferring || locked.ClusterJobID != acceptedJobID || locked.FileHash != acceptedHash {
+		t.Fatalf("accepted source was overwritten: %#v", locked)
 	}
 }
 
@@ -739,7 +888,7 @@ func TestClusterDispatchDoesNotCarrySubscriptionFolders(t *testing.T) {
 	}
 }
 
-func TestClusterItemIsIdempotentAcrossMessagesButRedispatchesChangedObject(t *testing.T) {
+func TestClusterItemDoesNotRedispatchChangedObjectAfterEpisodeCompleted(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	dispatcher := &recordingClusterDispatcher{}
 	RegisterClusterDispatcher(dispatcher)
@@ -775,18 +924,22 @@ func TestClusterItemIsIdempotentAcrossMessagesButRedispatchesChangedObject(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changedCount != 1 {
+	if changedCount != 0 {
 		t.Fatalf("changed count = %d", changedCount)
 	}
 	count, err = dispatchClusterItems(context.Background(), sub, stored, ref, clusterSourceMessage{ID: "3"})
-	if err != nil || count != 1 {
+	if err != nil || count != 0 {
 		t.Fatalf("changed object dispatch count=%d err=%v", count, err)
 	}
-	if len(dispatcher.tasks) != 2 {
-		t.Fatalf("total tasks = %d, want 2", len(dispatcher.tasks))
+	if len(dispatcher.tasks) != 1 {
+		t.Fatalf("total tasks = %d, want accepted episode to keep one task", len(dispatcher.tasks))
 	}
-	if dispatcher.tasks[0].IdempotencyKey == dispatcher.tasks[1].IdempotencyKey {
-		t.Fatal("changed object reused dispatch idempotency key")
+	persisted, err := db.GetSubscriptionItem(sub.ID, first.SourceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.SubscriptionItemStatusTransferred || persisted.FileHash != first.FileHash {
+		t.Fatalf("completed episode was overwritten: %#v", persisted)
 	}
 }
 

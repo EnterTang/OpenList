@@ -640,7 +640,7 @@ func TestRunTelegramPropagatesConfiguredTempTargetResolutionError(t *testing.T) 
 	}
 }
 
-func TestSelectTelegramTempTransferCandidatesPrefersLargestAcrossProviders(t *testing.T) {
+func TestSelectTelegramTempTransferCandidatesPrefersProviderAcrossDifferentSizes(t *testing.T) {
 	sub := &model.Subscription{
 		ID:         8,
 		TMDBName:   "飞常日志",
@@ -680,8 +680,8 @@ func TestSelectTelegramTempTransferCandidatesPrefersLargestAcrossProviders(t *te
 	if got, want := len(selected), 1; got != want {
 		t.Fatalf("selected count = %d, want %d: %#v", got, want, selected)
 	}
-	if selected[0].Source.Name != "quark" {
-		t.Fatalf("selected source = %q, want largest quark candidate", selected[0].Source.Name)
+	if selected[0].Source.Name != "pan123" {
+		t.Fatalf("selected source = %q, want preferred pan123 candidate", selected[0].Source.Name)
 	}
 	if selected[0].Item.Season != 2 || selected[0].Item.Episode != 10 {
 		t.Fatalf("selected season/episode = %d/%d, want 2/10", selected[0].Item.Season, selected[0].Item.Episode)
@@ -769,7 +769,7 @@ func TestSelectTelegramTempTransferCandidatesDedupesSameProviderEpisode(t *testi
 	}
 }
 
-func TestSelectTelegramTempTransferCandidatesUsesProviderPriorityOnlyForEqualSize(t *testing.T) {
+func TestSelectTelegramTempTransferCandidatesUsesStablePriorityForEqualSize(t *testing.T) {
 	sub := &model.Subscription{MediaType: "tv", TMDBName: "Example", Seasons: []int{1}}
 	seenAt := time.Now()
 	candidates := []telegramTempCandidate{

@@ -35,6 +35,7 @@ type dispatchTarget struct {
 func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context, task subscription.ClusterInspectTask) (string, error) {
 	job, err := d.runtime.DispatchShareInspect(ctx, DispatchShareInspectRequest{
 		IdempotencyKey: task.IdempotencyKey,
+		LeaseDuration:  inspectJobLeaseDuration,
 		TaskContext: protocol.TaskContext{
 			WorkflowVersion: ClusterInspectWorkflowVersion, SealedManifestVersion: clusterInspectManifestVersion,
 			Subscription: protocol.SubscriptionTaskContext{
@@ -55,26 +56,27 @@ func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context,
 }
 
 func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterShareInspectManifest, manifest protocol.ShareInspectManifest) error {
-	expected := record.ObservationExpected
-	if expected <= 0 {
-		expected = 1
-	}
-	observationKey := strings.TrimSpace(record.ObservationKey)
-	if observationKey == "" {
-		observationKey = record.JobID
-	}
-	var records []model.ClusterShareInspectManifest
-	query := db.GetDb().WithContext(ctx).Where("subscription_id = ? AND observation_key = ?", record.SubscriptionID, observationKey).
-		Order("created_at ASC, id ASC")
-	if err := query.Find(&records).Error; err != nil {
+	progress, err := loadShareInspectObservationProgress(ctx, record)
+	if err != nil {
 		return err
 	}
-	if len(records) < expected {
-		return fmt.Errorf("%w: received %d of %d manifests", coordinator.ErrShareInspectObservationIncomplete, len(records), expected)
+	if progress.Terminal < progress.Expected {
+		now := time.Now().UTC()
+		if err := db.GetDb().WithContext(ctx).Model(&model.ClusterShareInspectManifest{}).
+			Where("subscription_id = ? AND observation_key = ? AND status = ?", record.SubscriptionID, progress.ObservationKey, model.ClusterShareInspectStatusPending).
+			Updates(map[string]any{
+				"status":     model.ClusterShareInspectStatusIncomplete,
+				"updated_at": now,
+				"last_error": fmt.Sprintf("received %d of %d manifests", progress.Terminal, progress.Expected),
+			}).Error; err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: received %d of %d manifests", coordinator.ErrShareInspectObservationIncomplete, progress.Terminal, progress.Expected)
 	}
-	if len(records) > expected {
-		return fmt.Errorf("cluster share inspect observation %s has %d manifests, expected %d", observationKey, len(records), expected)
+	if progress.Terminal > progress.Expected {
+		return fmt.Errorf("cluster share inspect observation %s has %d terminals, expected %d", progress.ObservationKey, progress.Terminal, progress.Expected)
 	}
+	records := progress.Manifests
 	inputs := make([]subscription.ClusterInspectManifestInput, 0, len(records))
 	for _, item := range records {
 		var decoded protocol.ShareInspectManifest
@@ -87,8 +89,8 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 		if err := db.GetDb().WithContext(ctx).First(&job, "id = ?", item.JobID).Error; err != nil {
 			return err
 		}
-		var taskContext protocol.TaskContext
-		if err := json.Unmarshal([]byte(job.TaskContextJSON), &taskContext); err != nil {
+		taskContext, err := decodeShareInspectTaskContext(&job)
+		if err != nil {
 			return err
 		}
 		task := subscription.ClusterInspectTask{
@@ -121,12 +123,83 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 	}
 	if len(ids) > 0 {
 		if err := db.GetDb().WithContext(ctx).Model(&model.ClusterShareInspectManifest{}).
-			Where("id IN ? AND status = ?", ids, model.ClusterShareInspectStatusPending).
+			Where("id IN ? AND status IN ?", ids, []string{model.ClusterShareInspectStatusPending, model.ClusterShareInspectStatusIncomplete}).
 			Updates(map[string]any{"status": model.ClusterShareInspectStatusConsumed, "consumed_at": now, "last_error": ""}).Error; err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+type shareInspectObservationProgress struct {
+	ObservationKey string
+	Expected       int
+	Terminal       int
+	Manifests      []model.ClusterShareInspectManifest
+}
+
+func loadShareInspectObservationProgress(ctx context.Context, record model.ClusterShareInspectManifest) (*shareInspectObservationProgress, error) {
+	expected := record.ObservationExpected
+	if expected <= 0 {
+		expected = 1
+	}
+	observationKey := strings.TrimSpace(record.ObservationKey)
+	if observationKey == "" {
+		observationKey = record.JobID
+	}
+	var manifests []model.ClusterShareInspectManifest
+	if err := db.GetDb().WithContext(ctx).
+		Where("subscription_id = ? AND observation_key = ?", record.SubscriptionID, observationKey).
+		Order("created_at ASC, id ASC").
+		Find(&manifests).Error; err != nil {
+		return nil, err
+	}
+	manifestJobIDs := make(map[string]struct{}, len(manifests))
+	for _, item := range manifests {
+		manifestJobIDs[item.JobID] = struct{}{}
+	}
+	var failedJobs []model.ClusterJob
+	if err := db.GetDb().WithContext(ctx).
+		Where("subscription_id = ? AND type = ? AND status = ?", record.SubscriptionID, model.ClusterJobTypeShareInspect, model.ClusterJobStatusFailed).
+		Find(&failedJobs).Error; err != nil {
+		return nil, err
+	}
+	terminalFailed := 0
+	for i := range failedJobs {
+		job := &failedJobs[i]
+		if _, ok := manifestJobIDs[job.ID]; ok {
+			continue
+		}
+		taskContext, err := decodeShareInspectTaskContext(job)
+		if err != nil {
+			return nil, err
+		}
+		key := strings.TrimSpace(taskContext.Subscription.ObservationKey)
+		if key == "" {
+			key = job.ID
+		}
+		if key != observationKey {
+			continue
+		}
+		terminalFailed++
+	}
+	return &shareInspectObservationProgress{
+		ObservationKey: observationKey,
+		Expected:       expected,
+		Terminal:       len(manifests) + terminalFailed,
+		Manifests:      manifests,
+	}, nil
+}
+
+func decodeShareInspectTaskContext(job *model.ClusterJob) (protocol.TaskContext, error) {
+	var taskContext protocol.TaskContext
+	if job == nil {
+		return taskContext, errors.New("share inspect job is nil")
+	}
+	if err := json.Unmarshal([]byte(job.TaskContextJSON), &taskContext); err != nil {
+		return taskContext, err
+	}
+	return taskContext, nil
 }
 
 func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, tasks []subscription.ClusterMediaTask) ([]subscription.ClusterDispatchResult, error) {
