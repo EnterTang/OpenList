@@ -68,7 +68,11 @@ const (
 	// mediaJobLeaseDuration covers slow share-save + cross-cloud move. Workers
 	// renew while connected; they keep executing across short disconnects.
 	mediaJobLeaseDuration = 2 * time.Hour
-	clusterWSReadTimeout  = 5 * time.Minute
+	// inspectJobLeaseDuration covers large share-tree listings while workers may
+	// be busy with media transfers. The previous 1-minute default caused endless
+	// lease-expiry churn when inspect jobs queued behind media work.
+	inspectJobLeaseDuration = 30 * time.Minute
+	clusterWSReadTimeout    = 5 * time.Minute
 	coordinatorLeaseRenewalInterval = 15 * time.Second
 )
 
@@ -674,7 +678,8 @@ func (r *Runtime) redispatchQueuedJobs(ctx context.Context, limit int) error {
 	var jobs []model.ClusterJob
 	if err := db.GetDb().WithContext(ctx).
 		Where("status = ? AND available_at <= ? AND current_attempt_id = ?", model.ClusterJobStatusQueued, time.Now().UTC(), "").
-		Order("priority DESC, available_at ASC").Limit(limit).Find(&jobs).Error; err != nil {
+		Order("CASE WHEN type = '" + model.ClusterJobTypeShareInspect + "' THEN 0 ELSE 1 END, priority DESC, available_at ASC").
+		Limit(limit).Find(&jobs).Error; err != nil {
 		return err
 	}
 	for i := range jobs {
@@ -774,9 +779,12 @@ func (r *Runtime) redispatchJob(ctx context.Context, hub *transport.Hub, job *mo
 		}
 	}
 	now := time.Now().UTC()
-	leaseFor := time.Minute
-	if job.Type == model.ClusterJobTypeMediaTransfer {
+	leaseFor := inspectJobLeaseDuration
+	switch job.Type {
+	case model.ClusterJobTypeMediaTransfer:
 		leaseFor = mediaJobLeaseDuration
+	case model.ClusterJobTypeShareInspect:
+		leaseFor = inspectJobLeaseDuration
 	}
 	leaseUntil := now.Add(leaseFor)
 	attemptID := uuid.NewString()
@@ -1042,7 +1050,7 @@ func (r *Runtime) DispatchShareInspect(ctx context.Context, req DispatchShareIns
 	now := time.Now().UTC()
 	leaseDuration := req.LeaseDuration
 	if leaseDuration <= 0 {
-		leaseDuration = time.Minute
+		leaseDuration = inspectJobLeaseDuration
 	}
 	jobID, attemptID, leaseToken := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	leaseUntil := now.Add(leaseDuration)

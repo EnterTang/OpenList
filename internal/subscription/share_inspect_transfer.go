@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
@@ -288,10 +289,104 @@ func shareTransferCandidatesToTelegramTemp(selected []shareTransferCandidate) []
 }
 
 func transferSelectedShareCandidates(ctx context.Context, sub *model.Subscription, selected []shareTransferCandidate, transfer bool, seenAt time.Time, resultHash string) ([]model.SubscriptionItem, string, int, int, int, error) {
-	selected, err := saveShareTransferCandidatesFn(ctx, selected)
+	selected, skipped, err := filterAcceptedShareTransferCandidates(sub, selected)
 	if err != nil {
 		return nil, resultHash, 0, 0, 0, err
 	}
+	skippedItems, skippedAdded, skippedChanged, err := persistSkippedShareTransferCandidates(skipped)
+	if err != nil {
+		return nil, resultHash, skippedAdded, skippedChanged, 0, err
+	}
+	if len(selected) == 0 {
+		return skippedItems, resultHash, skippedAdded, skippedChanged, 0, nil
+	}
+	selected, err = saveShareTransferCandidatesFn(ctx, selected)
+	if err != nil {
+		return skippedItems, resultHash, skippedAdded, skippedChanged, 0, err
+	}
 	selected = rebuildShareTransferItems(sub, selected, seenAt)
-	return applyTelegramTempTransferCandidates(ctx, sub, shareTransferCandidatesToTelegramTemp(selected), transfer, seenAt, resultHash)
+	items, hash, added, changed, transferred, err := applyTelegramTempTransferCandidates(ctx, sub, shareTransferCandidatesToTelegramTemp(selected), transfer, seenAt, resultHash)
+	return append(skippedItems, items...), hash, skippedAdded + added, skippedChanged + changed, transferred, err
+}
+
+const acceptedEpisodeSkipReason = "skipped: episode already has an accepted transfer"
+
+func filterAcceptedShareTransferCandidates(sub *model.Subscription, selected []shareTransferCandidate) ([]shareTransferCandidate, []shareTransferCandidate, error) {
+	if sub == nil || normalizeMediaType(sub.MediaType) == "movie" || len(selected) == 0 {
+		return selected, nil, nil
+	}
+	existing, err := db.ListSubscriptionItems(sub.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	lockedSlots := make(map[string]struct{})
+	acceptedKeys := make(map[string]struct{})
+	for i := range existing {
+		item := &existing[i]
+		if !subscriptionItemHasAcceptedTransfer(item) || item.Episode <= 0 {
+			continue
+		}
+		acceptedKeys[item.SourceKey] = struct{}{}
+		if slot := mediaSlotKey(sub, item); slot != "" {
+			lockedSlots[slot] = struct{}{}
+		}
+	}
+	if len(lockedSlots) == 0 {
+		return selected, nil, nil
+	}
+	filtered := make([]shareTransferCandidate, 0, len(selected))
+	skipped := make([]shareTransferCandidate, 0)
+	for _, candidate := range selected {
+		if candidate.Item == nil || candidate.Item.Episode <= 0 {
+			filtered = append(filtered, candidate)
+			continue
+		}
+		if _, locked := lockedSlots[mediaSlotKey(sub, candidate.Item)]; locked {
+			if _, alreadyAccepted := acceptedKeys[candidate.Item.SourceKey]; !alreadyAccepted {
+				skipped = append(skipped, candidate)
+			}
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	return filtered, skipped, nil
+}
+
+func persistSkippedShareTransferCandidates(skipped []shareTransferCandidate) ([]model.SubscriptionItem, int, int, error) {
+	items := make([]model.SubscriptionItem, 0, len(skipped))
+	added, changed := 0, 0
+	for _, candidate := range skipped {
+		if candidate.Item == nil {
+			continue
+		}
+		item := *candidate.Item
+		item.SourceProvider = normalizeSubscriptionProvider(candidate.Source.Name)
+		if item.SourceURL == "" {
+			item.SourceURL = candidate.Ref.RawURL
+		}
+		previous, previousErr := db.GetSubscriptionItem(item.SubscriptionID, item.SourceKey)
+		item.Status = model.SubscriptionItemStatusSkipped
+		item.ClusterJobID = ""
+		item.LastError = acceptedEpisodeSkipReason
+		stored, isNew, err := db.UpsertSubscriptionItem(&item)
+		if err != nil {
+			return items, added, changed, err
+		}
+		if stored.Status != model.SubscriptionItemStatusSkipped || stored.LastError != acceptedEpisodeSkipReason {
+			stored.Status = model.SubscriptionItemStatusSkipped
+			stored.ClusterJobID = ""
+			stored.LastError = acceptedEpisodeSkipReason
+			stored, _, err = db.UpsertSubscriptionItem(stored)
+			if err != nil {
+				return items, added, changed, err
+			}
+		}
+		if isNew {
+			added++
+		} else if previousErr == nil && (previous.Status != stored.Status || previous.LastError != stored.LastError) {
+			changed++
+		}
+		items = append(items, *stored)
+	}
+	return items, added, changed, nil
 }

@@ -163,3 +163,125 @@ func TestConsumeSubscriptionShareInspectWaitsForObservationAndSelectsLargest(t *
 		t.Fatalf("first record = %#v, want consumed with batch", recordOne)
 	}
 }
+
+func TestConsumeSubscriptionShareInspectDefersAndResumesIncompleteObservation(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+	db.Init(database)
+	sub := &model.Subscription{Name: "Example", SourceType: model.SubscriptionSourcePanSou}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	createJobAndRecord := func(jobID, observationKey string, expected int, createdAt time.Time) model.ClusterShareInspectManifest {
+		task := protocol.TaskContext{
+			Subscription: protocol.SubscriptionTaskContext{
+				SubscriptionID: sub.ID, ObservationKey: observationKey, ObservationExpected: expected,
+			},
+			Share: protocol.ShareTaskContext{Provider: "quark", URL: "https://pan.quark.cn/s/" + jobID},
+		}
+		taskJSON, _ := json.Marshal(task)
+		if err := database.Create(&model.ClusterJob{
+			ID: jobID, IdempotencyKey: jobID, Type: model.ClusterJobTypeShareInspect,
+			SubscriptionID: sub.ID, TaskContextJSON: string(taskJSON), CreatedAt: createdAt,
+		}).Error; err != nil {
+			t.Fatalf("create job: %v", err)
+		}
+		manifest := protocol.ShareInspectManifest{}
+		payload, _ := json.Marshal(manifest)
+		record := model.ClusterShareInspectManifest{
+			ID: jobID + "-record", JobID: jobID, SubscriptionID: sub.ID,
+			ObservationKey: observationKey, ObservationExpected: expected,
+			PayloadJSON: string(payload), Status: model.ClusterShareInspectStatusPending,
+			InspectedAt: createdAt, CreatedAt: createdAt,
+		}
+		if err := database.Create(&record).Error; err != nil {
+			t.Fatalf("create record: %v", err)
+		}
+		return record
+	}
+	now := time.Now().UTC()
+	firstRecord := createJobAndRecord("first-job", "observation", 2, now.Add(-time.Minute))
+
+	if err := consumeSubscriptionShareInspect(context.Background(), firstRecord, protocol.ShareInspectManifest{}); !errors.Is(err, coordinator.ErrShareInspectObservationIncomplete) {
+		t.Fatalf("consume incomplete observation: %v", err)
+	}
+	if err := database.First(&firstRecord, "id = ?", firstRecord.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if firstRecord.Status != model.ClusterShareInspectStatusIncomplete || firstRecord.ConsumedAt != nil {
+		t.Fatalf("first record = %#v, want incomplete and out of pending queue", firstRecord)
+	}
+
+	secondRecord := createJobAndRecord("second-job", "observation", 2, now)
+	if err := consumeSubscriptionShareInspect(context.Background(), secondRecord, protocol.ShareInspectManifest{}); err != nil {
+		t.Fatalf("resume complete observation: %v", err)
+	}
+	if err := database.First(&firstRecord, "id = ?", firstRecord.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if firstRecord.Status != model.ClusterShareInspectStatusConsumed || firstRecord.ConsumedAt == nil {
+		t.Fatalf("first record = %#v, want consumed after missing manifest arrived", firstRecord)
+	}
+}
+
+func TestConsumeSubscriptionShareInspectCompletesWhenInspectJobFailedWithoutManifest(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+	db.Init(database)
+	dispatcher := &inspectObservationDispatcher{}
+	subscription.RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { subscription.RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{Name: "Example", TMDBName: "Example", SourceType: model.SubscriptionSourceManual, TransferEnabled: true, MediaType: "tv", TargetRoot: "/tv"}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	const observationKey = "observation-failed"
+	makeTask := func(jobID, provider, shareURL string) protocol.TaskContext {
+		return protocol.TaskContext{
+			Subscription: protocol.SubscriptionTaskContext{
+				SubscriptionID: sub.ID, SubscriptionName: sub.Name,
+				ObservationKey: observationKey, ObservationExpected: 2,
+			},
+			Share: protocol.ShareTaskContext{Provider: provider, URL: shareURL},
+		}
+	}
+	createSucceededRecord := func(id, jobID string, task protocol.TaskContext, manifest protocol.ShareInspectManifest) model.ClusterShareInspectManifest {
+		taskJSON, _ := json.Marshal(task)
+		if err := database.Create(&model.ClusterJob{ID: jobID, IdempotencyKey: jobID, Type: model.ClusterJobTypeShareInspect, SubscriptionID: sub.ID, Status: model.ClusterJobStatusSucceeded, TaskContextJSON: string(taskJSON)}).Error; err != nil {
+			t.Fatalf("create job: %v", err)
+		}
+		payload, _ := json.Marshal(manifest)
+		record := model.ClusterShareInspectManifest{
+			ID: id, JobID: jobID, SubscriptionID: sub.ID,
+			ObservationKey: observationKey, ObservationExpected: 2,
+			PayloadJSON: string(payload), Status: model.ClusterShareInspectStatusPending, InspectedAt: time.Now().UTC(),
+		}
+		if err := database.Create(&record).Error; err != nil {
+			t.Fatalf("create record: %v", err)
+		}
+		return record
+	}
+	manifest := protocol.ShareInspectManifest{
+		Objects: []protocol.SourceObject{{Provider: "pan123", SourceFileID: "ok", SourceRelativePath: "Example.S01E01.mkv", Size: 500}},
+	}
+	record := createSucceededRecord("record-ok", "inspect-ok", makeTask("inspect-ok", "pan123", "https://www.123pan.com/s/ok"), manifest)
+	taskJSON, _ := json.Marshal(makeTask("inspect-failed", "quark", "https://pan.quark.cn/s/dead"))
+	if err := database.Create(&model.ClusterJob{
+		ID: "inspect-failed", IdempotencyKey: "inspect-failed", Type: model.ClusterJobTypeShareInspect,
+		SubscriptionID: sub.ID, Status: model.ClusterJobStatusFailed, TaskContextJSON: string(taskJSON),
+		LastError: "分享地址已失效",
+	}).Error; err != nil {
+		t.Fatalf("create failed job: %v", err)
+	}
+	if err := consumeSubscriptionShareInspect(context.Background(), record, manifest); err != nil {
+		t.Fatalf("consume observation with terminal failed inspect: %v", err)
+	}
+	if len(dispatcher.tasks) != 1 {
+		t.Fatalf("dispatched tasks = %#v, want one media task", dispatcher.tasks)
+	}
+}

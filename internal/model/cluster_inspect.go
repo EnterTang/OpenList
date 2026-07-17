@@ -3,8 +3,9 @@ package model
 import "time"
 
 const (
-	ClusterShareInspectStatusPending  = "pending"
-	ClusterShareInspectStatusConsumed = "consumed"
+	ClusterShareInspectStatusPending    = "pending"
+	ClusterShareInspectStatusIncomplete = "incomplete"
+	ClusterShareInspectStatusConsumed   = "consumed"
 )
 
 // ClusterShareInspectManifest is the Coordinator's durable sealed copy of a

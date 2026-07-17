@@ -142,19 +142,21 @@ func selectTelegramTempTransferCandidates(sub *model.Subscription, candidates []
 }
 
 func betterTelegramTempCandidate(candidate, existing telegramTempCandidate, priorityIndex map[string]int) bool {
-	if candidate.Entry.Size != existing.Entry.Size {
-		return candidate.Entry.Size > existing.Entry.Size
-	}
-	candidateRank := providerPriorityRank(candidate.Source.Name, priorityIndex)
-	existingRank := providerPriorityRank(existing.Source.Name, priorityIndex)
+	candidateProvider := normalizeSubscriptionProvider(candidate.Source.Name)
+	existingProvider := normalizeSubscriptionProvider(existing.Source.Name)
+	candidateRank := providerPriorityRank(candidateProvider, priorityIndex)
+	existingRank := providerPriorityRank(existingProvider, priorityIndex)
 	if candidateRank != existingRank {
 		return candidateRank < existingRank
 	}
+	if candidate.Entry.Size != existing.Entry.Size {
+		return candidate.Entry.Size > existing.Entry.Size
+	}
 	candidateKey := strings.Join([]string{
-		normalizeSubscriptionProvider(candidate.Source.Name), candidate.Entry.Path, candidate.Entry.ID, candidate.Item.SourceKey,
+		candidateProvider, candidate.Entry.Path, candidate.Entry.ID, candidate.Item.SourceKey,
 	}, "\x00")
 	existingKey := strings.Join([]string{
-		normalizeSubscriptionProvider(existing.Source.Name), existing.Entry.Path, existing.Entry.ID, existing.Item.SourceKey,
+		existingProvider, existing.Entry.Path, existing.Entry.ID, existing.Item.SourceKey,
 	}, "\x00")
 	return candidateKey < existingKey
 }

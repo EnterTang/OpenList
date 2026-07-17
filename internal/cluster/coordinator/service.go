@@ -781,6 +781,12 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		} else {
 			jobUpdates["status"] = model.ClusterJobStatusFailed
 			jobUpdates["finished_at"] = now
+			if job.Type == model.ClusterJobTypeShareInspect {
+				if _, err := persistFailedShareInspectResultTx(tx, peer.NodeID(), &job, attempt, result); err != nil {
+					return err
+				}
+				storedInspect = true
+			}
 		}
 		updated := tx.Model(&model.ClusterJobAttempt{}).
 			Where("id = ? AND status IN ?", attempt.ID, allowedStatuses).
@@ -886,6 +892,65 @@ func persistShareInspectResultTx(tx *gorm.DB, nodeID string, job *model.ClusterJ
 		return "", errors.New("share inspection job already has a conflicting sealed manifest")
 	}
 	return payloadHash, nil
+}
+
+func persistFailedShareInspectResultTx(tx *gorm.DB, nodeID string, job *model.ClusterJob, attempt *model.ClusterJobAttempt, result protocol.JobResult) (string, error) {
+	if job == nil || attempt == nil {
+		return "", errors.New("share inspection job context is unavailable")
+	}
+	var taskContext protocol.TaskContext
+	if err := json.Unmarshal([]byte(job.TaskContextJSON), &taskContext); err != nil {
+		return "", fmt.Errorf("decode share inspection task context: %w", err)
+	}
+	objectsJSON := []byte("[]")
+	objectHash := fmt.Sprintf("%x", sha256.Sum256(objectsJSON))
+	manifest := protocol.ShareInspectManifest{
+		Version:      taskContext.SealedManifestVersion,
+		Share:        taskContext.Share,
+		CanonicalRef: strings.TrimSpace(taskContext.Share.URL),
+		Objects:      nil,
+		ObjectHash:   objectHash,
+		InspectedAt:  nowOr(result.FinishedAt),
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		return "", fmt.Errorf("encode failed share inspection result: %w", err)
+	}
+	payloadHash := fmt.Sprintf("%x", sha256.Sum256(raw))
+	item := model.ClusterShareInspectManifest{
+		ID: uuid.NewString(), JobID: job.ID, AttemptID: attempt.ID, NodeID: nodeID,
+		Generation: attempt.Generation, SubscriptionID: job.SubscriptionID,
+		ObservationKey:      taskContext.Subscription.ObservationKey,
+		ObservationExpected: taskContext.Subscription.ObservationExpected,
+		Version:             manifest.Version, CanonicalRef: manifest.CanonicalRef,
+		ObjectHash: objectHash, PayloadJSON: string(raw), PayloadHash: payloadHash,
+		Status: model.ClusterShareInspectStatusPending, InspectedAt: manifest.InspectedAt.UTC(),
+		LastError: strings.TrimSpace(result.Error),
+	}
+	if strings.TrimSpace(item.ObservationKey) == "" {
+		item.ObservationKey = job.ID
+	}
+	if item.ObservationExpected <= 0 {
+		item.ObservationExpected = 1
+	}
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&item).Error; err != nil {
+		return "", err
+	}
+	var stored model.ClusterShareInspectManifest
+	if err := tx.First(&stored, "job_id = ?", job.ID).Error; err != nil {
+		return "", err
+	}
+	if stored.PayloadHash != payloadHash {
+		return "", errors.New("share inspection job already has a conflicting sealed manifest")
+	}
+	return payloadHash, nil
+}
+
+func nowOr(value time.Time) time.Time {
+	if value.IsZero() {
+		return time.Now().UTC()
+	}
+	return value.UTC()
 }
 
 func reconcileParentJobTx(tx *gorm.DB, parentJobID string, now time.Time) error {

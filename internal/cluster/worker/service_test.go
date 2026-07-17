@@ -20,14 +20,15 @@ import (
 )
 
 type fakeResultQueue struct {
-	enqueueID  string
-	enqueueErr error
-	enqueued   any
-	cleanup    resultqueue.CleanupRequest
-	cleanupID  string
-	ctxErr     error
-	claimed    bool
-	claimErr   error
+	enqueueID      string
+	enqueueErr     error
+	enqueued       any
+	cleanup        resultqueue.CleanupRequest
+	cleanupID      string
+	ctxErr         error
+	claimed        bool
+	claimErr       error
+	cleanupBacklog int64
 }
 
 type cleanupTestDriver struct {
@@ -93,7 +94,7 @@ func (q *fakeResultQueue) ReleaseAttempt(context.Context, string) error {
 	q.claimed = false
 	return nil
 }
-func (*fakeResultQueue) CleanupBacklog(context.Context) (int64, error) { return 0, nil }
+func (q *fakeResultQueue) CleanupBacklog(context.Context) (int64, error) { return q.cleanupBacklog, nil }
 
 func (*fakeResultQueue) EnsureGroup(context.Context) error { return nil }
 func (*fakeResultQueue) Reclaim(context.Context, time.Duration, string, int64) ([]resultqueue.Result, string, error) {
@@ -547,5 +548,33 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 		Size:                  1024,
 		SHA256:                strings.Repeat("A", 64),
 		HashSource:            "mobile_provider_response",
+	}
+}
+
+func TestEffectiveMediaConcurrencyReservesInspectSlots(t *testing.T) {
+	original := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	conf.Conf.Tasks.Move.Workers = 5
+	t.Cleanup(func() { conf.Conf = original })
+	if got := effectiveMediaConcurrency(); got != 3 {
+		t.Fatalf("effective media concurrency = %d, want 3", got)
+	}
+}
+
+func TestCleanupBacklogBlocksOfferAllowsShareInspect(t *testing.T) {
+	queue := &fakeResultQueue{cleanupBacklog: 3}
+	service := New(queue, nil)
+	offer := protocol.JobOffer{JobType: model.ClusterJobTypeShareInspect}
+	if err := service.cleanupBacklogBlocksOffer(context.Background(), offer); err != nil {
+		t.Fatalf("share inspect should ignore cleanup backlog: %v", err)
+	}
+}
+
+func TestCleanupBacklogBlocksOfferRejectsMediaTransfer(t *testing.T) {
+	queue := &fakeResultQueue{cleanupBacklog: 2}
+	service := New(queue, nil)
+	offer := protocol.JobOffer{JobType: model.ClusterJobTypeMediaTransfer}
+	if err := service.cleanupBacklogBlocksOffer(context.Background(), offer); err == nil {
+		t.Fatal("expected media transfer to reject cleanup backlog")
 	}
 }
