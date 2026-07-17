@@ -176,7 +176,36 @@ type clusterInspectCandidate struct {
 	message clusterSourceMessage
 }
 
+// ObservationCloseState tells the incremental apply path how much of the
+// observation is currently known. PendingProviders lists the share providers
+// of sibling share.inspect jobs that have not yet reported a terminal result;
+// AllTerminal means every expected child has reported (successfully or via an
+// empty failed manifest), so any slot without a better candidate left to wait
+// for must be force-closed with whatever candidate is available.
+type ObservationCloseState struct {
+	PendingProviders []string
+	AllTerminal      bool
+}
+
+// ApplyClusterInspectObservation applies a fully known set of manifests: every
+// resolved episode/movie winner is dispatched immediately. Callers that only
+// have a partial view of an in-flight observation should use
+// ApplyClusterInspectObservationIncremental instead.
 func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInspectManifestInput) (int, error) {
+	return applyClusterInspectObservation(ctx, manifests, ObservationCloseState{AllTerminal: true})
+}
+
+// ApplyClusterInspectObservationIncremental applies whatever manifests have
+// arrived so far for an observation that may still have non-terminal sibling
+// share.inspect jobs. Only slots that decideSlotClose considers closed (or,
+// once state.AllTerminal is true, every remaining open slot) are dispatched;
+// the rest stay pending so a later call can dispatch them once more
+// information arrives.
+func ApplyClusterInspectObservationIncremental(ctx context.Context, manifests []ClusterInspectManifestInput, state ObservationCloseState) (int, error) {
+	return applyClusterInspectObservation(ctx, manifests, state)
+}
+
+func applyClusterInspectObservation(ctx context.Context, manifests []ClusterInspectManifestInput, state ObservationCloseState) (int, error) {
 	if len(manifests) == 0 {
 		return 0, nil
 	}
@@ -234,6 +263,10 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 	if err != nil {
 		return 0, err
 	}
+	closable, err := filterObservationDispatchCandidates(sub, stored, state, priority)
+	if err != nil {
+		return 0, err
+	}
 	type dispatchGroup struct {
 		ref     ShareRef
 		message clusterSourceMessage
@@ -241,7 +274,7 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 	}
 	groups := make(map[string]*dispatchGroup)
 	groupOrder := make([]string, 0)
-	for _, item := range stored {
+	for _, item := range closable {
 		if item == nil || item.Status != model.SubscriptionItemStatusPending {
 			continue
 		}
@@ -326,6 +359,46 @@ func betterClusterInspectCandidate(candidate, existing clusterInspectCandidate, 
 	candidateKey := strings.Join([]string{candidateProvider, candidate.item.FilePath, candidate.item.FileID, candidate.item.SourceKey}, "\x00")
 	existingKey := strings.Join([]string{existingProvider, existing.item.FilePath, existing.item.FileID, existing.item.SourceKey}, "\x00")
 	return candidateKey < existingKey
+}
+
+// filterObservationDispatchCandidates narrows the winners reconcileClusterEpisodeSlots
+// resolved down to the subset allowed to dispatch this round. Movie items and TV
+// items without a recognized episode slot pass through unchanged (they never
+// waited on sibling inspects). Recognized TV episode slots only dispatch once
+// decideSlotClose says the slot is closed, unless the whole observation is
+// already fully terminal, in which case every remaining winner is force-closed.
+func filterObservationDispatchCandidates(sub *model.Subscription, items []*model.SubscriptionItem, state ObservationCloseState, priority []string) ([]*model.SubscriptionItem, error) {
+	if sub == nil || normalizeMediaType(sub.MediaType) == "movie" || state.AllTerminal {
+		return items, nil
+	}
+	cfg, err := GetConfig()
+	if err != nil {
+		return nil, err
+	}
+	episodeMinBytes := earlyCloseMinBytes(cfg.EpisodeEarlyCloseMinBytes, 1<<30)
+	movieMinBytes := earlyCloseMinBytes(cfg.MovieEarlyCloseMinBytes, 20<<30)
+	eligible := make([]*model.SubscriptionItem, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		if item.Episode <= 0 || mediaSlotKey(sub, item) == "" {
+			eligible = append(eligible, item)
+			continue
+		}
+		decision := decideSlotClose(slotCloseInput{
+			MediaType:        sub.MediaType,
+			Winner:           item,
+			PendingProviders: state.PendingProviders,
+			EpisodeMinBytes:  episodeMinBytes,
+			MovieMinBytes:    movieMinBytes,
+			Priority:         priority,
+		})
+		if decision.Closed {
+			eligible = append(eligible, item)
+		}
+	}
+	return eligible, nil
 }
 
 const clusterSkippedDuplicateEpisodeReason = "skipped: larger or preferred file selected for the same episode"
