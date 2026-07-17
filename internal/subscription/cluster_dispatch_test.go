@@ -402,6 +402,153 @@ func TestApplyClusterInspectObservationDoesNotRedispatchAcceptedEpisode(t *testi
 	}
 }
 
+// TestApplyClusterInspectObservationPrefersProviderPriorityForMovieSlot mirrors
+// TestApplyClusterInspectObservationPrefersProviderPriorityAcrossShares but for
+// a movie subscription: two candidates land on the same movie slot (same
+// TargetPath) from different providers in one batch apply, and only the
+// preferred provider should dispatch.
+func TestApplyClusterInspectObservationPrefersProviderPriorityForMovieSlot(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		Name: "Movie", TMDBName: "Movie", TMDBYear: 2026, SourceType: model.SubscriptionSourceManual,
+		TransferEnabled: true, MediaType: "movie", TargetRoot: "/movies",
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	inputs := []ClusterInspectManifestInput{
+		{
+			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderAliyunDrive), ShareURL: "https://www.alipan.com/s/example"},
+			Objects: []ClusterInspectObject{
+				{FileID: "movie-aliyun", RelativePath: "Movie.aliyun.mkv", Size: 900},
+			},
+		},
+		{
+			Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan123), ShareURL: "https://www.123pan.com/s/example"},
+			Objects: []ClusterInspectObject{
+				{FileID: "movie-pan123", RelativePath: "Movie.pan123.mkv", Size: 600},
+			},
+		},
+	}
+
+	count, err := ApplyClusterInspectObservation(context.Background(), inputs)
+	if err != nil {
+		t.Fatalf("apply observation: %v", err)
+	}
+	if count != 1 || len(dispatcher.tasks) != 1 {
+		t.Fatalf("dispatched=%d tasks=%#v, want exactly one movie winner", count, dispatcher.tasks)
+	}
+	if dispatcher.tasks[0].ShareProvider != string(ShareProviderPan123) || dispatcher.tasks[0].SourceFileID != "movie-pan123" {
+		t.Fatalf("movie winner = %#v, want preferred pan123 file even though it is smaller", dispatcher.tasks[0])
+	}
+
+	// Both candidates land on the same slot within one batch apply, so
+	// selectClusterInspectCandidates resolves the winner before either is
+	// persisted: only the preferred pan123 file should ever become a row.
+	items, err := db.ListSubscriptionItems(sub.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	if len(items) != 1 || items[0].FileID != "movie-pan123" {
+		t.Fatalf("items = %#v, want only the single preferred movie winner stored", items)
+	}
+	if items[0].Status != model.SubscriptionItemStatusTransferring {
+		t.Fatalf("pan123 status = %q, want the preferred movie candidate dispatched", items[0].Status)
+	}
+}
+
+// TestApplyClusterInspectObservationIncrementalKeepsOneWinnerPerMovieSlot
+// verifies that the incremental apply path also keeps a single winner per
+// movie slot: a weaker provider's manifest arrives first while a stronger
+// sibling is still pending (so it must wait), then the stronger sibling
+// arrives and becomes the sole winner, with the earlier candidate skipped.
+func TestApplyClusterInspectObservationIncrementalKeepsOneWinnerPerMovieSlot(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{
+		Name: "Movie", TMDBName: "Movie", TMDBYear: 2026, SourceType: model.SubscriptionSourceManual,
+		TransferEnabled: true, MediaType: "movie", TargetRoot: "/movies",
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	weaker := ClusterInspectManifestInput{
+		Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderAliyunDrive), ShareURL: "https://www.alipan.com/s/example"},
+		Objects: []ClusterInspectObject{{FileID: "movie-aliyun", RelativePath: "Movie.aliyun.mkv", Size: 900}},
+	}
+	stronger := ClusterInspectManifestInput{
+		Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan123), ShareURL: "https://www.123pan.com/s/example"},
+		Objects: []ClusterInspectObject{{FileID: "movie-pan123", RelativePath: "Movie.pan123.mkv", Size: 600}},
+	}
+
+	count, err := ApplyClusterInspectObservationIncremental(
+		context.Background(),
+		[]ClusterInspectManifestInput{weaker},
+		ObservationCloseState{PendingProviders: []string{string(ShareProviderPan123)}},
+	)
+	if err != nil {
+		t.Fatalf("apply weaker manifest: %v", err)
+	}
+	if count != 0 || len(dispatcher.tasks) != 0 {
+		t.Fatalf("dispatched=%d tasks=%#v, want the weaker movie candidate to wait for the pending pan123 sibling", count, dispatcher.tasks)
+	}
+
+	items, err := db.ListSubscriptionItems(sub.ID)
+	if err != nil {
+		t.Fatalf("list items after weaker manifest: %v", err)
+	}
+	if len(items) != 1 || items[0].Status != model.SubscriptionItemStatusPending {
+		t.Fatalf("items after weaker manifest = %#v, want the sole candidate left pending", items)
+	}
+
+	count, err = ApplyClusterInspectObservationIncremental(
+		context.Background(),
+		[]ClusterInspectManifestInput{stronger},
+		ObservationCloseState{},
+	)
+	if err != nil {
+		t.Fatalf("apply stronger manifest: %v", err)
+	}
+	if count != 1 || len(dispatcher.tasks) != 1 {
+		t.Fatalf("dispatched=%d tasks=%#v, want exactly one winner once the stronger sibling arrives", count, dispatcher.tasks)
+	}
+	if dispatcher.tasks[0].ShareProvider != string(ShareProviderPan123) || dispatcher.tasks[0].SourceFileID != "movie-pan123" {
+		t.Fatalf("winner = %#v, want the preferred pan123 file", dispatcher.tasks[0])
+	}
+
+	items, err = db.ListSubscriptionItems(sub.ID)
+	if err != nil {
+		t.Fatalf("list items after stronger manifest: %v", err)
+	}
+	var aliyunItem, pan123Item *model.SubscriptionItem
+	for i := range items {
+		switch items[i].FileID {
+		case "movie-aliyun":
+			aliyunItem = &items[i]
+		case "movie-pan123":
+			pan123Item = &items[i]
+		}
+	}
+	if aliyunItem == nil || pan123Item == nil {
+		t.Fatalf("items = %#v, want both movie candidates stored", items)
+	}
+	if aliyunItem.Status != model.SubscriptionItemStatusSkipped {
+		t.Fatalf("aliyun status = %q, want the losing candidate skipped once the winner is known", aliyunItem.Status)
+	}
+	if pan123Item.Status != model.SubscriptionItemStatusTransferring {
+		t.Fatalf("pan123 status = %q, want the winning candidate dispatched", pan123Item.Status)
+	}
+}
+
 func TestClusterTasksPreservePreferredWorkerWithoutChangingMediaIdempotency(t *testing.T) {
 	sub := &model.Subscription{
 		ID: 41, Name: "Example", PreferredWorkerNodeID: "worker-139",

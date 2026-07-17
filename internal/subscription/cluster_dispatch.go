@@ -305,7 +305,7 @@ func applyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 }
 
 func selectClusterInspectCandidates(sub *model.Subscription, candidates []clusterInspectCandidate, priority []string) []clusterInspectCandidate {
-	if sub == nil || len(candidates) <= 1 || normalizeMediaType(sub.MediaType) == "movie" {
+	if sub == nil || len(candidates) <= 1 {
 		return candidates
 	}
 	priority = normalizeTransferPriority(priority)
@@ -409,11 +409,13 @@ func filterObservationDispatchCandidates(sub *model.Subscription, items []*model
 
 const clusterSkippedDuplicateEpisodeReason = "skipped: larger or preferred file selected for the same episode"
 
-// reconcileClusterEpisodeSlots keeps one active transfer candidate per TV episode
-// across independently inspected shares/messages. Non-winners that are still
-// pending or transferring are marked skipped so workers never temp-save them.
+// reconcileClusterEpisodeSlots keeps one active transfer candidate per media
+// slot (TV episode or movie) across independently inspected shares/messages.
+// Non-winners that are still pending or transferring are marked skipped so
+// workers never temp-save them. TV files without a recognized episode number
+// are left untouched (no cross-share dedupe is attempted for them).
 func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.SubscriptionItem, priority []string) ([]*model.SubscriptionItem, error) {
-	if sub == nil || normalizeMediaType(sub.MediaType) == "movie" || len(stored) == 0 {
+	if sub == nil || len(stored) == 0 {
 		return stored, nil
 	}
 	priority = normalizeTransferPriority(priority)
@@ -429,8 +431,8 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 			continue
 		}
 		storedByKey[item.SourceKey] = item
-		if slot := mediaSlotKey(sub, item); slot != "" && item.Episode > 0 {
-			touchedSlots[slot] = struct{}{}
+		if clusterItemHasDedupSlot(sub, item) {
+			touchedSlots[mediaSlotKey(sub, item)] = struct{}{}
 		}
 	}
 	if len(touchedSlots) == 0 {
@@ -449,7 +451,7 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 		if _, ok := touchedSlots[slot]; !ok {
 			continue
 		}
-		if !clusterItemCompetesForEpisodeSlot(item) {
+		if !clusterItemCompetesForSlot(sub, item) {
 			continue
 		}
 		if refreshed, ok := storedByKey[item.SourceKey]; ok {
@@ -462,10 +464,10 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 			continue
 		}
 		slot := mediaSlotKey(sub, item)
-		if _, ok := touchedSlots[slot]; !ok || item.Episode <= 0 {
+		if _, ok := touchedSlots[slot]; !ok {
 			continue
 		}
-		if !clusterItemCompetesForEpisodeSlot(item) {
+		if !clusterItemCompetesForSlot(sub, item) {
 			continue
 		}
 		found := false
@@ -501,7 +503,7 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 			continue
 		}
 		slot := mediaSlotKey(sub, item)
-		if slot == "" || item.Episode <= 0 {
+		if _, touched := touchedSlots[slot]; slot == "" || !touched {
 			dispatchable = append(dispatchable, item)
 			continue
 		}
@@ -558,8 +560,19 @@ func subscriptionItemHasAcceptedTransfer(item *model.SubscriptionItem) bool {
 	return item != nil && (item.Status == model.SubscriptionItemStatusTransferring || item.Status == model.SubscriptionItemStatusTransferred)
 }
 
-func clusterItemCompetesForEpisodeSlot(item *model.SubscriptionItem) bool {
-	if item == nil || item.Episode <= 0 {
+// clusterItemHasDedupSlot reports whether item participates in cross-share
+// slot dedupe: movies always compete by TargetPath, while TV items only
+// compete once an episode number was recognized (TV files without one keep
+// their independent "path:" pseudo-slot, which is never touched here).
+func clusterItemHasDedupSlot(sub *model.Subscription, item *model.SubscriptionItem) bool {
+	if item == nil || mediaSlotKey(sub, item) == "" {
+		return false
+	}
+	return normalizeMediaType(sub.MediaType) == "movie" || item.Episode > 0
+}
+
+func clusterItemCompetesForSlot(sub *model.Subscription, item *model.SubscriptionItem) bool {
+	if !clusterItemHasDedupSlot(sub, item) {
 		return false
 	}
 	switch item.Status {
