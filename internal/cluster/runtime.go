@@ -528,7 +528,22 @@ func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coo
 	}
 }
 
-func (r *Runtime) acquireCoordinatorLease(ctx context.Context, now time.Time) error {
+func (r *Runtime) acquireCoordinatorLease(ctx context.Context, startedAt time.Time) error {
+	deadline := startedAt.Add(coordinatorLeaseDuration + 10*time.Second)
+	for {
+		now := time.Now().UTC()
+		err := r.acquireCoordinatorLeaseOnce(ctx, now)
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "cluster coordinator lease is held by") || now.After(deadline) || ctx.Err() != nil {
+			return err
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func (r *Runtime) acquireCoordinatorLeaseOnce(ctx context.Context, now time.Time) error {
 	if db.GetDb() == nil {
 		return errors.New("cluster coordinator database is unavailable")
 	}
