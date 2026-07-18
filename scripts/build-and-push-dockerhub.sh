@@ -162,6 +162,23 @@ run_frontend_pnpm() {
   (cd "$FRONTEND_DIR" && "${FRONTEND_PNPM[@]}" "$@")
 }
 
+install_frontend_dependencies() {
+  local install_log
+  install_log="$(mktemp "${TMPDIR:-/tmp}/openlist-frontend-pnpm-install.XXXXXX.log")"
+  if CI=true run_frontend_pnpm install --frozen-lockfile 2>&1 | tee "$install_log"; then
+    rm -f "$install_log"
+    return 0
+  fi
+  if grep -Fq "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH" "$install_log"; then
+    echo "warning: frontend lockfile config mismatch detected; retrying pnpm install --no-frozen-lockfile" >&2
+    rm -f "$install_log"
+    CI=true run_frontend_pnpm install --no-frozen-lockfile
+    return 0
+  fi
+  rm -f "$install_log"
+  return 1
+}
+
 VERSION="${VERSION:-$(cd "$BACKEND_DIR" && git describe --abbrev=0 --tags 2>/dev/null || echo dev)}"
 WEB_VERSION="${WEB_VERSION:-$(cd "$FRONTEND_DIR" && node -p "require('./package.json').version" 2>/dev/null || echo custom)}"
 GIT_COMMIT="${GIT_COMMIT:-$(cd "$BACKEND_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
@@ -246,7 +263,7 @@ echo "==> Version:  $VERSION / frontend $WEB_VERSION / commit $GIT_COMMIT"
 
 if [ "$RUN_PNPM_INSTALL" = "true" ]; then
   echo "==> Installing frontend dependencies"
-  CI=true run_frontend_pnpm install --frozen-lockfile
+  install_frontend_dependencies
 fi
 
 prepare_frontend_i18n
