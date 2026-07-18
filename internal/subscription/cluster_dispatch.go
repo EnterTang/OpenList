@@ -31,6 +31,7 @@ type ClusterMediaTask struct {
 	SubscriptionItemID    uint
 	SubscriptionName      string
 	PreferredWorkerNodeID string
+	Trigger               string
 	SourceKey             string
 	SourceMessageID       string
 	SourceMessageChannel  string
@@ -69,6 +70,7 @@ type ClusterInspectTask struct {
 	SubscriptionID        uint
 	SubscriptionName      string
 	PreferredWorkerNodeID string
+	Trigger               string
 	SourceMessageID       string
 	SourceMessageChannel  string
 	SourceMessageURL      string
@@ -145,6 +147,10 @@ func clusterInspectTask(sub *model.Subscription, ref ShareRef, message clusterSo
 }
 
 func clusterInspectObservationTask(sub *model.Subscription, ref ShareRef, message clusterSourceMessage, observationKey string, observationExpected int) ClusterInspectTask {
+	return clusterInspectObservationTaskForTrigger(sub, ref, message, observationKey, observationExpected, "")
+}
+
+func clusterInspectObservationTaskForTrigger(sub *model.Subscription, ref ShareRef, message clusterSourceMessage, observationKey string, observationExpected int, trigger string) ClusterInspectTask {
 	fingerprint := shortHash(strings.Join([]string{string(ref.Provider), ref.ShareID, ref.ParentID, ref.Passcode}, "\x00"))
 	if strings.TrimSpace(observationKey) == "" {
 		observationKey = hashClusterSource("observation", fmt.Sprint(sub.ID), message.ID, fingerprint)
@@ -157,7 +163,7 @@ func clusterInspectObservationTask(sub *model.Subscription, ref ShareRef, messag
 			"inspect", fmt.Sprint(sub.ID), observationKey, fingerprint,
 			message.ID, message.Channel, message.URL, message.Text,
 		),
-		SubscriptionID: sub.ID, SubscriptionName: sub.Name, PreferredWorkerNodeID: sub.PreferredWorkerNodeID,
+		SubscriptionID: sub.ID, SubscriptionName: sub.Name, PreferredWorkerNodeID: sub.PreferredWorkerNodeID, Trigger: trigger,
 		SourceMessageID: message.ID, SourceMessageChannel: message.Channel,
 		SourceMessageURL: message.URL, SourceMessageText: message.Text,
 		ShareProvider: string(ref.Provider), ShareURL: ref.RawURL, SharePasscode: ref.Passcode,
@@ -476,7 +482,7 @@ func acceptedClusterEpisodeWinner(items []*model.SubscriptionItem) *model.Subscr
 }
 
 func subscriptionItemHasAcceptedTransfer(item *model.SubscriptionItem) bool {
-	return item != nil && (item.Status == model.SubscriptionItemStatusTransferring || item.Status == model.SubscriptionItemStatusTransferred)
+	return item != nil && (item.Status == model.SubscriptionItemStatusTransferring || item.Status == model.SubscriptionItemStatusNotifying || item.Status == model.SubscriptionItemStatusTransferred)
 }
 
 func clusterItemCompetesForEpisodeSlot(item *model.SubscriptionItem) bool {
@@ -484,7 +490,7 @@ func clusterItemCompetesForEpisodeSlot(item *model.SubscriptionItem) bool {
 		return false
 	}
 	switch item.Status {
-	case model.SubscriptionItemStatusPending, model.SubscriptionItemStatusTransferring, model.SubscriptionItemStatusTransferred:
+	case model.SubscriptionItemStatusPending, model.SubscriptionItemStatusTransferring, model.SubscriptionItemStatusNotifying, model.SubscriptionItemStatusTransferred:
 		return true
 	default:
 		return false

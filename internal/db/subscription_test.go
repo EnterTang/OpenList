@@ -1208,7 +1208,7 @@ func TestListSubscriptionEpisodeSourceDetailsResolvesWorkerNames(t *testing.T) {
 	}
 
 	snapshots := []model.SubscriptionEpisodeSource{
-		{SubscriptionID: sub.ID, Season: 1, Episode: 1, SourceItemID: items[0].ID, SourceType: model.SubscriptionSourceTelegram, SourceProvider: "quark", FileName: "assigned.mkv", Status: model.SubscriptionItemStatusTransferred, ClusterJobID: "job-assigned"},
+		{SubscriptionID: sub.ID, Season: 1, Episode: 1, SourceItemID: items[0].ID, SourceType: model.SubscriptionSourceTelegram, SourceProvider: "quark", FileName: "assigned.mkv", Status: model.SubscriptionItemStatusTransferring, ClusterJobID: "job-assigned"},
 		{SubscriptionID: sub.ID, Season: 1, Episode: 2, SourceItemID: items[1].ID, SourceType: model.SubscriptionSourceTelegram, SourceProvider: "quark", FileName: "attempt.mkv", Status: model.SubscriptionItemStatusFailed, ClusterJobID: "job-attempt"},
 		{SubscriptionID: sub.ID, Season: 1, Episode: 3, SourceItemID: items[2].ID, SourceType: model.SubscriptionSourceTelegram, SourceProvider: "quark", FileName: "unassigned.mkv", Status: model.SubscriptionItemStatusPending, ClusterJobID: "job-unassigned"},
 		{SubscriptionID: sub.ID, Season: 1, Episode: 4, SourceItemID: items[3].ID, SourceType: model.SubscriptionSourceManual, SourceProvider: "pan123", FileName: "standalone.mkv", Status: model.SubscriptionItemStatusTransferred},

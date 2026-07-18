@@ -13,6 +13,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type ShareProvider interface {
@@ -140,6 +141,9 @@ func runManualCheckJob(ctx context.Context, job *model.ETFSubscriptionJob, opts 
 	client := NewTargetClient(job.TargetBaseURL, job.TargetAPIToken, opts.HTTPClient, opts.Timeout)
 	result, err := client.CheckSubscription(ctx, subscriptionID, job.JobKey)
 	if err != nil {
+		if targetSubscriptionNotFound(err) {
+			return recreateMissingTargetSubscription(ctx, job.ID, err)
+		}
 		if IsDeliveryUncertain(err) {
 			if job.TargetSupportsIdempotency {
 				return markJobFailed(ctx, job.ID, err, opts)
@@ -149,6 +153,62 @@ func runManualCheckJob(ctx context.Context, job *model.ETFSubscriptionJob, opts 
 		return markJobFailed(ctx, job.ID, err, opts)
 	}
 	return markManualCheckSucceeded(ctx, job.ID, result)
+}
+
+func targetSubscriptionNotFound(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "target service returned 404") && strings.Contains(message, "subscription not found")
+}
+
+func recreateMissingTargetSubscription(ctx context.Context, jobID uint, cause error) error {
+	if cause == nil {
+		cause = errors.New("target subscription is not found")
+	}
+	return db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job model.ETFSubscriptionJob
+		if err := tx.First(&job, jobID).Error; err != nil {
+			return err
+		}
+		if job.Type != model.ETFSubscriptionJobTypeManualCheck {
+			return errors.New("ETF notification job is not a manual check")
+		}
+		var root model.ETFMediaRoot
+		if err := tx.First(&root, job.MediaRootID).Error; err != nil {
+			return err
+		}
+		job.Attempts++
+		job.Status = model.ETFSubscriptionJobStatusDeadLetter
+		job.NextRetryAt = nil
+		job.LastError = cause.Error()
+		if err := tx.Save(&job).Error; err != nil {
+			return err
+		}
+		root.TargetSubscriptionID = 0
+		root.LastCreateTaskID = ""
+		root.LastCheckTaskID = ""
+		root.Status = model.ETFMediaRootStatusDirty
+		root.LastError = cause.Error()
+		if err := tx.Save(&root).Error; err != nil {
+			return err
+		}
+		replacement := &model.ETFSubscriptionJob{
+			JobKey:                    "recreate:" + root.RootKey + ":" + job.Fingerprint,
+			MediaRootID:               root.ID,
+			BatchID:                   job.BatchID,
+			Type:                      model.ETFSubscriptionJobTypeCreate,
+			Status:                    model.ETFSubscriptionJobStatusPending,
+			TargetBaseURL:             root.TargetBaseURL,
+			TargetAPIToken:            root.TargetAPIToken,
+			TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+			ShareType:                 normalizeShareType(root.ShareType),
+			Fingerprint:               job.Fingerprint,
+			ClusterJobIDsJSON:         job.ClusterJobIDsJSON,
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(replacement).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusPending)
+	})
 }
 
 func markJobUnknown(ctx context.Context, jobID uint, cause error) error {

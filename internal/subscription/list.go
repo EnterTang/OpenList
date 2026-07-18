@@ -26,11 +26,26 @@ func ListSubscriptionsWithProgress(filter db.SubscriptionFilter, archiveStatus s
 	for _, item := range subscriptionItems {
 		itemsBySubscription[item.SubscriptionID] = append(itemsBySubscription[item.SubscriptionID], item)
 	}
+	events, err := db.ListSubscriptionTelegramEventsBySubscriptionIDs(subscriptionIDs)
+	if err != nil {
+		return nil, 0, err
+	}
+	latestEventBySubscription := make(map[uint]model.SubscriptionTelegramEvent, len(items))
+	for _, event := range events {
+		if _, exists := latestEventBySubscription[event.SubscriptionID]; !exists {
+			latestEventBySubscription[event.SubscriptionID] = event
+		}
+	}
 
 	archiveStatus = strings.ToLower(strings.TrimSpace(archiveStatus))
 	filtered := make([]model.Subscription, 0, len(items))
 	for _, item := range items {
 		item.Progress = CalculateSubscriptionProgress(&item, itemsBySubscription[item.ID], now)
+		var latestEvent *model.SubscriptionTelegramEvent
+		if event, ok := latestEventBySubscription[item.ID]; ok {
+			latestEvent = &event
+		}
+		hydrateSubscriptionRealtimeStatus(&item, itemsBySubscription[item.ID], latestEvent)
 		if archiveStatus != "" && archiveStatus != "all" && item.Progress.ArchiveStatus != archiveStatus {
 			continue
 		}

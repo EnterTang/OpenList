@@ -551,13 +551,13 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 	}
 }
 
-func TestEffectiveMediaConcurrencyReservesInspectSlots(t *testing.T) {
+func TestDefaultMediaConcurrencyUsesConfiguredMoveWorkers(t *testing.T) {
 	original := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())
 	conf.Conf.Tasks.Move.Workers = 5
 	t.Cleanup(func() { conf.Conf = original })
-	if got := effectiveMediaConcurrency(); got != 3 {
-		t.Fatalf("effective media concurrency = %d, want 3", got)
+	if got := defaultMediaConcurrency(); got != 5 {
+		t.Fatalf("default media concurrency = %d, want 5", got)
 	}
 }
 

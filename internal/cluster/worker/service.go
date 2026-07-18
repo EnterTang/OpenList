@@ -113,30 +113,13 @@ type resolvedMediaTransferTargets struct {
 }
 
 func New(queue resultQueue, sender Sender) *Service {
-	concurrency := effectiveMediaConcurrency()
+	concurrency := defaultMediaConcurrency()
 	return &Service{
 		queue: queue, sender: sender,
 		pending: make(map[string]resultqueue.Result), active: make(map[string]*activeTask), control: make(map[string]chan error), permits: make(map[string]chan protocol.StagePermit),
 		storageOperator: openListStorageOperator{}, storageObserved: make(map[string]observedState),
 		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), targetGates: make(map[string]*limitGate),
 	}
-}
-
-const inspectConcurrencyReserve = 2
-
-func inspectConcurrencyReserveSlots() int {
-	if inspectConcurrencyReserve < 0 {
-		return 0
-	}
-	return inspectConcurrencyReserve
-}
-
-func effectiveMediaConcurrency() int {
-	limit := defaultMediaConcurrency() - inspectConcurrencyReserveSlots()
-	if limit < 1 {
-		return 1
-	}
-	return limit
 }
 
 func defaultMediaConcurrency() int {

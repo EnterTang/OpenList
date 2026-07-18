@@ -41,6 +41,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context,
 			Subscription: protocol.SubscriptionTaskContext{
 				SubscriptionID: task.SubscriptionID, SubscriptionName: task.SubscriptionName,
 				PreferredWorkerNodeID: task.PreferredWorkerNodeID,
+				Trigger:               task.Trigger,
 				SourceMessageID:       task.SourceMessageID, SourceMessageChannel: task.SourceMessageChannel,
 				SourceMessageURL: task.SourceMessageURL, SourceMessageText: task.SourceMessageText,
 				ShareRefFingerprint: task.ShareRefFingerprint,
@@ -96,6 +97,7 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 		task := subscription.ClusterInspectTask{
 			SubscriptionID: taskContext.Subscription.SubscriptionID, SubscriptionName: taskContext.Subscription.SubscriptionName,
 			PreferredWorkerNodeID: taskContext.Subscription.PreferredWorkerNodeID,
+			Trigger:               taskContext.Subscription.Trigger,
 			SourceMessageID:       taskContext.Subscription.SourceMessageID, SourceMessageChannel: taskContext.Subscription.SourceMessageChannel,
 			SourceMessageURL: taskContext.Subscription.SourceMessageURL, SourceMessageText: taskContext.Subscription.SourceMessageText,
 			ShareProvider: taskContext.Share.Provider, ShareURL: taskContext.Share.URL, SharePasscode: taskContext.Share.Passcode,
@@ -111,7 +113,15 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 		}
 		inputs = append(inputs, subscription.ClusterInspectManifestInput{Task: task, Objects: objects})
 	}
-	if _, err := subscription.ApplyClusterInspectObservation(ctx, inputs); err != nil {
+	trigger := ""
+	if len(inputs) > 0 {
+		trigger = inputs[0].Task.Trigger
+	}
+	if trigger == "realtime" {
+		if _, err := subscription.ApplyRealtimeClusterInspectObservation(ctx, inputs); err != nil {
+			return err
+		}
+	} else if _, err := subscription.ApplyClusterInspectObservation(ctx, inputs); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
@@ -281,6 +291,7 @@ func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProf
 		Subscription: protocol.SubscriptionTaskContext{
 			SubscriptionID: task.SubscriptionID, SubscriptionItemID: task.SubscriptionItemID,
 			SubscriptionName: task.SubscriptionName, PreferredWorkerNodeID: task.PreferredWorkerNodeID, SourceKey: task.SourceKey,
+			Trigger:         task.Trigger,
 			SourceMessageID: task.SourceMessageID, ShareRefFingerprint: task.ShareRefFingerprint,
 		},
 		Share: protocol.ShareTaskContext{Provider: task.ShareProvider, URL: task.ShareURL, Passcode: task.SharePasscode},

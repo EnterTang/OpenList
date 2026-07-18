@@ -288,6 +288,7 @@ type SubscriptionTaskContext struct {
 	SubscriptionItemID    uint   `json:"subscription_item_id"`
 	SubscriptionName      string `json:"subscription_name"`
 	PreferredWorkerNodeID string `json:"preferred_worker_node_id,omitempty"`
+	Trigger               string `json:"trigger,omitempty"`
 	SourceKey             string `json:"source_key"`
 	SourceMessageID       string `json:"source_message_id,omitempty"`
 	SourceMessageChannel  string `json:"source_message_channel,omitempty"`

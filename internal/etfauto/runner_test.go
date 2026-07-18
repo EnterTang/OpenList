@@ -319,6 +319,71 @@ func TestUncertainDeliveryRetriesWhenTargetDeclaresIdempotency(t *testing.T) {
 	}
 }
 
+func TestManualCheckRecreatesMissingTargetSubscription(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	var createRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/subscriptions/77", "/api/v1/subscriptions/77/check":
+			http.Error(w, `{"code":"NOT_FOUND","message":"subscription not found"}`, http.StatusNotFound)
+		case "/api/v1/subscriptions":
+			createRequests++
+			_ = json.NewEncoder(w).Encode(map[string]any{"subscription": map[string]any{"id": 88}, "task_id": "task-recreated"})
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	root := model.ETFMediaRoot{RootKey: "missing-target", Status: model.ETFMediaRootStatusDirty, TargetBaseURL: server.URL + "/api/v1", TargetSubscriptionID: 77}
+	if err := db.GetDb().Create(&root).Error; err != nil {
+		t.Fatal(err)
+	}
+	manualCheck := model.ETFSubscriptionJob{
+		JobKey: "check:missing-target:fingerprint-1", MediaRootID: root.ID, Type: model.ETFSubscriptionJobTypeManualCheck,
+		Status: model.ETFSubscriptionJobStatusPending, TargetBaseURL: root.TargetBaseURL, TargetSubscriptionID: 77, Fingerprint: "fingerprint-1",
+	}
+	if err := db.GetDb().Create(&manualCheck).Error; err != nil {
+		t.Fatal(err)
+	}
+	share := &fakeShareProvider{record: &model.MobileShareRecord{ID: 10, ShareURL: "https://yun.139.com/w/i/root"}}
+	if processed, err := RunPendingJobs(ctx, RunnerOptions{ShareProvider: share, HTTPClient: server.Client(), Now: time.Now().UTC()}); err != nil || processed != 1 {
+		t.Fatalf("manual check processed=%d err=%v", processed, err)
+	}
+	if err := db.GetDb().First(&manualCheck, manualCheck.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if manualCheck.Status != model.ETFSubscriptionJobStatusDeadLetter {
+		t.Fatalf("manual check status = %q, want dead_letter", manualCheck.Status)
+	}
+	if err := db.GetDb().First(&root, root.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if root.TargetSubscriptionID != 0 || root.Status != model.ETFMediaRootStatusDirty {
+		t.Fatalf("root after missing target = %#v", root)
+	}
+	var replacement model.ETFSubscriptionJob
+	if err := db.GetDb().Where("type = ?", model.ETFSubscriptionJobTypeCreate).First(&replacement).Error; err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Status != model.ETFSubscriptionJobStatusPending || replacement.JobKey != "recreate:missing-target:fingerprint-1" {
+		t.Fatalf("replacement = %#v", replacement)
+	}
+	if processed, err := RunPendingJobs(ctx, RunnerOptions{ShareProvider: share, HTTPClient: server.Client(), Now: time.Now().UTC()}); err != nil || processed != 1 {
+		t.Fatalf("replacement processed=%d err=%v", processed, err)
+	}
+	if createRequests != 1 {
+		t.Fatalf("create requests = %d, want 1", createRequests)
+	}
+	if err := db.GetDb().First(&root, root.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if root.TargetSubscriptionID != 88 || root.LastCreateTaskID != "task-recreated" {
+		t.Fatalf("recreated root = %#v", root)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }

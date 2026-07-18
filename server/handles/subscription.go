@@ -227,6 +227,7 @@ func GetSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
+	subscription.HydrateRealtimeStatus(item, items)
 	common.SuccessResp(c, gin.H{"subscription": item, "items": filterDisplayedSubscriptionItems(items)})
 }
 
@@ -261,6 +262,7 @@ func CreateSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
+	subscription.RefreshTelegramRealtimeListener()
 	common.SuccessResp(c, req)
 }
 
@@ -302,6 +304,7 @@ func UpdateSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
+	subscription.RefreshTelegramRealtimeListener()
 	common.SuccessResp(c, req)
 }
 
@@ -317,6 +320,7 @@ func DeleteSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
+	subscription.RefreshTelegramRealtimeListener()
 	common.SuccessResp(c)
 }
 

@@ -23,6 +23,7 @@ func TestProcessPendingManifestsCompletesWithoutETFRootPath(t *testing.T) {
 		&model.ClusterJobStage{},
 		&model.ClusterJob{},
 		&model.SubscriptionItem{},
+		&model.SubscriptionEpisodeSource{},
 	)
 	conf.Conf.Cluster.ETFRootPath = ""
 	conf.Conf.Cluster.TargetBaseURL = ""
@@ -175,12 +176,14 @@ func TestCompleteManifestMaterializationMarksJobSucceeded(t *testing.T) {
 		&model.ClusterJobStage{},
 		&model.ClusterJob{},
 		&model.SubscriptionItem{},
+		&model.SubscriptionEpisodeSource{},
 	)
 	manifest := model.ClusterUploadManifest{ID: "manifest-1", JobID: "job-1", MediaItemID: "media-1", PayloadHash: "payload-1", Status: model.ClusterUploadManifestStatusAccepted, LastError: "old error"}
 	stage := model.ClusterJobStage{ID: "stage-1", JobID: "job-1", AttemptID: "attempt-1", Name: model.ClusterStageETFMaterializing, Status: model.ClusterStageStatusRunning}
-	item := model.SubscriptionItem{ID: 9, SubscriptionID: 7, SourceKey: "source-1", Status: model.SubscriptionItemStatusTransferring, ClusterJobID: "job-1"}
+	item := model.SubscriptionItem{ID: 9, SubscriptionID: 7, SourceKey: "source-1", FileHash: "hash-1", Status: model.SubscriptionItemStatusTransferring, ClusterJobID: "job-1"}
+	source := model.SubscriptionEpisodeSource{SubscriptionID: item.SubscriptionID, Season: 1, Episode: 1, SourceItemID: item.ID, FileHash: item.FileHash, Status: model.SubscriptionItemStatusTransferring}
 	job := model.ClusterJob{ID: "job-1", IdempotencyKey: "job-1", Status: model.ClusterJobStatusRunning, NotificationStatus: model.ClusterNotificationStatusUnknown, SubscriptionID: 7, SubscriptionItemID: item.ID}
-	for _, value := range []any{&manifest, &stage, &item, &job} {
+	for _, value := range []any{&manifest, &stage, &item, &source, &job} {
 		if err := database.Create(value).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -212,8 +215,14 @@ func TestCompleteManifestMaterializationMarksJobSucceeded(t *testing.T) {
 	if err := database.First(&item, item.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if item.Status != model.SubscriptionItemStatusTransferred {
+	if item.Status != model.SubscriptionItemStatusNotifying {
 		t.Fatalf("subscription item status = %q", item.Status)
+	}
+	if err := database.First(&source, source.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if source.Status != model.SubscriptionItemStatusNotifying {
+		t.Fatalf("episode source status = %q", source.Status)
 	}
 }
 

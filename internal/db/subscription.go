@@ -95,6 +95,12 @@ func UpdateSubscriptionTMDBEpisodeEnd(snapshot *model.Subscription, discoveredTM
 
 func DeleteSubscription(id uint) error {
 	return errors.WithStack(db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.SubscriptionTelegramEvent{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.SubscriptionRealtimeCandidate{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.SubscriptionItem{}).Error; err != nil {
 			return err
 		}
@@ -544,6 +550,7 @@ func ListSubscriptionRuns(filter SubscriptionRunFilter) ([]model.SubscriptionRun
 func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.SubscriptionEpisodeSourceDetail, error) {
 	var items []model.SubscriptionEpisodeSourceDetail
 	episodeSourceTable := modelTableName("SubscriptionEpisodeSource")
+	subscriptionItemTable := modelTableName("SubscriptionItem")
 	clusterJobTable := modelTableName("ClusterJob")
 	clusterNodeTable := modelTableName("ClusterNode")
 	clusterJobAttemptTable := modelTableName("ClusterJobAttempt")
@@ -562,13 +569,14 @@ func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.Subscrip
 			"subscription_episode_sources.file_name",
 			"subscription_episode_sources.cluster_job_id",
 			"subscription_episode_sources.selected_at",
-			"subscription_episode_sources.status",
+			"CASE WHEN subscription_items.id IS NOT NULL THEN subscription_items.status ELSE subscription_episode_sources.status END AS status",
 			"CASE " +
 				"WHEN subscription_episode_sources.cluster_job_id = '' OR subscription_episode_sources.cluster_job_id IS NULL THEN '本机' " +
 				"WHEN assigned_nodes.name IS NOT NULL AND assigned_nodes.name <> '' THEN assigned_nodes.name " +
 				"WHEN attempt_nodes.name IS NOT NULL AND attempt_nodes.name <> '' THEN attempt_nodes.name " +
 				"ELSE '未指派' END AS worker_name",
 		}, ", ")).
+		Joins("LEFT JOIN ? AS subscription_items ON subscription_items.id = subscription_episode_sources.source_item_id AND subscription_items.file_hash = subscription_episode_sources.file_hash", clause.Table{Name: subscriptionItemTable}).
 		Joins("LEFT JOIN ? AS cluster_jobs ON cluster_jobs.id = subscription_episode_sources.cluster_job_id", clause.Table{Name: clusterJobTable}).
 		Joins("LEFT JOIN ? AS assigned_nodes ON assigned_nodes.id = cluster_jobs.assigned_node_id", clause.Table{Name: clusterNodeTable}).
 		Joins(

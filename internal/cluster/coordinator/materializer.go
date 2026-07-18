@@ -252,6 +252,7 @@ func (s *Service) persistArchiveRecord(ctx context.Context, record *model.ETFArc
 
 func (s *Service) completeManifestMaterialization(ctx context.Context, manifestID, jobID, notificationStatus string, now time.Time) error {
 	var completed model.ClusterJob
+	var completedItem model.SubscriptionItem
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&model.ClusterUploadManifest{}).Where("id = ?", manifestID).Updates(map[string]any{
 			"status":      model.ClusterUploadManifestStatusConsumed,
@@ -277,9 +278,25 @@ func (s *Service) completeManifestMaterialization(ctx context.Context, manifestI
 			return err
 		}
 		if completed.SubscriptionItemID != 0 {
+			itemResult := tx.Where("id = ? AND cluster_job_id = ?", completed.SubscriptionItemID, jobID).First(&completedItem)
+			if itemResult.Error != nil && !errors.Is(itemResult.Error, gorm.ErrRecordNotFound) {
+				return itemResult.Error
+			}
+			if itemResult.RowsAffected == 0 {
+				return reconcileParentJobTx(tx, completed.ParentJobID, now)
+			}
+			itemStatus := model.SubscriptionItemStatusTransferred
+			if notificationStatus != model.ClusterNotificationStatusNotRequired && notificationStatus != model.ClusterNotificationStatusSucceeded {
+				itemStatus = model.SubscriptionItemStatusNotifying
+			}
 			if err := tx.Model(&model.SubscriptionItem{}).
 				Where("id = ? AND cluster_job_id = ?", completed.SubscriptionItemID, jobID).
-				Updates(map[string]any{"status": model.SubscriptionItemStatusTransferred, "last_error": ""}).Error; err != nil {
+				Updates(map[string]any{"status": itemStatus, "last_error": ""}).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&model.SubscriptionEpisodeSource{}).
+				Where("source_item_id = ? AND file_hash = ?", completedItem.ID, completedItem.FileHash).
+				Updates(map[string]any{"status": itemStatus, "updated_at": now}).Error; err != nil {
 				return err
 			}
 		}

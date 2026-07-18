@@ -567,7 +567,41 @@ func updateClusterJobNotificationStatus(tx *gorm.DB, raw, status string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	return tx.Model(&model.ClusterJob{}).Where("id IN ?", ids).Update("notification_status", status).Error
+	if err := tx.Model(&model.ClusterJob{}).Where("id IN ?", ids).Update("notification_status", status).Error; err != nil {
+		return err
+	}
+	if status != model.ClusterNotificationStatusSucceeded && status != model.ClusterNotificationStatusFailed {
+		return nil
+	}
+	var jobs []model.ClusterJob
+	if err := tx.Where("id IN ? AND subscription_item_id <> 0", ids).Find(&jobs).Error; err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		var item model.SubscriptionItem
+		result := tx.Where("id = ? AND cluster_job_id = ?", job.SubscriptionItemID, job.ID).First(&item)
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+		itemStatus := model.SubscriptionItemStatusTransferred
+		lastError := ""
+		if status == model.ClusterNotificationStatusFailed {
+			itemStatus = model.SubscriptionItemStatusFailed
+			lastError = "target notification failed"
+		}
+		if err := tx.Model(&model.SubscriptionItem{}).Where("id = ? AND cluster_job_id = ?", item.ID, job.ID).
+			Updates(map[string]any{"status": itemStatus, "last_error": lastError}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.SubscriptionEpisodeSource{}).Where("source_item_id = ? AND file_hash = ?", item.ID, item.FileHash).
+			Updates(map[string]any{"status": itemStatus}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func getMediaRoot(ctx context.Context, id uint) (*model.ETFMediaRoot, error) {

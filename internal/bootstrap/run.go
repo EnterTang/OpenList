@@ -106,6 +106,9 @@ func Start() {
 		subscription.StartScheduler()
 		etfauto.StartWorker()
 	}
+	if clusterReady && clusterRole.RunsCoordinator() {
+		subscription.StartTelegramRealtimeListener()
+	}
 	if !flags.Debug && !flags.Dev {
 		gin.SetMode(gin.ReleaseMode)
 	}

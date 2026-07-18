@@ -3,6 +3,7 @@ package subscription
 import (
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -214,8 +215,26 @@ func mergeTelegramSourceConfig(raw string, defaults model.SubscriptionTelegramSo
 		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 			return raw, errors.WithMessage(err, "invalid telegram source config")
 		}
+		var rawFields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &rawFields); err != nil {
+			return raw, errors.WithMessage(err, "invalid telegram source config")
+		}
 		cfg = normalizeTelegramSourceConfig(cfg)
 		cfg = fillTelegramSourceConfig(cfg, defaults)
+		if _, exists := rawFields["realtime_enabled"]; !exists {
+			cfg.RealtimeEnabled = defaults.RealtimeEnabled
+		}
+		if _, exists := rawFields["realtime_groups"]; !exists {
+			cfg.RealtimeGroups = append([]string(nil), defaults.RealtimeGroups...)
+		}
+		if _, exists := rawFields["realtime_candidate_wait_seconds"]; !exists && defaults.RealtimeCandidateWaitSeconds != nil {
+			wait := *defaults.RealtimeCandidateWaitSeconds
+			cfg.RealtimeCandidateWaitSeconds = &wait
+		}
+		if _, exists := rawFields["realtime_expected_providers"]; !exists {
+			cfg.RealtimeExpectedProviders = append([]string(nil), defaults.RealtimeExpectedProviders...)
+		}
+		cfg = normalizeTelegramSourceConfig(cfg)
 	}
 	if isZeroTelegramSourceConfig(cfg) {
 		return strings.TrimSpace(raw), nil
@@ -267,6 +286,8 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 
 var defaultTransferPriority = []string{"pan123", "pan115", "quark", "aliyun_drive"}
 
+const defaultRealtimeCandidateWaitSeconds = 120
+
 func normalizeTransferPriority(values []string) []string {
 	if len(values) == 0 {
 		return append([]string(nil), defaultTransferPriority...)
@@ -313,6 +334,18 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 	cfg.APIHash = strings.TrimSpace(cfg.APIHash)
 	cfg.SessionFile = strings.TrimSpace(cfg.SessionFile)
 	cfg.Channels = cleanStringList(cfg.Channels, false)
+	cfg.RealtimeGroups = cleanStringList(cfg.RealtimeGroups, false)
+	if cfg.RealtimeCandidateWaitSeconds == nil {
+		wait := defaultRealtimeCandidateWaitSeconds
+		cfg.RealtimeCandidateWaitSeconds = &wait
+	} else if *cfg.RealtimeCandidateWaitSeconds < 0 {
+		zero := 0
+		cfg.RealtimeCandidateWaitSeconds = &zero
+	} else if *cfg.RealtimeCandidateWaitSeconds > 600 {
+		max := 600
+		cfg.RealtimeCandidateWaitSeconds = &max
+	}
+	cfg.RealtimeExpectedProviders = normalizeRealtimeExpectedProviders(cfg.RealtimeExpectedProviders)
 	cfg.Quark.Channels = append(cfg.Quark.Channels, cfg.QuarkChannels...)
 	cfg.AliyunDrive.Channels = append(cfg.AliyunDrive.Channels, cfg.AliyunDriveChannels...)
 	cfg.Pan123.Channels = append(cfg.Pan123.Channels, cfg.Pan123Channels...)
@@ -339,6 +372,40 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 	}
 	cfg.TransferPriority = normalizeTransferPriority(cfg.TransferPriority)
 	return cfg
+}
+
+func normalizeRealtimeExpectedProviders(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		provider := normalizeTransferPriorityName(value)
+		if provider == "" {
+			continue
+		}
+		if _, exists := seen[provider]; exists {
+			continue
+		}
+		seen[provider] = struct{}{}
+		normalized = append(normalized, provider)
+	}
+	return normalized
+}
+
+func realtimeCandidateWait(cfg model.SubscriptionTelegramSourceConfig) time.Duration {
+	seconds := defaultRealtimeCandidateWaitSeconds
+	if cfg.RealtimeCandidateWaitSeconds != nil {
+		seconds = *cfg.RealtimeCandidateWaitSeconds
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	if seconds > 600 {
+		seconds = 600
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func isZeroTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) bool {

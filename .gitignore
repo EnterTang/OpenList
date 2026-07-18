@@ -41,3 +41,4 @@ output/
 
 # Local agent brainstorm / companion sessions
 .superpowers/
+.gstack/
