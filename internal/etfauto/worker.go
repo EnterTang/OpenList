@@ -9,8 +9,9 @@ import (
 )
 
 type ProcessResult struct {
-	ClosedBatches int `json:"closed_batches"`
-	ProcessedJobs int `json:"processed_jobs"`
+	ClosedBatches     int `json:"closed_batches"`
+	ReconciledUnknown int `json:"reconciled_unknown"`
+	ProcessedJobs     int `json:"processed_jobs"`
 }
 
 var workerState struct {
@@ -24,11 +25,15 @@ func ProcessOnce(ctx context.Context, opts RunnerOptions) (*ProcessResult, error
 	if err != nil {
 		return nil, err
 	}
+	reconciled, err := ReconcileUnknownJobs(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 	processed, err := RunPendingJobs(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	return &ProcessResult{ClosedBatches: closed, ProcessedJobs: processed}, nil
+	return &ProcessResult{ClosedBatches: closed, ReconciledUnknown: reconciled, ProcessedJobs: processed}, nil
 }
 
 func StartWorker() {

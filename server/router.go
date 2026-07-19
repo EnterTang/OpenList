@@ -110,6 +110,8 @@ func Init(e *gin.Engine) {
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))
 	_sharing(auth.Group("/share", middlewares.AuthNotGuest))
+	externalSubscriptions(api.Group("/subscriptions", middlewares.ExternalSubscriptionAuth))
+	externalSubscriptions(api.Group("/v1/subscriptions", middlewares.ExternalSubscriptionAuth))
 	admin(auth.Group("/admin", middlewares.AuthAdmin))
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
@@ -117,6 +119,16 @@ func Init(e *gin.Engine) {
 	static.Static(g, func(handlers ...gin.HandlerFunc) {
 		e.NoRoute(handlers...)
 	})
+}
+
+func externalSubscriptions(g *gin.RouterGroup) {
+	g.POST("", handles.ExternalCreateSubscription)
+	g.POST("/manual", handles.ExternalCreateSubscription)
+	g.GET("", handles.ExternalGetSubscription)
+	g.GET("/lookup", handles.ExternalLookupSubscription)
+	g.GET("/:id", handles.ExternalGetSubscription)
+	g.POST("/:id/check", handles.ExternalCheckSubscription)
+	g.POST("/:id/update", handles.ExternalUpdateSubscription)
 }
 
 func admin(g *gin.RouterGroup) {

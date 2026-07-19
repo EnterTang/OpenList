@@ -32,6 +32,9 @@ Options:
 Environment:
   FRONTEND_DIR            Same as --frontend-dir.
   FRONTEND_VERSION        Override embedded frontend version metadata.
+  EMBEDDED_REDIS_CACHE_DIR
+                          Persistent cache for verified Redis downloads.
+                          Defaults to ~/.cache/openlist/embedded-redis.
   GITHUB_TOKEN            Optional, only needed when downloading frontend i18n.
 
 The Windows artifact embeds Redis from pinned upstream packages and requires
@@ -39,7 +42,6 @@ network access to:
   - github.com
   - raw.githubusercontent.com
   - repo.msys2.org
-  - www.gnu.org
 
 Output:
   build/compress/openlist-windows-amd64.zip          (--target windows-amd64, amd64, or all)
@@ -263,6 +265,9 @@ run_backend_build() {
     verify_embedded_redis_generated_dir "$EMBEDDED_REDIS_OUTPUT" || return 1
   fi
 }
+
+EMBEDDED_REDIS_CACHE_DIR="${EMBEDDED_REDIS_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-$BACKEND_DIR}/.cache}/openlist/embedded-redis}"
+export EMBEDDED_REDIS_CACHE_DIR
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0

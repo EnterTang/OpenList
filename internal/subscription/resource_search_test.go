@@ -19,6 +19,31 @@ func TestNormalizeResourceSearchSources(t *testing.T) {
 	}
 }
 
+func TestResourceSearchSourceCapabilitiesExposeMissingPanSouConfiguration(t *testing.T) {
+	capabilities := ResourceSearchSourceCapabilities(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			APIID:    12345,
+			APIHash:  "configured",
+			Channels: []string{"@channel"},
+		},
+	})
+	if !capabilities[model.SubscriptionSourceTelegram].Available {
+		t.Fatalf("telegram capability = %#v, want available", capabilities[model.SubscriptionSourceTelegram])
+	}
+	panSou := capabilities[model.SubscriptionSourcePanSou]
+	if panSou.Configured || panSou.Available || panSou.UnavailableReason != "not_configured" {
+		t.Fatalf("pansou capability = %#v, want explicit unavailable status", panSou)
+	}
+
+	capabilities = ResourceSearchSourceCapabilities(model.SubscriptionConfig{
+		PanSou: model.SubscriptionPanSouSourceConfig{BaseURL: " https://pansou.example "},
+	})
+	panSou = capabilities[model.SubscriptionSourcePanSou]
+	if !panSou.Configured || !panSou.Available || panSou.UnavailableReason != "" {
+		t.Fatalf("configured pansou capability = %#v", panSou)
+	}
+}
+
 func TestParseResourceSearchOutputExtractsLinks(t *testing.T) {
 	body, err := json.Marshal(map[string]any{
 		"data": []map[string]any{

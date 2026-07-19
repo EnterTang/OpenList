@@ -286,6 +286,72 @@ func TestRunPendingJobsMarksUncertainDeliveryUnknown(t *testing.T) {
 	}
 }
 
+func TestProcessOnceReconcilesUnknownCreateByLookupWithoutAnotherPost(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	var lookupRequests, createRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/subscriptions/lookup":
+			lookupRequests++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"exists": true, "subscription_id": 27, "task_id": "task-observed", "status": "completed",
+			})
+		case r.Method == http.MethodPost:
+			createRequests++
+			http.Error(w, "duplicate create must not be attempted", http.StatusConflict)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	root := model.ETFMediaRoot{
+		RootKey: "unknown-lookup-root", MediaType: "tv", TMDBID: 308874,
+		Status: model.ETFMediaRootStatusCollecting, TargetBaseURL: server.URL + "/api/v1", TargetAPIToken: "token",
+	}
+	if err := db.GetDb().Create(&root).Error; err != nil {
+		t.Fatal(err)
+	}
+	clusterJob := model.ClusterJob{ID: "cluster-unknown-lookup", IdempotencyKey: "cluster-unknown-lookup", NotificationStatus: model.ClusterNotificationStatusUnknown}
+	if err := db.GetDb().Create(&clusterJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := model.ETFSubscriptionJob{
+		JobKey: "notification-unknown-lookup", MediaRootID: root.ID, Type: model.ETFSubscriptionJobTypeCreate,
+		Status: model.ETFSubscriptionJobStatusUnknown, TargetBaseURL: root.TargetBaseURL, TargetAPIToken: root.TargetAPIToken,
+		Fingerprint: "fingerprint-observed", ClusterJobIDsJSON: `["cluster-unknown-lookup"]`,
+	}
+	if err := db.GetDb().Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := ProcessOnce(ctx, RunnerOptions{HTTPClient: server.Client(), Timeout: time.Second, Now: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ReconciledUnknown != 1 || result.ProcessedJobs != 0 || lookupRequests != 1 || createRequests != 0 {
+		t.Fatalf("result=%#v lookup=%d create=%d", result, lookupRequests, createRequests)
+	}
+	if err := db.GetDb().First(&job, job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ETFSubscriptionJobStatusSucceeded || job.TargetSubscriptionID != 27 {
+		t.Fatalf("reconciled job = %#v", job)
+	}
+	if err := db.GetDb().First(&root, root.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if root.TargetSubscriptionID != 27 || root.LastCreateTaskID != "task-observed" {
+		t.Fatalf("reconciled root = %#v", root)
+	}
+	if err := db.GetDb().First(&clusterJob, "id = ?", clusterJob.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if clusterJob.NotificationStatus != model.ClusterNotificationStatusSucceeded {
+		t.Fatalf("cluster notification = %q", clusterJob.NotificationStatus)
+	}
+}
+
 func TestUncertainDeliveryRetriesWhenTargetDeclaresIdempotency(t *testing.T) {
 	setupETFSubscriptionDB(t)
 	ctx := context.Background()

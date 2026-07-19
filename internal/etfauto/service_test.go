@@ -3,6 +3,7 @@ package etfauto
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -271,6 +272,268 @@ func TestCloseContentChangedBatchQueuesOneManualCheckJob(t *testing.T) {
 	}
 	if len(jobs) != 1 {
 		t.Fatalf("manual check job count after repeated close = %d, want 1", len(jobs))
+	}
+}
+
+func TestCloseNoChangeBatchCompletesLinkedNotification(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	cfg := Config{Enabled: true, TargetBaseURL: "http://localhost:8080/api/v1", QuietWindow: time.Second, SharePeriodUnit: 1, ShareType: "etf"}
+	for _, id := range []string{"cluster-no-change-initial", "cluster-no-change-repeat"} {
+		if err := db.GetDb().Create(&model.ClusterJob{ID: id, IdempotencyKey: id, NotificationStatus: model.ClusterNotificationStatusPending}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record: archivedETFRecord(1, strings.Repeat("a", 64)), ClusterJobID: "cluster-no-change-initial",
+		MediaRootFileID: "folder-media-root", MediaRootPath: "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		MediaRootCreated: true, OccurredAt: now,
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CloseDueBatches(ctx, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	createJobs, err := ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeCreate})
+	if err != nil || len(createJobs) != 1 {
+		t.Fatalf("create jobs=%#v err=%v", createJobs, err)
+	}
+	if err := MarkCreateSubscriptionSucceeded(ctx, createJobs[0].ID, CreateSubscriptionResult{
+		SubscriptionID: 77, Fingerprint: createJobs[0].Fingerprint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record: archivedETFRecord(1, strings.Repeat("a", 64)), ClusterJobID: "cluster-no-change-repeat",
+		MediaRootFileID: "folder-media-root", MediaRootPath: "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		OccurredAt: now.Add(3 * time.Second),
+	}, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CloseDueBatches(ctx, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	checks, err := ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeManualCheck})
+	if err != nil || len(checks) != 0 {
+		t.Fatalf("manual checks=%#v err=%v", checks, err)
+	}
+	var clusterJob model.ClusterJob
+	if err := db.GetDb().First(&clusterJob, "id = ?", "cluster-no-change-repeat").Error; err != nil {
+		t.Fatal(err)
+	}
+	if clusterJob.NotificationStatus != model.ClusterNotificationStatusSucceeded {
+		t.Fatalf("no-change notification=%q", clusterJob.NotificationStatus)
+	}
+	root, err := getMediaRoot(ctx, batch.MediaRootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Status != model.ETFMediaRootStatusSubscribed || root.PendingChangeCount != 0 {
+		t.Fatalf("no-change root=%#v", root)
+	}
+}
+
+func TestReconcileNoChangeBatchNotificationsRepairsHistoricalPending(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	root := &model.ETFMediaRoot{
+		RootKey: "historical-no-change", TargetSubscriptionID: 65,
+		CurrentFingerprint: "same", LastNotifiedFingerprint: "same",
+		PendingChangeCount: 1, Status: model.ETFMediaRootStatusDirty,
+	}
+	if err := db.GetDb().Create(root).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := &model.ClusterJob{ID: "historical-no-change-job", IdempotencyKey: "historical-no-change-job", NotificationStatus: model.ClusterNotificationStatusPending}
+	if err := db.GetDb().Create(job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().Create(&model.ETFSubscriptionJob{
+		JobKey: "historical-no-change-succeeded", MediaRootID: root.ID,
+		Type: model.ETFSubscriptionJobTypeManualCheck, Status: model.ETFSubscriptionJobStatusSucceeded,
+		TargetSubscriptionID: root.TargetSubscriptionID, Fingerprint: "same",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().Create(&model.ETFMediaRootBatch{
+		BatchKey: "historical-no-change-batch", MediaRootID: root.ID, Status: model.ETFMediaRootBatchStatusClosed,
+		ETFCount: 1, FingerprintAfterBatch: "same", ClusterJobIDsJSON: `["historical-no-change-job"]`,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	completed, err := ReconcileNoChangeBatchNotifications(ctx)
+	if err != nil || completed != 1 {
+		t.Fatalf("completed=%d err=%v", completed, err)
+	}
+	if err := db.GetDb().First(job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().First(root, root.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.NotificationStatus != model.ClusterNotificationStatusSucceeded || root.PendingChangeCount != 0 || root.Status != model.ETFMediaRootStatusSubscribed {
+		t.Fatalf("job=%#v root=%#v", job, root)
+	}
+	completed, err = ReconcileNoChangeBatchNotifications(ctx)
+	if err != nil || completed != 0 {
+		t.Fatalf("second completed=%d err=%v", completed, err)
+	}
+}
+
+func TestReconcileNoChangeBatchNotificationsUsesSucceededBatchCoverage(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	root := &model.ETFMediaRoot{RootKey: "covered-root", TargetSubscriptionID: 65, CurrentFingerprint: "latest", LastNotifiedFingerprint: "latest", Status: model.ETFMediaRootStatusSubscribed}
+	if err := db.GetDb().Create(root).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := &model.ClusterJob{ID: "covered-intermediate-job", IdempotencyKey: "covered-intermediate-job", NotificationStatus: model.ClusterNotificationStatusPending}
+	if err := db.GetDb().Create(job).Error; err != nil {
+		t.Fatal(err)
+	}
+	batch := &model.ETFMediaRootBatch{BatchKey: "covered-intermediate-batch", MediaRootID: root.ID, Status: model.ETFMediaRootBatchStatusClosed, ETFCount: 1, FingerprintAfterBatch: "intermediate", ClusterJobIDsJSON: `["covered-intermediate-job"]`}
+	if err := db.GetDb().Create(batch).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().Create(&model.ETFSubscriptionJob{JobKey: "covered-latest-check", MediaRootID: root.ID, BatchID: batch.ID + 1, Type: model.ETFSubscriptionJobTypeManualCheck, Status: model.ETFSubscriptionJobStatusSucceeded, Fingerprint: "latest"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	completed, err := ReconcileNoChangeBatchNotifications(ctx)
+	if err != nil || completed != 1 {
+		t.Fatalf("completed=%d err=%v", completed, err)
+	}
+	if err := db.GetDb().First(job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.NotificationStatus != model.ClusterNotificationStatusSucceeded {
+		t.Fatalf("covered notification=%q", job.NotificationStatus)
+	}
+}
+
+func TestQueueOrphanBatchNotificationsCreatesCatchUpJob(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	root := &model.ETFMediaRoot{RootKey: "orphan-root", CurrentFingerprint: "current", PendingChangeCount: 1, Status: model.ETFMediaRootStatusDirty, TargetBaseURL: "https://target.example/api/v1", TargetSupportsIdempotency: true}
+	if err := db.GetDb().Create(root).Error; err != nil {
+		t.Fatal(err)
+	}
+	clusterJob := &model.ClusterJob{ID: "orphan-cluster-job", IdempotencyKey: "orphan-cluster-job", Status: model.ClusterJobStatusSucceeded, NotificationStatus: model.ClusterNotificationStatusPending}
+	if err := db.GetDb().Create(clusterJob).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().Create(&model.ETFMediaRootBatch{BatchKey: "orphan-batch", MediaRootID: root.ID, Status: model.ETFMediaRootBatchStatusClosed, ETFCount: 1, FingerprintAfterBatch: "current", ClusterJobIDsJSON: `["orphan-cluster-job"]`}).Error; err != nil {
+		t.Fatal(err)
+	}
+	queued, linked, err := QueueOrphanBatchNotifications(ctx)
+	if err != nil || queued != 1 || linked != 1 {
+		t.Fatalf("queued=%d linked=%d err=%v", queued, linked, err)
+	}
+	var job model.ETFSubscriptionJob
+	if err := db.GetDb().Where("media_root_id = ?", root.ID).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Type != model.ETFSubscriptionJobTypeCreate || job.Status != model.ETFSubscriptionJobStatusPending || job.ClusterJobIDsJSON != `["orphan-cluster-job"]` {
+		t.Fatalf("orphan catch-up=%#v", job)
+	}
+}
+
+func TestLateCreateSuccessPreservesNewFingerprintAndQueuesCatchUp(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	cfg := Config{
+		Enabled: true, TargetBaseURL: "http://localhost:8080/api/v1", TargetAPIToken: "target-token",
+		QuietWindow: time.Second, SharePeriodUnit: 1, ShareType: "etf",
+	}
+	for _, clusterID := range []string{"cluster-initial", "cluster-later", "cluster-later-repeat"} {
+		if err := db.GetDb().Create(&model.ClusterJob{
+			ID: clusterID, IdempotencyKey: clusterID, NotificationStatus: model.ClusterNotificationStatusPending,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	initialBatch, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record:       archivedETFRecord(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		ClusterJobID: "cluster-initial", MediaRootFileID: "folder-media-root",
+		MediaRootPath:    "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		MediaRootCreated: true, OccurredAt: now,
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CloseDueBatches(ctx, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	createJobs, err := ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeCreate})
+	if err != nil || len(createJobs) != 1 {
+		t.Fatalf("create jobs=%#v err=%v", createJobs, err)
+	}
+	initialFingerprint := createJobs[0].Fingerprint
+
+	if _, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record:       archivedETFRecord(2, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		ClusterJobID: "cluster-later", MediaRootFileID: "folder-media-root",
+		MediaRootPath: "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		OccurredAt:    now.Add(3 * time.Second),
+	}, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CloseDueBatches(ctx, now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	changedFingerprint, err := ComputeMediaRootFingerprint(ctx, initialBatch.MediaRootID)
+	if err != nil || changedFingerprint == initialFingerprint {
+		t.Fatalf("changed fingerprint=%q initial=%q err=%v", changedFingerprint, initialFingerprint, err)
+	}
+	if err := MarkCreateSubscriptionSucceeded(ctx, createJobs[0].ID, CreateSubscriptionResult{
+		SubscriptionID: 77, TaskID: "task-create", Fingerprint: initialFingerprint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := getMediaRoot(ctx, initialBatch.MediaRootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.CurrentFingerprint != changedFingerprint || root.LastNotifiedFingerprint != initialFingerprint || root.Status != model.ETFMediaRootStatusDirty || root.TargetSubscriptionID != 77 {
+		t.Fatalf("root after late create = %#v", root)
+	}
+	checks, err := ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeManualCheck})
+	if err != nil || len(checks) != 1 {
+		t.Fatalf("catch-up jobs=%#v err=%v", checks, err)
+	}
+	if checks[0].Fingerprint != changedFingerprint || checks[0].TargetSubscriptionID != 77 || checks[0].ClusterJobIDsJSON != `["cluster-later"]` {
+		t.Fatalf("catch-up job = %#v", checks[0])
+	}
+
+	if _, err := RecordArchiveEvent(ctx, ArchiveEvent{
+		Record:       archivedETFRecord(2, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		ClusterJobID: "cluster-later-repeat", MediaRootFileID: "folder-media-root",
+		MediaRootPath: "/139_60t/ETF管理/tv/国产剧/婚姻攻略 (2024) {tmdb-260868}",
+		OccurredAt:    now.Add(6 * time.Second),
+	}, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CloseDueBatches(ctx, now.Add(8*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	checks, err = ListJobs(ctx, JobFilter{Type: model.ETFSubscriptionJobTypeManualCheck})
+	if err != nil || len(checks) != 1 {
+		t.Fatalf("merged catch-up jobs=%#v err=%v", checks, err)
+	}
+	if checks[0].ClusterJobIDsJSON != `["cluster-later","cluster-later-repeat"]` {
+		t.Fatalf("merged cluster ids = %s", checks[0].ClusterJobIDsJSON)
+	}
+	var initialCluster, laterCluster model.ClusterJob
+	if err := db.GetDb().First(&initialCluster, "id = ?", "cluster-initial").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().First(&laterCluster, "id = ?", "cluster-later").Error; err != nil {
+		t.Fatal(err)
+	}
+	if initialCluster.NotificationStatus != model.ClusterNotificationStatusSucceeded || laterCluster.NotificationStatus != model.ClusterNotificationStatusPending {
+		t.Fatalf("notification statuses initial=%q later=%q", initialCluster.NotificationStatus, laterCluster.NotificationStatus)
 	}
 }
 

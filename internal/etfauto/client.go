@@ -38,6 +38,15 @@ type TargetTaskResult struct {
 	RawJSON        string `json:"raw_json"`
 }
 
+type TargetLookupResult struct {
+	Exists         bool
+	SubscriptionID int64
+	TaskID         string
+	TaskStatus     string
+	Status         string
+	RawJSON        string
+}
+
 type DeliveryUncertainError struct{ Err error }
 
 func (e *DeliveryUncertainError) Error() string {
@@ -123,6 +132,46 @@ func (c *TargetClient) CheckSubscription(ctx context.Context, subscriptionID int
 		return nil, err
 	}
 	return parseTargetTaskResult(raw)
+}
+
+func (c *TargetClient) LookupSubscription(ctx context.Context, mediaType string, tmdbID int64) (*TargetLookupResult, error) {
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType != "tv" && mediaType != "movie" {
+		return nil, fmt.Errorf("media type must be tv or movie")
+	}
+	if tmdbID <= 0 {
+		return nil, fmt.Errorf("tmdb id is required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("/subscriptions/lookup"), nil)
+	if err != nil {
+		return nil, err
+	}
+	query := req.URL.Query()
+	query.Set("media_type", mediaType)
+	query.Set("tmdb_id", strconv.FormatInt(tmdbID, 10))
+	req.URL.RawQuery = query.Encode()
+	raw, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	var decoded struct {
+		Exists         bool   `json:"exists"`
+		SubscriptionID int64  `json:"subscription_id"`
+		TaskID         string `json:"task_id"`
+		TaskStatus     string `json:"task_status"`
+		Status         string `json:"status"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, err
+	}
+	if decoded.Exists && decoded.SubscriptionID <= 0 {
+		return nil, fmt.Errorf("target lookup returned an existing subscription without an id: %s", string(raw))
+	}
+	return &TargetLookupResult{
+		Exists: decoded.Exists, SubscriptionID: decoded.SubscriptionID,
+		TaskID: decoded.TaskID, TaskStatus: decoded.TaskStatus, Status: decoded.Status,
+		RawJSON: string(raw),
+	}, nil
 }
 
 func setIdempotencyKey(req *http.Request, values []string) {

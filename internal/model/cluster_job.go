@@ -53,6 +53,7 @@ const (
 	ClusterNotificationStatusSucceeded   = "succeeded"
 	ClusterNotificationStatusUnknown     = "unknown"
 	ClusterNotificationStatusFailed      = "failed"
+	ClusterNotificationStatusNotStarted  = "not_started"
 	ClusterNotificationStatusNotRequired = "not_required"
 
 	ClusterCleanupStatusPending   = "pending"
@@ -84,37 +85,38 @@ const (
 // ClusterJob is the durable coordinator-side business task. TaskContextJSON is
 // an immutable snapshot whose hash is copied into every worker result.
 type ClusterJob struct {
-	ID                       string     `json:"id" gorm:"primaryKey;size:64"`
-	CreatedAt                time.Time  `json:"created_at"`
-	UpdatedAt                time.Time  `json:"updated_at"`
-	ParentJobID              string     `json:"parent_job_id" gorm:"size:64;index"`
-	Type                     string     `json:"type" gorm:"size:64;index"`
-	Status                   string     `json:"status" gorm:"size:32;index"`
-	NotificationStatus       string     `json:"notification_status" gorm:"size:32;index"`
-	WorkerCleanupStatus      string     `json:"worker_cleanup_status" gorm:"size:32;index"`
-	ResultDeliveryStatus     string     `json:"result_delivery_status" gorm:"size:32;index"`
-	IdempotencyKey           string     `json:"idempotency_key" gorm:"size:255;uniqueIndex"`
-	WorkflowVersion          string     `json:"workflow_version" gorm:"size:64"`
-	Priority                 int        `json:"priority" gorm:"index"`
-	SubscriptionID           uint       `json:"subscription_id" gorm:"index"`
-	SubscriptionItemID       uint       `json:"subscription_item_id" gorm:"index"`
-	MediaItemID              string     `json:"media_item_id" gorm:"size:128;index"`
-	SourceProvider           string     `json:"source_provider" gorm:"size:64;index"`
-	SourceURL                string     `json:"source_url" gorm:"type:text"`
-	TaskContextJSON          string     `json:"task_context_json" gorm:"type:text"`
-	TaskContextHash          string     `json:"task_context_hash" gorm:"size:64;index"`
-	RequiredCapabilitiesJSON string     `json:"required_capabilities_json" gorm:"type:text"`
-	ExpectedBytes            int64      `json:"expected_bytes"`
-	ExpectedItems            int        `json:"expected_items"`
-	AssignedNodeID           string     `json:"assigned_node_id" gorm:"size:64;index"`
-	CurrentAttemptID         string     `json:"current_attempt_id" gorm:"size:64;index"`
-	CurrentGeneration        uint64     `json:"current_generation"`
-	AvailableAt              time.Time  `json:"available_at" gorm:"index"`
-	StartedAt                *time.Time `json:"started_at"`
-	FinishedAt               *time.Time `json:"finished_at"`
-	ArchivedAt               *time.Time `json:"archived_at" gorm:"index"`
-	LastErrorCode            string     `json:"last_error_code" gorm:"size:128"`
-	LastError                string     `json:"last_error" gorm:"type:text"`
+	ID                       string            `json:"id" gorm:"primaryKey;size:64"`
+	CreatedAt                time.Time         `json:"created_at"`
+	UpdatedAt                time.Time         `json:"updated_at"`
+	ParentJobID              string            `json:"parent_job_id" gorm:"size:64;index"`
+	Type                     string            `json:"type" gorm:"size:64;index"`
+	Status                   string            `json:"status" gorm:"size:32;index"`
+	NotificationStatus       string            `json:"notification_status" gorm:"size:32;index"`
+	WorkerCleanupStatus      string            `json:"worker_cleanup_status" gorm:"size:32;index"`
+	ResultDeliveryStatus     string            `json:"result_delivery_status" gorm:"size:32;index"`
+	IdempotencyKey           string            `json:"idempotency_key" gorm:"size:255;uniqueIndex"`
+	WorkflowVersion          string            `json:"workflow_version" gorm:"size:64"`
+	Priority                 int               `json:"priority" gorm:"index"`
+	SubscriptionID           uint              `json:"subscription_id" gorm:"index"`
+	SubscriptionItemID       uint              `json:"subscription_item_id" gorm:"index"`
+	MediaItemID              string            `json:"media_item_id" gorm:"size:128;index"`
+	SourceProvider           string            `json:"source_provider" gorm:"size:64;index"`
+	SourceURL                string            `json:"source_url" gorm:"type:text"`
+	TaskContextJSON          string            `json:"task_context_json" gorm:"type:text"`
+	TaskContextHash          string            `json:"task_context_hash" gorm:"size:64;index"`
+	RequiredCapabilitiesJSON string            `json:"required_capabilities_json" gorm:"type:text"`
+	ExpectedBytes            int64             `json:"expected_bytes"`
+	ExpectedItems            int               `json:"expected_items"`
+	AssignedNodeID           string            `json:"assigned_node_id" gorm:"size:64;index"`
+	CurrentAttemptID         string            `json:"current_attempt_id" gorm:"size:64;index"`
+	CurrentGeneration        uint64            `json:"current_generation"`
+	AvailableAt              time.Time         `json:"available_at" gorm:"index"`
+	StartedAt                *time.Time        `json:"started_at"`
+	FinishedAt               *time.Time        `json:"finished_at"`
+	ArchivedAt               *time.Time        `json:"archived_at" gorm:"index"`
+	LastErrorCode            string            `json:"last_error_code" gorm:"size:128"`
+	LastError                string            `json:"last_error" gorm:"type:text"`
+	Stages                   []ClusterJobStage `json:"stages,omitempty" gorm:"-"`
 }
 
 // ClusterJobAttempt represents one leased execution of a job. Generation is a

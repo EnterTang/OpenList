@@ -250,6 +250,169 @@ func TestJobAcceptAndResultRequireCurrentLease(t *testing.T) {
 	}
 }
 
+func TestFailedMediaResultConvergesNotificationAndActiveStages(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, contextHash, model.ClusterAttemptStatusRunning)
+	job.SubscriptionItemID = 0
+	job.NotificationStatus = model.ClusterNotificationStatusPending
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	stage := &model.ClusterJobStage{
+		ID: "upload-permitted", JobID: job.ID, AttemptID: attempt.ID,
+		Name: model.ClusterStageUploadingMobile, Status: model.ClusterStageStatusPermitted,
+	}
+	if err := database.Create(stage).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, _ := protocol.NewEnvelope(protocol.MessageJobResult, protocol.JobResult{
+		AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: 1, LeaseToken: "lease"},
+		Status:     "failed", ErrorCode: "unexpected_eof", Error: "unexpected EOF", FinishedAt: time.Now().UTC(),
+	})
+	result.Seq = 1
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *result); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusFailed || job.NotificationStatus != model.ClusterNotificationStatusNotStarted {
+		t.Fatalf("job terminal state = %#v", job)
+	}
+	if err := database.First(stage, "id = ?", stage.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusFailed || stage.ErrorCode != "unexpected_eof" || stage.Error != "unexpected EOF" || stage.FinishedAt == nil {
+		t.Fatalf("stage terminal state = %#v", stage)
+	}
+}
+
+func TestRetryableMediaResultQueuesAnotherAttempt(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, contextHash, model.ClusterAttemptStatusRunning)
+	job.SubscriptionItemID = 0
+	job.NotificationStatus = model.ClusterNotificationStatusPending
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	stage := &model.ClusterJobStage{
+		ID: "upload-short-read", JobID: job.ID, AttemptID: attempt.ID,
+		Name: model.ClusterStageUploadingMobile, Status: model.ClusterStageStatusRunning,
+	}
+	if err := database.Create(stage).Error; err != nil {
+		t.Fatal(err)
+	}
+	finishedAt := time.Now().UTC()
+	result, _ := protocol.NewEnvelope(protocol.MessageJobResult, protocol.JobResult{
+		AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: 1, LeaseToken: "lease"},
+		Status:     "failed", ErrorCode: "source_unexpected_eof", Error: "source stream ended early", FinishedAt: finishedAt,
+	})
+	result.Seq = 1
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *result); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusQueued || job.AssignedNodeID != "" || job.CurrentAttemptID != "" || job.FinishedAt != nil {
+		t.Fatalf("retryable job = %#v", job)
+	}
+	if !job.AvailableAt.Equal(finishedAt.Add(15 * time.Second)) {
+		t.Fatalf("available at = %v, want %v", job.AvailableAt, finishedAt.Add(15*time.Second))
+	}
+	if job.NotificationStatus != model.ClusterNotificationStatusNotStarted {
+		t.Fatalf("notification status = %q, want not_started", job.NotificationStatus)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != model.ClusterAttemptStatusFailed {
+		t.Fatalf("attempt status = %q, want failed", attempt.Status)
+	}
+}
+
+func TestRetryableMediaResultStopsAfterAttemptLimit(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, contextHash, model.ClusterAttemptStatusRunning)
+	job.SubscriptionItemID = 0
+	job.CurrentGeneration = automaticMediaTransferAttemptLimit
+	attempt.Generation = automaticMediaTransferAttemptLimit
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, _ := protocol.NewEnvelope(protocol.MessageJobResult, protocol.JobResult{
+		AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: automaticMediaTransferAttemptLimit, LeaseToken: "lease"},
+		Status:     "failed", ErrorCode: "source_unexpected_eof", Error: "source stream ended early", FinishedAt: time.Now().UTC(),
+	})
+	result.Seq = 1
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *result); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusFailed || job.FinishedAt == nil {
+		t.Fatalf("exhausted retry job = %#v", job)
+	}
+}
+
+func TestDuplicateMediaResultDoesNotRegressMaterializedJob(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, contextHash, model.ClusterAttemptStatusSucceeded)
+	job.Status = model.ClusterJobStatusSucceeded
+	job.SubscriptionItemID = 0
+	attempt.ResultHash = "result-already-delivered"
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, _ := protocol.NewEnvelope(protocol.MessageJobResult, protocol.JobResult{
+		AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: 1, LeaseToken: "lease"},
+		Status:     "succeeded", ResultHash: attempt.ResultHash, FinishedAt: time.Now().UTC(),
+	})
+	result.Seq = 1
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *result); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusSucceeded {
+		t.Fatalf("duplicate result regressed job to %q", job.Status)
+	}
+}
+
 func TestShareInspectResultIsSealedBeforeJobSucceeds(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	task := protocol.TaskContext{
@@ -572,9 +735,13 @@ func TestStageStatusUpdatesCurrentAttemptAndRejectsStaleAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	message, err := protocol.NewEnvelope(protocol.MessageStageStatus, protocol.StageStatusUpdate{AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: attempt.Generation, LeaseToken: "lease"}, Stage: model.ClusterStageSavingShare, Status: model.ClusterStageStatusSucceeded})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	message.Seq = 2
-	if err := service.HandleMessage(context.Background(), &testPeer{}, *message); err != nil { t.Fatal(err) }
+	if err := service.HandleMessage(context.Background(), &testPeer{}, *message); err != nil {
+		t.Fatal(err)
+	}
 	if err := database.First(&stage, "id = ?", stage.ID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -613,6 +780,43 @@ func TestArchiveAndRetryFailedJobs(t *testing.T) {
 	}
 	if job.Status != model.ClusterJobStatusQueued || job.ArchivedAt != nil || job.CurrentAttemptID != "" {
 		t.Fatalf("retried job=%#v", job)
+	}
+}
+
+func TestListJobsIncludesStageProgress(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	job := model.ClusterJob{
+		ID:               "job-with-stages",
+		IdempotencyKey:   "job-with-stages",
+		Status:           model.ClusterJobStatusRunning,
+		CurrentAttemptID: "attempt-1",
+	}
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	stages := []model.ClusterJobStage{
+		{ID: "stage-old-attempt", JobID: job.ID, AttemptID: "attempt-old", Name: model.ClusterStageSavingShare, Status: model.ClusterStageStatusFailed},
+		{ID: "stage-download", JobID: job.ID, AttemptID: "attempt-1", Name: model.ClusterStageDownloading, Status: model.ClusterStageStatusSucceeded},
+		{ID: "stage-upload", JobID: job.ID, AttemptID: "attempt-1", Name: model.ClusterStageUploadingMobile, Status: model.ClusterStageStatusRunning, RetryCount: 1},
+	}
+	for i := range stages {
+		if err := database.Create(&stages[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	jobs, err := New(database, "token").ListJobs(context.Background(), model.ClusterJobStatusRunning, false, 10)
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if len(jobs) != 1 || len(jobs[0].Stages) != 2 {
+		t.Fatalf("jobs with stages = %#v", jobs)
+	}
+	if jobs[0].Stages[0].Name != model.ClusterStageDownloading || jobs[0].Stages[0].Status != model.ClusterStageStatusSucceeded {
+		t.Fatalf("first stage = %#v", jobs[0].Stages[0])
+	}
+	if jobs[0].Stages[1].Name != model.ClusterStageUploadingMobile || jobs[0].Stages[1].Status != model.ClusterStageStatusRunning || jobs[0].Stages[1].RetryCount != 1 {
+		t.Fatalf("second stage = %#v", jobs[0].Stages[1])
 	}
 }
 
@@ -752,38 +956,65 @@ func TestListNodesHidesStaleOfflineByDefaultAndShowsTimedOutNodeOffline(t *testi
 	}
 }
 
-func TestDeleteStaleNodeRemovesNodeOwnedMetadataButPreservesJobs(t *testing.T) {
+func TestDeleteNodeRemovesNodeOwnedMetadataButPreservesHistory(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	service := New(database, "secret")
 	now := time.Unix(1721113000, 0).UTC()
-	staleHeartbeat := now.Add(-8 * 24 * time.Hour)
-	if err := database.Create(&model.ClusterNode{ID: "stale-delete", Status: model.ClusterNodeStatusOffline, LastHeartbeatAt: &staleHeartbeat}).Error; err != nil {
+	offlineHeartbeat := now.Add(-time.Hour)
+	if err := database.Create(&model.ClusterNode{ID: "offline-delete", Status: model.ClusterNodeStatusOffline, LastHeartbeatAt: &offlineHeartbeat}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Create(&model.ClusterNodeSession{ID: "session-delete", NodeID: "stale-delete", Status: model.ClusterSessionStatusDisconnected}).Error; err != nil {
+	if err := database.Create(&model.ClusterNodeSession{ID: "session-delete", NodeID: "offline-delete", Status: model.ClusterSessionStatusDisconnected}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Create(&model.ClusterNodeInventory{ID: "inventory-delete", NodeID: "stale-delete", Revision: 1, CollectedAt: staleHeartbeat}).Error; err != nil {
+	if err := database.Create(&model.ClusterNodeInventory{ID: "inventory-delete", NodeID: "offline-delete", Revision: 1, CollectedAt: offlineHeartbeat}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Create(&model.ClusterNodeDesiredConfig{NodeID: "stale-delete", Status: model.ClusterDesiredStatusApplied}).Error; err != nil {
+	if err := database.Create(&model.ClusterNodeDesiredConfig{NodeID: "offline-delete", Status: model.ClusterDesiredStatusApplied}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Create(&model.ClusterStorageProfile{ID: "profile-delete", NodeID: "stale-delete", MountPath: "/stale-delete"}).Error; err != nil {
+	if err := database.Create(&model.ClusterStorageProfile{ID: "profile-delete", NodeID: "offline-delete", MountPath: "/offline-delete"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Create(&model.ClusterJob{ID: "job-delete", IdempotencyKey: "job-delete", AssignedNodeID: "stale-delete", Status: model.ClusterJobStatusQueued}).Error; err != nil {
+	if err := database.Create(&model.ClusterOutbox{ID: "outbox-delete", MessageID: "outbox-delete", PeerNodeID: "offline-delete", Seq: 1}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := service.DeleteStaleNode(context.Background(), "stale-delete", now, 7*24*time.Hour); err != nil {
+	if err := database.Create(&model.ClusterInbox{ID: "inbox-delete", MessageID: "inbox-delete", PeerNodeID: "offline-delete", SessionID: "session-delete", Seq: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterJob{ID: "job-delete", IdempotencyKey: "job-delete", AssignedNodeID: "offline-delete", Status: model.ClusterJobStatusQueued}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeleteNode(context.Background(), "offline-delete", now); err != nil {
 		t.Fatal(err)
 	}
 	var count int64
-	if err := database.Model(&model.ClusterNode{}).Where("id = ?", "stale-delete").Count(&count).Error; err != nil {
+	if err := database.Model(&model.ClusterNode{}).Where("id = ?", "offline-delete").Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
 		t.Fatalf("node count = %d", count)
+	}
+	for _, owned := range []any{
+		&model.ClusterNodeSession{},
+		&model.ClusterNodeInventory{},
+		&model.ClusterNodeDesiredConfig{},
+		&model.ClusterStorageProfile{},
+	} {
+		if err := database.Model(owned).Where("node_id = ?", "offline-delete").Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("%T count = %d", owned, count)
+		}
+	}
+	for _, transportRecord := range []any{&model.ClusterOutbox{}, &model.ClusterInbox{}} {
+		if err := database.Model(transportRecord).Where("peer_node_id = ?", "offline-delete").Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("%T count = %d", transportRecord, count)
+		}
 	}
 	if err := database.Model(&model.ClusterJob{}).Where("id = ?", "job-delete").Count(&count).Error; err != nil {
 		t.Fatal(err)
@@ -793,23 +1024,42 @@ func TestDeleteStaleNodeRemovesNodeOwnedMetadataButPreservesJobs(t *testing.T) {
 	}
 }
 
-func TestDeleteStaleNodeRejectsOnlineAndFreshOfflineNodes(t *testing.T) {
+func TestDeleteNodeAllowsInactiveStates(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	service := New(database, "secret")
+	now := time.Unix(1721113500, 0).UTC()
+	for _, state := range []string{
+		model.ClusterNodeStatusPending,
+		model.ClusterNodeStatusOffline,
+		model.ClusterNodeStatusDisabled,
+		model.ClusterNodeStatusRevoked,
+	} {
+		nodeID := "remove-" + state
+		if err := database.Create(&model.ClusterNode{ID: nodeID, Status: state, Disabled: state == model.ClusterNodeStatusDisabled || state == model.ClusterNodeStatusRevoked}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := service.DeleteNode(context.Background(), nodeID, now); err != nil {
+			t.Fatalf("delete %s node: %v", state, err)
+		}
+	}
+}
+
+func TestDeleteNodeRejectsOnlineAndDrainingNodes(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	service := New(database, "secret")
 	now := time.Unix(1721114000, 0).UTC()
-	freshHeartbeat := now.Add(-24 * time.Hour)
 	onlineHeartbeat := now.Add(-10 * time.Second)
-	if err := database.Create(&model.ClusterNode{ID: "fresh-offline", Status: model.ClusterNodeStatusOffline, LastHeartbeatAt: &freshHeartbeat}).Error; err != nil {
-		t.Fatal(err)
-	}
 	if err := database.Create(&model.ClusterNode{ID: "online-node", Status: model.ClusterNodeStatusOnline, LastHeartbeatAt: &onlineHeartbeat}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := service.DeleteStaleNode(context.Background(), "fresh-offline", now, 7*24*time.Hour); err == nil || !strings.Contains(err.Error(), "not stale offline") {
-		t.Fatalf("fresh offline err = %v", err)
+	if err := database.Create(&model.ClusterNode{ID: "draining-node", Status: model.ClusterNodeStatusDraining, Drain: true}).Error; err != nil {
+		t.Fatal(err)
 	}
-	if err := service.DeleteStaleNode(context.Background(), "online-node", now, 7*24*time.Hour); err == nil || !strings.Contains(err.Error(), "cannot be removed") {
+	if err := service.DeleteNode(context.Background(), "online-node", now); err == nil || !strings.Contains(err.Error(), "cannot be removed") {
 		t.Fatalf("online node err = %v", err)
+	}
+	if err := service.DeleteNode(context.Background(), "draining-node", now); err == nil || !strings.Contains(err.Error(), "draining") {
+		t.Fatalf("draining node err = %v", err)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 const (
 	tmdbEpisodeRefreshInterval = 24 * time.Hour
 	tmdbEpisodeRefreshWorkers  = 4
+	subscriptionDeleteTimeout  = 15 * time.Second
 )
 
 type listSubscriptionsReq struct {
@@ -286,6 +287,10 @@ func UpdateSubscription(c *gin.Context) {
 		return
 	}
 	normalizeSubscription(&req)
+	if req.Name == "" {
+		common.ErrorStrResp(c, "name is required", 400)
+		return
+	}
 	if err := validateSubscriptionPreferredWorkerNodeID(&req); err != nil {
 		common.ErrorResp(c, err, 400)
 		return
@@ -316,12 +321,30 @@ func DeleteSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	if err := db.DeleteSubscription(req.ID); err != nil {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), subscriptionDeleteTimeout)
+	defer cancel()
+	if err := db.DeleteSubscriptionContext(ctx, req.ID); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			common.ErrorStrResp(c, "subscription delete timed out; no changes were committed", 503)
+			return
+		}
+		if subscriptionDeleteDatabaseBusy(err) {
+			common.ErrorStrResp(c, "subscription delete is temporarily blocked by another database operation; no changes were committed", 503)
+			return
+		}
 		common.ErrorResp(c, err, 500)
 		return
 	}
 	subscription.RefreshTelegramRealtimeListener()
 	common.SuccessResp(c)
+}
+
+func subscriptionDeleteDatabaseBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database is locked") || strings.Contains(message, "sqlite_busy")
 }
 
 func PreviewSubscription(c *gin.Context) {
@@ -485,7 +508,7 @@ func GetSubscriptionConfig(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, cfg)
+	common.SuccessResp(c, subscriptionConfigResponse(cfg))
 }
 
 func SaveSubscriptionConfig(c *gin.Context) {
@@ -494,12 +517,92 @@ func SaveSubscriptionConfig(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
+	current, err := subscription.GetConfig()
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	mergeSubscriptionConfigSecrets(&req, current)
 	cfg, err := subscription.SaveConfig(req)
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, cfg)
+	common.SuccessResp(c, subscriptionConfigResponse(cfg))
+}
+
+func subscriptionConfigResponse(cfg model.SubscriptionConfig) model.SubscriptionConfigResponse {
+	capabilities := subscription.ResourceSearchSourceCapabilities(cfg)
+	configured := map[string]bool{
+		"telegram.api_hash":                   cfg.Telegram.APIHash != "",
+		"telegram.quark.cookie":               cfg.Telegram.Quark.Cookie != "",
+		"telegram.quark.refresh_token":        cfg.Telegram.Quark.RefreshToken != "",
+		"telegram.quark.access_token":         cfg.Telegram.Quark.AccessToken != "",
+		"telegram.aliyun_drive.cookie":        cfg.Telegram.AliyunDrive.Cookie != "",
+		"telegram.aliyun_drive.refresh_token": cfg.Telegram.AliyunDrive.RefreshToken != "",
+		"telegram.aliyun_drive.access_token":  cfg.Telegram.AliyunDrive.AccessToken != "",
+		"telegram.pan123.cookie":              cfg.Telegram.Pan123.Cookie != "",
+		"telegram.pan123.refresh_token":       cfg.Telegram.Pan123.RefreshToken != "",
+		"telegram.pan123.access_token":        cfg.Telegram.Pan123.AccessToken != "",
+		"telegram.pan115.cookie":              cfg.Telegram.Pan115.Cookie != "",
+		"telegram.pan115.refresh_token":       cfg.Telegram.Pan115.RefreshToken != "",
+		"telegram.pan115.access_token":        cfg.Telegram.Pan115.AccessToken != "",
+	}
+	redactSubscriptionConfigSecrets(&cfg)
+	return model.SubscriptionConfigResponse{
+		SubscriptionConfig: cfg,
+		SecretStatus: model.SubscriptionConfigSecretStatus{
+			Configured:      configured,
+			UnchangedMarker: model.SubscriptionSecretUnchangedMarker,
+			ClearMarker:     model.SubscriptionSecretClearMarker,
+		},
+		SourceCapabilities: capabilities,
+	}
+}
+
+func mergeSubscriptionConfigSecrets(next *model.SubscriptionConfig, current model.SubscriptionConfig) {
+	if next == nil {
+		return
+	}
+	next.Telegram.APIHash = mergeSubscriptionSecret(next.Telegram.APIHash, current.Telegram.APIHash)
+	mergeSubscriptionPanSecrets(&next.Telegram.Quark, current.Telegram.Quark)
+	mergeSubscriptionPanSecrets(&next.Telegram.AliyunDrive, current.Telegram.AliyunDrive)
+	mergeSubscriptionPanSecrets(&next.Telegram.Pan123, current.Telegram.Pan123)
+	mergeSubscriptionPanSecrets(&next.Telegram.Pan115, current.Telegram.Pan115)
+}
+
+func mergeSubscriptionPanSecrets(next *model.SubscriptionTelegramPanConfig, current model.SubscriptionTelegramPanConfig) {
+	next.Cookie = mergeSubscriptionSecret(next.Cookie, current.Cookie)
+	next.RefreshToken = mergeSubscriptionSecret(next.RefreshToken, current.RefreshToken)
+	next.AccessToken = mergeSubscriptionSecret(next.AccessToken, current.AccessToken)
+}
+
+func mergeSubscriptionSecret(next, current string) string {
+	switch next {
+	case "", model.SubscriptionSecretUnchangedMarker:
+		return current
+	case model.SubscriptionSecretClearMarker:
+		return ""
+	default:
+		return next
+	}
+}
+
+func redactSubscriptionConfigSecrets(cfg *model.SubscriptionConfig) {
+	if cfg == nil {
+		return
+	}
+	cfg.Telegram.APIHash = ""
+	redactSubscriptionPanSecrets(&cfg.Telegram.Quark)
+	redactSubscriptionPanSecrets(&cfg.Telegram.AliyunDrive)
+	redactSubscriptionPanSecrets(&cfg.Telegram.Pan123)
+	redactSubscriptionPanSecrets(&cfg.Telegram.Pan115)
+}
+
+func redactSubscriptionPanSecrets(cfg *model.SubscriptionTelegramPanConfig) {
+	cfg.Cookie = ""
+	cfg.RefreshToken = ""
+	cfg.AccessToken = ""
 }
 
 func TelegramSubscriptionStatus(c *gin.Context) {

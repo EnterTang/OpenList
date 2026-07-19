@@ -16,8 +16,8 @@ MSYS2_RUNTIME_PACKAGE_URL="https://repo.msys2.org/msys/x86_64/msys2-runtime-${MS
 MSYS2_RUNTIME_PACKAGE_SHA256="b7cf3a7a423b78c2fb6752859075381b7fa52ffad2d8d66778f49c04dcf50312"
 MSYS2_RUNTIME_SOURCE_URL="https://repo.msys2.org/msys/sources/msys2-runtime-${MSYS2_RUNTIME_VERSION}.src.tar.zst"
 MSYS2_RUNTIME_LICENSE_SHA256="794433752103cf4bbb4a84a1bdb8fbc150abb1762704bb35fecc9f7f820be984"
-LGPL3_LICENSE_URL="https://www.gnu.org/licenses/lgpl-3.0.txt"
-LGPL3_LICENSE_SHA256="e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+LGPL3_LICENSE_URL="https://raw.githubusercontent.com/qt/qtbase/v6.8.0/LICENSES/LGPL-3.0-only.txt"
+LGPL3_LICENSE_SHA256="da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
 OPENSSL_VERSION="3.6.2-1"
 OPENSSL_LICENSE_URL="https://raw.githubusercontent.com/openssl/openssl/openssl-3.6.2/LICENSE.txt"
 OPENSSL_LICENSE_SHA256="7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a"
@@ -58,6 +58,11 @@ Commands:
   prepare  Download, verify, and assemble the generated Redis payload.
   clean    Remove only the generated Redis payload archive.
 
+Environment:
+  EMBEDDED_REDIS_CACHE_DIR
+                          Optional persistent cache for verified downloads.
+                          Interrupted downloads remain as .part files.
+
 Requirements:
   - curl
   - Info-ZIP zip/unzip
@@ -70,7 +75,6 @@ Network access:
   - github.com
   - raw.githubusercontent.com
   - repo.msys2.org
-  - www.gnu.org
 USAGE
 }
 
@@ -195,17 +199,50 @@ assemble_payload() (
 download_file() {
   local url="$1"
   local output="$2"
+  local expected_sha256="${3:-}"
+  local cache_file=""
+  local partial_file=""
+  local download_output="$output"
+
+  if [ -n "${EMBEDDED_REDIS_CACHE_DIR:-}" ]; then
+    mkdir -p "$EMBEDDED_REDIS_CACHE_DIR"
+    if [ -n "$expected_sha256" ]; then
+      cache_file="$EMBEDDED_REDIS_CACHE_DIR/$expected_sha256"
+    else
+      cache_file="$EMBEDDED_REDIS_CACHE_DIR/$(basename "$output")"
+    fi
+    partial_file="$cache_file.part"
+
+    if [ -f "$cache_file" ] && {
+      [ -z "$expected_sha256" ] || verify_sha256 "$cache_file" "$expected_sha256"
+    }; then
+      cp "$cache_file" "$output"
+      echo "==> Reusing cached download: $(basename "$output")"
+      return 0
+    fi
+    rm -f -- "$cache_file"
+    download_output="$partial_file"
+  fi
 
   curl -fL \
     --retry 5 \
+    --retry-all-errors \
     --retry-delay 2 \
     --connect-timeout 15 \
     --speed-limit 1024 \
     --speed-time 30 \
     --max-time 300 \
     --continue-at - \
-    --output "$output" \
+    --output "$download_output" \
     "$url"
+
+  if [ -n "$cache_file" ]; then
+    if [ -n "$expected_sha256" ]; then
+      verify_sha256 "$partial_file" "$expected_sha256"
+    fi
+    mv -f "$partial_file" "$cache_file"
+    cp "$cache_file" "$output"
+  fi
 }
 
 prepare_payload() (
@@ -228,7 +265,7 @@ prepare_payload() (
   mkdir -p "$source_dir"
 
   echo "==> Downloading Redis for Windows ${REDIS_VERSION}"
-  download_file "$REDIS_ARCHIVE_URL" "$archive"
+  download_file "$REDIS_ARCHIVE_URL" "$archive" "$REDIS_ARCHIVE_SHA256"
   verify_sha256 "$archive" "$REDIS_ARCHIVE_SHA256"
 
   for name in "${REDIS_BINARY_FILES[@]}"; do
@@ -236,18 +273,18 @@ prepare_payload() (
     unzip -j -q "$archive" "$archive_path" -d "$source_dir"
   done
 
-  download_file "$REDIS_COPYING_URL" "$source_dir/COPYING.redis"
+  download_file "$REDIS_COPYING_URL" "$source_dir/COPYING.redis" "$REDIS_COPYING_SHA256"
   verify_sha256 "$source_dir/COPYING.redis" "$REDIS_COPYING_SHA256"
-  download_file "$REDIS_WINDOWS_LICENSE_URL" "$source_dir/LICENSE.redis-windows"
+  download_file "$REDIS_WINDOWS_LICENSE_URL" "$source_dir/LICENSE.redis-windows" "$REDIS_WINDOWS_LICENSE_SHA256"
   verify_sha256 "$source_dir/LICENSE.redis-windows" "$REDIS_WINDOWS_LICENSE_SHA256"
 
-  download_file "$MSYS2_RUNTIME_PACKAGE_URL" "$msys2_runtime_package"
+  download_file "$MSYS2_RUNTIME_PACKAGE_URL" "$msys2_runtime_package" "$MSYS2_RUNTIME_PACKAGE_SHA256"
   verify_sha256 "$msys2_runtime_package" "$MSYS2_RUNTIME_PACKAGE_SHA256"
   tar -xOf "$msys2_runtime_package" usr/share/doc/Cygwin/CYGWIN_LICENSE >"$source_dir/LICENSE.msys2-runtime"
   verify_sha256 "$source_dir/LICENSE.msys2-runtime" "$MSYS2_RUNTIME_LICENSE_SHA256"
-  download_file "$LGPL3_LICENSE_URL" "$source_dir/LICENSE.LGPL-3.0"
+  download_file "$LGPL3_LICENSE_URL" "$source_dir/LICENSE.LGPL-3.0" "$LGPL3_LICENSE_SHA256"
   verify_sha256 "$source_dir/LICENSE.LGPL-3.0" "$LGPL3_LICENSE_SHA256"
-  download_file "$OPENSSL_LICENSE_URL" "$source_dir/LICENSE.openssl"
+  download_file "$OPENSSL_LICENSE_URL" "$source_dir/LICENSE.openssl" "$OPENSSL_LICENSE_SHA256"
   verify_sha256 "$source_dir/LICENSE.openssl" "$OPENSSL_LICENSE_SHA256"
 
   cat >"$source_dir/THIRD_PARTY_NOTICES.txt" <<NOTICES

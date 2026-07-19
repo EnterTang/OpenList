@@ -37,9 +37,10 @@ func SearchResources(ctx context.Context, req model.SubscriptionResourceSearchRe
 		return nil, err
 	}
 	resp := &model.SubscriptionResourceSearchResp{
-		Query:        query,
-		Sources:      sources,
-		SourceErrors: map[string]string{},
+		Query:              query,
+		Sources:            sources,
+		SourceErrors:       map[string]string{},
+		SourceCapabilities: ResourceSearchSourceCapabilities(cfg),
 	}
 	for _, source := range sources {
 		var results []model.SubscriptionResourceSearchResult
@@ -62,6 +63,42 @@ func SearchResources(ctx context.Context, req model.SubscriptionResourceSearchRe
 		resp.SourceErrors = nil
 	}
 	return resp, nil
+}
+
+// ResourceSearchSourceCapabilities reports configuration-derived availability
+// without performing external calls. The frontend can use this before a search
+// to avoid offering sources that are guaranteed to fail.
+func ResourceSearchSourceCapabilities(cfg model.SubscriptionConfig) map[string]model.SubscriptionSearchSourceCapability {
+	telegramConfigured := hasTelegramSearchCommand(cfg.Telegram) || hasBuiltinTelegramConfig(cfg.Telegram)
+	telegramAvailable := hasTelegramSearchCommand(cfg.Telegram) ||
+		(hasBuiltinTelegramConfig(cfg.Telegram) &&
+			(len(telegramChannelGroups(cfg.Telegram)) > 0 || len(cfg.Telegram.Channels) > 0))
+	telegramReason := ""
+	if !telegramConfigured {
+		telegramReason = "not_configured"
+	} else if !telegramAvailable {
+		telegramReason = "channels_not_configured"
+	}
+
+	panSouConfigured := (len(cfg.PanSou.SearchCommand) > 0 && strings.TrimSpace(cfg.PanSou.SearchCommand[0]) != "") ||
+		strings.TrimSpace(cfg.PanSou.BaseURL) != ""
+	panSouReason := ""
+	if !panSouConfigured {
+		panSouReason = "not_configured"
+	}
+
+	return map[string]model.SubscriptionSearchSourceCapability{
+		model.SubscriptionSourceTelegram: {
+			Configured:        telegramConfigured,
+			Available:         telegramAvailable,
+			UnavailableReason: telegramReason,
+		},
+		model.SubscriptionSourcePanSou: {
+			Configured:        panSouConfigured,
+			Available:         panSouConfigured,
+			UnavailableReason: panSouReason,
+		},
+	}
 }
 
 func normalizeResourceSearchSources(values []string) []string {

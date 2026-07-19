@@ -35,6 +35,13 @@ func TestHybridDispatcherPersistsAndOffersHighestWeightProviderBindings(t *testi
 	assertProviderPipelineCount(t, database, &model.ClusterJob{}, 2)
 	assertProviderPipelineCount(t, database, &model.ClusterJobAttempt{}, 1)
 	assertProviderPipelineCount(t, database, &model.ClusterOutbox{}, 1)
+	var mediaJob model.ClusterJob
+	if err := database.First(&mediaJob, "type = ?", model.ClusterJobTypeMediaTransfer).Error; err != nil {
+		t.Fatal(err)
+	}
+	if mediaJob.NotificationStatus != model.ClusterNotificationStatusNotStarted {
+		t.Fatalf("new media notification status = %q, want %q", mediaJob.NotificationStatus, model.ClusterNotificationStatusNotStarted)
+	}
 	if len(fakeTransport.sent) != 1 || fakeTransport.sent[0].Type != protocol.MessageJobOffer {
 		t.Fatalf("sent messages = %#v", fakeTransport.sent)
 	}

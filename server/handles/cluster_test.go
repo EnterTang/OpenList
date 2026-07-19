@@ -63,9 +63,9 @@ func TestListClusterNodesHidesStaleOfflineByDefault(t *testing.T) {
 	}
 }
 
-func TestDeleteClusterNodeRejectsFreshOfflineNode(t *testing.T) {
+func TestDeleteClusterNodeRemovesOfflineNode(t *testing.T) {
 	database := setupClusterHandleRuntime(t)
-	freshHeartbeat := time.Now().UTC().Add(-24 * time.Hour)
+	freshHeartbeat := time.Now().UTC().Add(-time.Hour)
 	if err := database.Create(&model.ClusterNode{ID: "fresh-offline", Status: model.ClusterNodeStatusOffline, LastHeartbeatAt: &freshHeartbeat}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -73,10 +73,14 @@ func TestDeleteClusterNodeRejectsFreshOfflineNode(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "fresh-offline"}}
 	DeleteClusterNode(c)
 	resp := decodeHandleResp[any](t, recorder)
-	if resp.Code != 400 {
-		t.Fatalf("code = %d, want 400: %s", resp.Code, recorder.Body.String())
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200: %s", resp.Code, recorder.Body.String())
 	}
-	if resp.Message != "cluster node is not stale offline" {
-		t.Fatalf("message = %q", resp.Message)
+	var count int64
+	if err := database.Model(&model.ClusterNode{}).Where("id = ?", "fresh-offline").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("node count = %d", count)
 	}
 }

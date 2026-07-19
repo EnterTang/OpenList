@@ -3,7 +3,9 @@ package _123
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -108,60 +111,86 @@ func (d *Pan123) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 }
 
 func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if f, ok := file.(File); ok {
-		data := base.Json{
-			"driveId":   0,
-			"etag":      f.Etag,
-			"fileId":    f.FileId,
-			"fileName":  f.FileName,
-			"s3keyFlag": f.S3KeyFlag,
-			"size":      f.Size,
-			"type":      f.Type,
-		}
-		resp, err := d.Request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
-			req.SetBody(data)
-		}, nil)
-		if err != nil {
-			return nil, err
-		}
-		downloadUrl := utils.Json.Get(resp, "data", "DownloadUrl").ToString()
-		ou, err := url.Parse(downloadUrl)
-		if err != nil {
-			return nil, err
-		}
-		u_ := ou.String()
-		nu := ou.Query().Get("params")
-		if nu != "" {
-			du, _ := base64.StdEncoding.DecodeString(nu)
-			u, err := url.Parse(string(du))
-			if err != nil {
-				return nil, err
-			}
-			u_ = u.String()
-		}
-
-		log.Debug("download url: ", u_)
-		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://yun.123pan.com/").Get(u_)
-		if err != nil {
-			return nil, err
-		}
-		log.Debug(res.String())
-		link := model.Link{
-			URL: u_,
-		}
-		log.Debugln("res code: ", res.StatusCode())
-		if res.StatusCode() == 302 {
-			link.URL = res.Header().Get("location")
-		} else if res.StatusCode() < 300 {
-			link.URL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
-		}
-		link.Header = http.Header{
-			"Referer": []string{fmt.Sprintf("%s://%s/", ou.Scheme, ou.Host)},
-		}
-		return &link, nil
-	} else {
+	f, ok := file.(File)
+	if !ok {
 		return nil, fmt.Errorf("can't convert obj")
 	}
+	initial, err := d.resolveDownload(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	rangeReader := stream.RangeReaderFunc(func(readCtx context.Context, requested http_range.Range) (io.ReadCloser, error) {
+		return newPan123DownloadReader(
+			readCtx,
+			f.Size,
+			requested,
+			initial,
+			func(refreshCtx context.Context) (pan123ResolvedDownload, error) {
+				return d.resolveDownload(refreshCtx, f)
+			},
+			pan123FallbackConfig{},
+		)
+	})
+	return &model.Link{
+		URL: initial.URL, Header: initial.Header, RangeReader: rangeReader, ContentLength: f.Size,
+	}, nil
+}
+
+func (d *Pan123) resolveDownload(ctx context.Context, file File) (pan123ResolvedDownload, error) {
+	data := base.Json{
+		"driveId":   0,
+		"etag":      file.Etag,
+		"fileId":    file.FileId,
+		"fileName":  file.FileName,
+		"s3keyFlag": file.S3KeyFlag,
+		"size":      file.Size,
+		"type":      file.Type,
+	}
+	resp, err := d.Request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data).SetContext(ctx)
+	}, nil)
+	if err != nil {
+		return pan123ResolvedDownload{}, err
+	}
+	downloadURL := utils.Json.Get(resp, "data", "DownloadUrl").ToString()
+	originalURL, err := url.Parse(downloadURL)
+	if err != nil {
+		return pan123ResolvedDownload{}, err
+	}
+	requestURL := originalURL.String()
+	if params := originalURL.Query().Get("params"); params != "" {
+		decoded, decodeErr := base64.StdEncoding.DecodeString(params)
+		if decodeErr != nil {
+			return pan123ResolvedDownload{}, fmt.Errorf("decode 123pan download parameters: %w", decodeErr)
+		}
+		parsed, parseErr := url.Parse(string(decoded))
+		if parseErr != nil {
+			return pan123ResolvedDownload{}, parseErr
+		}
+		requestURL = parsed.String()
+	}
+	res, err := base.NoRedirectClient.R().
+		SetContext(ctx).
+		SetHeader("Referer", "https://yun.123pan.com/").
+		Get(requestURL)
+	if err != nil {
+		return pan123ResolvedDownload{}, err
+	}
+	directURL := requestURL
+	if res.StatusCode() == http.StatusFound {
+		directURL = res.Header().Get("location")
+	} else if res.StatusCode() < http.StatusMultipleChoices {
+		directURL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
+	}
+	if directURL == "" {
+		return pan123ResolvedDownload{}, errors.New("123pan download URL resolution returned an empty redirect")
+	}
+	return pan123ResolvedDownload{
+		URL: directURL,
+		Header: http.Header{
+			"Referer": []string{fmt.Sprintf("%s://%s/", originalURL.Scheme, originalURL.Host)},
+		},
+	}, nil
 }
 
 func (d *Pan123) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {

@@ -22,6 +22,11 @@ const (
 	SubscriptionItemStatusSkipped      = "skipped"
 	SubscriptionItemStatusFailed       = "failed"
 
+	// Subscription secret markers let configuration clients distinguish an
+	// unchanged credential from an explicit clear without echoing stored values.
+	SubscriptionSecretUnchangedMarker = "__OPENLIST_SECRET_UNCHANGED__"
+	SubscriptionSecretClearMarker     = "__OPENLIST_SECRET_CLEAR__"
+
 	SubscriptionArchiveStatusOngoing   = "ongoing"
 	SubscriptionArchiveStatusCompleted = "completed"
 	SubscriptionArchiveStatusStalled   = "stalled"
@@ -58,6 +63,24 @@ type Subscription struct {
 	LastError                string                     `json:"last_error" gorm:"type:text"`
 	Progress                 SubscriptionProgress       `json:"progress" gorm:"-"`
 	RealtimeStatus           SubscriptionRealtimeStatus `json:"realtime_status" gorm:"-"`
+}
+
+type ExternalSubscriptionRequest struct {
+	ID                 uint       `json:"id" gorm:"primarykey"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	IdempotencyKey     string     `json:"idempotency_key" gorm:"size:191;uniqueIndex"`
+	LookupKey          string     `json:"lookup_key" gorm:"size:191;uniqueIndex"`
+	RequestFingerprint string     `json:"request_fingerprint" gorm:"size:64;index"`
+	SubscriptionID     uint       `json:"subscription_id" gorm:"uniqueIndex"`
+	RequestJSON        string     `json:"request_json" gorm:"type:text"`
+	ResponseJSON       string     `json:"response_json" gorm:"type:text"`
+	LastStatus         string     `json:"last_status" gorm:"size:32;index"`
+	LastMessage        string     `json:"last_message" gorm:"type:text"`
+	ProgressJSON       string     `json:"progress_json" gorm:"type:text"`
+	SeasonsJSON        string     `json:"seasons_json" gorm:"type:text"`
+	LastRunAt          *time.Time `json:"last_run_at"`
+	LastError          string     `json:"last_error" gorm:"type:text"`
 }
 
 // SubscriptionProgress is calculated from subscription items when a
@@ -147,21 +170,37 @@ type SubscriptionBoard struct {
 }
 
 type SubscriptionEpisodeSourceDetail struct {
-	ID             uint      `json:"id"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	SubscriptionID uint      `json:"subscription_id"`
-	Season         int       `json:"season"`
-	Episode        int       `json:"episode"`
-	SourceItemID   uint      `json:"source_item_id"`
-	SourceType     string    `json:"source_type"`
-	SourceProvider string    `json:"source_provider"`
-	ShareURL       string    `json:"share_url"`
-	FileName       string    `json:"file_name"`
-	ClusterJobID   string    `json:"cluster_job_id"`
-	SelectedAt     time.Time `json:"selected_at"`
-	Status         string    `json:"status"`
-	WorkerName     string    `json:"worker_name"`
+	ID                        uint       `json:"id"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
+	SubscriptionID            uint       `json:"subscription_id"`
+	Season                    int        `json:"season"`
+	Episode                   int        `json:"episode"`
+	SourceItemID              uint       `json:"source_item_id"`
+	SourceType                string     `json:"source_type"`
+	SourceProvider            string     `json:"source_provider"`
+	ShareURL                  string     `json:"share_url"`
+	FileName                  string     `json:"file_name"`
+	ClusterJobID              string     `json:"cluster_job_id"`
+	SelectedAt                time.Time  `json:"selected_at"`
+	Status                    string     `json:"status"`
+	ItemLastError             string     `json:"item_last_error,omitempty"`
+	WorkerName                string     `json:"worker_name"`
+	JobStatus                 string     `json:"job_status,omitempty"`
+	JobNotificationStatus     string     `json:"job_notification_status,omitempty"`
+	JobGeneration             uint64     `json:"job_generation,omitempty"`
+	JobStartedAt              *time.Time `json:"job_started_at,omitempty"`
+	JobFinishedAt             *time.Time `json:"job_finished_at,omitempty"`
+	JobLastErrorCode          string     `json:"job_last_error_code,omitempty"`
+	JobLastError              string     `json:"job_last_error,omitempty"`
+	CurrentStage              string     `json:"current_stage,omitempty"`
+	CurrentStageStatus        string     `json:"current_stage_status,omitempty"`
+	CurrentStageRetryCount    int        `json:"current_stage_retry_count,omitempty"`
+	CurrentStageErrorCode     string     `json:"current_stage_error_code,omitempty"`
+	CurrentStageError         string     `json:"current_stage_error,omitempty"`
+	EffectiveStatus           string     `json:"effective_status,omitempty"`
+	NotificationDisplayStatus string     `json:"notification_display_status,omitempty"`
+	HasArchivedETF            bool       `json:"has_archived_etf,omitempty"`
 }
 
 type SubscriptionStorageTarget struct {
@@ -254,10 +293,32 @@ type SubscriptionResourceSearchReq struct {
 }
 
 type SubscriptionResourceSearchResp struct {
-	Query        string                             `json:"query"`
-	Sources      []string                           `json:"sources"`
-	Results      []SubscriptionResourceSearchResult `json:"results"`
-	SourceErrors map[string]string                  `json:"source_errors,omitempty"`
+	Query              string                                        `json:"query"`
+	Sources            []string                                      `json:"sources"`
+	Results            []SubscriptionResourceSearchResult            `json:"results"`
+	SourceErrors       map[string]string                             `json:"source_errors,omitempty"`
+	SourceCapabilities map[string]SubscriptionSearchSourceCapability `json:"source_capabilities"`
+}
+
+type SubscriptionSearchSourceCapability struct {
+	Configured        bool   `json:"configured"`
+	Available         bool   `json:"available"`
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
+}
+
+type SubscriptionConfigSecretStatus struct {
+	Configured      map[string]bool `json:"configured"`
+	UnchangedMarker string          `json:"unchanged_marker"`
+	ClearMarker     string          `json:"clear_marker"`
+}
+
+// SubscriptionConfigResponse embeds the legacy configuration shape so older
+// clients keep working while newer clients can handle redacted credentials and
+// source availability explicitly.
+type SubscriptionConfigResponse struct {
+	SubscriptionConfig
+	SecretStatus       SubscriptionConfigSecretStatus                `json:"secret_status"`
+	SourceCapabilities map[string]SubscriptionSearchSourceCapability `json:"source_capabilities"`
 }
 
 type SubscriptionResourceSearchResult struct {

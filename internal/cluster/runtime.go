@@ -64,15 +64,15 @@ type Runtime struct {
 }
 
 const (
-	coordinatorLeaseDuration        = 45 * time.Second
+	coordinatorLeaseDuration = 45 * time.Second
 	// mediaJobLeaseDuration covers slow share-save + cross-cloud move. Workers
 	// renew while connected; they keep executing across short disconnects.
 	mediaJobLeaseDuration = 2 * time.Hour
 	// inspectJobLeaseDuration covers large share-tree listings while workers may
 	// be busy with media transfers. The previous 1-minute default caused endless
 	// lease-expiry churn when inspect jobs queued behind media work.
-	inspectJobLeaseDuration = 30 * time.Minute
-	clusterWSReadTimeout    = 5 * time.Minute
+	inspectJobLeaseDuration         = 30 * time.Minute
+	clusterWSReadTimeout            = 5 * time.Minute
 	coordinatorLeaseRenewalInterval = 15 * time.Second
 )
 
@@ -1212,7 +1212,7 @@ func (r *Runtime) DispatchMediaJob(ctx context.Context, req DispatchMediaJobRequ
 		ParentJobID:              req.TaskContext.ParentBatchID,
 		Type:                     model.ClusterJobTypeMediaTransfer,
 		Status:                   model.ClusterJobStatusLeased,
-		NotificationStatus:       model.ClusterNotificationStatusPending,
+		NotificationStatus:       model.ClusterNotificationStatusNotStarted,
 		WorkerCleanupStatus:      model.ClusterCleanupStatusPending,
 		ResultDeliveryStatus:     model.ClusterResultDeliveryStatusQueued,
 		IdempotencyKey:           idempotencyKey,

@@ -245,13 +245,42 @@ func updateMobileShareRecordsError(records []*model.MobileShareRecord, err error
 	if err == nil {
 		return nil
 	}
+	remoteInvalid := mobileShareRemoteInvalidError(err)
 	for _, record := range records {
 		record.LastError = err.Error()
+		if remoteInvalid {
+			record.IsValid = false
+		}
 		if updateErr := db.UpdateMobileShareRecord(record); updateErr != nil {
 			return updateErr
 		}
 	}
 	return nil
+}
+
+func mobileShareRemoteInvalidError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	for _, marker := range []string{
+		"外链不存在",
+		"外链已不存在",
+		"外链被分享者取消",
+		"分享链接不存在",
+		"分享已取消",
+		"分享被取消",
+		"out link does not exist",
+		"outlink does not exist",
+		"share link does not exist",
+		"share link has been cancelled",
+		"share link has been canceled",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func mobileShareRecordValues(records []*model.MobileShareRecord) []model.MobileShareRecord {

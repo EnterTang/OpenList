@@ -1,9 +1,11 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -347,6 +349,29 @@ func TestUpdateAndDeleteSubscriptionEditableFields(t *testing.T) {
 	}
 }
 
+func TestDeleteSubscriptionContextStopsBeforeDeletingWhenCancelled(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Cancelled delete",
+		TMDBName:   "Cancelled delete",
+		SourceType: model.SubscriptionSourceManual,
+	}
+	if err := CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := DeleteSubscriptionContext(ctx, sub.ID)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("delete error = %v, want context canceled", err)
+	}
+	if _, err := GetSubscriptionByID(sub.ID); err != nil {
+		t.Fatalf("cancelled delete removed subscription: %v", err)
+	}
+}
+
 func TestUpdateSubscriptionTMDBEpisodeEndPreservesRuntimeFields(t *testing.T) {
 	setupETFArchiveDB(t)
 
@@ -654,6 +679,57 @@ func TestUpsertSubscriptionEpisodeSourceReplacesExistingAndDeletesWithSubscripti
 	}
 	if len(sources) != 0 {
 		t.Fatalf("episode sources after delete = %#v, want none", sources)
+	}
+}
+
+func TestTryClaimSubscriptionEpisodeSourceKeepsFirstActiveClaim(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	first := &model.SubscriptionEpisodeSource{
+		SubscriptionID: 1,
+		Season:         1,
+		Episode:        2,
+		SourceItemID:   101,
+		SourceType:     model.SubscriptionSourceTelegram,
+		SourceProvider: "pan123",
+		FileName:       "first.mkv",
+		FileHash:       "first-hash",
+	}
+	claimed, saved, err := TryClaimSubscriptionEpisodeSource(first, now)
+	if err != nil || !claimed {
+		t.Fatalf("first claim claimed=%v saved=%#v err=%v", claimed, saved, err)
+	}
+
+	second := &model.SubscriptionEpisodeSource{
+		SubscriptionID: 1,
+		Season:         1,
+		Episode:        2,
+		SourceItemID:   202,
+		SourceType:     model.SubscriptionSourceTelegram,
+		SourceProvider: "pan123",
+		FileName:       "second.mkv",
+		FileHash:       "second-hash",
+	}
+	claimed, saved, err = TryClaimSubscriptionEpisodeSource(second, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed || saved.SourceItemID != first.SourceItemID || saved.FileHash != first.FileHash {
+		t.Fatalf("second claim unexpectedly replaced active owner: claimed=%v saved=%#v", claimed, saved)
+	}
+
+	if err := db.Model(&model.SubscriptionEpisodeSource{}).
+		Where("subscription_id = ? AND season = ? AND episode = ?", 1, 1, 2).
+		Update("status", model.SubscriptionItemStatusFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	claimed, saved, err = TryClaimSubscriptionEpisodeSource(second, now.Add(2*time.Second))
+	if err != nil || !claimed {
+		t.Fatalf("replacement after failure claimed=%v saved=%#v err=%v", claimed, saved, err)
+	}
+	if saved.SourceItemID != second.SourceItemID || saved.FileHash != second.FileHash {
+		t.Fatalf("replacement owner = %#v, want second", saved)
 	}
 }
 
@@ -1270,6 +1346,186 @@ func TestListSubscriptionEpisodeSourceDetailsResolvesWorkerNames(t *testing.T) {
 	}
 	if len(details) != 0 {
 		t.Fatalf("legacy subscription details = %#v, want none without snapshots", details)
+	}
+}
+
+func TestListSubscriptionEpisodeSourceDetailsIncludesCurrentJobProgress(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Job progress subscription",
+		TMDBName:   "Job progress subscription",
+		SourceType: model.SubscriptionSourceTelegram,
+	}
+	if err := CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	item, _, err := UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: sub.ID,
+		SourceKey:      "job-progress-item",
+		FileHash:       "job-progress-hash",
+		Season:         1,
+		Episode:        7,
+		Status:         model.SubscriptionItemStatusTransferred,
+		LastSeenAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create subscription item: %v", err)
+	}
+	startedAt := time.Now().Add(-time.Minute).UTC()
+	finishedAt := time.Now().UTC()
+	job := &model.ClusterJob{
+		ID:                 "job-progress",
+		IdempotencyKey:     "job-progress",
+		Status:             model.ClusterJobStatusSucceeded,
+		NotificationStatus: model.ClusterNotificationStatusSucceeded,
+		SubscriptionID:     sub.ID,
+		SubscriptionItemID: item.ID,
+		CurrentAttemptID:   "attempt-progress",
+		CurrentGeneration:  2,
+		StartedAt:          &startedAt,
+		FinishedAt:         &finishedAt,
+	}
+	if err := db.Create(job).Error; err != nil {
+		t.Fatalf("create cluster job: %v", err)
+	}
+	if err := db.Create(&model.ClusterJobStage{
+		ID:         "stage-progress",
+		JobID:      job.ID,
+		AttemptID:  job.CurrentAttemptID,
+		Name:       model.ClusterStageTargetNotifying,
+		Status:     model.ClusterStageStatusSucceeded,
+		RetryCount: 1,
+	}).Error; err != nil {
+		t.Fatalf("create cluster job stage: %v", err)
+	}
+	if _, err := UpsertSubscriptionEpisodeSource(&model.SubscriptionEpisodeSource{
+		SubscriptionID: sub.ID,
+		Season:         1,
+		Episode:        7,
+		SourceItemID:   item.ID,
+		SourceType:     model.SubscriptionSourceTelegram,
+		SourceProvider: "quark",
+		FileName:       "episode-07.mkv",
+		FileHash:       item.FileHash,
+		Status:         model.SubscriptionItemStatusTransferring,
+		ClusterJobID:   job.ID,
+	}); err != nil {
+		t.Fatalf("create episode source snapshot: %v", err)
+	}
+
+	details, err := ListSubscriptionEpisodeSourceDetails(sub.ID)
+	if err != nil {
+		t.Fatalf("list episode source details: %v", err)
+	}
+	if len(details) != 1 {
+		t.Fatalf("detail count = %d, want 1: %#v", len(details), details)
+	}
+	detail := details[0]
+	if detail.Status != model.SubscriptionItemStatusTransferred {
+		t.Fatalf("detail status = %q, want current item status", detail.Status)
+	}
+	if detail.JobStatus != model.ClusterJobStatusSucceeded || detail.JobNotificationStatus != model.ClusterNotificationStatusSucceeded {
+		t.Fatalf("job status = %q notification = %q", detail.JobStatus, detail.JobNotificationStatus)
+	}
+	if detail.JobGeneration != 2 || detail.JobStartedAt == nil || detail.JobFinishedAt == nil {
+		t.Fatalf("job timing/generation = %#v", detail)
+	}
+	if detail.CurrentStage != model.ClusterStageTargetNotifying || detail.CurrentStageStatus != model.ClusterStageStatusSucceeded || detail.CurrentStageRetryCount != 1 {
+		t.Fatalf("current stage = %#v", detail)
+	}
+}
+
+func TestListSubscriptionEpisodeSourceDetailsComposesHistoricalSuccessAndTerminalStates(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Historical success subscription",
+		TMDBID:     308874,
+		MediaType:  "tv",
+		SourceType: model.SubscriptionSourceTelegram,
+	}
+	if err := CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	item, _, err := UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: sub.ID,
+		SourceKey:      "latest-failed",
+		FileHash:       "latest-failed-hash",
+		Season:         1,
+		Episode:        3,
+		Status:         model.SubscriptionItemStatusFailed,
+		LastError:      "unexpected EOF",
+		ClusterJobID:   "latest-failed-job",
+		LastSeenAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &model.ClusterJob{
+		ID:                 item.ClusterJobID,
+		IdempotencyKey:     item.ClusterJobID,
+		Status:             model.ClusterJobStatusFailed,
+		NotificationStatus: model.ClusterNotificationStatusPending,
+		SubscriptionID:     sub.ID,
+		SubscriptionItemID: item.ID,
+		CurrentAttemptID:   "failed-attempt",
+		LastError:          item.LastError,
+	}
+	if err := db.Create(job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.ClusterJobStage{
+		ID: "permitted-stage", JobID: job.ID, AttemptID: job.CurrentAttemptID,
+		Name: model.ClusterStageUploadingMobile, Status: model.ClusterStageStatusPermitted,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.ETFArchiveRecord{
+		StorageID: 1, StorageMountPath: "/139", SourceName: "historical.mkv",
+		ArchiveETFPath: "/139/archive/historical.mkv.etf", TMDBMatched: true,
+		TMDBID: sub.TMDBID, MediaType: sub.MediaType, Season: 1, Episode: 3,
+		SourceSize: 1234, SourceSHA256: strings.Repeat("A", 64), Status: model.ETFArchiveStatusArchived,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpsertSubscriptionEpisodeSource(&model.SubscriptionEpisodeSource{
+		SubscriptionID: sub.ID, Season: 1, Episode: 3, SourceItemID: item.ID,
+		SourceType: model.SubscriptionSourceTelegram, SourceProvider: "pan123",
+		FileName: "latest.mkv", FileHash: item.FileHash, Status: item.Status, ClusterJobID: job.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	details, err := ListSubscriptionEpisodeSourceDetails(sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(details) != 1 {
+		t.Fatalf("details=%#v", details)
+	}
+	detail := details[0]
+	if !detail.HasArchivedETF || detail.EffectiveStatus != "historical_succeeded_latest_failed" {
+		t.Fatalf("historical composition = %#v", detail)
+	}
+	if detail.NotificationDisplayStatus != model.ClusterNotificationStatusNotStarted {
+		t.Fatalf("notification display=%q", detail.NotificationDisplayStatus)
+	}
+	if detail.CurrentStageStatus != model.ClusterStageStatusFailed || detail.CurrentStageError != item.LastError {
+		t.Fatalf("stage composition=%#v", detail)
+	}
+	if err := db.Create(&model.ETFSubscriptionJob{
+		JobKey: "active-notification-for-failed-job", Type: model.ETFSubscriptionJobTypeCreate,
+		Status: model.ETFSubscriptionJobStatusPending, ClusterJobIDsJSON: `["latest-failed-job"]`,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	details, err = ListSubscriptionEpisodeSourceDetails(sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details[0].NotificationDisplayStatus != model.ClusterNotificationStatusPending {
+		t.Fatalf("active notification display=%q, want pending", details[0].NotificationDisplayStatus)
 	}
 }
 

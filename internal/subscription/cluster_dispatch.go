@@ -550,11 +550,31 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 		return 0, errors.New("cluster subscription dispatcher is not registered")
 	}
 	tasks := make([]ClusterMediaTask, 0, len(items))
+	dispatchItems := make([]*model.SubscriptionItem, 0, len(items))
+	claimedItems := make(map[*model.SubscriptionItem]bool, len(items))
 	for _, item := range items {
 		if item == nil || item.Status != model.SubscriptionItemStatusPending {
 			continue
 		}
+		if normalizeMediaType(sub.MediaType) != "movie" && item.Episode > 0 {
+			source, err := subscriptionEpisodeSourceSnapshot(sub, item)
+			if err != nil {
+				return 0, err
+			}
+			claimed, _, err := db.TryClaimSubscriptionEpisodeSource(source, time.Now())
+			if err != nil {
+				return 0, err
+			}
+			if !claimed {
+				if err := skipClusterDuplicateEpisodeItem(item); err != nil {
+					return 0, err
+				}
+				continue
+			}
+			claimedItems[item] = true
+		}
 		tasks = append(tasks, clusterMediaTask(sub, item, ref, message))
+		dispatchItems = append(dispatchItems, item)
 	}
 	if len(tasks) == 0 {
 		return 0, nil
@@ -566,18 +586,17 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 	}
 	dispatched := 0
 	var firstErr error
-	for _, item := range items {
-		if item == nil || item.Status != model.SubscriptionItemStatusPending {
-			continue
-		}
+	for _, item := range dispatchItems {
 		result, ok := resultByKey[item.SourceKey]
 		if !ok {
-			if dispatchErr != nil {
-				item.Status = model.SubscriptionItemStatusFailed
-				item.LastError = dispatchErr.Error()
-				if firstErr == nil {
-					firstErr = dispatchErr
-				}
+			item.Status = model.SubscriptionItemStatusFailed
+			missingErr := dispatchErr
+			if missingErr == nil {
+				missingErr = errors.New("cluster dispatch returned no result for claimed episode source")
+			}
+			item.LastError = missingErr.Error()
+			if firstErr == nil {
+				firstErr = missingErr
 			}
 		} else if result.Error != nil {
 			item.Status = model.SubscriptionItemStatusFailed
@@ -597,6 +616,11 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 				if _, _, upsertErr := db.UpsertSubscriptionItem(item); upsertErr != nil && firstErr == nil {
 					firstErr = upsertErr
 				}
+				if claimedItems[item] {
+					if releaseErr := db.ReleaseSubscriptionEpisodeSourceClaim(item); releaseErr != nil && firstErr == nil {
+						firstErr = releaseErr
+					}
+				}
 				continue
 			}
 			item.Status = model.SubscriptionItemStatusTransferring
@@ -606,6 +630,11 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 				if firstErr == nil {
 					firstErr = err
 				}
+				if claimedItems[item] {
+					if releaseErr := db.ReleaseSubscriptionEpisodeSourceClaim(item); releaseErr != nil && firstErr == nil {
+						firstErr = releaseErr
+					}
+				}
 				continue
 			}
 			dispatched++
@@ -613,6 +642,11 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 		}
 		if _, _, err := db.UpsertSubscriptionItem(item); err != nil && firstErr == nil {
 			firstErr = err
+		}
+		if claimedItems[item] {
+			if err := db.ReleaseSubscriptionEpisodeSourceClaim(item); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return dispatched, firstErr

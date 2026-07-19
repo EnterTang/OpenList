@@ -33,6 +33,10 @@ type Sender interface {
 	Send(context.Context, protocol.Envelope) error
 }
 
+type clusterErrorCoder interface {
+	ClusterErrorCode() string
+}
+
 type resultQueue interface {
 	ValidateDurability(context.Context) error
 	EnqueueDurably(context.Context, any) (string, error)
@@ -866,7 +870,7 @@ func safeClusterPathSegment(value string) string {
 	return "id-" + hex.EncodeToString(sum[:8])
 }
 
-func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOffer) error {
+func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOffer) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -966,6 +970,24 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err != nil {
 		return err
 	}
+	uploadStageFinished := false
+	finishUploadStage := func(status, stageError string) {
+		if uploadStageFinished {
+			return
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, status, stageError)
+		uploadStageFinished = true
+	}
+	defer func() {
+		if uploadStageFinished {
+			return
+		}
+		stageError := "cluster upload stage ended without a terminal status"
+		if err != nil {
+			stageError = err.Error()
+		}
+		finishUploadStage(model.ClusterStageStatusFailed, stageError)
+	}()
 	manifest := protocol.UploadETFManifest{
 		AttemptRef:            offer.AttemptRef,
 		ParentBatchID:         offer.TaskContext.ParentBatchID,
@@ -1019,10 +1041,10 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		}
 		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
 		if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
-			s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, enqueueErr.Error())
+			finishUploadStage(model.ClusterStageStatusFailed, enqueueErr.Error())
 			return fmt.Errorf("reconcile existing cluster upload: %w", enqueueErr)
 		}
-		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, "")
+		finishUploadStage(model.ClusterStageStatusSucceeded, "")
 		return nil
 	}
 	finalizePayload := task_group.TransferFinalizePayload{
@@ -1044,14 +1066,14 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
 	transferTask, err := fs.Move(taskCtx, stagedSource, targetRoot, true)
 	if err != nil {
-		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
+		finishUploadStage(model.ClusterStageStatusFailed, err.Error())
 		return fmt.Errorf("transfer cluster media: %w", err)
 	}
 	if err := waitNativeTransferTask(ctx, transferTask); err != nil {
-		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusFailed, err.Error())
+		finishUploadStage(model.ClusterStageStatusFailed, err.Error())
 		return fmt.Errorf("native cluster move task: %w", err)
 	}
-	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusSucceeded, "")
+	finishUploadStage(model.ClusterStageStatusSucceeded, "")
 	return nil
 }
 
@@ -1172,6 +1194,10 @@ func (s *Service) sendJobResult(ctx context.Context, offer protocol.JobOffer, re
 	} else {
 		payload.Status = "failed"
 		payload.ErrorCode = "worker_execution_failed"
+		var coded clusterErrorCoder
+		if errors.As(runErr, &coded) && strings.TrimSpace(coded.ClusterErrorCode()) != "" {
+			payload.ErrorCode = strings.TrimSpace(coded.ClusterErrorCode())
+		}
 		payload.Error = runErr.Error()
 	}
 	message, err := protocol.NewEnvelope(protocol.MessageJobResult, payload)

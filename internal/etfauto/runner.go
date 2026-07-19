@@ -13,7 +13,6 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type ShareProvider interface {
@@ -74,6 +73,69 @@ func RunPendingJobs(ctx context.Context, opts RunnerOptions) (int, error) {
 		processed++
 	}
 	return processed, nil
+}
+
+func ReconcileUnknownJobs(ctx context.Context, opts RunnerOptions) (int, error) {
+	opts = normalizeRunnerOptions(opts)
+	database := db.GetDb()
+	if database == nil {
+		return 0, errors.New("database is not initialized")
+	}
+	var jobs []model.ETFSubscriptionJob
+	if err := database.WithContext(ctx).
+		Where("status = ? AND type = ?", model.ETFSubscriptionJobStatusUnknown, model.ETFSubscriptionJobTypeCreate).
+		Order("updated_at ASC").
+		Limit(opts.Limit).
+		Find(&jobs).Error; err != nil {
+		return 0, errors.WithStack(err)
+	}
+	reconciled := 0
+	for i := range jobs {
+		job := &jobs[i]
+		root, err := getMediaRoot(ctx, job.MediaRootID)
+		if err != nil {
+			return reconciled, err
+		}
+		client := NewTargetClient(job.TargetBaseURL, job.TargetAPIToken, opts.HTTPClient, opts.Timeout)
+		lookup, err := client.LookupSubscription(ctx, root.MediaType, root.TMDBID)
+		if err != nil {
+			return reconciled, err
+		}
+		if lookup.Exists {
+			if err := MarkCreateSubscriptionSucceeded(ctx, job.ID, CreateSubscriptionResult{
+				SubscriptionID: lookup.SubscriptionID,
+				TaskID:         lookup.TaskID,
+				Fingerprint:    job.Fingerprint,
+				ResponseJSON:   lookup.RawJSON,
+			}); err != nil {
+				return reconciled, err
+			}
+			reconciled++
+			continue
+		}
+		if job.TargetSupportsIdempotency {
+			if err := retryUnknownJobTx(ctx, job.ID); err != nil {
+				return reconciled, err
+			}
+			reconciled++
+		}
+	}
+	return reconciled, nil
+}
+
+func retryUnknownJobTx(ctx context.Context, jobID uint) error {
+	return db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job model.ETFSubscriptionJob
+		if err := tx.First(&job, "id = ? AND status = ?", jobID, model.ETFSubscriptionJobStatusUnknown).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&job).Updates(map[string]any{
+			"status": model.ETFSubscriptionJobStatusPending, "next_retry_at": nil, "last_error": "",
+		}).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusPending)
+	})
 }
 
 func runJob(ctx context.Context, job *model.ETFSubscriptionJob, opts RunnerOptions) error {
@@ -204,7 +266,7 @@ func recreateMissingTargetSubscription(ctx context.Context, jobID uint, cause er
 			Fingerprint:               job.Fingerprint,
 			ClusterJobIDsJSON:         job.ClusterJobIDsJSON,
 		}
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(replacement).Error; err != nil {
+		if _, err := createOrMergeSubscriptionJobTx(tx, replacement); err != nil {
 			return err
 		}
 		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusPending)

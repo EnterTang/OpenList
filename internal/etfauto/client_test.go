@@ -137,3 +137,32 @@ func TestTargetClientUsesPublicAPIRoutesWithToken(t *testing.T) {
 		t.Fatalf("result = %#v, want subscription 53 task-public pending", result)
 	}
 }
+
+func TestTargetClientLooksUpSubscriptionByMediaIdentity(t *testing.T) {
+	const token = "lookup-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/subscriptions/lookup" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Query().Get("media_type") != "tv" || r.URL.Query().Get("tmdb_id") != "308874" {
+			t.Fatalf("query = %s", r.URL.RawQuery)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"exists": true, "subscription_id": 27, "task_id": "task-existing",
+			"task_status": "completed", "status": "completed",
+		})
+	}))
+	defer server.Close()
+
+	result, err := NewTargetClient(server.URL+"/api/v1", token, server.Client(), time.Second).
+		LookupSubscription(context.Background(), "TV", 308874)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Exists || result.SubscriptionID != 27 || result.TaskID != "task-existing" || result.RawJSON == "" {
+		t.Fatalf("lookup result = %#v", result)
+	}
+}

@@ -725,6 +725,31 @@ func (s *Service) handleJobAccept(ctx context.Context, peer transport.Peer, mess
 	})
 }
 
+const automaticMediaTransferAttemptLimit uint64 = 3
+
+func shouldRetryMediaTransfer(errorCode string, generation uint64) bool {
+	if generation >= automaticMediaTransferAttemptLimit {
+		return false
+	}
+	switch strings.TrimSpace(errorCode) {
+	case "source_unexpected_eof", "source_range_failed", "source_link_expired":
+		return true
+	default:
+		return false
+	}
+}
+
+func mediaTransferRetryDelay(generation uint64) time.Duration {
+	switch generation {
+	case 0, 1:
+		return 15 * time.Second
+	case 2:
+		return time.Minute
+	default:
+		return 3 * time.Minute
+	}
+}
+
 func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, message protocol.Envelope, result protocol.JobResult) error {
 	now := result.FinishedAt.UTC()
 	if now.IsZero() {
@@ -774,13 +799,33 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 			if job.Type == model.ClusterJobTypeShareInspect {
 				jobUpdates["status"] = model.ClusterJobStatusSucceeded
 				jobUpdates["finished_at"] = now
+			} else if job.Status == model.ClusterJobStatusSucceeded {
+				jobUpdates["status"] = model.ClusterJobStatusSucceeded
 			} else {
 				jobUpdates["status"] = model.ClusterJobStatusRunning
 			}
 			jobUpdates["result_delivery_status"] = model.ClusterResultDeliveryStatusQueued
 		} else {
-			jobUpdates["status"] = model.ClusterJobStatusFailed
-			jobUpdates["finished_at"] = now
+			retryScheduled := false
+			if job.Type == model.ClusterJobTypeMediaTransfer {
+				jobUpdates["notification_status"] = model.ClusterNotificationStatusNotStarted
+				if err := failNonTerminalAttemptStagesTx(tx, &job, result.ErrorCode, result.Error, now); err != nil {
+					return err
+				}
+				if shouldRetryMediaTransfer(result.ErrorCode, job.CurrentGeneration) {
+					retryScheduled = true
+					jobUpdates["status"] = model.ClusterJobStatusQueued
+					jobUpdates["finished_at"] = nil
+					jobUpdates["archived_at"] = nil
+					jobUpdates["assigned_node_id"] = ""
+					jobUpdates["current_attempt_id"] = ""
+					jobUpdates["available_at"] = now.Add(mediaTransferRetryDelay(job.CurrentGeneration))
+				}
+			}
+			if !retryScheduled {
+				jobUpdates["status"] = model.ClusterJobStatusFailed
+				jobUpdates["finished_at"] = now
+			}
 			if job.Type == model.ClusterJobTypeShareInspect {
 				if _, err := persistFailedShareInspectResultTx(tx, peer.NodeID(), &job, attempt, result); err != nil {
 					return err
@@ -806,7 +851,7 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		if err := tx.Model(&model.ClusterJob{}).Where("id = ?", result.JobID).Updates(jobUpdates).Error; err != nil {
 			return err
 		}
-		if result.Status != "succeeded" && job.Type == model.ClusterJobTypeMediaTransfer && job.SubscriptionItemID != 0 {
+		if result.Status != "succeeded" && job.Type == model.ClusterJobTypeMediaTransfer && job.SubscriptionItemID != 0 && jobUpdates["status"] == model.ClusterJobStatusFailed {
 			if err := tx.Model(&model.SubscriptionItem{}).
 				Where("id = ? AND cluster_job_id = ?", job.SubscriptionItemID, job.ID).
 				Updates(map[string]any{"status": model.SubscriptionItemStatusFailed, "last_error": result.Error}).Error; err != nil {
@@ -827,6 +872,27 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		_, _ = s.ProcessPendingShareInspects(ctx, 1)
 	}
 	return nil
+}
+
+func failNonTerminalAttemptStagesTx(tx *gorm.DB, job *model.ClusterJob, errorCode, stageError string, now time.Time) error {
+	if tx == nil || job == nil || strings.TrimSpace(job.CurrentAttemptID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(stageError) == "" {
+		stageError = "cluster media transfer failed before the worker reported a terminal stage status"
+	}
+	return tx.Model(&model.ClusterJobStage{}).
+		Where("job_id = ? AND attempt_id = ? AND status IN ?", job.ID, job.CurrentAttemptID, []string{
+			model.ClusterStageStatusPending,
+			model.ClusterStageStatusPermitted,
+			model.ClusterStageStatusRunning,
+		}).
+		Updates(map[string]any{
+			"status":      model.ClusterStageStatusFailed,
+			"finished_at": now,
+			"error_code":  errorCode,
+			"error":       stageError,
+		}).Error
 }
 
 func persistShareInspectResultTx(tx *gorm.DB, nodeID string, job *model.ClusterJob, attempt *model.ClusterJobAttempt, result protocol.JobResult) (string, error) {
@@ -1437,7 +1503,7 @@ func (s *Service) ListNodes(ctx context.Context, includeStale bool, now time.Tim
 	return result, nil
 }
 
-func (s *Service) DeleteStaleNode(ctx context.Context, nodeID string, now time.Time, staleAfter time.Duration) error {
+func (s *Service) DeleteNode(ctx context.Context, nodeID string, now time.Time) error {
 	if s.db == nil {
 		return errors.New("cluster database is unavailable")
 	}
@@ -1458,11 +1524,17 @@ func (s *Service) DeleteStaleNode(ctx context.Context, nodeID string, now time.T
 		switch status {
 		case model.ClusterNodeStatusOnline:
 			return errors.New("connected cluster node cannot be removed")
-		case model.ClusterNodeStatusDisabled, model.ClusterNodeStatusRevoked, model.ClusterNodeStatusDraining:
-			return fmt.Errorf("cluster node in state %s cannot be removed", status)
+		case model.ClusterNodeStatusDraining:
+			return errors.New("draining cluster node cannot be removed")
 		}
-		if !isStaleOfflineNode(node, now, staleAfter, heartbeatTimeout) {
-			return errors.New("cluster node is not stale offline")
+		// Keep immutable execution and result history for auditability, but remove
+		// all coordinator-owned identity, configuration, inventory, and transport
+		// state so an inactive Worker no longer remains registered.
+		if err := tx.Where("peer_node_id = ?", nodeID).Delete(&model.ClusterOutbox{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("peer_node_id = ?", nodeID).Delete(&model.ClusterInbox{}).Error; err != nil {
+			return err
 		}
 		if err := tx.Where("node_id = ?", nodeID).Delete(&model.ClusterNodeSession{}).Error; err != nil {
 			return err
@@ -1501,8 +1573,35 @@ func (s *Service) ListJobs(ctx context.Context, status string, includeArchived b
 		query = query.Where("status = ?", status)
 	}
 	var jobs []model.ClusterJob
-	err := query.Order("created_at DESC").Limit(limit).Find(&jobs).Error
-	return jobs, err
+	if err := query.Order("created_at DESC").Limit(limit).Find(&jobs).Error; err != nil || len(jobs) == 0 {
+		return jobs, err
+	}
+	jobIDs := make([]string, 0, len(jobs))
+	currentAttemptByJobID := make(map[string]string, len(jobs))
+	for i := range jobs {
+		jobIDs = append(jobIDs, jobs[i].ID)
+		currentAttemptByJobID[jobs[i].ID] = jobs[i].CurrentAttemptID
+	}
+	var stages []model.ClusterJobStage
+	if err := s.db.WithContext(ctx).
+		Where("job_id IN ?", jobIDs).
+		Order("job_id ASC, created_at ASC, id ASC").
+		Find(&stages).Error; err != nil {
+		return nil, err
+	}
+	stagesByJobID := make(map[string][]model.ClusterJobStage, len(jobs))
+	for i := range stages {
+		stage := stages[i]
+		currentAttemptID := currentAttemptByJobID[stage.JobID]
+		if currentAttemptID == "" || stage.AttemptID != currentAttemptID {
+			continue
+		}
+		stagesByJobID[stage.JobID] = append(stagesByJobID[stage.JobID], stage)
+	}
+	for i := range jobs {
+		jobs[i].Stages = stagesByJobID[jobs[i].ID]
+	}
+	return jobs, nil
 }
 
 func (s *Service) RetryJob(ctx context.Context, jobID string) error {

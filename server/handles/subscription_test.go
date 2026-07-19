@@ -3,6 +3,7 @@ package handles
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -61,6 +62,187 @@ type subscriptionEpisodeSourcesData struct {
 
 type recordingSubscriptionDispatcher struct {
 	inspectTasks []subscription.ClusterInspectTask
+}
+
+func TestUpdateSubscriptionRejectsBlankName(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Keep this name",
+		TMDBName:   "Keep this name",
+		SourceType: model.SubscriptionSourceManual,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	request := *sub
+	request.Name = "   "
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/subscription/update", strings.NewReader(string(body)))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateSubscription(c)
+
+	resp := decodeHandleResp[any](t, recorder)
+	if resp.Code != 400 || resp.Message != "name is required" {
+		t.Fatalf("response = %#v, want blank-name validation failure", resp)
+	}
+	stored, err := db.GetSubscriptionByID(sub.ID)
+	if err != nil {
+		t.Fatalf("get stored subscription: %v", err)
+	}
+	if stored.Name != "Keep this name" {
+		t.Fatalf("stored name = %q, want unchanged", stored.Name)
+	}
+}
+
+func TestDeleteSubscriptionHonorsCancelledRequestContext(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Cancelled handler delete",
+		TMDBName:   "Cancelled handler delete",
+		SourceType: model.SubscriptionSourceManual,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/admin/subscription/delete",
+		strings.NewReader(`{"id":`+strconv.Itoa(int(sub.ID))+`}`),
+	).WithContext(ctx)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	DeleteSubscription(c)
+
+	resp := decodeHandleResp[any](t, recorder)
+	if resp.Code != 503 || resp.Message != "subscription delete timed out; no changes were committed" {
+		t.Fatalf("response = %#v, want explicit cancellation response: %s", resp, recorder.Body.String())
+	}
+	if _, err := db.GetSubscriptionByID(sub.ID); err != nil {
+		t.Fatalf("cancelled handler delete removed subscription: %v", err)
+	}
+}
+
+// Regression: ISSUE-003 — SQLite writer contention left deletion without a useful terminal error.
+// Found by /qa on 2026-07-18
+// Report: .gstack/qa-reports/qa-report-oplistetf-entertang-work-2026-07-18.md
+func TestSubscriptionDeleteDatabaseBusy(t *testing.T) {
+	if !subscriptionDeleteDatabaseBusy(errors.New("database is locked (5) (SQLITE_BUSY)")) {
+		t.Fatal("SQLite busy error was not classified as a temporary delete conflict")
+	}
+	if subscriptionDeleteDatabaseBusy(errors.New("validation failed")) {
+		t.Fatal("unrelated error was classified as a SQLite busy conflict")
+	}
+}
+
+func TestSubscriptionConfigResponsesRedactAndPreserveSecrets(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+
+	const (
+		apiHash      = "api-secret-value"
+		refreshToken = "refresh-secret-value"
+		accessToken  = "access-secret-value"
+	)
+	_, err := subscription.SaveConfig(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			APIID:    12345,
+			APIHash:  apiHash,
+			Channels: []string{"@configured_channel"},
+			AliyunDrive: model.SubscriptionTelegramPanConfig{
+				RefreshToken: refreshToken,
+				AccessToken:  accessToken,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed subscription config: %v", err)
+	}
+
+	c, recorder := newSubscriptionHandleContext(t, http.MethodGet, "/admin/subscription/config")
+	GetSubscriptionConfig(c)
+	resp := decodeHandleResp[model.SubscriptionConfigResponse](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("get config code = %d: %s", resp.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), apiHash) || strings.Contains(recorder.Body.String(), refreshToken) || strings.Contains(recorder.Body.String(), accessToken) {
+		t.Fatalf("config response exposed a stored secret: %s", recorder.Body.String())
+	}
+	if resp.Data.Telegram.APIHash != "" || resp.Data.Telegram.AliyunDrive.RefreshToken != "" || resp.Data.Telegram.AliyunDrive.AccessToken != "" {
+		t.Fatalf("redacted config still contains secrets: %#v", resp.Data.Telegram)
+	}
+	if !resp.Data.SecretStatus.Configured["telegram.api_hash"] || !resp.Data.SecretStatus.Configured["telegram.aliyun_drive.refresh_token"] {
+		t.Fatalf("secret configured status = %#v", resp.Data.SecretStatus)
+	}
+	if resp.Data.SecretStatus.UnchangedMarker != model.SubscriptionSecretUnchangedMarker || resp.Data.SecretStatus.ClearMarker != model.SubscriptionSecretClearMarker {
+		t.Fatalf("secret update protocol = %#v", resp.Data.SecretStatus)
+	}
+	if resp.Data.SourceCapabilities[model.SubscriptionSourcePanSou].Available {
+		t.Fatalf("unconfigured pansou capability = %#v", resp.Data.SourceCapabilities[model.SubscriptionSourcePanSou])
+	}
+
+	update := resp.Data.SubscriptionConfig
+	update.PanSou.BaseURL = "https://pansou.example"
+	body, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/subscription/config", strings.NewReader(string(body)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	SaveSubscriptionConfig(c)
+	savedResp := decodeHandleResp[model.SubscriptionConfigResponse](t, recorder)
+	if savedResp.Code != 200 {
+		t.Fatalf("save config code = %d: %s", savedResp.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), apiHash) || strings.Contains(recorder.Body.String(), refreshToken) || strings.Contains(recorder.Body.String(), accessToken) {
+		t.Fatalf("save response exposed a stored secret: %s", recorder.Body.String())
+	}
+	stored, err := subscription.GetConfig()
+	if err != nil {
+		t.Fatalf("get saved config: %v", err)
+	}
+	if stored.Telegram.APIHash != apiHash || stored.Telegram.AliyunDrive.RefreshToken != refreshToken || stored.Telegram.AliyunDrive.AccessToken != accessToken {
+		t.Fatalf("redacted save overwrote credentials: %#v", stored.Telegram)
+	}
+	if !savedResp.Data.SourceCapabilities[model.SubscriptionSourcePanSou].Available {
+		t.Fatalf("configured pansou capability = %#v", savedResp.Data.SourceCapabilities[model.SubscriptionSourcePanSou])
+	}
+
+	clear := savedResp.Data.SubscriptionConfig
+	clear.Telegram.APIHash = model.SubscriptionSecretClearMarker
+	clear.Telegram.AliyunDrive.RefreshToken = model.SubscriptionSecretUnchangedMarker
+	body, err = json.Marshal(clear)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/subscription/config", strings.NewReader(string(body)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	SaveSubscriptionConfig(c)
+	clearResp := decodeHandleResp[model.SubscriptionConfigResponse](t, recorder)
+	if clearResp.Code != 200 {
+		t.Fatalf("clear config code = %d: %s", clearResp.Code, recorder.Body.String())
+	}
+	stored, err = subscription.GetConfig()
+	if err != nil {
+		t.Fatalf("get cleared config: %v", err)
+	}
+	if stored.Telegram.APIHash != "" || stored.Telegram.AliyunDrive.RefreshToken != refreshToken {
+		t.Fatalf("explicit clear/unchanged markers not honored: %#v", stored.Telegram)
+	}
 }
 
 func (d *recordingSubscriptionDispatcher) DispatchSubscriptionInspect(_ context.Context, task subscription.ClusterInspectTask) (string, error) {

@@ -199,12 +199,20 @@ func MarkCreateSubscriptionSucceeded(ctx context.Context, jobID uint, result Cre
 		job.LastError = ""
 		root.TargetSubscriptionID = result.SubscriptionID
 		root.LastCreateTaskID = strings.TrimSpace(result.TaskID)
-		root.CurrentFingerprint = result.Fingerprint
 		root.LastNotifiedFingerprint = result.Fingerprint
-		root.PendingChangeCount = 0
-		root.DirtySince = nil
-		root.Status = model.ETFMediaRootStatusSubscribed
 		root.LastError = ""
+		currentFingerprint := strings.TrimSpace(root.CurrentFingerprint)
+		if currentFingerprint == "" || currentFingerprint == result.Fingerprint {
+			root.CurrentFingerprint = result.Fingerprint
+			root.PendingChangeCount = 0
+			root.DirtySince = nil
+			root.Status = model.ETFMediaRootStatusSubscribed
+		} else {
+			if err := queueCatchUpManualCheckTx(tx, &root, &job, result.SubscriptionID, currentFingerprint); err != nil {
+				return err
+			}
+			root.Status = model.ETFMediaRootStatusDirty
+		}
 		if err := tx.Save(&job).Error; err != nil {
 			return err
 		}
@@ -372,7 +380,7 @@ func closeBatch(ctx context.Context, batch *model.ETFMediaRootBatch) error {
 				Fingerprint:               fingerprint,
 				ClusterJobIDsJSON:         batch.ClusterJobIDsJSON,
 			}
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(job).Error; err != nil {
+			if _, err := createOrMergeSubscriptionJobTx(tx, job); err != nil {
 				return err
 			}
 		} else {
@@ -380,23 +388,37 @@ func closeBatch(ctx context.Context, batch *model.ETFMediaRootBatch) error {
 			root.DirtySince = &dirtySince
 			root.PendingChangeCount += batch.ETFCount
 			root.Status = model.ETFMediaRootStatusDirty
-			if root.TargetSubscriptionID > 0 && fingerprint != root.LastNotifiedFingerprint {
-				job := &model.ETFSubscriptionJob{
-					JobKey:                    "check:" + root.RootKey + ":" + fingerprint,
-					MediaRootID:               root.ID,
-					BatchID:                   batch.ID,
-					Type:                      model.ETFSubscriptionJobTypeManualCheck,
-					Status:                    model.ETFSubscriptionJobStatusPending,
-					TargetBaseURL:             root.TargetBaseURL,
-					TargetAPIToken:            root.TargetAPIToken,
-					TargetSupportsIdempotency: root.TargetSupportsIdempotency,
-					ShareType:                 normalizeShareType(root.ShareType),
-					TargetSubscriptionID:      root.TargetSubscriptionID,
-					Fingerprint:               fingerprint,
-					ClusterJobIDsJSON:         batch.ClusterJobIDsJSON,
-				}
-				if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(job).Error; err != nil {
-					return err
+			if root.TargetSubscriptionID > 0 {
+				if fingerprint == root.LastNotifiedFingerprint {
+					root.PendingChangeCount -= batch.ETFCount
+					if root.PendingChangeCount < 0 {
+						root.PendingChangeCount = 0
+					}
+					if root.PendingChangeCount == 0 {
+						root.DirtySince = nil
+						root.Status = model.ETFMediaRootStatusSubscribed
+					}
+					if err := updateClusterJobNotificationStatus(tx, batch.ClusterJobIDsJSON, model.ClusterNotificationStatusSucceeded); err != nil {
+						return err
+					}
+				} else {
+					job := &model.ETFSubscriptionJob{
+						JobKey:                    "check:" + root.RootKey + ":" + fingerprint,
+						MediaRootID:               root.ID,
+						BatchID:                   batch.ID,
+						Type:                      model.ETFSubscriptionJobTypeManualCheck,
+						Status:                    model.ETFSubscriptionJobStatusPending,
+						TargetBaseURL:             root.TargetBaseURL,
+						TargetAPIToken:            root.TargetAPIToken,
+						TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+						ShareType:                 normalizeShareType(root.ShareType),
+						TargetSubscriptionID:      root.TargetSubscriptionID,
+						Fingerprint:               fingerprint,
+						ClusterJobIDsJSON:         batch.ClusterJobIDsJSON,
+					}
+					if _, err := createOrMergeSubscriptionJobTx(tx, job); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -405,6 +427,195 @@ func closeBatch(ctx context.Context, batch *model.ETFMediaRootBatch) error {
 		}
 		return tx.Save(&root).Error
 	})
+}
+
+func ReconcileNoChangeBatchNotifications(ctx context.Context) (int64, error) {
+	database := db.GetDb()
+	if database == nil {
+		return 0, errors.New("database is not initialized")
+	}
+	var completed int64
+	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		completed, err = reconcileNoChangeBatchNotificationsTx(tx)
+		return err
+	})
+	return completed, errors.WithStack(err)
+}
+
+func reconcileNoChangeBatchNotificationsTx(tx *gorm.DB) (int64, error) {
+	var roots []model.ETFMediaRoot
+	if err := tx.Where("target_subscription_id > 0").Find(&roots).Error; err != nil {
+		return 0, err
+	}
+	var completed int64
+	for i := range roots {
+		var latestSucceededBatchID uint
+		if err := tx.Model(&model.ETFSubscriptionJob{}).
+			Where("media_root_id = ? AND status = ?", roots[i].ID, model.ETFSubscriptionJobStatusSucceeded).
+			Select("COALESCE(MAX(batch_id), 0)").Scan(&latestSucceededBatchID).Error; err != nil {
+			return completed, err
+		}
+		var succeededFingerprints []string
+		if err := tx.Model(&model.ETFSubscriptionJob{}).
+			Where("media_root_id = ? AND status = ? AND fingerprint <> ''", roots[i].ID, model.ETFSubscriptionJobStatusSucceeded).
+			Distinct().Pluck("fingerprint", &succeededFingerprints).Error; err != nil {
+			return completed, err
+		}
+		if latestSucceededBatchID == 0 && len(succeededFingerprints) == 0 {
+			continue
+		}
+		var batches []model.ETFMediaRootBatch
+		query := tx.Select("cluster_job_ids_json", "etf_count").
+			Where("media_root_id = ? AND status = ?", roots[i].ID, model.ETFMediaRootBatchStatusClosed)
+		if latestSucceededBatchID > 0 && len(succeededFingerprints) > 0 {
+			query = query.Where("id <= ? OR fingerprint_after_batch IN ?", latestSucceededBatchID, succeededFingerprints)
+		} else if latestSucceededBatchID > 0 {
+			query = query.Where("id <= ?", latestSucceededBatchID)
+		} else {
+			query = query.Where("fingerprint_after_batch IN ?", succeededFingerprints)
+		}
+		if err := query.Find(&batches).Error; err != nil {
+			return completed, err
+		}
+		rootCompleted := false
+		for j := range batches {
+			ids, err := decodeClusterJobIDs(batches[j].ClusterJobIDsJSON)
+			if err != nil {
+				return completed, err
+			}
+			if len(ids) == 0 {
+				continue
+			}
+			var pending int64
+			if err := tx.Model(&model.ClusterJob{}).
+				Where("id IN ? AND notification_status <> ?", ids, model.ClusterNotificationStatusSucceeded).
+				Count(&pending).Error; err != nil {
+				return completed, err
+			}
+			if pending == 0 {
+				continue
+			}
+			if err := updateClusterJobNotificationStatus(tx, batches[j].ClusterJobIDsJSON, model.ClusterNotificationStatusSucceeded); err != nil {
+				return completed, err
+			}
+			completed += pending
+			rootCompleted = true
+			roots[i].PendingChangeCount -= batches[j].ETFCount
+			if roots[i].PendingChangeCount < 0 {
+				roots[i].PendingChangeCount = 0
+			}
+		}
+		if rootCompleted {
+			if roots[i].PendingChangeCount == 0 && roots[i].CurrentFingerprint == roots[i].LastNotifiedFingerprint {
+				roots[i].DirtySince = nil
+				roots[i].Status = model.ETFMediaRootStatusSubscribed
+			}
+			if err := tx.Save(&roots[i]).Error; err != nil {
+				return completed, err
+			}
+		}
+	}
+	return completed, nil
+}
+
+func QueueOrphanBatchNotifications(ctx context.Context) (int, int64, error) {
+	database := db.GetDb()
+	if database == nil {
+		return 0, 0, errors.New("database is not initialized")
+	}
+	queuedJobs := 0
+	var linkedClusterJobs int64
+	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var jobs []model.ETFSubscriptionJob
+		if err := tx.Select("cluster_job_ids_json").Find(&jobs).Error; err != nil {
+			return err
+		}
+		linked := make(map[string]struct{})
+		for i := range jobs {
+			ids, err := decodeClusterJobIDs(jobs[i].ClusterJobIDsJSON)
+			if err != nil {
+				return err
+			}
+			for _, id := range ids {
+				linked[id] = struct{}{}
+			}
+		}
+		var roots []model.ETFMediaRoot
+		if err := tx.Where("status = ?", model.ETFMediaRootStatusDirty).Find(&roots).Error; err != nil {
+			return err
+		}
+		for i := range roots {
+			var batches []model.ETFMediaRootBatch
+			if err := tx.Where("media_root_id = ? AND status = ?", roots[i].ID, model.ETFMediaRootBatchStatusClosed).Find(&batches).Error; err != nil {
+				return err
+			}
+			orphanIDs := make([]string, 0)
+			for j := range batches {
+				ids, err := decodeClusterJobIDs(batches[j].ClusterJobIDsJSON)
+				if err != nil {
+					return err
+				}
+				for _, id := range ids {
+					if _, exists := linked[id]; exists {
+						continue
+					}
+					var count int64
+					if err := tx.Model(&model.ClusterJob{}).
+						Where("id = ? AND status = ? AND notification_status = ?", id, model.ClusterJobStatusSucceeded, model.ClusterNotificationStatusPending).
+						Count(&count).Error; err != nil {
+						return err
+					}
+					if count > 0 {
+						orphanIDs = append(orphanIDs, id)
+						linked[id] = struct{}{}
+					}
+				}
+			}
+			if len(orphanIDs) == 0 {
+				continue
+			}
+			clusterIDs, err := json.Marshal(orphanIDs)
+			if err != nil {
+				return err
+			}
+			jobType := model.ETFSubscriptionJobTypeManualCheck
+			jobKey := "check:" + roots[i].RootKey + ":" + roots[i].CurrentFingerprint
+			if roots[i].TargetSubscriptionID <= 0 {
+				jobType = model.ETFSubscriptionJobTypeCreate
+				jobKey = "recreate:" + roots[i].RootKey + ":" + roots[i].CurrentFingerprint
+			}
+			candidate := &model.ETFSubscriptionJob{
+				JobKey: jobKey, MediaRootID: roots[i].ID, Type: jobType,
+				Status: model.ETFSubscriptionJobStatusPending, TargetBaseURL: roots[i].TargetBaseURL,
+				TargetAPIToken: roots[i].TargetAPIToken, TargetSupportsIdempotency: roots[i].TargetSupportsIdempotency,
+				ShareType: normalizeShareType(roots[i].ShareType), TargetSubscriptionID: roots[i].TargetSubscriptionID,
+				Fingerprint: roots[i].CurrentFingerprint, ClusterJobIDsJSON: string(clusterIDs),
+			}
+			saved, err := createOrMergeSubscriptionJobTx(tx, candidate)
+			if err != nil {
+				return err
+			}
+			if saved.Status != model.ETFSubscriptionJobStatusPending {
+				if !saved.TargetSupportsIdempotency {
+					continue
+				}
+				saved.Status = model.ETFSubscriptionJobStatusPending
+				saved.NextRetryAt = nil
+				saved.LastError = ""
+				if err := tx.Save(saved).Error; err != nil {
+					return err
+				}
+				if err := updateClusterJobNotificationStatus(tx, saved.ClusterJobIDsJSON, model.ClusterNotificationStatusPending); err != nil {
+					return err
+				}
+			}
+			queuedJobs++
+			linkedClusterJobs += int64(len(orphanIDs))
+		}
+		return nil
+	})
+	return queuedJobs, linkedClusterJobs, errors.WithStack(err)
 }
 
 func upsertMediaRoot(ctx context.Context, event ArchiveEvent, cfg Config) (*model.ETFMediaRoot, bool, error) {
@@ -515,13 +726,26 @@ func upsertCollectingBatch(ctx context.Context, root *model.ETFMediaRoot, event 
 }
 
 func mergeClusterJobIDs(raw, id string) (string, error) {
-	ids, err := decodeClusterJobIDs(raw)
-	if err != nil {
-		return "", err
-	}
 	id = strings.TrimSpace(id)
+	additional := ""
 	if id != "" {
-		ids = append(ids, id)
+		encoded, err := json.Marshal([]string{id})
+		if err != nil {
+			return "", errors.WithStack(err)
+		}
+		additional = string(encoded)
+	}
+	return mergeClusterJobIDJSON(raw, additional)
+}
+
+func mergeClusterJobIDJSON(values ...string) (string, error) {
+	ids := make([]string, 0)
+	for _, raw := range values {
+		decoded, err := decodeClusterJobIDs(raw)
+		if err != nil {
+			return "", err
+		}
+		ids = append(ids, decoded...)
 	}
 	seen := make(map[string]struct{}, len(ids))
 	unique := make([]string, 0, len(ids))
@@ -545,6 +769,146 @@ func mergeClusterJobIDs(raw, id string) (string, error) {
 		return "", errors.WithStack(err)
 	}
 	return string(encoded), nil
+}
+
+func subtractClusterJobIDs(raw, excludedRaw string) (string, error) {
+	ids, err := decodeClusterJobIDs(raw)
+	if err != nil {
+		return "", err
+	}
+	excluded, err := decodeClusterJobIDs(excludedRaw)
+	if err != nil {
+		return "", err
+	}
+	excludedSet := make(map[string]struct{}, len(excluded))
+	for _, id := range excluded {
+		excludedSet[strings.TrimSpace(id)] = struct{}{}
+	}
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := excludedSet[strings.TrimSpace(id)]; !ok {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(filtered)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	return string(encoded), nil
+}
+
+func createOrMergeSubscriptionJobTx(tx *gorm.DB, candidate *model.ETFSubscriptionJob) (*model.ETFSubscriptionJob, error) {
+	if tx == nil || candidate == nil {
+		return nil, errors.New("ETF subscription job is nil")
+	}
+	var existing model.ETFSubscriptionJob
+	err := tx.Where("job_key = ?", candidate.JobKey).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if err := tx.Create(candidate).Error; err != nil {
+			return nil, err
+		}
+		return candidate, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	mergedIDs, err := mergeClusterJobIDJSON(existing.ClusterJobIDsJSON, candidate.ClusterJobIDsJSON)
+	if err != nil {
+		return nil, err
+	}
+	existing.ClusterJobIDsJSON = mergedIDs
+	if candidate.BatchID > existing.BatchID {
+		existing.BatchID = candidate.BatchID
+	}
+	if candidate.TargetSubscriptionID > 0 {
+		existing.TargetSubscriptionID = candidate.TargetSubscriptionID
+	}
+	if candidate.TargetBaseURL != "" {
+		existing.TargetBaseURL = candidate.TargetBaseURL
+		existing.TargetAPIToken = candidate.TargetAPIToken
+		existing.TargetSupportsIdempotency = candidate.TargetSupportsIdempotency
+	}
+	if candidate.Fingerprint != "" {
+		existing.Fingerprint = candidate.Fingerprint
+	}
+	if err := tx.Save(&existing).Error; err != nil {
+		return nil, err
+	}
+	status := model.ClusterNotificationStatusPending
+	switch existing.Status {
+	case model.ETFSubscriptionJobStatusSucceeded:
+		status = model.ClusterNotificationStatusSucceeded
+	case model.ETFSubscriptionJobStatusUnknown:
+		status = model.ClusterNotificationStatusUnknown
+	case model.ETFSubscriptionJobStatusDeadLetter:
+		status = model.ClusterNotificationStatusFailed
+	}
+	if err := updateClusterJobNotificationStatus(tx, candidate.ClusterJobIDsJSON, status); err != nil {
+		return nil, err
+	}
+	return &existing, nil
+}
+
+func queueCatchUpManualCheckTx(tx *gorm.DB, root *model.ETFMediaRoot, createJob *model.ETFSubscriptionJob, targetSubscriptionID int64, fingerprint string) error {
+	var batches []model.ETFMediaRootBatch
+	query := tx.Where("media_root_id = ? AND status = ?", root.ID, model.ETFMediaRootBatchStatusClosed)
+	if createJob.BatchID > 0 {
+		query = query.Where("id > ?", createJob.BatchID)
+	}
+	if err := query.Order("id ASC").Find(&batches).Error; err != nil {
+		return err
+	}
+	clusterIDs := ""
+	latestBatchID := createJob.BatchID
+	pendingCount := 0
+	var dirtySince *time.Time
+	for i := range batches {
+		var err error
+		clusterIDs, err = mergeClusterJobIDJSON(clusterIDs, batches[i].ClusterJobIDsJSON)
+		if err != nil {
+			return err
+		}
+		if batches[i].ID > latestBatchID {
+			latestBatchID = batches[i].ID
+		}
+		pendingCount += batches[i].ETFCount
+		if dirtySince == nil || batches[i].FirstEventAt.Before(*dirtySince) {
+			value := batches[i].FirstEventAt
+			dirtySince = &value
+		}
+	}
+	var err error
+	clusterIDs, err = subtractClusterJobIDs(clusterIDs, createJob.ClusterJobIDsJSON)
+	if err != nil {
+		return err
+	}
+	catchUp := &model.ETFSubscriptionJob{
+		JobKey:                    "check:" + root.RootKey + ":" + fingerprint,
+		MediaRootID:               root.ID,
+		BatchID:                   latestBatchID,
+		Type:                      model.ETFSubscriptionJobTypeManualCheck,
+		Status:                    model.ETFSubscriptionJobStatusPending,
+		TargetBaseURL:             root.TargetBaseURL,
+		TargetAPIToken:            root.TargetAPIToken,
+		TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+		ShareType:                 normalizeShareType(root.ShareType),
+		TargetSubscriptionID:      targetSubscriptionID,
+		Fingerprint:               fingerprint,
+		ClusterJobIDsJSON:         clusterIDs,
+	}
+	if _, err := createOrMergeSubscriptionJobTx(tx, catchUp); err != nil {
+		return err
+	}
+	if root.PendingChangeCount < pendingCount {
+		root.PendingChangeCount = pendingCount
+	}
+	if root.DirtySince == nil && dirtySince != nil {
+		root.DirtySince = dirtySince
+	}
+	return nil
 }
 
 func decodeClusterJobIDs(raw string) ([]string, error) {

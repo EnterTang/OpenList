@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -94,7 +95,17 @@ func UpdateSubscriptionTMDBEpisodeEnd(snapshot *model.Subscription, discoveredTM
 }
 
 func DeleteSubscription(id uint) error {
-	return errors.WithStack(db.Transaction(func(tx *gorm.DB) error {
+	return DeleteSubscriptionContext(context.Background(), id)
+}
+
+func DeleteSubscriptionContext(ctx context.Context, id uint) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return errors.WithStack(db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.ExternalSubscriptionRequest{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where(columnName("subscription_id")+" = ?", id).Delete(&model.SubscriptionTelegramEvent{}).Error; err != nil {
 			return err
 		}
@@ -276,6 +287,102 @@ func ListSubscriptionItemsBySubscriptionIDs(subscriptionIDs []uint) ([]model.Sub
 
 func UpsertSubscriptionEpisodeSource(item *model.SubscriptionEpisodeSource) (*model.SubscriptionEpisodeSource, error) {
 	return upsertSubscriptionEpisodeSource(db, item)
+}
+
+const subscriptionEpisodeClaimTimeout = 5 * time.Minute
+
+// TryClaimSubscriptionEpisodeSource atomically claims one season/episode slot
+// before a cluster job is dispatched. The existing snapshot is the durable
+// claim, so independent Telegram observations cannot both become active.
+func TryClaimSubscriptionEpisodeSource(item *model.SubscriptionEpisodeSource, now time.Time) (bool, *model.SubscriptionEpisodeSource, error) {
+	if item == nil {
+		return false, nil, errors.New("subscription episode source is nil")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	item.SelectedAt = now
+	item.Status = model.SubscriptionItemStatusTransferring
+	item.ClusterJobID = ""
+
+	var saved model.SubscriptionEpisodeSource
+	err := db.Transaction(func(tx *gorm.DB) error {
+		updates := map[string]any{
+			"source_item_id":  item.SourceItemID,
+			"source_type":     item.SourceType,
+			"source_provider": item.SourceProvider,
+			"share_url":       item.ShareURL,
+			"file_name":       item.FileName,
+			"file_hash":       item.FileHash,
+			"status":          item.Status,
+			"cluster_job_id":  "",
+			"selected_at":     item.SelectedAt,
+			"updated_at":      now,
+		}
+		staleBefore := now.Add(-subscriptionEpisodeClaimTimeout)
+		result := tx.Model(&model.SubscriptionEpisodeSource{}).
+			Where(columnName("subscription_id")+" = ? AND "+columnName("season")+" = ? AND "+columnName("episode")+" = ?", item.SubscriptionID, item.Season, item.Episode).
+			Where("("+columnName("source_item_id")+" = ? AND "+columnName("file_hash")+" = ?) OR "+columnName("status")+" IN ? OR ("+columnName("cluster_job_id")+" = '' AND "+columnName("selected_at")+" < ?)",
+				item.SourceItemID, item.FileHash,
+				[]string{model.SubscriptionItemStatusFailed, model.SubscriptionItemStatusSkipped}, staleBefore).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			candidate := *item
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&candidate).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Where(
+			columnName("subscription_id")+" = ? AND "+columnName("season")+" = ? AND "+columnName("episode")+" = ?",
+			item.SubscriptionID, item.Season, item.Episode,
+		).First(&saved).Error
+	})
+	if err != nil {
+		return false, nil, errors.WithStack(err)
+	}
+	claimed := saved.SourceItemID == item.SourceItemID && saved.FileHash == item.FileHash
+	return claimed, &saved, nil
+}
+
+func UpdateClaimedSubscriptionEpisodeSource(item *model.SubscriptionItem, status, clusterJobID string) error {
+	if item == nil {
+		return errors.New("subscription item is nil")
+	}
+	now := time.Now()
+	updates := map[string]any{"status": status, "updated_at": now}
+	if clusterJobID != "" {
+		updates["cluster_job_id"] = clusterJobID
+	}
+	result := db.Model(&model.SubscriptionEpisodeSource{}).
+		Where(columnName("subscription_id")+" = ? AND "+columnName("season")+" = ? AND "+columnName("episode")+" = ? AND "+columnName("source_item_id")+" = ? AND "+columnName("file_hash")+" = ?",
+			item.SubscriptionID, item.Season, item.Episode, item.ID, item.FileHash).
+		Updates(updates)
+	if result.Error != nil {
+		return errors.WithStack(result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrStaleSubscriptionTerminalCallback
+	}
+	return nil
+}
+
+// ReleaseSubscriptionEpisodeSourceClaim removes an uncommitted pre-dispatch
+// claim only when it is still owned by the same subscription item and hash.
+// A claim that already carries a cluster job ID belongs to an accepted task
+// and must never be removed by a late dispatch error path.
+func ReleaseSubscriptionEpisodeSourceClaim(item *model.SubscriptionItem) error {
+	if item == nil {
+		return errors.New("subscription item is nil")
+	}
+	result := db.Where(
+		columnName("subscription_id")+" = ? AND "+columnName("season")+" = ? AND "+columnName("episode")+" = ? AND "+
+			columnName("source_item_id")+" = ? AND "+columnName("file_hash")+" = ? AND "+columnName("cluster_job_id")+" = ''",
+		item.SubscriptionID, item.Season, item.Episode, item.ID, item.FileHash,
+	).Delete(&model.SubscriptionEpisodeSource{})
+	return errors.WithStack(result.Error)
 }
 
 func upsertSubscriptionEpisodeSource(tx *gorm.DB, item *model.SubscriptionEpisodeSource) (*model.SubscriptionEpisodeSource, error) {
@@ -554,6 +661,9 @@ func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.Subscrip
 	clusterJobTable := modelTableName("ClusterJob")
 	clusterNodeTable := modelTableName("ClusterNode")
 	clusterJobAttemptTable := modelTableName("ClusterJobAttempt")
+	clusterJobStageTable := modelTableName("ClusterJobStage")
+	subscriptionTable := modelTableName("Subscription")
+	etfArchiveTable := modelTableName("ETFArchiveRecord")
 	err := db.Table("? AS subscription_episode_sources", clause.Table{Name: episodeSourceTable}).
 		Select(strings.Join([]string{
 			"subscription_episode_sources.id",
@@ -570,14 +680,43 @@ func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.Subscrip
 			"subscription_episode_sources.cluster_job_id",
 			"subscription_episode_sources.selected_at",
 			"CASE WHEN subscription_items.id IS NOT NULL THEN subscription_items.status ELSE subscription_episode_sources.status END AS status",
+			"CASE WHEN subscription_items.id IS NOT NULL THEN subscription_items.last_error ELSE '' END AS item_last_error",
+			"cluster_jobs.status AS job_status",
+			"cluster_jobs.notification_status AS job_notification_status",
+			"cluster_jobs.current_generation AS job_generation",
+			"cluster_jobs.started_at AS job_started_at",
+			"cluster_jobs.finished_at AS job_finished_at",
+			"cluster_jobs.last_error_code AS job_last_error_code",
+			"cluster_jobs.last_error AS job_last_error",
+			"current_stage.name AS current_stage",
+			"current_stage.status AS current_stage_status",
+			"current_stage.retry_count AS current_stage_retry_count",
+			"current_stage.error_code AS current_stage_error_code",
+			"current_stage.error AS current_stage_error",
+			"EXISTS (SELECT 1 FROM ? AS archived_etf JOIN ? AS source_subscription ON source_subscription.id = subscription_episode_sources.subscription_id " +
+				"WHERE archived_etf.tmdb_id = source_subscription.tmdb_id AND archived_etf.media_type = source_subscription.media_type " +
+				"AND archived_etf.season = subscription_episode_sources.season AND archived_etf.episode = subscription_episode_sources.episode " +
+				"AND archived_etf.status IN ('archived', 'corrected')) AS has_archived_etf",
 			"CASE " +
 				"WHEN subscription_episode_sources.cluster_job_id = '' OR subscription_episode_sources.cluster_job_id IS NULL THEN '本机' " +
 				"WHEN assigned_nodes.name IS NOT NULL AND assigned_nodes.name <> '' THEN assigned_nodes.name " +
 				"WHEN attempt_nodes.name IS NOT NULL AND attempt_nodes.name <> '' THEN attempt_nodes.name " +
 				"ELSE '未指派' END AS worker_name",
-		}, ", ")).
+		}, ", "), clause.Table{Name: etfArchiveTable}, clause.Table{Name: subscriptionTable}).
 		Joins("LEFT JOIN ? AS subscription_items ON subscription_items.id = subscription_episode_sources.source_item_id AND subscription_items.file_hash = subscription_episode_sources.file_hash", clause.Table{Name: subscriptionItemTable}).
 		Joins("LEFT JOIN ? AS cluster_jobs ON cluster_jobs.id = subscription_episode_sources.cluster_job_id", clause.Table{Name: clusterJobTable}).
+		Joins(
+			"LEFT JOIN ? AS current_stage ON current_stage.id = ("+
+				"SELECT stage_candidates.id FROM ? AS stage_candidates "+
+				"WHERE stage_candidates.job_id = cluster_jobs.id "+
+				"AND (cluster_jobs.current_attempt_id = '' OR stage_candidates.attempt_id = cluster_jobs.current_attempt_id) "+
+				"ORDER BY CASE stage_candidates.status "+
+				"WHEN 'running' THEN 0 WHEN 'permitted' THEN 1 WHEN 'failed' THEN 2 WHEN 'pending' THEN 3 ELSE 4 END, "+
+				"stage_candidates.updated_at DESC, stage_candidates.id DESC LIMIT 1"+
+				")",
+			clause.Table{Name: clusterJobStageTable},
+			clause.Table{Name: clusterJobStageTable},
+		).
 		Joins("LEFT JOIN ? AS assigned_nodes ON assigned_nodes.id = cluster_jobs.assigned_node_id", clause.Table{Name: clusterNodeTable}).
 		Joins(
 			"LEFT JOIN ? AS latest_attempt ON latest_attempt.id = ("+
@@ -592,7 +731,78 @@ func ListSubscriptionEpisodeSourceDetails(subscriptionID uint) ([]model.Subscrip
 		Where("subscription_episode_sources.subscription_id = ?", subscriptionID).
 		Order("subscription_episode_sources.season, subscription_episode_sources.episode").
 		Scan(&items).Error
+	if err == nil {
+		activeNotificationJobs, activeErr := activeETFNotificationClusterJobIDs()
+		if activeErr != nil {
+			return nil, activeErr
+		}
+		for i := range items {
+			items[i].EffectiveStatus = items[i].Status
+			if items[i].Status == model.SubscriptionItemStatusFailed && items[i].HasArchivedETF {
+				items[i].EffectiveStatus = "historical_succeeded_latest_failed"
+			}
+			items[i].NotificationDisplayStatus = items[i].JobNotificationStatus
+			if isTerminalFailedClusterJobStatus(items[i].JobStatus) &&
+				(items[i].JobNotificationStatus == model.ClusterNotificationStatusPending || items[i].JobNotificationStatus == "") {
+				if _, active := activeNotificationJobs[items[i].ClusterJobID]; !active {
+					items[i].NotificationDisplayStatus = model.ClusterNotificationStatusNotStarted
+				}
+			}
+			if isTerminalFailedClusterJobStatus(items[i].JobStatus) && isNonTerminalClusterStageStatus(items[i].CurrentStageStatus) {
+				items[i].CurrentStageStatus = model.ClusterStageStatusFailed
+				if items[i].CurrentStageError == "" {
+					items[i].CurrentStageError = items[i].JobLastError
+				}
+			}
+		}
+	}
 	return items, errors.WithStack(err)
+}
+
+func activeETFNotificationClusterJobIDs() (map[string]struct{}, error) {
+	var jobs []model.ETFSubscriptionJob
+	if err := db.Select("cluster_job_ids_json").
+		Where("status IN ?", []string{
+			model.ETFSubscriptionJobStatusPending,
+			model.ETFSubscriptionJobStatusRunning,
+			model.ETFSubscriptionJobStatusFailed,
+		}).
+		Find(&jobs).Error; err != nil {
+		return nil, errors.WithStack(err)
+	}
+	ids := make(map[string]struct{})
+	for i := range jobs {
+		var jobIDs []string
+		if raw := strings.TrimSpace(jobs[i].ClusterJobIDsJSON); raw != "" {
+			if err := json.Unmarshal([]byte(raw), &jobIDs); err != nil {
+				return nil, errors.Wrap(err, "decode ETF notification cluster job IDs")
+			}
+		}
+		for _, id := range jobIDs {
+			if id = strings.TrimSpace(id); id != "" {
+				ids[id] = struct{}{}
+			}
+		}
+	}
+	return ids, nil
+}
+
+func isTerminalFailedClusterJobStatus(status string) bool {
+	switch status {
+	case model.ClusterJobStatusFailed, model.ClusterJobStatusPartialFailed, model.ClusterJobStatusCancelled, model.ClusterJobStatusDeadLetter:
+		return true
+	default:
+		return false
+	}
+}
+
+func isNonTerminalClusterStageStatus(status string) bool {
+	switch status {
+	case model.ClusterStageStatusPending, model.ClusterStageStatusPermitted, model.ClusterStageStatusRunning:
+		return true
+	default:
+		return false
+	}
 }
 
 func subscriptionRunQuery(filter SubscriptionRunFilter) *gorm.DB {

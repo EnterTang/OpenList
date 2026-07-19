@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,35 @@ func (s channelSender) Send(ctx context.Context, message protocol.Envelope) erro
 	}
 }
 
+type codedWorkerError struct {
+	code string
+}
+
+func (e codedWorkerError) Error() string {
+	return "coded worker failure"
+}
+
+func (e codedWorkerError) ClusterErrorCode() string {
+	return e.code
+}
+
+func TestSendJobResultUsesClusterErrorCode(t *testing.T) {
+	sender := make(channelSender, 1)
+	service := New(&fakeResultQueue{}, sender)
+	offer := protocol.JobOffer{AttemptRef: protocol.AttemptRef{JobID: "job-1", AttemptID: "attempt-1", Generation: 1}}
+	if err := service.sendJobResult(context.Background(), offer, nil, fmt.Errorf("wrapped: %w", codedWorkerError{code: "source_unexpected_eof"})); err != nil {
+		t.Fatalf("send job result: %v", err)
+	}
+	message := <-sender
+	result, err := protocol.DecodePayload[protocol.JobResult](message)
+	if err != nil {
+		t.Fatalf("decode job result: %v", err)
+	}
+	if result.ErrorCode != "source_unexpected_eof" {
+		t.Fatalf("error code = %q, want source_unexpected_eof", result.ErrorCode)
+	}
+}
+
 func (q *fakeResultQueue) EnqueueResultAndCleanupDurably(ctx context.Context, value any, cleanup resultqueue.CleanupRequest) (string, string, error) {
 	q.ctxErr = ctx.Err()
 	q.enqueued = value
@@ -94,7 +124,9 @@ func (q *fakeResultQueue) ReleaseAttempt(context.Context, string) error {
 	q.claimed = false
 	return nil
 }
-func (q *fakeResultQueue) CleanupBacklog(context.Context) (int64, error) { return q.cleanupBacklog, nil }
+func (q *fakeResultQueue) CleanupBacklog(context.Context) (int64, error) {
+	return q.cleanupBacklog, nil
+}
 
 func (*fakeResultQueue) EnsureGroup(context.Context) error { return nil }
 func (*fakeResultQueue) Reclaim(context.Context, time.Duration, string, int64) ([]resultqueue.Result, string, error) {

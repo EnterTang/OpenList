@@ -177,8 +177,37 @@ curl() {
 download_file "https://example.invalid/fixture.zip" "$tmp_dir/download.zip"
 grep -Fx -- '--continue-at' "$curl_args" >/dev/null || fail "download_file does not enable resumable downloads"
 grep -Fx -- '--speed-time' "$curl_args" >/dev/null || fail "download_file does not bound low-speed stalls"
+grep -Fx -- '--retry-all-errors' "$curl_args" >/dev/null || fail "download_file does not retry transient TLS failures"
 unset -f curl
-pass "download_file enables resumable retries and a low-speed timeout"
+pass "download_file retries transient failures with resume and low-speed bounds"
+
+download_cache_dir="$tmp_dir/download-cache"
+cached_download="$tmp_dir/cached-download.txt"
+cached_fixture_digest="$(sha256_file "$digest_fixture")"
+cache_curl_calls="$tmp_dir/cache-curl-calls.txt"
+curl() {
+  local output_path=""
+  local arg
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
+    if [ "$arg" = "--output" ]; then
+      output_path="$1"
+      shift
+    fi
+  done
+  printf 'called\n' >>"$cache_curl_calls"
+  cp "$digest_fixture" "$output_path"
+}
+EMBEDDED_REDIS_CACHE_DIR="$download_cache_dir" download_file \
+  "https://example.invalid/cached.txt" "$cached_download" "$cached_fixture_digest"
+[ "$(cat "$cached_download")" = "$(cat "$digest_fixture")" ] || fail "cached download did not produce the expected content"
+rm -f -- "$cache_curl_calls"
+EMBEDDED_REDIS_CACHE_DIR="$download_cache_dir" download_file \
+  "https://example.invalid/cached.txt" "$cached_download" "$cached_fixture_digest"
+[ ! -e "$cache_curl_calls" ] || fail "verified cached download unexpectedly invoked curl"
+unset -f curl
+pass "download_file uses a persistent, SHA-256-verified cache"
 
 release_usage="$(bash "$LOCAL_RELEASE_SCRIPT" --help)"
 helper_usage="$(bash "$HELPER" --help)"
@@ -200,8 +229,7 @@ for required_help_text in \
   "sha256sum or shasum" \
   "github.com" \
   "raw.githubusercontent.com" \
-  "repo.msys2.org" \
-  "www.gnu.org"
+  "repo.msys2.org"
 do
   case "$release_usage" in
     *"$required_help_text"*) ;;
