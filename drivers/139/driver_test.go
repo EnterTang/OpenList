@@ -3,14 +3,18 @@ package _139
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
@@ -120,5 +124,122 @@ func TestUploadPersonalPartsFallsBackToCdnUploadURL(t *testing.T) {
 	}
 	if !sawUpload {
 		t.Fatal("expected upload request")
+	}
+}
+
+func TestPersonalUploadExpiredURLIsClassified(t *testing.T) {
+	err := &personalUploadPartError{
+		PartNumber: 7,
+		Err:        errors.New(`unexpected status code: 403, body: <?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>`),
+	}
+	if !isPersonalUploadURLExpired(err) {
+		t.Fatal("expected expired upload URL error to be classified as refreshable")
+	}
+}
+
+func TestPersonalUploadOther403IsNotClassifiedAsExpired(t *testing.T) {
+	err := errors.New(`unexpected status code: 403, body: <?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>Access denied</Message></Error>`)
+	if isPersonalUploadURLExpired(err) {
+		t.Fatal("expected non-expired 403 to remain terminal")
+	}
+}
+
+func TestUploadPersonalPartsFromStreamUsesPartOffset(t *testing.T) {
+	body := []byte("abcdef")
+	seen := make([]string, 0, 2)
+	oldHTTPClient := base.HttpClient
+	base.HttpClient = http.DefaultClient
+	defer func() { base.HttpClient = oldHTTPClient }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		partBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upload body: %v", err)
+		}
+		seen = append(seen, string(partBody))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	fileStream := &streamPkg.FileStream{
+		Obj:    &model.Object{Name: "test.bin", Size: int64(len(body))},
+		Reader: bytes.NewReader(body),
+		Ctx:    context.Background(),
+	}
+	err := (&Yun139{}).uploadPersonalPartsFromStream(
+		context.Background(),
+		[]PartInfo{
+			{PartNumber: 1, PartSize: 3, ParallelHashCtx: ParallelHashCtx{PartOffset: 0}},
+			{PartNumber: 2, PartSize: 3, ParallelHashCtx: ParallelHashCtx{PartOffset: 3}},
+		},
+		[]PersonalPartInfo{{PartNumber: 1, UploadUrl: server.URL}, {PartNumber: 2, UploadUrl: server.URL}},
+		fileStream,
+		driver.NewProgress(6, func(float64) {}),
+		1,
+	)
+	if err != nil {
+		t.Fatalf("uploadPersonalPartsFromStream returned error: %v", err)
+	}
+	if !reflect.DeepEqual(seen, []string{"abc", "def"}) {
+		t.Fatalf("uploaded parts = %#v, want [abc def]", seen)
+	}
+}
+
+func TestPersonalUploadRefreshesExpiredPart(t *testing.T) {
+	body := []byte("abcdef")
+	var uploadAttempts int
+	oldHTTPClient := base.HttpClient
+	base.HttpClient = http.DefaultClient
+	defer func() { base.HttpClient = oldHTTPClient }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploadAttempts++
+		if uploadAttempts == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>`))
+			return
+		}
+		got, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read retry body: %v", err)
+		}
+		if string(got) != "def" {
+			t.Fatalf("retry body = %q, want def", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	fileStream := &streamPkg.FileStream{
+		Obj:    &model.Object{Name: "test.bin", Size: int64(len(body))},
+		Reader: bytes.NewReader(body),
+		Ctx:    context.Background(),
+	}
+	parts := []PartInfo{
+		{PartNumber: 1, PartSize: 3, ParallelHashCtx: ParallelHashCtx{PartOffset: 0}},
+		{PartNumber: 2, PartSize: 3, ParallelHashCtx: ParallelHashCtx{PartOffset: 3}},
+	}
+	refreshCalls := 0
+	err := (&Yun139{}).uploadPersonalPartsWithRefresh(
+		context.Background(),
+		parts,
+		[]PersonalPartInfo{{PartNumber: 2, UploadUrl: server.URL}},
+		fileStream,
+		driver.NewProgress(3, func(float64) {}),
+		2,
+		2,
+		func(remaining []PartInfo) ([]PersonalPartInfo, error) {
+			refreshCalls++
+			if len(remaining) != 1 || remaining[0].PartNumber != 2 {
+				t.Fatalf("remaining parts = %#v, want part 2", remaining)
+			}
+			return []PersonalPartInfo{{PartNumber: 2, UploadUrl: server.URL}}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("uploadPersonalPartsWithRefresh returned error: %v", err)
+	}
+	if refreshCalls != 1 || uploadAttempts != 2 {
+		t.Fatalf("refresh calls = %d, upload attempts = %d, want 1 and 2", refreshCalls, uploadAttempts)
 	}
 }

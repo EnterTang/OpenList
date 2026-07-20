@@ -23,6 +23,14 @@ func (p *Progress) Write(b []byte) (n int, err error) {
 	return n, err
 }
 
+func (p *Progress) Add(n int64) {
+	if n <= 0 {
+		return
+	}
+	p.Done += n
+	p.up(float64(p.Done) / float64(p.Total) * 100)
+}
+
 func NewProgress(total int64, up UpdateProgress) *Progress {
 	return &Progress{
 		Total: total,
