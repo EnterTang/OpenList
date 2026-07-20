@@ -248,6 +248,7 @@ func admin(g *gin.RouterGroup) {
 	subscription.POST("/delete", handles.DeleteSubscription)
 	subscription.POST("/preview", handles.PreviewSubscription)
 	subscription.POST("/check", handles.CheckSubscription)
+	subscription.POST("/retry_failed", handles.RetryFailedSubscription)
 	subscription.GET("/runs", handles.ListSubscriptionRuns)
 	subscription.GET("/board", handles.ListSubscriptionBoard)
 	subscription.GET("/episode_sources", handles.ListSubscriptionEpisodeSources)

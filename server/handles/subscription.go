@@ -375,6 +375,24 @@ func CheckSubscription(c *gin.Context) {
 	common.SuccessResp(c, result)
 }
 
+func RetryFailedSubscription(c *gin.Context) {
+	var req model.SubscriptionCheckReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if _, err := db.ResetFailedSubscriptionItems(c.Request.Context(), req.ID); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	result, err := subscription.RunForRole(c.Request.Context(), req.ID, true, conf.Conf.Cluster.Role)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
 func ListSubscriptionRuns(c *gin.Context) {
 	var req listSubscriptionRunsReq
 	if err := c.ShouldBind(&req); err != nil {
