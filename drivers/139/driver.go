@@ -20,6 +20,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/cron"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
+	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -678,6 +679,26 @@ func personalUploadNeedsPartUpload(resp PersonalUploadResp) bool {
 	return false
 }
 
+func (d *Yun139) getPersonalUploadURLs(ctx context.Context, fileID, uploadID string, partInfos []PartInfo) ([]PersonalPartInfo, error) {
+	data := base.Json{
+		"fileId":    fileID,
+		"uploadId":  uploadID,
+		"partInfos": partInfos,
+		"commonAccountInfo": base.Json{
+			"account":     d.getAccount(),
+			"accountType": 1,
+		},
+	}
+	var resp PersonalUploadUrlResp
+	if _, err := d.personalRequestWithHeaders("/file/getUploadUrl", http.MethodPost, func(req *resty.Request) {
+		req.SetContext(ctx)
+		req.SetBody(data)
+	}, &resp, d.personalUploadHeaders()); err != nil {
+		return nil, err
+	}
+	return resp.Data.PartInfos, nil
+}
+
 func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
 	switch d.Addition.Type {
 	case MetaPersonalNew:
@@ -733,10 +754,12 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		if personalUploadNeedsPartUpload(resp) {
 			// Progress
 			p := driver.NewProgress(size, up)
-			rateLimited := driver.NewLimitedUploadStream(ctx, stream)
 
 			// 先上传前100个分片
-			err = d.uploadPersonalParts(ctx, partInfos, resp.Data.PartInfos, rateLimited, p)
+			firstBatchEnd := min(int64(personalUploadPartInfoLimit), int64(len(partInfos)))
+			err = d.uploadPersonalPartsWithRefresh(ctx, partInfos, resp.Data.PartInfos, stream, p, 1, firstBatchEnd, func(remaining []PartInfo) ([]PersonalPartInfo, error) {
+				return d.getPersonalUploadURLs(ctx, resp.Data.FileId, resp.Data.UploadId, remaining)
+			})
 			if err != nil {
 				return err
 			}
@@ -760,7 +783,9 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 				if err != nil {
 					return err
 				}
-				err = d.uploadPersonalParts(ctx, partInfos, moreresp.Data.PartInfos, rateLimited, p)
+				err = d.uploadPersonalPartsWithRefresh(ctx, partInfos, moreresp.Data.PartInfos, stream, p, batchPartInfos[0].PartNumber, batchPartInfos[len(batchPartInfos)-1].PartNumber, func(remaining []PartInfo) ([]PersonalPartInfo, error) {
+					return d.getPersonalUploadURLs(ctx, resp.Data.FileId, resp.Data.UploadId, remaining)
+				})
 				if err != nil {
 					return err
 				}
