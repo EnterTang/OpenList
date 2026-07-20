@@ -117,6 +117,51 @@ func seedSubscriptionRunBoardFixture(t *testing.T) (model.Subscription, model.Su
 	return subscriptions[0], subscriptions[1], subscriptions[2], runs
 }
 
+func TestResetFailedSubscriptionItems(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	subscription := &model.Subscription{Name: "Retry Show", TMDBName: "Retry Show"}
+	if err := CreateSubscription(subscription); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	items := []*model.SubscriptionItem{
+		{SubscriptionID: subscription.ID, SourceKey: "failed", Status: model.SubscriptionItemStatusFailed, ClusterJobID: "failed-job", LastError: "network failure"},
+		{SubscriptionID: subscription.ID, SourceKey: "transferred", Status: model.SubscriptionItemStatusTransferred, ClusterJobID: "done-job", LastError: ""},
+		{SubscriptionID: subscription.ID, SourceKey: "pending", Status: model.SubscriptionItemStatusPending, ClusterJobID: "pending-job", LastError: ""},
+	}
+	for _, item := range items {
+		if err := db.Create(item).Error; err != nil {
+			t.Fatalf("create subscription item %q: %v", item.SourceKey, err)
+		}
+	}
+
+	reset, err := ResetFailedSubscriptionItems(context.Background(), subscription.ID)
+	if err != nil {
+		t.Fatalf("reset failed subscription items: %v", err)
+	}
+	if reset != 1 {
+		t.Fatalf("reset count = %d, want 1", reset)
+	}
+
+	var failed, transferred, pending model.SubscriptionItem
+	for _, item := range []*model.SubscriptionItem{&failed, &transferred, &pending} {
+		if err := db.Where("source_key = ?", map[*model.SubscriptionItem]string{
+			&failed: "failed", &transferred: "transferred", &pending: "pending",
+		}[item]).First(item).Error; err != nil {
+			t.Fatalf("reload subscription item: %v", err)
+		}
+	}
+	if failed.Status != model.SubscriptionItemStatusPending || failed.ClusterJobID != "" || failed.LastError != "" {
+		t.Fatalf("failed item after reset = %#v", failed)
+	}
+	if transferred.Status != model.SubscriptionItemStatusTransferred || transferred.ClusterJobID != "done-job" {
+		t.Fatalf("transferred item changed = %#v", transferred)
+	}
+	if pending.Status != model.SubscriptionItemStatusPending || pending.ClusterJobID != "pending-job" {
+		t.Fatalf("pending item changed = %#v", pending)
+	}
+}
+
 func TestSubscriptionTaskBoardHonorsConfiguredTablePrefix(t *testing.T) {
 	setupPrefixedSubscriptionDB(t)
 

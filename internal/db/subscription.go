@@ -133,6 +133,32 @@ func GetSubscriptionByID(id uint) (*model.Subscription, error) {
 	return &item, nil
 }
 
+func ResetFailedSubscriptionItems(ctx context.Context, subscriptionID uint) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var reset int64
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var subscription model.Subscription
+		if err := tx.First(&subscription, subscriptionID).Error; err != nil {
+			return err
+		}
+		result := tx.Model(&model.SubscriptionItem{}).
+			Where("subscription_id = ? AND status = ?", subscriptionID, model.SubscriptionItemStatusFailed).
+			Updates(map[string]any{
+				"status":         model.SubscriptionItemStatusPending,
+				"cluster_job_id": "",
+				"last_error":     "",
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		reset = result.RowsAffected
+		return nil
+	})
+	return int(reset), errors.WithStack(err)
+}
+
 func ListSubscriptions(filter SubscriptionFilter) ([]model.Subscription, int64, error) {
 	query := subscriptionListQuery(filter)
 	var total int64
