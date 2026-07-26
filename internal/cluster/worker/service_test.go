@@ -193,12 +193,32 @@ func TestEnqueueThenCleanupKeepsMediaWhenResultPersistenceFails(t *testing.T) {
 	require.ErrorIs(t, err, resultqueue.ErrUnavailable)
 }
 
+func TestReportCleanupStatusSendsStageUpdate(t *testing.T) {
+	sender := make(channelSender, 1)
+	service := New(&fakeResultQueue{}, sender)
+	cleanup := resultqueue.CleanupRequest{JobID: "job-1", AttemptID: "attempt-1", Generation: 2, LeaseToken: "lease"}
+	service.reportCleanupStatus(context.Background(), cleanup, model.ClusterStageStatusSucceeded, "")
+	message := <-sender
+	update, err := protocol.DecodePayload[protocol.StageStatusUpdate](message)
+	require.NoError(t, err)
+	require.Equal(t, model.ClusterStageWorkerMediaCleanup, update.Stage)
+	require.Equal(t, model.ClusterStageStatusSucceeded, update.Status)
+	require.Equal(t, cleanup.JobID, update.JobID)
+	require.Equal(t, cleanup.AttemptID, update.AttemptID)
+	require.Equal(t, cleanup.Generation, update.Generation)
+	require.Equal(t, cleanup.LeaseToken, update.LeaseToken)
+	require.False(t, update.FinishedAt.IsZero())
+}
+
 func TestNewCleanupRequestUsesExactFinalPath(t *testing.T) {
 	manifest := validUploadManifest(t)
 	request, err := NewCleanupRequest(manifest, "/mobile")
 	require.NoError(t, err)
 	require.Equal(t, "/mobile/upload/tv/国产剧/Show/Season 1/Show.S01E01.mkv", request.OpenListPath)
 	require.Equal(t, "remote-1", request.RemoteFileID)
+	require.Equal(t, manifest.AttemptID, request.AttemptID)
+	require.Equal(t, manifest.Generation, request.Generation)
+	require.Equal(t, manifest.LeaseToken, request.LeaseToken)
 	require.True(t, request.EmptyRecycleBin)
 }
 

@@ -757,6 +757,58 @@ func TestStageStatusUpdatesCurrentAttemptAndRejectsStaleAttempt(t *testing.T) {
 	}
 }
 
+func TestWorkerCleanupStageTracksRetriesAndJobStatus(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	taskContext := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(taskContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(taskContext, contextHash, model.ClusterAttemptStatusAccepted)
+	job.WorkerCleanupStatus = model.ClusterCleanupStatusPending
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := New(database, "token")
+	peer := &testPeer{}
+	send := func(sequence uint64, status, stageError string) {
+		t.Helper()
+		message, err := protocol.NewEnvelope(protocol.MessageStageStatus, protocol.StageStatusUpdate{
+			AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: attempt.Generation, LeaseToken: "lease"},
+			Stage:      model.ClusterStageWorkerMediaCleanup, Status: status, Error: stageError,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		message.Seq = sequence
+		if err := service.HandleMessage(context.Background(), peer, *message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send(1, model.ClusterStageStatusRunning, "")
+	send(2, model.ClusterStageStatusFailed, "temporary provider error")
+	send(3, model.ClusterStageStatusRunning, "")
+	send(4, model.ClusterStageStatusSucceeded, "")
+
+	var storedJob model.ClusterJob
+	if err := database.First(&storedJob, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedJob.WorkerCleanupStatus != model.ClusterCleanupStatusSucceeded {
+		t.Fatalf("cleanup status = %q", storedJob.WorkerCleanupStatus)
+	}
+	var stage model.ClusterJobStage
+	if err := database.Where("attempt_id = ? AND name = ?", attempt.ID, model.ClusterStageWorkerMediaCleanup).First(&stage).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusSucceeded || stage.FinishedAt == nil {
+		t.Fatalf("cleanup stage = %#v", stage)
+	}
+}
+
 func TestArchiveAndRetryFailedJobs(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	job := model.ClusterJob{ID: "failed-job", IdempotencyKey: "failed-job", Status: model.ClusterJobStatusFailed}

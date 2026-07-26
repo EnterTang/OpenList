@@ -153,21 +153,27 @@ func (s *Service) EnqueueThenCleanup(ctx context.Context, manifest protocol.Uplo
 		cancelPersist()
 		return "", err
 	}
+	s.reportCleanupStatus(ctx, cleanup, model.ClusterStageStatusRunning, "")
 	id, cleanupID, err := s.queue.EnqueueResultAndCleanupDurably(persistCtx, manifest, cleanup)
 	cancelPersist()
 	if err != nil {
+		s.reportCleanupStatus(ctx, cleanup, model.ClusterStageStatusFailed, err.Error())
 		return "", err
 	}
 	cleanupCtx, cancelCleanup := detachedFinalizationContext(ctx)
 	defer cancelCleanup()
 	if err := executeCleanup(cleanupCtx, cleanup); err != nil {
+		s.reportCleanupStatus(ctx, cleanup, model.ClusterStageStatusFailed, err.Error())
 		// The durable ETF result is the point of no return for the upload.
 		// Returning the cleanup error would make the transfer task upload the
 		// same media again. Keep the result queued and surface cleanup as an
 		// operational warning instead.
 		log.Errorf("cluster upload result %s persisted but media cleanup failed: %v", id, err)
-	} else if err := s.queue.AckAndDeleteCleanup(cleanupCtx, cleanupID); err != nil {
-		log.Warnf("cluster upload result %s cleaned but cleanup receipt %s could not be removed: %v", id, cleanupID, err)
+	} else {
+		s.reportCleanupStatus(ctx, cleanup, model.ClusterStageStatusSucceeded, "")
+		if err := s.queue.AckAndDeleteCleanup(cleanupCtx, cleanupID); err != nil {
+			log.Warnf("cluster upload result %s cleaned but cleanup receipt %s could not be removed: %v", id, cleanupID, err)
+		}
 	}
 	return id, nil
 }
@@ -203,10 +209,13 @@ func (s *Service) RunCleanupProcessor(ctx context.Context) error {
 				_ = s.queue.MoveCleanupToDLQ(ctx, queued, "invalid_cleanup: "+err.Error())
 				continue
 			}
+			s.reportCleanupStatus(ctx, request, model.ClusterStageStatusRunning, "")
 			if err := executeCleanup(ctx, request); err != nil {
+				s.reportCleanupStatus(ctx, request, model.ClusterStageStatusFailed, err.Error())
 				log.Warnf("retry cluster cleanup %s: %v", queued.ID, err)
 				continue
 			}
+			s.reportCleanupStatus(ctx, request, model.ClusterStageStatusSucceeded, "")
 			if err := s.queue.AckAndDeleteCleanup(ctx, queued.ID); err != nil {
 				log.Warnf("ack cluster cleanup %s: %v", queued.ID, err)
 			}
@@ -700,6 +709,9 @@ func NewCleanupRequest(manifest protocol.UploadETFManifest, storageMountPath str
 		Version:          "v1",
 		JobID:            safeClusterPathSegment(manifest.JobID),
 		MediaItemID:      safeClusterPathSegment(manifest.MediaItemID),
+		AttemptID:        manifest.AttemptID,
+		Generation:       manifest.Generation,
+		LeaseToken:       manifest.LeaseToken,
 		OpenListPath:     path.Clean(strings.TrimSpace(manifest.RemotePath)),
 		StorageMountPath: path.Clean(storageMountPath),
 		RemoteFileID:     manifest.RemoteFileID,
@@ -1096,6 +1108,32 @@ func findExistingStagedSource(ctx context.Context, tempRoot string, primary prot
 func (s *Service) reportStageStatus(ctx context.Context, offer protocol.JobOffer, stage, status, stageError string) {
 	if err := s.sendStageStatus(ctx, offer, stage, status, stageError); err != nil {
 		log.Warnf("cluster job %s stage %s/%s notify failed: %v", offer.JobID, stage, status, err)
+	}
+}
+
+func (s *Service) reportCleanupStatus(ctx context.Context, cleanup resultqueue.CleanupRequest, status, stageError string) {
+	if cleanup.JobID == "" || cleanup.AttemptID == "" || cleanup.Generation == 0 || cleanup.LeaseToken == "" {
+		return
+	}
+	update := protocol.StageStatusUpdate{
+		AttemptRef: protocol.AttemptRef{JobID: cleanup.JobID, AttemptID: cleanup.AttemptID, Generation: cleanup.Generation, LeaseToken: cleanup.LeaseToken},
+		Stage:      model.ClusterStageWorkerMediaCleanup,
+		Status:     status,
+		Error:      stageError,
+	}
+	if status == model.ClusterStageStatusSucceeded || status == model.ClusterStageStatusFailed {
+		update.FinishedAt = time.Now().UTC()
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageStageStatus, update)
+	if err != nil {
+		log.Warnf("cluster cleanup %s status %s envelope failed: %v", cleanup.JobID, status, err)
+		return
+	}
+	if s.sender == nil {
+		return
+	}
+	if err := s.sender.Send(ctx, *message); err != nil {
+		log.Warnf("cluster cleanup %s status %s notify failed: %v", cleanup.JobID, status, err)
 	}
 }
 

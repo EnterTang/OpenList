@@ -66,6 +66,9 @@ type CleanupRequest struct {
 	Version           string          `json:"version"`
 	JobID             string          `json:"job_id"`
 	MediaItemID       string          `json:"media_item_id"`
+	AttemptID         string          `json:"attempt_id,omitempty"`
+	Generation        uint64          `json:"generation,omitempty"`
+	LeaseToken        string          `json:"lease_token,omitempty"`
 	OpenListPath      string          `json:"openlist_path"`
 	StorageMountPath  string          `json:"storage_mount_path"`
 	RemoteFileID      string          `json:"remote_file_id,omitempty"`
