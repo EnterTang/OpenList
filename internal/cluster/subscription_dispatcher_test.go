@@ -52,8 +52,8 @@ func TestSubscriptionMediaTaskContextUsesWorkerManagedProviderTargets(t *testing
 		TMDBID:                123,
 		Season:                1,
 		Episode:               1,
-		LogicalMediaRoot:      "/139_60t/�?台剧",
-		LogicalTargetPath:     "/139_60t/�?台剧/Example/Season 01/Example.S01E01.mkv",
+		LogicalMediaRoot:      "/139_60t/港台剧",
+		LogicalTargetPath:     "/139_60t/港台剧/Example/Season 01/Example.S01E01.mkv",
 		PreferredWorkerNodeID: "worker-139",
 		WorkflowVersion:       "workflow-1",
 		SealedManifestVersion: "manifest-1",
@@ -523,7 +523,7 @@ func TestConsumeSubscriptionShareInspectCompletesWhenInspectJobFailedWithoutMani
 	if err := database.Create(&model.ClusterJob{
 		ID: "inspect-failed", IdempotencyKey: "inspect-failed", Type: model.ClusterJobTypeShareInspect,
 		SubscriptionID: sub.ID, Status: model.ClusterJobStatusFailed, TaskContextJSON: string(taskJSON),
-		LastError: "分享地址已失�?",
+		LastError: "分享地址已失效",
 	}).Error; err != nil {
 		t.Fatalf("create failed job: %v", err)
 	}
