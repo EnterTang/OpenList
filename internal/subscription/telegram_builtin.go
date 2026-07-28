@@ -164,17 +164,27 @@ func runBuiltinTelegramClient(ctx context.Context, cfg model.SubscriptionTelegra
 	if err := os.MkdirAll(filepath.Dir(sessionFile), 0700); err != nil {
 		return err
 	}
+	unlock, err := lockTelegramSession(ctx, sessionFile)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	timeout := time.Duration(cfg.CommandTimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := telegram.NewClient(cfg.APIID, cfg.APIHash, telegram.Options{
+	opts, err := telegramClientOptions(cfg, telegram.Options{
 		SessionStorage: &session.FileStorage{Path: sessionFile},
 		NoUpdates:      true,
 		Device:         telegram.DeviceTDesktopWindows(),
 	})
+	if err != nil {
+		return err
+	}
+	client := telegram.NewClient(cfg.APIID, cfg.APIHash, opts)
 	if err := client.Run(ctx, func(ctx context.Context) error {
 		return fn(ctx, client)
 	}); err != nil {

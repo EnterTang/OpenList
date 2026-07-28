@@ -256,6 +256,9 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	if cfg.SessionFile == "" {
 		cfg.SessionFile = defaults.SessionFile
 	}
+	if cfg.ProxyURL == "" {
+		cfg.ProxyURL = defaults.ProxyURL
+	}
 	cfg.Quark = fillTelegramPanConfig(cfg.Quark, defaults.Quark)
 	cfg.AliyunDrive = fillTelegramPanConfig(cfg.AliyunDrive, defaults.AliyunDrive)
 	cfg.Pan123 = fillTelegramPanConfig(cfg.Pan123, defaults.Pan123)
@@ -333,6 +336,7 @@ func normalizeTransferPriorityName(value string) string {
 func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) model.SubscriptionTelegramSourceConfig {
 	cfg.APIHash = strings.TrimSpace(cfg.APIHash)
 	cfg.SessionFile = strings.TrimSpace(cfg.SessionFile)
+	cfg.ProxyURL = strings.TrimSpace(cfg.ProxyURL)
 	cfg.Channels = cleanStringList(cfg.Channels, false)
 	cfg.RealtimeGroups = cleanStringList(cfg.RealtimeGroups, false)
 	if cfg.RealtimeCandidateWaitSeconds == nil {

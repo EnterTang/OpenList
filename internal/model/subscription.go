@@ -218,6 +218,9 @@ type SubscriptionTelegramSourceConfig struct {
 	APIID                        int                           `json:"api_id"`
 	APIHash                      string                        `json:"api_hash"`
 	SessionFile                  string                        `json:"session_file"`
+	// ProxyURL routes MTProto through an explicit proxy (e.g. socks5://192.168.1.1:7891).
+	// Empty keeps the default direct dialer.
+	ProxyURL                     string                        `json:"proxy_url,omitempty"`
 	Channels                     []string                      `json:"channels"`
 	QuarkChannels                []string                      `json:"quark_channels,omitempty"`
 	AliyunDriveChannels          []string                      `json:"aliyun_drive_channels,omitempty"`
