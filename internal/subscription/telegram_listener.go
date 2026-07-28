@@ -253,7 +253,7 @@ func (l *telegramRealtimeListener) runProfileOnce(ctx context.Context, profile r
 	dispatcher.OnNewMessage(func(ctx context.Context, entities tg.Entities, update *tg.UpdateNewMessage) error {
 		return handle(ctx, entities, update.Message)
 	})
-	opts, err := telegramClientOptions(profile.config, telegram.Options{
+	client := telegram.NewClient(profile.config.APIID, profile.config.APIHash, telegram.Options{
 		SessionStorage: &session.FileStorage{Path: defaultTelegramSessionFile(profile.config)},
 		UpdateHandler:  dispatcher,
 		Device:         telegram.DeviceTDesktopWindows(),
@@ -265,10 +265,6 @@ func (l *telegramRealtimeListener) runProfileOnce(ctx context.Context, profile r
 			}
 		},
 	})
-	if err != nil {
-		return err
-	}
-	client := telegram.NewClient(profile.config.APIID, profile.config.APIHash, opts)
 	return client.Run(ctx, func(ctx context.Context) error {
 		status, err := client.Auth().Status(ctx)
 		if err != nil {

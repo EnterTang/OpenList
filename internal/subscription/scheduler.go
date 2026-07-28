@@ -10,20 +10,16 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const defaultMaxConcurrentSubscriptionRuns = 2
-
 var defaultScheduler = &scheduler{
-	stop:                   make(chan struct{}),
-	running:                map[uint]struct{}{},
-	maxConcurrentRuns:      defaultMaxConcurrentSubscriptionRuns,
+	stop:    make(chan struct{}),
+	running: map[uint]struct{}{},
 }
 
 type scheduler struct {
-	mu                sync.Mutex
-	started           bool
-	stop              chan struct{}
-	running           map[uint]struct{}
-	maxConcurrentRuns int
+	mu      sync.Mutex
+	started bool
+	stop    chan struct{}
+	running map[uint]struct{}
 }
 
 func StartScheduler() {
@@ -114,13 +110,6 @@ func (s *scheduler) markRunning(id uint) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.running[id]; ok {
-		return false
-	}
-	limit := s.maxConcurrentRuns
-	if limit <= 0 {
-		limit = defaultMaxConcurrentSubscriptionRuns
-	}
-	if len(s.running) >= limit {
 		return false
 	}
 	s.running[id] = struct{}{}

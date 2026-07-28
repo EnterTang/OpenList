@@ -55,18 +55,6 @@ func TestSchedulerStorageWaitStops(t *testing.T) {
 	}
 }
 
-func TestSchedulerMarkRunningUsesDefaultConcurrencyLimit(t *testing.T) {
-	s := &scheduler{running: map[uint]struct{}{}}
-	for id := uint(1); id <= defaultMaxConcurrentSubscriptionRuns; id++ {
-		if !s.markRunning(id) {
-			t.Fatalf("expected run %d to start under default limit", id)
-		}
-	}
-	if s.markRunning(defaultMaxConcurrentSubscriptionRuns + 1) {
-		t.Fatal("expected default concurrency limit to defer extra runs")
-	}
-}
-
 func TestSubscriptionExecutionTransfersLocallyOnlyForStandaloneRole(t *testing.T) {
 	for _, role := range []string{"", model.ClusterRoleStandalone, " STANDALONE "} {
 		if !subscriptionTransfersLocally(role) {
