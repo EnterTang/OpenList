@@ -35,7 +35,7 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 		}
 		// Healthy provider credentials still require worker-local subscription
 		// routing. Otherwise the coordinator could assign a provider-only task
-		// that the worker must reject because it has no Pan123/Pan115 staging
+		// that the worker must reject because it has no share-provider staging
 		// folder or 139 delivery folder.
 		if requiresWorkerStagingRouting(snapshot.Account.Provider) || requiresWorkerDeliveryRouting(snapshot.Account.Provider) {
 			if !subscriptionConfigLoaded {
@@ -84,7 +84,7 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 
 func requiresWorkerStagingRouting(provider string) bool {
 	switch normalizeControlKey(provider) {
-	case "pan123", "pan115":
+	case "pan123", "pan115", "quark", "aliyun_drive":
 		return true
 	default:
 		return false
@@ -97,16 +97,13 @@ func requiresWorkerDeliveryRouting(provider string) bool {
 
 func hasWorkerStagingRouting(cfg model.SubscriptionConfig, provider string) bool {
 	provider = normalizeControlKey(provider)
-	var target model.SubscriptionStorageTarget
-	switch provider {
-	case "pan123":
-		target = cfg.Telegram.Pan123.TempTransferTarget
-	case "pan115":
-		target = cfg.Telegram.Pan115.TempTransferTarget
-	default:
+	if !requiresWorkerStagingRouting(provider) {
 		return true
 	}
-	target = subscription.NormalizeSubscriptionStorageTarget(target)
+	target, ok := workerStagingTargetFromConfig(cfg, provider)
+	if !ok {
+		return false
+	}
 	return target.Provider == provider && target.Folder != "" && subscription.ValidateSubscriptionStorageTarget(target) == nil
 }
 

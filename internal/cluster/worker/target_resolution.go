@@ -115,21 +115,17 @@ func (s *Service) resolveDeliveryTargetRoot(ctx context.Context, task protocol.T
 // the folder because mounts and directory layouts are local to that worker.
 func localStagingTarget(task protocol.TaskContext) (model.SubscriptionStorageTarget, bool, error) {
 	provider := normalizeControlKey(task.StagingTarget.Provider)
-	if provider != "pan123" && provider != "pan115" {
+	if !requiresWorkerStagingRouting(provider) {
 		return model.SubscriptionStorageTarget{}, false, nil
 	}
 	cfg, err := getWorkerSubscriptionConfig()
 	if err != nil {
 		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("load worker subscription config: %w", err)
 	}
-	var target model.SubscriptionStorageTarget
-	switch provider {
-	case "pan123":
-		target = cfg.Telegram.Pan123.TempTransferTarget
-	case "pan115":
-		target = cfg.Telegram.Pan115.TempTransferTarget
+	target, ok := workerStagingTargetFromConfig(cfg, provider)
+	if !ok {
+		return model.SubscriptionStorageTarget{}, false, nil
 	}
-	target = subscription.NormalizeSubscriptionStorageTarget(target)
 	if err := subscription.ValidateSubscriptionStorageTarget(target); err != nil {
 		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("invalid worker local %s staging target: %w", provider, err)
 	}
@@ -140,6 +136,23 @@ func localStagingTarget(task protocol.TaskContext) (model.SubscriptionStorageTar
 		return model.SubscriptionStorageTarget{}, false, fmt.Errorf("worker local %s staging target must use provider %s with a folder", provider, provider)
 	}
 	return target, true, nil
+}
+
+func workerStagingTargetFromConfig(cfg model.SubscriptionConfig, provider string) (model.SubscriptionStorageTarget, bool) {
+	var target model.SubscriptionStorageTarget
+	switch normalizeControlKey(provider) {
+	case "pan123":
+		target = cfg.Telegram.Pan123.TempTransferTarget
+	case "pan115":
+		target = cfg.Telegram.Pan115.TempTransferTarget
+	case "quark":
+		target = cfg.Telegram.Quark.TempTransferTarget
+	case "aliyun_drive":
+		target = cfg.Telegram.AliyunDrive.TempTransferTarget
+	default:
+		return model.SubscriptionStorageTarget{}, false
+	}
+	return subscription.NormalizeSubscriptionStorageTarget(target), true
 }
 
 // localDeliveryTarget returns the local ETF delivery target for a provider-only

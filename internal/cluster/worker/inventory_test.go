@@ -156,6 +156,28 @@ func TestBuildInventoryRequiresWorkerLocalStagingRoutingForPanShareSave(t *testi
 			}},
 			want: false,
 		},
+		{provider: "quark", driver: "Quark", want: false},
+		{provider: "aliyun_drive", driver: "AliyundriveOpen", want: false},
+		{
+			provider: "quark",
+			driver:   "Quark",
+			config: model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+				Quark: model.SubscriptionTelegramPanConfig{
+					TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "\u8f6c\u5b58\u5230\u79fb\u52a8"},
+				},
+			}},
+			want: true,
+		},
+		{
+			provider: "aliyun_drive",
+			driver:   "AliyundriveOpen",
+			config: model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+				AliyunDrive: model.SubscriptionTelegramPanConfig{
+					TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: "\u8f6c\u5b58\u81f3\u79fb\u52a8"},
+				},
+			}},
+			want: true,
+		},
 	} {
 		t.Run(tc.provider+"/"+tc.driver, func(t *testing.T) {
 			storage := model.Storage{ID: 7, MountPath: "/" + tc.provider, Driver: tc.driver, Status: "work"}

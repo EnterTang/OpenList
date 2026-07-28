@@ -37,7 +37,7 @@ func TestResolveStagingTempRootUsesEnabledStorageForTaskTarget(t *testing.T) {
 		Share: protocol.ShareTaskContext{Provider: "aliyundrive"},
 		StagingTarget: protocol.ProviderTargetRequirement{
 			Provider:      "pan123",
-			Folder:        "转存至移动",
+			Folder:        "è½?å­è³ç§»å¨",
 			NeedShareSave: true,
 			RequiredBytes: 8 << 30,
 		},
@@ -46,7 +46,7 @@ func TestResolveStagingTempRootUsesEnabledStorageForTaskTarget(t *testing.T) {
 
 	got, err := service.resolveStagingTempRoot(t.Context(), task)
 	require.NoError(t, err)
-	require.Equal(t, "/worker-pan123/转存至移动", got)
+	require.Equal(t, "/worker-pan123/è½?å­è³ç§»å¨", got)
 }
 
 func TestResolveStagingTempRootRejectsMissingBoundAccountWithoutLegacyFallback(t *testing.T) {
@@ -63,7 +63,7 @@ func TestResolveStagingTempRootRejectsMissingBoundAccountWithoutLegacyFallback(t
 	service := New(&fakeResultQueue{}, nil)
 	_, err = service.resolveStagingTempRoot(t.Context(), protocol.TaskContext{
 		StagingTarget: protocol.ProviderTargetRequirement{
-			Provider: "pan123", Folder: "转存至移动", StorageID: 999, NeedShareSave: true,
+			Provider: "pan123", Folder: "è½?å­è³ç§»å¨", StorageID: 999, NeedShareSave: true,
 		},
 		SourceObjects: []protocol.SourceObject{{Provider: "pan123", SourceFileID: "file-1", Size: 1 << 30}},
 	})
@@ -94,7 +94,7 @@ func TestResolveDeliveryTargetRootUsesBindingMountAndTaskFolder(t *testing.T) {
 		TargetProfile: "mobile-primary",
 		DeliveryTarget: protocol.ProviderTargetRequirement{
 			Provider:      "yidong139",
-			Folder:        "剧集/港台剧",
+			Folder:        "å§é/æ¸?å°å§",
 			NeedUpload:    true,
 			RequiredBytes: 8 << 30,
 		},
@@ -102,7 +102,7 @@ func TestResolveDeliveryTargetRootUsesBindingMountAndTaskFolder(t *testing.T) {
 
 	got, bindingMount, err := service.resolveDeliveryTargetRoot(t.Context(), task)
 	require.NoError(t, err)
-	require.Equal(t, "/worker-139-a/剧集/港台剧", got)
+	require.Equal(t, "/worker-139-a/å§é/æ¸?å°å§", got)
 	require.Equal(t, "/worker-139-a", bindingMount)
 }
 
@@ -123,7 +123,7 @@ func TestResolveDeliveryTargetRootRejectsMismatchedProviderBinding(t *testing.T)
 	}
 	_, _, err = service.resolveDeliveryTargetRoot(t.Context(), protocol.TaskContext{
 		TargetProfile:  "mobile-primary",
-		DeliveryTarget: protocol.ProviderTargetRequirement{Provider: "yidong139", Folder: "剧集"},
+		DeliveryTarget: protocol.ProviderTargetRequirement{Provider: "yidong139", Folder: "å§é"},
 	})
 	require.ErrorContains(t, err, "no compatible provider account")
 }
@@ -161,14 +161,73 @@ func TestResolveStagingTempRootUsesWorkerConfigFolderInsteadOfTaskFolder(t *test
 	require.Equal(t, "/worker-pan123/worker-staging", got)
 }
 
+func TestResolveStagingTempRootUsesWorkerConfigForQuarkAndAliyun(t *testing.T) {
+	original := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = original })
+
+	for _, tc := range []struct {
+		name     string
+		provider string
+		driver   string
+		mount    string
+		folder   string
+		config   model.SubscriptionConfig
+	}{
+		{
+			name: "quark", provider: "quark", driver: "Quark", mount: "/worker-quark", folder: "\u8f6c\u5b58\u5230\u79fb\u52a8",
+			config: model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+				Quark: model.SubscriptionTelegramPanConfig{
+					TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "\u8f6c\u5b58\u5230\u79fb\u52a8"},
+				},
+			}},
+		},
+		{
+			name: "aliyun_drive", provider: "aliyun_drive", driver: "AliyundriveOpen", mount: "/worker-ali", folder: "\u8f6c\u5b58\u81f3\u79fb\u52a8",
+			config: model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+				AliyunDrive: model.SubscriptionTelegramPanConfig{
+					TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: "\u8f6c\u5b58\u81f3\u79fb\u52a8"},
+				},
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setWorkerSubscriptionConfig(t, tc.config)
+			database, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+			require.NoError(t, err)
+			db.Init(database)
+			require.NoError(t, database.Create(&model.Storage{ID: 8, MountPath: tc.mount, Driver: tc.driver, Status: "work"}).Error)
+			oldEnsure := ensureResolvedProviderFolder
+			ensureResolvedProviderFolder = func(_ context.Context, target subscription.ResolvedProviderTarget) (subscription.ResolvedProviderTarget, error) {
+				return target, nil
+			}
+			t.Cleanup(func() { ensureResolvedProviderFolder = oldEnsure })
+
+			service := New(&fakeResultQueue{}, nil)
+			got, err := service.resolveStagingTempRoot(t.Context(), protocol.TaskContext{
+				StagingTarget: protocol.ProviderTargetRequirement{
+					Provider: tc.provider, StorageID: 8, NeedShareSave: true, RequiredBytes: 1 << 30,
+				},
+				SourceObjects: []protocol.SourceObject{{Provider: tc.provider, SourceFileID: "file-1", Size: 1 << 30}},
+			})
+			require.NoError(t, err)
+			require.Equal(t, tc.mount+"/"+tc.folder, got)
+		})
+	}
+}
+
 func TestResolveStagingTempRootRequiresWorkerConfigForProviderOnlyTask(t *testing.T) {
 	setWorkerSubscriptionConfig(t, model.SubscriptionConfig{})
 
 	service := New(&fakeResultQueue{}, nil)
-	_, err := service.resolveStagingTempRoot(t.Context(), protocol.TaskContext{
-		StagingTarget: protocol.ProviderTargetRequirement{Provider: "pan123", NeedShareSave: true},
-	})
-	require.ErrorContains(t, err, "worker local pan123 staging folder is required")
+	for _, provider := range []string{"pan123", "quark", "aliyun_drive"} {
+		t.Run(provider, func(t *testing.T) {
+			_, err := service.resolveStagingTempRoot(t.Context(), protocol.TaskContext{
+				StagingTarget: protocol.ProviderTargetRequirement{Provider: provider, NeedShareSave: true},
+			})
+			require.ErrorContains(t, err, "worker local "+provider+" staging folder is required")
+		})
+	}
 }
 
 func TestResolveDeliveryTargetRootUsesWorkerConfigFolderAndTaskAccountBinding(t *testing.T) {
