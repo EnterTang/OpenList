@@ -60,6 +60,10 @@ const (
 	HandleHookRateLimit     = "handle_hook_rate_limit"
 	IgnoreSystemFiles       = "ignore_system_files"
 
+	PluginAntiHashEnabled    = "plugin_antihash_enabled"
+	PluginISORenameEnabled   = "plugin_iso_rename_enabled"
+	PluginExtensionWhitelist = "plugin_extension_whitelist"
+
 	// index
 	SearchIndex     = "search_index"
 	AutoUpdateIndex = "auto_update_index"
@@ -191,4 +195,5 @@ const (
 	PathKey
 	SharingIDKey
 	SkipHookKey
+	SkipPluginKey
 )
