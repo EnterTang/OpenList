@@ -560,6 +560,9 @@ func Copy(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		}
 	}
 
+	if !srcObj.IsDir() {
+		maybeProcessLocalPlugin(ctx, storage, stdpath.Join(dstDirPath, srcObj.GetName()))
+	}
 	if ctx.Value(conf.SkipHookKey) != nil || !needHandleObjsUpdateHook() {
 		return nil
 	}
@@ -695,6 +698,7 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		if ctx.Value(conf.SkipHookKey) == nil && needHandleObjsUpdateHook() {
 			go objsUpdateHook(context.WithoutCancel(ctx), storage, dstDirPath, false)
 		}
+		maybeProcessLocalPlugin(ctx, storage, dstPath)
 	}
 	log.Debugf("put file [%s] done", file.GetName())
 	if storage.Config().NoOverwriteUpload && fi != nil && fi.GetSize() > 0 {
