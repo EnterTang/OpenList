@@ -182,7 +182,36 @@ type clusterInspectCandidate struct {
 	message clusterSourceMessage
 }
 
+// ObservationCloseState tells the incremental apply path how much of the
+// observation is currently known. PendingProviders lists the share providers
+// of sibling share.inspect jobs that have not yet reported a terminal result;
+// AllTerminal means every expected child has reported (successfully or via an
+// empty failed manifest), so any slot without a better candidate left to wait
+// for must be force-closed with whatever candidate is available.
+type ObservationCloseState struct {
+	PendingProviders []string
+	AllTerminal      bool
+}
+
+// ApplyClusterInspectObservation applies a fully known set of manifests: every
+// resolved episode/movie winner is dispatched immediately. Callers that only
+// have a partial view of an in-flight observation should use
+// ApplyClusterInspectObservationIncremental instead.
 func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInspectManifestInput) (int, error) {
+	return applyClusterInspectObservation(ctx, manifests, ObservationCloseState{AllTerminal: true})
+}
+
+// ApplyClusterInspectObservationIncremental applies whatever manifests have
+// arrived so far for an observation that may still have non-terminal sibling
+// share.inspect jobs. Only slots that decideSlotClose considers closed (or,
+// once state.AllTerminal is true, every remaining open slot) are dispatched;
+// the rest stay pending so a later call can dispatch them once more
+// information arrives.
+func ApplyClusterInspectObservationIncremental(ctx context.Context, manifests []ClusterInspectManifestInput, state ObservationCloseState) (int, error) {
+	return applyClusterInspectObservation(ctx, manifests, state)
+}
+
+func applyClusterInspectObservation(ctx context.Context, manifests []ClusterInspectManifestInput, state ObservationCloseState) (int, error) {
 	if len(manifests) == 0 {
 		return 0, nil
 	}
@@ -240,6 +269,10 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 	if err != nil {
 		return 0, err
 	}
+	closable, err := filterObservationDispatchCandidates(sub, stored, state, priority)
+	if err != nil {
+		return 0, err
+	}
 	type dispatchGroup struct {
 		ref     ShareRef
 		message clusterSourceMessage
@@ -247,7 +280,7 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 	}
 	groups := make(map[string]*dispatchGroup)
 	groupOrder := make([]string, 0)
-	for _, item := range stored {
+	for _, item := range closable {
 		if item == nil || item.Status != model.SubscriptionItemStatusPending {
 			continue
 		}
@@ -278,7 +311,7 @@ func ApplyClusterInspectObservation(ctx context.Context, manifests []ClusterInsp
 }
 
 func selectClusterInspectCandidates(sub *model.Subscription, candidates []clusterInspectCandidate, priority []string) []clusterInspectCandidate {
-	if sub == nil || len(candidates) <= 1 || normalizeMediaType(sub.MediaType) == "movie" {
+	if sub == nil || len(candidates) <= 1 {
 		return candidates
 	}
 	priority = normalizeTransferPriority(priority)
@@ -334,13 +367,61 @@ func betterClusterInspectCandidate(candidate, existing clusterInspectCandidate, 
 	return candidateKey < existingKey
 }
 
+// filterObservationDispatchCandidates narrows the winners reconcileClusterEpisodeSlots
+// resolved down to the subset allowed to dispatch this round. TV items without a
+// recognized episode slot pass through unchanged (they never waited on sibling
+// inspects). Movie items and recognized TV episode slots only dispatch once
+// decideSlotClose says the slot is closed (priority-closed or size-floor, using
+// MovieEarlyCloseMinBytes for movies), unless the whole observation is already
+// fully terminal, in which case every remaining winner is force-closed.
+func filterObservationDispatchCandidates(sub *model.Subscription, items []*model.SubscriptionItem, state ObservationCloseState, priority []string) ([]*model.SubscriptionItem, error) {
+	if sub == nil || state.AllTerminal {
+		return items, nil
+	}
+	cfg, err := GetConfig()
+	if err != nil {
+		return nil, err
+	}
+	episodeMinBytes := earlyCloseMinBytes(cfg.EpisodeEarlyCloseMinBytes, 1<<30)
+	movieMinBytes := earlyCloseMinBytes(cfg.MovieEarlyCloseMinBytes, 20<<30)
+	isMovie := normalizeMediaType(sub.MediaType) == "movie"
+	eligible := make([]*model.SubscriptionItem, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		if !isMovie && item.Episode <= 0 {
+			eligible = append(eligible, item)
+			continue
+		}
+		if mediaSlotKey(sub, item) == "" {
+			eligible = append(eligible, item)
+			continue
+		}
+		decision := decideSlotClose(slotCloseInput{
+			MediaType:        sub.MediaType,
+			Winner:           item,
+			PendingProviders: state.PendingProviders,
+			EpisodeMinBytes:  episodeMinBytes,
+			MovieMinBytes:    movieMinBytes,
+			Priority:         priority,
+		})
+		if decision.Closed {
+			eligible = append(eligible, item)
+		}
+	}
+	return eligible, nil
+}
+
 const clusterSkippedDuplicateEpisodeReason = "skipped: larger or preferred file selected for the same episode"
 
-// reconcileClusterEpisodeSlots keeps one active transfer candidate per TV episode
-// across independently inspected shares/messages. Non-winners that are still
-// pending or transferring are marked skipped so workers never temp-save them.
+// reconcileClusterEpisodeSlots keeps one active transfer candidate per media
+// slot (TV episode or movie) across independently inspected shares/messages.
+// Non-winners that are still pending or transferring are marked skipped so
+// workers never temp-save them. TV files without a recognized episode number
+// are left untouched (no cross-share dedupe is attempted for them).
 func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.SubscriptionItem, priority []string) ([]*model.SubscriptionItem, error) {
-	if sub == nil || normalizeMediaType(sub.MediaType) == "movie" || len(stored) == 0 {
+	if sub == nil || len(stored) == 0 {
 		return stored, nil
 	}
 	priority = normalizeTransferPriority(priority)
@@ -356,8 +437,8 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 			continue
 		}
 		storedByKey[item.SourceKey] = item
-		if slot := mediaSlotKey(sub, item); slot != "" && item.Episode > 0 {
-			touchedSlots[slot] = struct{}{}
+		if clusterItemHasDedupSlot(sub, item) {
+			touchedSlots[mediaSlotKey(sub, item)] = struct{}{}
 		}
 	}
 	if len(touchedSlots) == 0 {
@@ -376,7 +457,7 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 		if _, ok := touchedSlots[slot]; !ok {
 			continue
 		}
-		if !clusterItemCompetesForEpisodeSlot(item) {
+		if !clusterItemCompetesForSlot(sub, item) {
 			continue
 		}
 		if refreshed, ok := storedByKey[item.SourceKey]; ok {
@@ -389,10 +470,10 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 			continue
 		}
 		slot := mediaSlotKey(sub, item)
-		if _, ok := touchedSlots[slot]; !ok || item.Episode <= 0 {
+		if _, ok := touchedSlots[slot]; !ok {
 			continue
 		}
-		if !clusterItemCompetesForEpisodeSlot(item) {
+		if !clusterItemCompetesForSlot(sub, item) {
 			continue
 		}
 		found := false
@@ -428,7 +509,7 @@ func reconcileClusterEpisodeSlots(sub *model.Subscription, stored []*model.Subsc
 			continue
 		}
 		slot := mediaSlotKey(sub, item)
-		if slot == "" || item.Episode <= 0 {
+		if _, touched := touchedSlots[slot]; slot == "" || !touched {
 			dispatchable = append(dispatchable, item)
 			continue
 		}
@@ -485,8 +566,19 @@ func subscriptionItemHasAcceptedTransfer(item *model.SubscriptionItem) bool {
 	return item != nil && (item.Status == model.SubscriptionItemStatusTransferring || item.Status == model.SubscriptionItemStatusNotifying || item.Status == model.SubscriptionItemStatusTransferred)
 }
 
-func clusterItemCompetesForEpisodeSlot(item *model.SubscriptionItem) bool {
-	if item == nil || item.Episode <= 0 {
+// clusterItemHasDedupSlot reports whether item participates in cross-share
+// slot dedupe: movies always compete by TargetPath, while TV items only
+// compete once an episode number was recognized (TV files without one keep
+// their independent "path:" pseudo-slot, which is never touched here).
+func clusterItemHasDedupSlot(sub *model.Subscription, item *model.SubscriptionItem) bool {
+	if item == nil || mediaSlotKey(sub, item) == "" {
+		return false
+	}
+	return normalizeMediaType(sub.MediaType) == "movie" || item.Episode > 0
+}
+
+func clusterItemCompetesForSlot(sub *model.Subscription, item *model.SubscriptionItem) bool {
+	if !clusterItemHasDedupSlot(sub, item) {
 		return false
 	}
 	switch item.Status {

@@ -61,22 +61,10 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 	if err != nil {
 		return err
 	}
-	if progress.Terminal < progress.Expected {
-		now := time.Now().UTC()
-		if err := db.GetDb().WithContext(ctx).Model(&model.ClusterShareInspectManifest{}).
-			Where("subscription_id = ? AND observation_key = ? AND status = ?", record.SubscriptionID, progress.ObservationKey, model.ClusterShareInspectStatusPending).
-			Updates(map[string]any{
-				"status":     model.ClusterShareInspectStatusIncomplete,
-				"updated_at": now,
-				"last_error": fmt.Sprintf("received %d of %d manifests", progress.Terminal, progress.Expected),
-			}).Error; err != nil {
-			return err
-		}
-		return fmt.Errorf("%w: received %d of %d manifests", coordinator.ErrShareInspectObservationIncomplete, progress.Terminal, progress.Expected)
-	}
 	if progress.Terminal > progress.Expected {
 		return fmt.Errorf("cluster share inspect observation %s has %d terminals, expected %d", progress.ObservationKey, progress.Terminal, progress.Expected)
 	}
+	complete := progress.Terminal >= progress.Expected
 	records := progress.Manifests
 	inputs := make([]subscription.ClusterInspectManifestInput, 0, len(records))
 	for _, item := range records {
@@ -118,11 +106,36 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 		trigger = inputs[0].Task.Trigger
 	}
 	if trigger == "realtime" {
-		if _, err := subscription.ApplyRealtimeClusterInspectObservation(ctx, inputs); err != nil {
+		if complete {
+			if _, err := subscription.ApplyRealtimeClusterInspectObservation(ctx, inputs); err != nil {
+				return err
+			}
+		}
+	} else {
+		closeState := subscription.ObservationCloseState{AllTerminal: complete}
+		if !complete {
+			pendingProviders, err := pendingShareInspectProviders(ctx, record.SubscriptionID, progress.ObservationKey, records)
+			if err != nil {
+				return err
+			}
+			closeState.PendingProviders = pendingProviders
+		}
+		if _, err := subscription.ApplyClusterInspectObservationIncremental(ctx, inputs, closeState); err != nil {
 			return err
 		}
-	} else if _, err := subscription.ApplyClusterInspectObservation(ctx, inputs); err != nil {
-		return err
+	}
+	if !complete {
+		now := time.Now().UTC()
+		if err := db.GetDb().WithContext(ctx).Model(&model.ClusterShareInspectManifest{}).
+			Where("subscription_id = ? AND observation_key = ? AND status = ?", record.SubscriptionID, progress.ObservationKey, model.ClusterShareInspectStatusPending).
+			Updates(map[string]any{
+				"status":     model.ClusterShareInspectStatusIncomplete,
+				"updated_at": now,
+				"last_error": fmt.Sprintf("received %d of %d manifests", progress.Terminal, progress.Expected),
+			}).Error; err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: received %d of %d manifests", coordinator.ErrShareInspectObservationIncomplete, progress.Terminal, progress.Expected)
 	}
 	now := time.Now().UTC()
 	ids := make([]string, 0, len(records)-1)
@@ -139,6 +152,58 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 		}
 	}
 	return nil
+}
+
+// pendingShareInspectProviders returns the share providers of sibling
+// share.inspect jobs for the same observation that have neither reported a
+// manifest nor reached a terminal status yet. decideSlotClose uses this list
+// to decide whether a currently winning candidate can be safely dispatched
+// before the rest of the observation finishes. manifests is the set already
+// loaded for this observation (e.g. via loadShareInspectObservationProgress),
+// reused here to avoid a redundant query.
+func pendingShareInspectProviders(ctx context.Context, subscriptionID uint, observationKey string, manifests []model.ClusterShareInspectManifest) ([]string, error) {
+	observationKey = strings.TrimSpace(observationKey)
+	var jobs []model.ClusterJob
+	if err := db.GetDb().WithContext(ctx).
+		Where("subscription_id = ? AND type = ?", subscriptionID, model.ClusterJobTypeShareInspect).
+		Where("status NOT IN ?", []string{
+			model.ClusterJobStatusSucceeded,
+			model.ClusterJobStatusFailed,
+			model.ClusterJobStatusCancelled,
+			model.ClusterJobStatusDeadLetter,
+		}).
+		Find(&jobs).Error; err != nil {
+		return nil, err
+	}
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+	reported := make(map[string]struct{}, len(manifests))
+	for _, item := range manifests {
+		reported[item.JobID] = struct{}{}
+	}
+	providers := make([]string, 0, len(jobs))
+	for i := range jobs {
+		job := &jobs[i]
+		if _, ok := reported[job.ID]; ok {
+			// Already has a manifest recorded; not actually pending even if
+			// the job row's own status has not caught up yet.
+			continue
+		}
+		taskContext, err := decodeShareInspectTaskContext(job)
+		if err != nil {
+			return nil, err
+		}
+		key := strings.TrimSpace(taskContext.Subscription.ObservationKey)
+		if key == "" {
+			key = job.ID
+		}
+		if key != observationKey {
+			continue
+		}
+		providers = append(providers, taskContext.Share.Provider)
+	}
+	return providers, nil
 }
 
 type shareInspectObservationProgress struct {

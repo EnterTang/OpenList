@@ -214,7 +214,7 @@ func TestNewCleanupRequestUsesExactFinalPath(t *testing.T) {
 	manifest := validUploadManifest(t)
 	request, err := NewCleanupRequest(manifest, "/mobile")
 	require.NoError(t, err)
-	require.Equal(t, "/mobile/upload/tv/国产剧/Show/Season 1/Show.S01E01.mkv", request.OpenListPath)
+	require.Equal(t, "/mobile/upload/tv/国产�?/Show/Season 1/Show.S01E01.mkv", request.OpenListPath)
 	require.Equal(t, "remote-1", request.RemoteFileID)
 	require.Equal(t, manifest.AttemptID, request.AttemptID)
 	require.Equal(t, manifest.Generation, request.Generation)
@@ -225,11 +225,11 @@ func TestNewCleanupRequestUsesExactFinalPath(t *testing.T) {
 func TestMapClusterDeliveryPathPreservesLogicalRelativeTarget(t *testing.T) {
 	got, err := mapClusterDeliveryPath(
 		"/worker-139/upload",
-		"/139_60t/上传中转",
-		"/139_60t/上传中转/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.2026.S01E01.第1集.mkv",
+		"/139_60t/上传�?�?",
+		"/139_60t/上传�?�?/tv/国产�?/小芳 (2026) {tmdb-296003}/Season 1/小芳.2026.S01E01.�?1�?.mkv",
 	)
 	require.NoError(t, err)
-	require.Equal(t, "/worker-139/upload/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.2026.S01E01.第1集.mkv", got)
+	require.Equal(t, "/worker-139/upload/tv/国产�?/小芳 (2026) {tmdb-296003}/Season 1/小芳.2026.S01E01.�?1�?.mkv", got)
 	require.NotContains(t, got, ".openlist-cluster")
 }
 
@@ -237,10 +237,10 @@ func TestMapClusterDeliveryPathTreatsEmptyLogicalRootAsWorkerRoot(t *testing.T) 
 	got, err := mapClusterDeliveryPath(
 		"/worker-139/upload",
 		"",
-		"/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.S01E01.mkv",
+		"/tv/国产�?/小芳 (2026) {tmdb-296003}/Season 1/小芳.S01E01.mkv",
 	)
 	require.NoError(t, err)
-	require.Equal(t, "/worker-139/upload/tv/国产剧/小芳 (2026) {tmdb-296003}/Season 1/小芳.S01E01.mkv", got)
+	require.Equal(t, "/worker-139/upload/tv/国产�?/小芳 (2026) {tmdb-296003}/Season 1/小芳.S01E01.mkv", got)
 }
 
 func TestTrustedSourceSHA256DoesNotTreatIdentityHashAsContent(t *testing.T) {
@@ -297,10 +297,10 @@ func TestWaitNativeTransferTaskCancelsManagerTaskBeforeReturning(t *testing.T) {
 func TestMapClusterDeliveryPathRejectsLogicalEscape(t *testing.T) {
 	for _, target := range []string{
 		"/139_60t/other/Episode.mkv",
-		"/139_60t/上传中转/../other/Episode.mkv",
+		"/139_60t/上传�?�?/../other/Episode.mkv",
 		"relative/Episode.mkv",
 	} {
-		_, err := mapClusterDeliveryPath("/worker-139/upload", "/139_60t/上传中转", target)
+		_, err := mapClusterDeliveryPath("/worker-139/upload", "/139_60t/上传�?�?", target)
 		require.Error(t, err, target)
 	}
 }
@@ -308,9 +308,9 @@ func TestMapClusterDeliveryPathRejectsLogicalEscape(t *testing.T) {
 func TestNewCleanupRequestIncludesStagedSourceCleanupByDefault(t *testing.T) {
 	manifest := validUploadManifest(t)
 	source := resultqueue.CleanupTarget{
-		OpenListPath:     "/123/转存至移动/Episode.mkv",
+		OpenListPath:     "/123/�?存至移动/Episode.mkv",
 		StorageMountPath: "/123",
-		OwnedRootPath:    "/123/转存至移动",
+		OwnedRootPath:    "/123/�?存至移动",
 		RemoteFileID:     "staged-source",
 		Name:             "Episode.mkv",
 		ExactFile:        true,
@@ -328,7 +328,7 @@ func TestNewSourceCleanupTargetRequiresExactRemoteID(t *testing.T) {
 	originalStorage := getCleanupStorageAndActualPath
 	originalGet := getCleanupObject
 	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
-		return d, "/转存至移动/Episode.mkv", nil
+		return d, "/�?存至移动/Episode.mkv", nil
 	}
 	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
 		return &model.Object{Name: "Episode.mkv"}, nil
@@ -339,16 +339,16 @@ func TestNewSourceCleanupTargetRequiresExactRemoteID(t *testing.T) {
 	})
 
 	manifest := validUploadManifest(t)
-	_, err := NewSourceCleanupTarget(context.Background(), manifest, "/123/转存至移动", "/123/转存至移动/Episode.mkv")
+	_, err := NewSourceCleanupTarget(context.Background(), manifest, "/123/�?存至移动", "/123/�?存至移动/Episode.mkv")
 	require.ErrorContains(t, err, "exact remote file id")
 
 	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
 		return &model.Object{ID: "source-file", Name: "Episode.mkv"}, nil
 	}
-	target, err := NewSourceCleanupTarget(context.Background(), manifest, "/123/转存至移动", "/123/转存至移动/Episode.mkv")
+	target, err := NewSourceCleanupTarget(context.Background(), manifest, "/123/�?存至移动", "/123/�?存至移动/Episode.mkv")
 	require.NoError(t, err)
-	require.Equal(t, "/123/转存至移动/Episode.mkv", target.OpenListPath)
-	require.Equal(t, "/123/转存至移动", target.OwnedRootPath)
+	require.Equal(t, "/123/�?存至移动/Episode.mkv", target.OpenListPath)
+	require.Equal(t, "/123/�?存至移动", target.OwnedRootPath)
 	require.Equal(t, "source-file", target.RemoteFileID)
 	require.True(t, target.ExactFile)
 }
@@ -360,7 +360,7 @@ func TestExecuteCleanupTargetRefusesRemoteIDMismatch(t *testing.T) {
 	originalRemove := removeCleanupObjectExact
 	removed := false
 	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
-		return d, "/转存至移动/Episode.mkv", nil
+		return d, "/�?存至移动/Episode.mkv", nil
 	}
 	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
 		return &model.Object{ID: "replacement-file", Name: "Episode.mkv"}, nil
@@ -376,8 +376,8 @@ func TestExecuteCleanupTargetRefusesRemoteIDMismatch(t *testing.T) {
 	})
 
 	err := executeCleanupTarget(context.Background(), resultqueue.CleanupTarget{
-		OpenListPath: "/123/转存至移动/Episode.mkv", StorageMountPath: "/123",
-		OwnedRootPath: "/123/转存至移动", RemoteFileID: "source-file", Name: "Episode.mkv", ExactFile: true,
+		OpenListPath: "/123/�?存至移动/Episode.mkv", StorageMountPath: "/123",
+		OwnedRootPath: "/123/�?存至移动", RemoteFileID: "source-file", Name: "Episode.mkv", ExactFile: true,
 	})
 	require.ErrorContains(t, err, "remote id changed")
 	require.False(t, removed)
@@ -544,7 +544,7 @@ func TestResolveStagingTempRootDoesNotSubstituteConfiguredProviderRoot(t *testin
 		Share: protocol.ShareTaskContext{Provider: "aliyundrive"},
 		StagingTarget: protocol.ProviderTargetRequirement{
 			Provider:      "pan123",
-			Folder:        "转存至移动",
+			Folder:        "�?存至移动",
 			NeedShareSave: true,
 			RequiredBytes: 8 << 30,
 		},
@@ -571,8 +571,8 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 		Share: protocol.ShareTaskContext{Provider: "aliyundrive", URL: "https://example.com/share"},
 		Media: protocol.MediaTaskContext{
 			MediaType:         "tv",
-			LogicalMediaRoot:  "/139_60t/上传中转",
-			LogicalTargetPath: "/139_60t/上传中转/tv/国产剧/Show/Season 1/Show.S01E01.mkv",
+			LogicalMediaRoot:  "/139_60t/上传�?�?",
+			LogicalTargetPath: "/139_60t/上传�?�?/tv/国产�?/Show/Season 1/Show.S01E01.mkv",
 		},
 		SourceObjects: []protocol.SourceObject{{Provider: "aliyundrive", SourceFileID: "file-1"}},
 		TargetProfile: "/mobile",
@@ -595,7 +595,7 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 		SourceObjects:         taskContext.SourceObjects,
 		MobileAccountBinding:  "/mobile",
 		RemoteFileID:          "remote-1",
-		RemotePath:            "/mobile/upload/tv/国产剧/Show/Season 1/Show.S01E01.mkv",
+		RemotePath:            "/mobile/upload/tv/国产�?/Show/Season 1/Show.S01E01.mkv",
 		Name:                  "Show.S01E01.mkv",
 		Size:                  1024,
 		SHA256:                strings.Repeat("A", 64),
@@ -610,6 +610,16 @@ func TestDefaultMediaConcurrencyUsesConfiguredMoveWorkers(t *testing.T) {
 	t.Cleanup(func() { conf.Conf = original })
 	if got := defaultMediaConcurrency(); got != 5 {
 		t.Fatalf("default media concurrency = %d, want 5", got)
+	}
+}
+
+func TestEffectiveMediaConcurrencyReservesInspectSlots(t *testing.T) {
+	original := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	conf.Conf.Tasks.Move.Workers = 5
+	t.Cleanup(func() { conf.Conf = original })
+	if got := effectiveMediaConcurrency(); got != 3 {
+		t.Fatalf("effective media concurrency = %d, want 3", got)
 	}
 }
 

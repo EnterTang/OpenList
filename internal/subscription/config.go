@@ -196,7 +196,24 @@ func normalizeConfig(cfg model.SubscriptionConfig) model.SubscriptionConfig {
 		cfg.Telegram.TransferPriority = append([]string(nil), defaultTransferPriority...)
 	}
 	cfg.PanSou = normalizePanSouSourceConfig(cfg.PanSou)
+	cfg.EpisodeEarlyCloseMinBytes = normalizeEarlyCloseMinBytesPtr(cfg.EpisodeEarlyCloseMinBytes, 1<<30)
+	cfg.MovieEarlyCloseMinBytes = normalizeEarlyCloseMinBytesPtr(cfg.MovieEarlyCloseMinBytes, 20<<30)
 	return cfg
+}
+
+func earlyCloseMinBytes(value *int64, defaultBytes int64) int64 {
+	if value == nil {
+		return defaultBytes
+	}
+	if *value < 0 {
+		return 0
+	}
+	return *value
+}
+
+func normalizeEarlyCloseMinBytesPtr(value *int64, defaultBytes int64) *int64 {
+	normalized := earlyCloseMinBytes(value, defaultBytes)
+	return &normalized
 }
 
 func cleanConfigPath(path string) string {
