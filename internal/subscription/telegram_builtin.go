@@ -164,6 +164,12 @@ func runBuiltinTelegramClient(ctx context.Context, cfg model.SubscriptionTelegra
 	if err := os.MkdirAll(filepath.Dir(sessionFile), 0700); err != nil {
 		return err
 	}
+	unlock, err := lockTelegramSession(ctx, sessionFile)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	timeout := time.Duration(cfg.CommandTimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
