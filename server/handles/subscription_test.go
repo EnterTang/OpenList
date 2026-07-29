@@ -245,6 +245,34 @@ func TestSubscriptionConfigResponsesRedactAndPreserveSecrets(t *testing.T) {
 	}
 }
 
+func TestSubscriptionConfigSecretStatusIncludesGuangYaPanStorage(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/guangya",
+		Driver:    "GuangYaPan",
+		Addition:  `{"access_token":"storage-access","refresh_token":"storage-refresh"}`,
+		Status:    "work",
+	}); err != nil {
+		t.Fatalf("create guangyapan storage: %v", err)
+	}
+
+	c, recorder := newSubscriptionHandleContext(t, http.MethodGet, "/admin/subscription/config")
+	GetSubscriptionConfig(c)
+	resp := decodeHandleResp[model.SubscriptionConfigResponse](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("get config code = %d: %s", resp.Code, recorder.Body.String())
+	}
+	if !resp.Data.SecretStatus.Configured["telegram.guangyapan.access_token"] {
+		t.Fatalf("expected guangyapan access_token configured from storage: %#v", resp.Data.SecretStatus)
+	}
+	if !resp.Data.SecretStatus.Configured["telegram.guangyapan.refresh_token"] {
+		t.Fatalf("expected guangyapan refresh_token configured from storage: %#v", resp.Data.SecretStatus)
+	}
+	if strings.Contains(recorder.Body.String(), "storage-access") || strings.Contains(recorder.Body.String(), "storage-refresh") {
+		t.Fatalf("config response leaked storage secrets: %s", recorder.Body.String())
+	}
+}
+
 func (d *recordingSubscriptionDispatcher) DispatchSubscriptionInspect(_ context.Context, task subscription.ClusterInspectTask) (string, error) {
 	d.inspectTasks = append(d.inspectTasks, task)
 	return "handler-inspect-job", nil

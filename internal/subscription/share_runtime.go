@@ -139,6 +139,8 @@ func telegramPanSourceConfigWithStorageFallback(provider ShareProviderName, cfg 
 			cfg = aliyunDriveConfigWithStorageFallback(cfg)
 		case ShareProviderPan123:
 			cfg = pan123ConfigWithStorageFallback(cfg)
+		case ShareProviderGuangYaPan:
+			cfg = guangyapanConfigWithStorageFallback(cfg)
 		}
 	}
 	cfg = telegramPanTempRootWithStorageFallback(provider, cfg)
