@@ -12,6 +12,7 @@ const (
 	ShareProviderAliyunDrive ShareProviderName = "aliyun_drive"
 	ShareProviderPan123      ShareProviderName = "pan123"
 	ShareProviderPan115      ShareProviderName = "pan115"
+	ShareProviderGuangYaPan  ShareProviderName = "guangyapan"
 )
 
 type ShareRef struct {

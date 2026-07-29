@@ -223,10 +223,12 @@ type SubscriptionTelegramSourceConfig struct {
 	AliyunDriveChannels          []string                      `json:"aliyun_drive_channels,omitempty"`
 	Pan123Channels               []string                      `json:"pan123_channels,omitempty"`
 	Pan115Channels               []string                      `json:"pan115_channels,omitempty"`
+	GuangYaPanChannels           []string                      `json:"guangyapan_channels,omitempty"`
 	Quark                        SubscriptionTelegramPanConfig `json:"quark"`
 	AliyunDrive                  SubscriptionTelegramPanConfig `json:"aliyun_drive"`
 	Pan123                       SubscriptionTelegramPanConfig `json:"pan123"`
 	Pan115                       SubscriptionTelegramPanConfig `json:"pan115"`
+	GuangYaPan                   SubscriptionTelegramPanConfig `json:"guangyapan"`
 	SearchCommand                []string                      `json:"search_command"`
 	AuthCommand                  []string                      `json:"auth_command"`
 	CommandEnv                   []string                      `json:"command_env"`

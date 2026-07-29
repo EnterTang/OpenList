@@ -393,6 +393,8 @@ func storageProviderName(driverName string) string {
 		return "pan123"
 	case "115 cloud", "115 open":
 		return "pan115"
+	case "guangyapan":
+		return "guangyapan"
 	case "139yun", "139 cloud", "139":
 		return "yidong139"
 	default:
@@ -410,6 +412,8 @@ func providerTargetNameForShareProvider(provider ShareProviderName) string {
 		return "pan123"
 	case ShareProviderPan115:
 		return "pan115"
+	case ShareProviderGuangYaPan:
+		return "guangyapan"
 	default:
 		return ""
 	}

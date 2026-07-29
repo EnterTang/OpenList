@@ -232,6 +232,8 @@ func defaultStorageDriverForShareProvider(provider ShareProviderName) (string, b
 		return "123Pan", true
 	case ShareProviderPan115:
 		return "115 Cloud", true
+	case ShareProviderGuangYaPan:
+		return "GuangYaPan", true
 	default:
 		return "", false
 	}
@@ -248,6 +250,8 @@ func telegramPanSourceForProvider(cfg model.SubscriptionTelegramSourceConfig, pr
 		source = telegramPanSubscriptionSource{Name: string(ShareProviderPan123), Config: cfg.Pan123}
 	case ShareProviderPan115:
 		source = telegramPanSubscriptionSource{Name: string(ShareProviderPan115), Config: cfg.Pan115}
+	case ShareProviderGuangYaPan:
+		source = telegramPanSubscriptionSource{Name: string(ShareProviderGuangYaPan), Config: cfg.GuangYaPan}
 	default:
 		return telegramPanSubscriptionSource{}, false
 	}
@@ -271,6 +275,8 @@ func telegramPanSourceCanSave(provider ShareProviderName, cfg model.Subscription
 			(strings.TrimSpace(cfg.AccessToken) != "" && strings.TrimSpace(cfg.DriveID) != "")
 	case ShareProviderPan123:
 		return strings.TrimSpace(cfg.AccessToken) != ""
+	case ShareProviderGuangYaPan:
+		return strings.TrimSpace(cfg.AccessToken) != "" || strings.TrimSpace(cfg.RefreshToken) != ""
 	default:
 		return false
 	}
@@ -286,6 +292,8 @@ func defaultNewShareSaverForProvider(provider ShareProviderName, cfg model.Subsc
 		return NewPan123ShareProvider(cfg), nil
 	case ShareProviderPan115:
 		return NewPan115ShareProvider(cfg), nil
+	case ShareProviderGuangYaPan:
+		return NewGuangYaPanShareProvider(cfg), nil
 	default:
 		return nil, fmt.Errorf("unsupported share provider: %s", provider)
 	}

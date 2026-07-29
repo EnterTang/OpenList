@@ -38,6 +38,8 @@ func DetectShareProvider(raw string) (ShareProviderName, bool) {
 		return ShareProviderPan123, true
 	case hostMatchesDomain(host, "115cdn.com") || hostMatchesDomain(host, "115.com"):
 		return ShareProviderPan115, true
+	case hostMatchesDomain(host, "guangyapan.com"):
+		return ShareProviderGuangYaPan, true
 	default:
 		return "", false
 	}
@@ -75,6 +77,8 @@ func ParseShareURL(raw string) (ShareRef, error) {
 		ref.Passcode = firstNonEmpty(query.Get("pwd"), fallbackPasscode)
 	case ShareProviderPan115:
 		ref.Passcode = firstNonEmpty(query.Get("password"), query.Get("pwd"), fallbackPasscode)
+	case ShareProviderGuangYaPan:
+		ref.Passcode = firstNonEmpty(query.Get("code"), query.Get("pwd"), fallbackPasscode)
 	}
 	return ref, nil
 }

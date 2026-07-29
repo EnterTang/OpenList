@@ -150,6 +150,7 @@ func validateSubscriptionConfigTargets(cfg model.SubscriptionConfig) error {
 		{"aliyun_drive", "aliyun_drive", cfg.Telegram.AliyunDrive.TempTransferTarget},
 		{"pan123", "pan123", cfg.Telegram.Pan123.TempTransferTarget},
 		{"pan115", "pan115", cfg.Telegram.Pan115.TempTransferTarget},
+		{"guangyapan", "guangyapan", cfg.Telegram.GuangYaPan.TempTransferTarget},
 	}
 	for _, item := range panTargets {
 		if err := ValidateSubscriptionStorageTarget(item.target); err != nil {
@@ -169,6 +170,7 @@ func validateSubscriptionConfigTargets(cfg model.SubscriptionConfig) error {
 		{"aliyun_drive", cfg.Telegram.AliyunDrive.TempTransferTarget, cfg.Telegram.AliyunDrive.TempTransferRoot},
 		{"pan123", cfg.Telegram.Pan123.TempTransferTarget, cfg.Telegram.Pan123.TempTransferRoot},
 		{"pan115", cfg.Telegram.Pan115.TempTransferTarget, cfg.Telegram.Pan115.TempTransferRoot},
+		{"guangyapan", cfg.Telegram.GuangYaPan.TempTransferTarget, cfg.Telegram.GuangYaPan.TempTransferRoot},
 	}
 	for _, item := range panRoots {
 		if item.target.Provider == "" && strings.TrimSpace(item.root) != "" {
@@ -277,6 +279,7 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	cfg.AliyunDrive = fillTelegramPanConfig(cfg.AliyunDrive, defaults.AliyunDrive)
 	cfg.Pan123 = fillTelegramPanConfig(cfg.Pan123, defaults.Pan123)
 	cfg.Pan115 = fillTelegramPanConfig(cfg.Pan115, defaults.Pan115)
+	cfg.GuangYaPan = fillTelegramPanConfig(cfg.GuangYaPan, defaults.GuangYaPan)
 	if len(cfg.Channels) == 0 && !hasTelegramChannelGroups(cfg) {
 		cfg.Channels = defaults.Channels
 	}
@@ -301,7 +304,7 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	return normalizeTelegramSourceConfig(cfg)
 }
 
-var defaultTransferPriority = []string{"pan123", "pan115", "quark", "aliyun_drive"}
+var defaultTransferPriority = []string{"pan123", "pan115", "guangyapan", "quark", "aliyun_drive"}
 
 const defaultRealtimeCandidateWaitSeconds = 120
 
@@ -342,6 +345,8 @@ func normalizeTransferPriorityName(value string) string {
 		return "pan123"
 	case "115", "pan115":
 		return "pan115"
+	case "guangya", "guangyapan":
+		return "guangyapan"
 	default:
 		return ""
 	}
@@ -367,14 +372,17 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 	cfg.AliyunDrive.Channels = append(cfg.AliyunDrive.Channels, cfg.AliyunDriveChannels...)
 	cfg.Pan123.Channels = append(cfg.Pan123.Channels, cfg.Pan123Channels...)
 	cfg.Pan115.Channels = append(cfg.Pan115.Channels, cfg.Pan115Channels...)
+	cfg.GuangYaPan.Channels = append(cfg.GuangYaPan.Channels, cfg.GuangYaPanChannels...)
 	cfg.Quark = normalizeTelegramPanConfig(cfg.Quark)
 	cfg.AliyunDrive = normalizeTelegramPanConfig(cfg.AliyunDrive)
 	cfg.Pan123 = normalizeTelegramPanConfig(cfg.Pan123)
 	cfg.Pan115 = normalizeTelegramPanConfig(cfg.Pan115)
+	cfg.GuangYaPan = normalizeTelegramPanConfig(cfg.GuangYaPan)
 	cfg.QuarkChannels = nil
 	cfg.AliyunDriveChannels = nil
 	cfg.Pan123Channels = nil
 	cfg.Pan115Channels = nil
+	cfg.GuangYaPanChannels = nil
 	if hasTelegramChannelGroups(cfg) {
 		cfg.Channels = telegramChannelGroups(cfg)
 	}
@@ -435,6 +443,7 @@ func isZeroTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) bool
 		isZeroTelegramPanConfig(cfg.AliyunDrive) &&
 		isZeroTelegramPanConfig(cfg.Pan123) &&
 		isZeroTelegramPanConfig(cfg.Pan115) &&
+		isZeroTelegramPanConfig(cfg.GuangYaPan) &&
 		len(cfg.SearchCommand) == 0 &&
 		len(cfg.AuthCommand) == 0 &&
 		len(cfg.CommandEnv) == 0 &&
@@ -446,16 +455,18 @@ func hasTelegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) bool {
 	return len(cfg.Quark.Channels) > 0 ||
 		len(cfg.AliyunDrive.Channels) > 0 ||
 		len(cfg.Pan123.Channels) > 0 ||
-		len(cfg.Pan115.Channels) > 0
+		len(cfg.Pan115.Channels) > 0 ||
+		len(cfg.GuangYaPan.Channels) > 0
 }
 
 func telegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) []string {
-	return cleanStringList(append(append(append(append(
+	return cleanStringList(append(append(append(append(append(
 		[]string{},
 		cfg.Quark.Channels...),
 		cfg.AliyunDrive.Channels...),
 		cfg.Pan123.Channels...),
-		cfg.Pan115.Channels...), false)
+		cfg.Pan115.Channels...),
+		cfg.GuangYaPan.Channels...), false)
 }
 
 func normalizeTelegramPanConfig(cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {

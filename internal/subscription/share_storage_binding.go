@@ -42,6 +42,9 @@ func bindTelegramPanConfigToStorage(provider ShareProviderName, cfg model.Subscr
 		if driveType := firstCredential(values, "DriveType", "drive_type"); driveType != "" {
 			cfg.DriveType = driveType
 		}
+	case ShareProviderGuangYaPan:
+		cfg.AccessToken = firstCredential(values, "AccessToken", "access_token")
+		cfg.RefreshToken = firstCredential(values, "RefreshToken", "refresh_token")
 	}
 	return normalizeTelegramPanConfig(cfg), nil
 }

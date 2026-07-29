@@ -129,7 +129,7 @@ func TestClusterInspectTransferPriorityUsesGlobalPriorityForPanSou(t *testing.T)
 	}
 
 	got := clusterInspectTransferPriority(&model.Subscription{SourceType: model.SubscriptionSourcePanSou})
-	want := []string{"quark", "pan123", "pan115", "aliyun_drive"}
+	want := []string{"quark", "pan123", "pan115", "aliyun_drive", "guangyapan"}
 	if !stringSlicesEqual(got, want) {
 		t.Fatalf("PanSou cluster priority = %#v, want %#v", got, want)
 	}

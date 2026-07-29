@@ -120,7 +120,7 @@ func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	if got, want := source.Channels, []string{"@sub-quark", "@default-aliyun", "@default-123", "@default-115"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("runtime channels = %#v, want %#v", got, want)
 	}
-	if got, want := source.TransferPriority, []string{"quark", "pan123", "aliyun_drive", "pan115"}; !stringSlicesEqual(got, want) {
+	if got, want := source.TransferPriority, []string{"quark", "pan123", "aliyun_drive", "pan115", "guangyapan"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("transfer priority = %#v, want %#v", got, want)
 	}
 }
@@ -326,7 +326,7 @@ func TestSubscriptionConfigEarlyCloseDefaults(t *testing.T) {
 
 func TestNormalizeConfigDefaultsTelegramTransferPriority(t *testing.T) {
 	cfg := normalizeConfig(model.SubscriptionConfig{})
-	if got, want := cfg.Telegram.TransferPriority, []string{"pan123", "pan115", "quark", "aliyun_drive"}; !stringSlicesEqual(got, want) {
+	if got, want := cfg.Telegram.TransferPriority, []string{"pan123", "pan115", "guangyapan", "quark", "aliyun_drive"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("transfer priority = %#v, want %#v", got, want)
 	}
 }
