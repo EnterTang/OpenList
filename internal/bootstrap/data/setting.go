@@ -18,69 +18,69 @@ import (
 )
 
 const defaultMediaCategoryRulesYAML = `movie:
-  动画片:
+  动画�?:
     genre_ids: '16'
-  纪录片:
+  �?录片:
     genre_ids: '99'
-  儿童家庭:
+  儿�?��?�庭:
     genre_ids: '10751'
-  动作片:
+  动作�?:
     genre_ids: '28'
-  冒险片:
+  冒险�?:
     genre_ids: '12'
-  科幻片:
+  科幻�?:
     genre_ids: '878'
-  奇幻片:
+  奇幻�?:
     genre_ids: '14'
-  悬疑片:
+  �?疑片:
     genre_ids: '9648'
-  惊悚片:
+  惊悚�?:
     genre_ids: '53'
   恐怖片:
     genre_ids: '27'
-  犯罪片:
+  �?�?�?:
     genre_ids: '80'
-  战争片:
+  战争�?:
     genre_ids: '10752'
-  西部片:
+  西部�?:
     genre_ids: '37'
-  喜剧片:
+  喜剧�?:
     genre_ids: '35'
-  爱情片:
+  爱情�?:
     genre_ids: '10749'
-  剧情片:
+  剧情�?:
     genre_ids: '18'
-  历史片:
+  历史�?:
     genre_ids: '36'
-  音乐片:
+  音乐�?:
     genre_ids: '10402'
-  电视电影:
+  电�?�电�?:
     genre_ids: '10770'
-  华语电影:
+  华�??电影:
     original_language: 'zh,cn,tw,hk'
-  外语电影:
+  外�??电影:
     original_language: '!zh,!cn,!tw,!hk'
 tv:
   动漫:
     genre_ids: '16'
-  纪录片:
+  �?录片:
     genre_ids: '99'
   综艺:
     genre_ids: '10764,10767'
-  儿童节目:
+  儿�?�节�?:
     genre_ids: '10762'
-  国产剧:
+  国产�?:
     origin_country: 'CN'
     original_language: 'zh,cn'
-  港台剧:
+  �?台剧:
     origin_country: 'TW,HK'
-  日韩剧:
+  日韩�?:
     origin_country: 'JP,KR'
-  欧美剧:
+  欧美�?:
     origin_country: 'US,GB,CA,AU,FR,DE,IT,ES'
-  海外其他剧:
+  海�?�其他剧:
     origin_country: '!CN,!TW,!HK,!JP,!KR,!US,!GB'
-  未分类:
+  �?分类:
 `
 
 func initSettings() {
@@ -253,6 +253,9 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.HandleHookAfterWriting, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.HandleHookRateLimit, Value: "0", Type: conf.TypeNumber, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.IgnoreSystemFiles, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `When enabled, ignores common system files during upload (.DS_Store, desktop.ini, Thumbs.db, and files starting with ._)`},
+		{Key: conf.PluginAntiHashEnabled, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
+		{Key: conf.PluginISORenameEnabled, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
+		{Key: conf.PluginExtensionWhitelist, Value: "", Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "Comma-separated extensions without dots, e.g. mkv,mp4,avi. Empty means no files are processed."},
 		{Key: conf.TMDBApiKey, Value: "", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.TMDBApiBaseURL, Value: "https://api.themoviedb.org/3", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.TMDBLanguage, Value: "zh-CN", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE},
