@@ -18,69 +18,69 @@ import (
 )
 
 const defaultMediaCategoryRulesYAML = `movie:
-  动画�?:
+  动画片:
     genre_ids: '16'
-  �?录片:
+  纪录片:
     genre_ids: '99'
-  儿�?��?�庭:
+  儿童家庭:
     genre_ids: '10751'
-  动作�?:
+  动作片:
     genre_ids: '28'
-  冒险�?:
+  冒险片:
     genre_ids: '12'
-  科幻�?:
+  科幻片:
     genre_ids: '878'
-  奇幻�?:
+  奇幻片:
     genre_ids: '14'
-  �?疑片:
+  悬疑片:
     genre_ids: '9648'
-  惊悚�?:
+  惊悚片:
     genre_ids: '53'
   恐怖片:
     genre_ids: '27'
-  �?�?�?:
+  犯罪片:
     genre_ids: '80'
-  战争�?:
+  战争片:
     genre_ids: '10752'
-  西部�?:
+  西部片:
     genre_ids: '37'
-  喜剧�?:
+  喜剧片:
     genre_ids: '35'
-  爱情�?:
+  爱情片:
     genre_ids: '10749'
-  剧情�?:
+  剧情片:
     genre_ids: '18'
-  历史�?:
+  历史片:
     genre_ids: '36'
-  音乐�?:
+  音乐片:
     genre_ids: '10402'
-  电�?�电�?:
+  电视电影:
     genre_ids: '10770'
-  华�??电影:
+  华语电影:
     original_language: 'zh,cn,tw,hk'
-  外�??电影:
+  外语电影:
     original_language: '!zh,!cn,!tw,!hk'
 tv:
   动漫:
     genre_ids: '16'
-  �?录片:
+  纪录片:
     genre_ids: '99'
   综艺:
     genre_ids: '10764,10767'
-  儿�?�节�?:
+  儿童节目:
     genre_ids: '10762'
-  国产�?:
+  国产剧:
     origin_country: 'CN'
     original_language: 'zh,cn'
-  �?台剧:
+  港台剧:
     origin_country: 'TW,HK'
-  日韩�?:
+  日韩剧:
     origin_country: 'JP,KR'
-  欧美�?:
+  欧美剧:
     origin_country: 'US,GB,CA,AU,FR,DE,IT,ES'
-  海�?�其他剧:
+  海外其他剧:
     origin_country: '!CN,!TW,!HK,!JP,!KR,!US,!GB'
-  �?分类:
+  未分类:
 `
 
 func initSettings() {

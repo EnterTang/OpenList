@@ -1,253 +1,253 @@
-# GuangYaPan£¨¹âÑ¼ÍøÅÌ£©Driver Implementation Plan
+# GuangYaPanï¼ˆå…‰é¸­ç½‘ç›˜ï¼‰Driver Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** ÔÚ openlist-etf ÖĞÒÆÖ²²¢ÊÊÅä Alist ¹âÑ¼Çı¶¯£¬²¢°´Íâ²¿¡¶¹âÑ¼×ª´æÓë API ½ÓÈë¼¼Êõ¹æ·¶¡·²¹Æë**·ÖÏíÁ´½Ó½âÎöÓë×ª´æ**£¬°Ñ¹âÑ¼×ö³ÉÓë 123 / 115 Í¬¼¶µÄÁÙÊ±×ª´æ×ÊÔ´³Ø£º·ÖÏí/ÀëÏßÈë¿â ¡ú Link ÏÂÔØ ¡ú ÉÏ´« 139¡£**²»Éú³É¡¢²»Ïû·Ñ `.etf`¡£**
+**Goal:** åœ¨ openlist-etf ä¸­ç§»æ¤å¹¶é€‚é… Alist å…‰é¸­é©±åŠ¨ï¼Œå¹¶æŒ‰å¤–éƒ¨ã€Šå…‰é¸­è½¬å­˜ä¸ API æ¥å…¥æŠ€æœ¯è§„èŒƒã€‹è¡¥é½**åˆ†äº«é“¾æ¥è§£æä¸è½¬å­˜**ï¼ŒæŠŠå…‰é¸­åšæˆä¸ 123 / 115 åŒçº§çš„ä¸´æ—¶è½¬å­˜èµ„æºæ± ï¼šåˆ†äº«/ç¦»çº¿å…¥åº“ â†’ Link ä¸‹è½½ â†’ ä¸Šä¼  139ã€‚**ä¸ç”Ÿæˆã€ä¸æ¶ˆè´¹ `.etf`ã€‚**
 
 **Architecture:**  
-1) **¸öÈËÅÌÇı¶¯**ÒÔ Alist `drivers/guangyapan` Îª»ùÏß£¨¼øÈ¨¡¢List/Link¡¢CRUD¡¢OSS Put¡¢ÀëÏß Tool£©¡£  
-2) **·ÖÏí×ª´æ**°´±¾¶Ô»°Ìá¹©µÄ Python/¹æ·¶ÊµÏÖ£º`get_share_summary` ¡ú `get_share_access_token` ¡ú `get_share_page_files_list` ¡ú `restore_share` ¡ú `get_task_status`£»Ô­Óï·ÅÔÚ `drivers/guangyapan/share.go`£¬¶©ÔÄ²ãÓÃ `ShareSaver` ¶Ô±ê `share_123.go` / `share_115.go`¡£  
-3) ÊµÏÖÊ±±ØĞë´¦Àí **Alist Óë¹æ·¶µÄ Header/client_id/¸ù ID ²îÒì**£¨¼ûÏÂ½Ú³åÍ»±í£©£¬ÒÔÊµ²âÎª×¼ÔñÓÅ£¬²¢Ğ´»Ø¹é²âÊÔËø¶¨½âÎöÓë´íÎóÂë¡£
+1) **ä¸ªäººç›˜é©±åŠ¨**ä»¥ Alist `drivers/guangyapan` ä¸ºåŸºçº¿ï¼ˆé‰´æƒã€List/Linkã€CRUDã€OSS Putã€ç¦»çº¿ Toolï¼‰ã€‚  
+2) **åˆ†äº«è½¬å­˜**æŒ‰æœ¬å¯¹è¯æä¾›çš„ Python/è§„èŒƒå®ç°ï¼š`get_share_summary` â†’ `get_share_access_token` â†’ `get_share_page_files_list` â†’ `restore_share` â†’ `get_task_status`ï¼›åŸè¯­æ”¾åœ¨ `drivers/guangyapan/share.go`ï¼Œè®¢é˜…å±‚ç”¨ `ShareSaver` å¯¹æ ‡ `share_123.go` / `share_115.go`ã€‚  
+3) å®ç°æ—¶å¿…é¡»å¤„ç† **Alist ä¸è§„èŒƒçš„ Header/client_id/æ ¹ ID å·®å¼‚**ï¼ˆè§ä¸‹èŠ‚å†²çªè¡¨ï¼‰ï¼Œä»¥å®æµ‹ä¸ºå‡†æ‹©ä¼˜ï¼Œå¹¶å†™å›å½’æµ‹è¯•é”å®šè§£æä¸é”™è¯¯ç ã€‚
 
-**Tech Stack:** Go£¨`github.com/OpenListTeam/OpenList/v4`£©¡¢resty¡¢aliyun-oss-go-sdk¡¢`golang.org/x/time/rate`¡¢go-cache¡¢singleflight
+**Tech Stack:** Goï¼ˆ`github.com/OpenListTeam/OpenList/v4`ï¼‰ã€restyã€aliyun-oss-go-sdkã€`golang.org/x/time/rate`ã€go-cacheã€singleflight
 
-## Product Role£¨ÒÑÈ·ÈÏ£©
+## Product Roleï¼ˆå·²ç¡®è®¤ï¼‰
 
 ```text
-¹âÑ¼·ÖÏíÁ´½Ó£¨º¬ÌáÈ¡Âë£©
-        ¡ı ParseURL + get_share_access_token + list + restore_share
-   GuangYaPan ¸öÈËÅÌÁÙÊ±Ä¿Â¼£¨×ÊÔ´³Ø£¬ÀàËÆ 123/115£©
-        ¡ı Link£¨signedURL Ö±Á´£©
-   ÉÏ´«µ½ 139Yun ¡ú ½ö 139 ×ö ETF
+å…‰é¸­åˆ†äº«é“¾æ¥ï¼ˆå«æå–ç ï¼‰
+        â†“ ParseURL + get_share_access_token + list + restore_share
+   GuangYaPan ä¸ªäººç›˜ä¸´æ—¶ç›®å½•ï¼ˆèµ„æºæ± ï¼Œç±»ä¼¼ 123/115ï¼‰
+        â†“ Linkï¼ˆsignedURL ç›´é“¾ï¼‰
+   ä¸Šä¼ åˆ° 139Yun â†’ ä»… 139 åš ETF
 ```
 
-- ¹âÑ¼£ºÖĞ×ªÅÌ£»º¬¹ÒÔØ¡¢ÀëÏßÈë¿â¡¢**·ÖÏí×ª´æ**¡¢Link¡¢ÁÙÊ±Ä¿Â¼ÇåÀí¡£
-- `code==156` / `check_can_flash_upload` ½ö×÷ÉÏ´«È¥ÖØ£¬²»×ö `.etf`¡£
-- 139£ºÎ¨Ò» ETF Âäµã¡£
+- å…‰é¸­ï¼šä¸­è½¬ç›˜ï¼›å«æŒ‚è½½ã€ç¦»çº¿å…¥åº“ã€**åˆ†äº«è½¬å­˜**ã€Linkã€ä¸´æ—¶ç›®å½•æ¸…ç†ã€‚
+- `code==156` / `check_can_flash_upload` ä»…ä½œä¸Šä¼ å»é‡ï¼Œä¸åš `.etf`ã€‚
+- 139ï¼šå”¯ä¸€ ETF è½ç‚¹ã€‚
 
-## ÒÑÈ·ÈÏ¾ö²ß
+## å·²ç¡®è®¤å†³ç­–
 
-1. **¸ùÂ·¾¶×Ö¶Î£º** `root_path`£¨Óë Alist Ò»ÖÂ£©¡£
-2. **Writer£º** ÓÅÏÈ Result °æ£¨·µ»Ø `model.Obj`£©£»ÄÃ²»µ½ id Ê±ÔÙÍË»Ø `error` °æ¡£
-3. **ÀëÏßÏÂÔØ£º** °üº¬£¨Phase 2£©¡£
-4. **·ÖÏí×ª´æ£º** **ÄÉÈë±¾Çı¶¯ÊÊÅä**£¨²»ÔÙÁí¿ªÔ¶ÆÚ¼Æ»®£©¡£Çı¶¯ÄÚÌá¹©×ª´æÔ­Óï£»¶©ÔÄ²àÍ¬²½½Ó `ShareProviderPanGuangya`£¨Ãû³Æ´ı¶¨£¬½¨Òé `guangyapan`£©¡£
-5. **²»×ö ETF¡£**
+1. **æ ¹è·¯å¾„å­—æ®µï¼š** `root_path`ï¼ˆä¸ Alist ä¸€è‡´ï¼‰ã€‚
+2. **Writerï¼š** ä¼˜å…ˆ Result ç‰ˆï¼ˆè¿”å› `model.Obj`ï¼‰ï¼›æ‹¿ä¸åˆ° id æ—¶å†é€€å› `error` ç‰ˆã€‚
+3. **ç¦»çº¿ä¸‹è½½ï¼š** åŒ…å«ï¼ˆPhase 2ï¼‰ã€‚
+4. **åˆ†äº«è½¬å­˜ï¼š** **çº³å…¥æœ¬é©±åŠ¨é€‚é…**ï¼ˆä¸å†å¦å¼€è¿œæœŸè®¡åˆ’ï¼‰ã€‚é©±åŠ¨å†…æä¾›è½¬å­˜åŸè¯­ï¼›è®¢é˜…ä¾§åŒæ­¥æ¥ `ShareProviderPanGuangya`ï¼ˆåç§°å¾…å®šï¼Œå»ºè®® `guangyapan`ï¼‰ã€‚
+5. **ä¸åš ETFã€‚**
 
-### Alist vs ¹æ·¶£ºÄÜÁ¦¶ÔÕÕ
+### Alist vs è§„èŒƒï¼šèƒ½åŠ›å¯¹ç…§
 
-| ÄÜÁ¦ | Alist ¹âÑ¼ | Íâ²¿¹æ·¶ / Python | ±¾¼Æ»® |
+| èƒ½åŠ› | Alist å…‰é¸­ | å¤–éƒ¨è§„èŒƒ / Python | æœ¬è®¡åˆ’ |
 |------|------------|-------------------|--------|
-| ¹ÒÔØ / Link / CRUD / OSS Put | ÓĞ | ²¿·ÖÂ·¾¶²»Í¬ | Phase 1£ºAlist »ùÏß + ¹æ·¶Â·¾¶¶µµ× |
-| URL/BT ÀëÏß | ÓĞ | Î´¸²¸Ç | Phase 2£ºÒÆÖ² Alist |
-| ·ÖÏí½âÎö / token / ÁĞ±í / restore | **ÎŞ** | **ÓĞÍêÕûÁ÷³Ì** | Phase 3£º°´¹æ·¶ÊµÏÖ |
-| ETF | ÎŞ | ÎŞ£¨½ö gcid Ãë´«¼ì²é£© | ²»×ö |
+| æŒ‚è½½ / Link / CRUD / OSS Put | æœ‰ | éƒ¨åˆ†è·¯å¾„ä¸åŒ | Phase 1ï¼šAlist åŸºçº¿ + è§„èŒƒè·¯å¾„å…œåº• |
+| URL/BT ç¦»çº¿ | æœ‰ | æœªè¦†ç›– | Phase 2ï¼šç§»æ¤ Alist |
+| åˆ†äº«è§£æ / token / åˆ—è¡¨ / restore | **æ— ** | **æœ‰å®Œæ•´æµç¨‹** | Phase 3ï¼šæŒ‰è§„èŒƒå®ç° |
+| ETF | æ—  | æ— ï¼ˆä»… gcid ç§’ä¼ æ£€æŸ¥ï¼‰ | ä¸åš |
 
 ---
 
 ## Global Constraints
 
-- Ä£¿éµ¼ÈëÒ»ÂÉ `github.com/OpenListTeam/OpenList/v4/...`¡£
-- Çı¶¯Ãû `GuangYaPan`£»`NoOverwriteUpload = true`¡¢`CheckStatus = true`¡£
-- ¸ùÂ·¾¶ JSON ×Ö¶Î `root_path`¡£
-- Writer ÓÅÏÈ Result ½Ó¿Ú¡£
-- ±ØĞëº¬ÀëÏßÏÂÔØ + **·ÖÏí×ª´æÔ­Óï + ¶©ÔÄ ShareSaver**¡£
-- ²»×ö¹âÑ¼ ETF¡£
-- ·ÖÏí API ÒÔÓÃ»§Ìá¹©µÄ¹æ·¶Îª×¼£»Óë Alist Header/Â·¾¶³åÍ»Ê±ÏÈ°´¹æ·¶ÊµÏÖ·ÖÏíÁ÷£¬¸öÈËÅÌ¶ÁĞ´ÓÅÏÈ±£³Ö Alist ÒÑÑéÖ¤Â·¾¶£¬±ØÒªÊ±Ë«Â·¾¶¼æÈİ¡£
-- Commit ÓÃ Conventional Commits£»½ûÖ¹Ìá½»ÕæÊµ token / ÊÖ»úºÅ¡£
+- æ¨¡å—å¯¼å…¥ä¸€å¾‹ `github.com/OpenListTeam/OpenList/v4/...`ã€‚
+- é©±åŠ¨å `GuangYaPan`ï¼›`NoOverwriteUpload = true`ã€`CheckStatus = true`ã€‚
+- æ ¹è·¯å¾„ JSON å­—æ®µ `root_path`ã€‚
+- Writer ä¼˜å…ˆ Result æ¥å£ã€‚
+- å¿…é¡»å«ç¦»çº¿ä¸‹è½½ + **åˆ†äº«è½¬å­˜åŸè¯­ + è®¢é˜… ShareSaver**ã€‚
+- ä¸åšå…‰é¸­ ETFã€‚
+- åˆ†äº« API ä»¥ç”¨æˆ·æä¾›çš„è§„èŒƒä¸ºå‡†ï¼›ä¸ Alist Header/è·¯å¾„å†²çªæ—¶å…ˆæŒ‰è§„èŒƒå®ç°åˆ†äº«æµï¼Œä¸ªäººç›˜è¯»å†™ä¼˜å…ˆä¿æŒ Alist å·²éªŒè¯è·¯å¾„ï¼Œå¿…è¦æ—¶åŒè·¯å¾„å…¼å®¹ã€‚
+- Commit ç”¨ Conventional Commitsï¼›ç¦æ­¢æäº¤çœŸå® token / æ‰‹æœºå·ã€‚
 
 ---
 
-## ¹æ·¶½ÓÈë£º·ÖÏí×ª´æ API£¨ÄÉÈëÇı¶¯£©
+## è§„èŒƒæ¥å…¥ï¼šåˆ†äº«è½¬å­˜ APIï¼ˆçº³å…¥é©±åŠ¨ï¼‰
 
-### Á÷³Ì
+### æµç¨‹
 
-1. ½âÎö£º`https://www.guangyapan.com/s/{shareId}` + `code`/`pwd`/¡¸ÌáÈ¡Âë¡¹ÎÄ±¾  
-2. `POST /userres/v1/get_share_summary`£¨¿ÉÑ¡£¬ÓÃÓÚ±êÌâ/Ğ£Ñé£©  
-3. `POST /userres/v1/get_share_access_token` ¡ú **share_access_token**£¨¡Ù ÓÃ»§ Bearer£©  
-4. `POST /userres/v1/get_share_page_files_list`£¨`parentId` ¹æ·¶Îª `"0"`£»µİ¹é×ÓÄ¿Â¼£©  
-5. `POST /userres/v1/restore_share`£¨±ØĞëÓÃ»§ `Authorization` + `fileIds` + Ä¿±ê `parentId`£©  
-6. `POST /userres/v1/get_task_status` µÈ´ıÍê³É  
+1. è§£æï¼š`https://www.guangyapan.com/s/{shareId}` + `code`/`pwd`/ã€Œæå–ç ã€æ–‡æœ¬  
+2. `POST /userres/v1/get_share_summary`ï¼ˆå¯é€‰ï¼Œç”¨äºæ ‡é¢˜/æ ¡éªŒï¼‰  
+3. `POST /userres/v1/get_share_access_token` â†’ **share_access_token**ï¼ˆâ‰  ç”¨æˆ· Bearerï¼‰  
+4. `POST /userres/v1/get_share_page_files_list`ï¼ˆ`parentId` è§„èŒƒä¸º `"0"`ï¼›é€’å½’å­ç›®å½•ï¼‰  
+5. `POST /userres/v1/restore_share`ï¼ˆå¿…é¡»ç”¨æˆ· `Authorization` + `fileIds` + ç›®æ ‡ `parentId`ï¼‰  
+6. `POST /userres/v1/get_task_status` ç­‰å¾…å®Œæˆ  
 
-### Óë Alist µÄ³åÍ»µã£¨ÊµÏÖÊ±Êµ²â²Ã¾ö£©
+### ä¸ Alist çš„å†²çªç‚¹ï¼ˆå®ç°æ—¶å®æµ‹è£å†³ï¼‰
 
-| Ïî | Alist | ¹æ·¶ / Python | ½¨Òé |
+| é¡¹ | Alist | è§„èŒƒ / Python | å»ºè®® |
 |----|-------|---------------|------|
-| Account host | `account.guangyapan.com` | `auth` »ò `account` | µÇÂ¼ÏÈÊÔ Alist host£»Ë¢ĞÂ¿É¼æÈİÁ½Õß |
-| `client_id` | `aMe-8VSlkrbQXpUR` | `"301"` | **Addition ¿ÉÅä**£»Ä¬ÈÏ¸ú Alist µÇÂ¼£¬·ÖÏíÁ÷Èô 401 ÔÙÊÔ¹æ·¶Öµ |
-| API `dt` | `"4"` | `"web"` | ¸öÈËÅÌ¸ú Alist£»·ÖÏíÇëÇó¿É¸ú¹æ·¶ |
-| `x-client-id` / protocol | ClientID / `301` | `301` / `0.0.1` | ·ÖÏíÇëÇó¶ÔÆë¹æ·¶ Header£»¸öÈËÅÌ¶ÔÆë Alist |
-| ¸ù `parentId` | `""` | `"0"` | **·ÖÏíÁĞ±í/×ª´æ¸ú¹æ·¶ÓÃ `"0"`**£»¸öÈËÅÌ List ¸ú Alist Êµ²â |
-| ÒµÎñ path Ç°×º | »ìÓÃ `/userres` Óë `/nd.bizuserres.s` | ¶àÎª `/userres/v1/...` | ·ÖÏíÒ»ÂÉ `/userres`£»¸öÈËÅÌ±£Áô Alist |
-| ÈÎÎñ status | int£¨2 ³É¹¦£© | ×Ö·û´® `"success"` »ò progress | ½âÎö²ãÍ¬Ê±¼æÈİ int / string |
-| ÒµÎñ `code` | ³£¿´ `msg` | `0`/`"0"`/`200` | Í³Ò» `isOK(code)` helper |
+| Account host | `account.guangyapan.com` | `auth` æˆ– `account` | ç™»å½•å…ˆè¯• Alist hostï¼›åˆ·æ–°å¯å…¼å®¹ä¸¤è€… |
+| `client_id` | `aMe-8VSlkrbQXpUR` | `"301"` | **Addition å¯é…**ï¼›é»˜è®¤è·Ÿ Alist ç™»å½•ï¼Œåˆ†äº«æµè‹¥ 401 å†è¯•è§„èŒƒå€¼ |
+| API `dt` | `"4"` | `"web"` | ä¸ªäººç›˜è·Ÿ Alistï¼›åˆ†äº«è¯·æ±‚å¯è·Ÿè§„èŒƒ |
+| `x-client-id` / protocol | ClientID / `301` | `301` / `0.0.1` | åˆ†äº«è¯·æ±‚å¯¹é½è§„èŒƒ Headerï¼›ä¸ªäººç›˜å¯¹é½ Alist |
+| æ ¹ `parentId` | `""` | `"0"` | **åˆ†äº«åˆ—è¡¨/è½¬å­˜è·Ÿè§„èŒƒç”¨ `"0"`**ï¼›ä¸ªäººç›˜ List è·Ÿ Alist å®æµ‹ |
+| ä¸šåŠ¡ path å‰ç¼€ | æ··ç”¨ `/userres` ä¸ `/nd.bizuserres.s` | å¤šä¸º `/userres/v1/...` | åˆ†äº«ä¸€å¾‹ `/userres`ï¼›ä¸ªäººç›˜ä¿ç•™ Alist |
+| ä»»åŠ¡ status | intï¼ˆ2 æˆåŠŸï¼‰ | å­—ç¬¦ä¸² `"success"` æˆ– progress | è§£æå±‚åŒæ—¶å…¼å®¹ int / string |
+| ä¸šåŠ¡ `code` | å¸¸çœ‹ `msg` | `0`/`"0"`/`200` | ç»Ÿä¸€ `isOK(code)` helper |
 
-### Çı¶¯ÄÚ API ±íÃæ£¨`drivers/guangyapan`£©
+### é©±åŠ¨å†… API è¡¨é¢ï¼ˆ`drivers/guangyapan`ï¼‰
 
 ```text
 ParseShareURL(raw) (shareID, code, error)
 GetShareSummary(ctx, shareID, code)
 GetShareAccessToken(ctx, shareID, code) string
-ListShareFiles(ctx, shareToken, parentID) []ShareFileItem   // ·ÖÒ³
+ListShareFiles(ctx, shareToken, parentID) []ShareFileItem   // åˆ†é¡µ
 RestoreShare(ctx, shareToken, fileIDs, parentID) taskID
 WaitShareRestoreTask(ctx, taskID) error
 ```
 
-¶©ÔÄ²ã `internal/subscription/share_guangyapan.go` ÊµÏÖ `ShareSaver`£º`ParseURL` / `ListShareChildren` / `SaveShareItems` / `WaitSaveComplete` / `EnsureDir`£¬ÄÚ²¿µ÷ÓÃÉÏÊöÇı¶¯·½·¨»òµÈ¼Û HTTP£¨Æ¾¾İÀ´×ÔÒÑ¹ÒÔØ GuangYaPan storage µÄ token£¬¶Ô±ê 123/115 µÄ TempTransfer °ó¶¨£©¡£
+è®¢é˜…å±‚ `internal/subscription/share_guangyapan.go` å®ç° `ShareSaver`ï¼š`ParseURL` / `ListShareChildren` / `SaveShareItems` / `WaitSaveComplete` / `EnsureDir`ï¼Œå†…éƒ¨è°ƒç”¨ä¸Šè¿°é©±åŠ¨æ–¹æ³•æˆ–ç­‰ä»· HTTPï¼ˆå‡­æ®æ¥è‡ªå·²æŒ‚è½½ GuangYaPan storage çš„ tokenï¼Œå¯¹æ ‡ 123/115 çš„ TempTransfer ç»‘å®šï¼‰ã€‚
 
 ---
 
-## Alist ÊµÏÖÈ«Ãæ·ÖÎö£¨¶Ô½Ó×¢ÒâÊÂÏî£©
+## Alist å®ç°å…¨é¢åˆ†æï¼ˆå¯¹æ¥æ³¨æ„äº‹é¡¹ï¼‰
 
-### 1. Ô´Âë½á¹¹
+### 1. æºç ç»“æ„
 
-| ÎÄ¼ş | Ö°Ôğ |
+| æ–‡ä»¶ | èŒè´£ |
 |------|------|
-| [`meta.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/meta.go) | `Addition`¡¢`driver.Config`¡¢×¢²á |
-| [`types.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/types.go) | ¼øÈ¨/ÁĞ±í/ÏÂÔØ/ÈÎÎñ/ÉÏ´«/ÀëÏßÀàĞÍ |
-| [`driver.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/driver.go) | Init¡¢CRUD¡¢Link¡¢Put¡¢Token¡¢ÏŞÁ÷¡¢OSS |
-| [`offline.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/offline.go) | ÀëÏßÈÎÎñ |
-| £¨±¾²Ö¿âĞÂÔö£©`share.go` | ¹æ·¶·ÖÏí×ª´æÔ­Óï |
+| [`meta.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/meta.go) | `Addition`ã€`driver.Config`ã€æ³¨å†Œ |
+| [`types.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/types.go) | é‰´æƒ/åˆ—è¡¨/ä¸‹è½½/ä»»åŠ¡/ä¸Šä¼ /ç¦»çº¿ç±»å‹ |
+| [`driver.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/driver.go) | Initã€CRUDã€Linkã€Putã€Tokenã€é™æµã€OSS |
+| [`offline.go`](https://github.com/AlistGo/alist/blob/main/drivers/guangyapan/offline.go) | ç¦»çº¿ä»»åŠ¡ |
+| ï¼ˆæœ¬ä»“åº“æ–°å¢ï¼‰`share.go` | è§„èŒƒåˆ†äº«è½¬å­˜åŸè¯­ |
 | Alist offline Tool | `internal/offline_download/guangyapan` |
-ÉÏÓÎ½üÆÚÏà¹ØÌá½»£¨ÒÆÖ²Ê±½¨Òé¶ÔÕÕ diff£©£º
+ä¸Šæ¸¸è¿‘æœŸç›¸å…³æäº¤ï¼ˆç§»æ¤æ—¶å»ºè®®å¯¹ç…§ diffï¼‰ï¼š
 
 - `feat: add GuangYaPan offline download (#9505)`
 - `fix(guangyapan): resolve offline root folder lookup (#9516)`
 - `fix(guangyapan): rate-limit API requests... (#9553)`
 
-### 2. Ë«ÓòÃûÓë¿Í»§¶Ë
+### 2. åŒåŸŸåä¸å®¢æˆ·ç«¯
 
-- **Account£º** `https://account.guangyapan.com`
-  - µÇÂ¼¡¢ÑéÖ¤Âë¡¢refresh¡¢`/v1/user/me`
-  - ¹Ì¶¨Ò»ÅúÉè±¸Î±×° Header£º`X-Device-*`¡¢`X-Client-Id`¡¢`X-SDK-Version=9.0.2`¡¢`X-Protocol-Version=301` µÈ
+- **Accountï¼š** `https://account.guangyapan.com`
+  - ç™»å½•ã€éªŒè¯ç ã€refreshã€`/v1/user/me`
+  - å›ºå®šä¸€æ‰¹è®¾å¤‡ä¼ªè£… Headerï¼š`X-Device-*`ã€`X-Client-Id`ã€`X-SDK-Version=9.0.2`ã€`X-Protocol-Version=301` ç­‰
   - `X-Device-Sign = "wdi10." + deviceID + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"`
-  - ¿ÉÑ¡ `X-Captcha-Token`
-- **API£º** `https://api.guangyapan.com`
-  - Header£º`Did`£¨device id£©¡¢`Dt=4`¡¢`Authorization: Bearer <access_token>`
-- **Ä¬ÈÏ ClientID£º** `aMe-8VSlkrbQXpUR`
-- **DeviceID£º** 32 Î»Ğ¡Ğ´ hex£»·Ç·¨Ôò×Ô¶¯Éú³É£»Ğè³Ö¾Ã»¯µ½ storage addition£¬±ÜÃâÃ¿´Î Init »»Éè±¸Ö¸ÎÆ
+  - å¯é€‰ `X-Captcha-Token`
+- **APIï¼š** `https://api.guangyapan.com`
+  - Headerï¼š`Did`ï¼ˆdevice idï¼‰ã€`Dt=4`ã€`Authorization: Bearer <access_token>`
+- **é»˜è®¤ ClientIDï¼š** `aMe-8VSlkrbQXpUR`
+- **DeviceIDï¼š** 32 ä½å°å†™ hexï¼›éæ³•åˆ™è‡ªåŠ¨ç”Ÿæˆï¼›éœ€æŒä¹…åŒ–åˆ° storage additionï¼Œé¿å…æ¯æ¬¡ Init æ¢è®¾å¤‡æŒ‡çº¹
 
-### 3. ¼øÈ¨ÓÅÏÈ¼¶Óë¶ÌĞÅÁ½¶ÎÁ÷£¨¼«Ò×²È¿Ó£©
+### 3. é‰´æƒä¼˜å…ˆçº§ä¸çŸ­ä¿¡ä¸¤æ®µæµï¼ˆææ˜“è¸©å‘ï¼‰
 
-`Init` ÓÅÏÈ¼¶£º
+`Init` ä¼˜å…ˆçº§ï¼š
 
-1. `access_token` ¡ú `GET /v1/user/me` Ğ£Ñé
-2. Ê§°ÜÔò `refresh_token` ¡ú `POST /v1/auth/token`£¨`grant_type=refresh_token`£©
-3. ÔÙÊ§°ÜÔò¶ÌĞÅ£º
-   - **½×¶Î A£º** Ìî `phone_number`£¬`send_code=true` ¡ú ·¢¶ÌĞÅ¡¢Ğ´Èë `verification_id`¡¢`send_code` ¸´Î»Îª false£»**Init ±ØĞë³É¹¦·µ»Ø**£¨½ö¸üĞÂ status ÎÄ°¸£©
-   - **½×¶Î B£º** Ìî `verify_code` ¡ú `verification/verify` ¡ú `signin` ¡ú ±£´æ token£¬Çå¿Õ `verify_code` / `verification_id`
+1. `access_token` â†’ `GET /v1/user/me` æ ¡éªŒ
+2. å¤±è´¥åˆ™ `refresh_token` â†’ `POST /v1/auth/token`ï¼ˆ`grant_type=refresh_token`ï¼‰
+3. å†å¤±è´¥åˆ™çŸ­ä¿¡ï¼š
+   - **é˜¶æ®µ Aï¼š** å¡« `phone_number`ï¼Œ`send_code=true` â†’ å‘çŸ­ä¿¡ã€å†™å…¥ `verification_id`ã€`send_code` å¤ä½ä¸º falseï¼›**Init å¿…é¡»æˆåŠŸè¿”å›**ï¼ˆä»…æ›´æ–° status æ–‡æ¡ˆï¼‰
+   - **é˜¶æ®µ Bï¼š** å¡« `verify_code` â†’ `verification/verify` â†’ `signin` â†’ ä¿å­˜ tokenï¼Œæ¸…ç©º `verify_code` / `verification_id`
 
-×¢ÒâÊÂÏî£º
+æ³¨æ„äº‹é¡¹ï¼š
 
-- ÊÖ»úºÅ¹æ·¶»¯Îª E.164 Õ¹Ê¾ĞÎÌ¬£º`+86 1xxxxxxxxxx`£¨ÖĞ¼äÓĞ¿Õ¸ñ£©£»captcha meta ÀïÁíÓĞÈ¥ `+86` µÄ´¿Êı×ÖĞÎÊ½¡£
-- captcha£º`POST /v1/shield/captcha/init`£¬`action=POST:/v1/auth/verification`£»Óö `captcha_invalid` / expired Ó¦Ç¿ÖÆË¢ĞÂºóÖØÊÔ¡£
-- µÇÂ¼³É¹¦ºó±ØĞë `op.MustSaveDriverStorage(d)`£¬·ñÔòË¢ĞÂºóµÄ token ¶ªÊ§¡£
-- `setTempStatus` ÓÃ `time.AfterFunc(200ms)` ÈÆ¹ı Init ½áÊøºó±»¸Ä³É WORK µÄĞĞÎª¡ª¡ªÒÆÖ²Ê±±£Áô»ò¸ÄÎª¸üÎÈÍ×µÄ status »úÖÆ£¬µ«²»ÒªÉ¾µô¡°½ö·¢¶ÌĞÅ²»±¨´í¡±µÄ²úÆ·ÓïÒå¡£
-- `CheckStatus: true`£ºÎ´µÇÂ¼Íê³ÉÊ± storage ×´Ì¬ÎÄ°¸Ó¦¶ÔÓÃ»§¿É¼û¡£
+- æ‰‹æœºå·è§„èŒƒåŒ–ä¸º E.164 å±•ç¤ºå½¢æ€ï¼š`+86 1xxxxxxxxxx`ï¼ˆä¸­é—´æœ‰ç©ºæ ¼ï¼‰ï¼›captcha meta é‡Œå¦æœ‰å» `+86` çš„çº¯æ•°å­—å½¢å¼ã€‚
+- captchaï¼š`POST /v1/shield/captcha/init`ï¼Œ`action=POST:/v1/auth/verification`ï¼›é‡ `captcha_invalid` / expired åº”å¼ºåˆ¶åˆ·æ–°åé‡è¯•ã€‚
+- ç™»å½•æˆåŠŸåå¿…é¡» `op.MustSaveDriverStorage(d)`ï¼Œå¦åˆ™åˆ·æ–°åçš„ token ä¸¢å¤±ã€‚
+- `setTempStatus` ç”¨ `time.AfterFunc(200ms)` ç»•è¿‡ Init ç»“æŸåè¢«æ”¹æˆ WORK çš„è¡Œä¸ºâ€”â€”ç§»æ¤æ—¶ä¿ç•™æˆ–æ”¹ä¸ºæ›´ç¨³å¦¥çš„ status æœºåˆ¶ï¼Œä½†ä¸è¦åˆ æ‰â€œä»…å‘çŸ­ä¿¡ä¸æŠ¥é”™â€çš„äº§å“è¯­ä¹‰ã€‚
+- `CheckStatus: true`ï¼šæœªç™»å½•å®Œæˆæ—¶ storage çŠ¶æ€æ–‡æ¡ˆåº”å¯¹ç”¨æˆ·å¯è§ã€‚
 
-### 4. ¸ùÄ¿Â¼½âÎö
+### 4. æ ¹ç›®å½•è§£æ
 
-- Addition ×Ö¶ÎÔÚ Alist ÊÇ×Ô¶¨Òå `root_path`£¨ÍêÕûÂ·¾¶£¬Èç `/µçÓ°/»ªÓï`£©£¬**²»ÊÇ** OpenList ³£¼ûµÄ `root_folder_path` / `root_folder_id`¡£
-- ¿ÕÂ·¾¶ ¡ú ¸ù `parentId=""`¡£
-- ·Ç¿Õ ¡ú °´ `/` ·Ö¶Î£¬ÔÚÃ¿²ã `get_file_list` ÀïÕÒ `resType==2` ÇÒÍ¬ÃûÎÄ¼ş¼Ğ¡£
-- `GetRooter` ·µ»Ø½âÎöºóµÄ folder id¡£
-- **ÀëÏßÏÂÔØÌØÀı£º** ÈôÄ¿±êÄ¿Â¼¾ÍÊÇÇı¶¯¸ù£¬´´½¨ÈÎÎñÊ±Òª°Ñ `parentId` ÖÃÎª¿Õ×Ö·û´®£¨¼û `#9516`£©¡£
+- Addition å­—æ®µåœ¨ Alist æ˜¯è‡ªå®šä¹‰ `root_path`ï¼ˆå®Œæ•´è·¯å¾„ï¼Œå¦‚ `/ç”µå½±/åè¯­`ï¼‰ï¼Œ**ä¸æ˜¯** OpenList å¸¸è§çš„ `root_folder_path` / `root_folder_id`ã€‚
+- ç©ºè·¯å¾„ â†’ æ ¹ `parentId=""`ã€‚
+- éç©º â†’ æŒ‰ `/` åˆ†æ®µï¼Œåœ¨æ¯å±‚ `get_file_list` é‡Œæ‰¾ `resType==2` ä¸”åŒåæ–‡ä»¶å¤¹ã€‚
+- `GetRooter` è¿”å›è§£æåçš„ folder idã€‚
+- **ç¦»çº¿ä¸‹è½½ç‰¹ä¾‹ï¼š** è‹¥ç›®æ ‡ç›®å½•å°±æ˜¯é©±åŠ¨æ ¹ï¼Œåˆ›å»ºä»»åŠ¡æ—¶è¦æŠŠ `parentId` ç½®ä¸ºç©ºå­—ç¬¦ä¸²ï¼ˆè§ `#9516`ï¼‰ã€‚
 
-OpenList ÊÊÅä½¨Òé£º
+OpenList é€‚é…å»ºè®®ï¼š
 
-- ·½°¸ A£¨ÍÆ¼ö¼æÈİÉÏÓÎ£©£º¼ÌĞøÓÃ `root_path` ×Ö¶ÎÃû£¬ÎÄµµ±êÃ÷º¬Òå¡£
-- ·½°¸ B£º¸ÄÇ¶ `driver.RootPath`£¨`root_folder_path`£©£¬²¢ÔÚ´úÂëÀï¶Á `GetRootPath()`¡£  
-  **Ñ¡¶¨ºóÈ«²ÖÒ»ÖÂ**£»ÈôÒªÓë Alist ÅäÖÃ»¥µ¼£¬ÓÅÏÈ·½°¸ A¡£
+- æ–¹æ¡ˆ Aï¼ˆæ¨èå…¼å®¹ä¸Šæ¸¸ï¼‰ï¼šç»§ç»­ç”¨ `root_path` å­—æ®µåï¼Œæ–‡æ¡£æ ‡æ˜å«ä¹‰ã€‚
+- æ–¹æ¡ˆ Bï¼šæ”¹åµŒ `driver.RootPath`ï¼ˆ`root_folder_path`ï¼‰ï¼Œå¹¶åœ¨ä»£ç é‡Œè¯» `GetRootPath()`ã€‚  
+  **é€‰å®šåå…¨ä»“ä¸€è‡´**ï¼›è‹¥è¦ä¸ Alist é…ç½®äº’å¯¼ï¼Œä¼˜å…ˆæ–¹æ¡ˆ Aã€‚
 
-### 5. ÒµÎñ API Çåµ¥
+### 5. ä¸šåŠ¡ API æ¸…å•
 
-| ÄÜÁ¦ | Method / Path | Òªµã |
+| èƒ½åŠ› | Method / Path | è¦ç‚¹ |
 |------|---------------|------|
-| ÁĞ±í | `POST /userres/v1/file/get_file_list` | body: `parentId,page,pageSize,orderBy,sortType,fileTypes:[]`£»·ÖÒ³Ö±µ½²»×ãÒ»Ò³»ò´ïµ½ total |
-| ÁĞ±í£¨Â·¾¶½âÎö£© | `POST /nd.bizuserres.s/v1/file/get_file_list` | **Óë List Â·¾¶Ç°×º²»Í¬**£»ÒÆÖ²Ê±Ô­Ñù±£Áô£¬Êµ²âºóÔÙÍ³Ò» |
-| ÏÂÔØ | `POST /nd.bizuserres.s/v1/get_res_download_url` | ÓÅÏÈ `signedURL`£¬·ñÔò `downloadUrl` |
-| ½¨Ä¿Â¼ | `POST /nd.bizuserres.s/v1/file/create_dir` | ³É¹¦ÅĞ `msg ~= success` |
-| ÖØÃüÃû | `.../file/rename` | |
-| É¾³ı | `.../file/delete_file` | `fileIds:[]`£»¿ÉÄÜ·µ»Ø `taskId`£¬ĞèÂÖÑ¯ |
-| ÒÆ¶¯ | `.../file/move_file` | Í¬ÉÏÒì²½ÈÎÎñ |
-| ¸´ÖÆ | `.../file/copy_file` | Í¬ÉÏ£»ÅúÁ¿Ê±ÒÀÀµÏŞÁ÷ |
-| ÈÎÎñ×´Ì¬ | `POST /nd.bizuserres.s/v1/get_task_status` | `status==2` ³É¹¦£»`-1/3` Ê§°Ü£»×î¶àÔ¼ 30¡Á300ms |
-| ÉÏ´«Æ¾Ö¤ | `POST /nd.bizuserres.s/v1/get_res_center_token` | `capacity:2,name,parentId,res.fileSize` |
-| ÉÏ´«Íê³É | `POST /nd.bizuserres.s/v1/file/get_info_by_task_id` | µÈµ½ `fileId`£»²¿·Ö code ÊÓÎª´¦ÀíÖĞ |
-| ÀëÏß½âÎö | `POST /cloudcollection/v1/resolve_res` | Ö§³Ö BT ×ÓÎÄ¼şË÷Òı |
-| ÀëÏß´´½¨ | `POST /cloudcollection/v1/create_task` | `url,parentId,newName[,fileIndexes]` |
-| ÀëÏßÁĞ±í | `POST /cloudcollection/v1/list_task` | |
-| ÀëÏßÉ¾³ı | `POST /cloudcollection/v2/delete_task` | ×¢Òâ **v2** |
+| åˆ—è¡¨ | `POST /userres/v1/file/get_file_list` | body: `parentId,page,pageSize,orderBy,sortType,fileTypes:[]`ï¼›åˆ†é¡µç›´åˆ°ä¸è¶³ä¸€é¡µæˆ–è¾¾åˆ° total |
+| åˆ—è¡¨ï¼ˆè·¯å¾„è§£æï¼‰ | `POST /nd.bizuserres.s/v1/file/get_file_list` | **ä¸ List è·¯å¾„å‰ç¼€ä¸åŒ**ï¼›ç§»æ¤æ—¶åŸæ ·ä¿ç•™ï¼Œå®æµ‹åå†ç»Ÿä¸€ |
+| ä¸‹è½½ | `POST /nd.bizuserres.s/v1/get_res_download_url` | ä¼˜å…ˆ `signedURL`ï¼Œå¦åˆ™ `downloadUrl` |
+| å»ºç›®å½• | `POST /nd.bizuserres.s/v1/file/create_dir` | æˆåŠŸåˆ¤ `msg ~= success` |
+| é‡å‘½å | `.../file/rename` | |
+| åˆ é™¤ | `.../file/delete_file` | `fileIds:[]`ï¼›å¯èƒ½è¿”å› `taskId`ï¼Œéœ€è½®è¯¢ |
+| ç§»åŠ¨ | `.../file/move_file` | åŒä¸Šå¼‚æ­¥ä»»åŠ¡ |
+| å¤åˆ¶ | `.../file/copy_file` | åŒä¸Šï¼›æ‰¹é‡æ—¶ä¾èµ–é™æµ |
+| ä»»åŠ¡çŠ¶æ€ | `POST /nd.bizuserres.s/v1/get_task_status` | `status==2` æˆåŠŸï¼›`-1/3` å¤±è´¥ï¼›æœ€å¤šçº¦ 30Ã—300ms |
+| ä¸Šä¼ å‡­è¯ | `POST /nd.bizuserres.s/v1/get_res_center_token` | `capacity:2,name,parentId,res.fileSize` |
+| ä¸Šä¼ å®Œæˆ | `POST /nd.bizuserres.s/v1/file/get_info_by_task_id` | ç­‰åˆ° `fileId`ï¼›éƒ¨åˆ† code è§†ä¸ºå¤„ç†ä¸­ |
+| ç¦»çº¿è§£æ | `POST /cloudcollection/v1/resolve_res` | æ”¯æŒ BT å­æ–‡ä»¶ç´¢å¼• |
+| ç¦»çº¿åˆ›å»º | `POST /cloudcollection/v1/create_task` | `url,parentId,newName[,fileIndexes]` |
+| ç¦»çº¿åˆ—è¡¨ | `POST /cloudcollection/v1/list_task` | |
+| ç¦»çº¿åˆ é™¤ | `POST /cloudcollection/v2/delete_task` | æ³¨æ„ **v2** |
 
-ÎÄ¼ş¼ĞÅĞ¶¨£º`resType == 2`¡£Ê±¼ä×Ö¶ÎÎª Unix Ãë£º`ctime` / `utime`¡£
+æ–‡ä»¶å¤¹åˆ¤å®šï¼š`resType == 2`ã€‚æ—¶é—´å­—æ®µä¸º Unix ç§’ï¼š`ctime` / `utime`ã€‚
 
-### 6. `postAPI` ĞĞÎª
+### 6. `postAPI` è¡Œä¸º
 
-- Ã¿¸ö path ¶ÀÁ¢ `rate.Limiter`£¬¼ä¸ô **500ms**£¨·ÀÅúÁ¿ copy ´ò±¬£©¡£
-- HTTP 401/403 ¡ú refresh ¡ú ÖØÊÔÒ»´Î¡£
-- Ö÷Òª¼ì²é HTTP status£»ÒµÎñ²ãÔÙ¿´ `msg` / ÌØ¶¨ `code`¡£
-- **×¢Òâ£º** List ³É¹¦Â·¾¶¼¸ºõ²»Ğ£Ñé body `code`£»Ğ´²Ù×÷ÆÕ±éĞ£Ñé `msg==success`¡£
+- æ¯ä¸ª path ç‹¬ç«‹ `rate.Limiter`ï¼Œé—´éš” **500ms**ï¼ˆé˜²æ‰¹é‡ copy æ‰“çˆ†ï¼‰ã€‚
+- HTTP 401/403 â†’ refresh â†’ é‡è¯•ä¸€æ¬¡ã€‚
+- ä¸»è¦æ£€æŸ¥ HTTP statusï¼›ä¸šåŠ¡å±‚å†çœ‹ `msg` / ç‰¹å®š `code`ã€‚
+- **æ³¨æ„ï¼š** List æˆåŠŸè·¯å¾„å‡ ä¹ä¸æ ¡éªŒ body `code`ï¼›å†™æ“ä½œæ™®éæ ¡éªŒ `msg==success`ã€‚
 
-### 7. ÉÏ´« / OSS
+### 7. ä¸Šä¼  / OSS
 
-1. `get_res_center_token` È¡ STS£º`accessKeyID/secret/sessionToken`£¨¿ÉÄÜÔÚ¶¥²ã»ò `creds` Ç¶Ì×£©¡£
-2. `code == 156` ¡ú ÊÓÎªÃë´« / ÒÑ´æÔÚ£¬Ìø¹ı OSS£¬Ö±½Ó `waitUploadTaskInfo`¡£
-3. ·ñÔò°¢ÀïÔÆ OSS multipart£º`InitiateMultipartUpload(..., oss.Sequential())`£¬·ÖÆ¬´óĞ¡°´ÎÄ¼şÌå»ı½×Ìİ£¨1/2/4/8 MiB£©¡£
-4. Endpoint ¹æ·¶»¯£ºÈ¥µô `bucket.` Ç°×º£¬²¹ `https://`¡£
-5. 0 ×Ö½ÚÎÄ¼ş×ß¿Õ `PutObject`¡£
-6. Alist `Put` ·µ»Ø `error`£»×ÊÔ´³Ø³¡¾°¸ú Alist ÊµÏÖ `Put`£¨`error`£©¼´¿É£¬ÎŞĞèÎª ETF ÉÏ `PutResult`¡£
+1. `get_res_center_token` å– STSï¼š`accessKeyID/secret/sessionToken`ï¼ˆå¯èƒ½åœ¨é¡¶å±‚æˆ– `creds` åµŒå¥—ï¼‰ã€‚
+2. `code == 156` â†’ è§†ä¸ºç§’ä¼  / å·²å­˜åœ¨ï¼Œè·³è¿‡ OSSï¼Œç›´æ¥ `waitUploadTaskInfo`ã€‚
+3. å¦åˆ™é˜¿é‡Œäº‘ OSS multipartï¼š`InitiateMultipartUpload(..., oss.Sequential())`ï¼Œåˆ†ç‰‡å¤§å°æŒ‰æ–‡ä»¶ä½“ç§¯é˜¶æ¢¯ï¼ˆ1/2/4/8 MiBï¼‰ã€‚
+4. Endpoint è§„èŒƒåŒ–ï¼šå»æ‰ `bucket.` å‰ç¼€ï¼Œè¡¥ `https://`ã€‚
+5. 0 å­—èŠ‚æ–‡ä»¶èµ°ç©º `PutObject`ã€‚
+6. Alist `Put` è¿”å› `error`ï¼›èµ„æºæ± åœºæ™¯è·Ÿ Alist å®ç° `Put`ï¼ˆ`error`ï¼‰å³å¯ï¼Œæ— éœ€ä¸º ETF ä¸Š `PutResult`ã€‚
 
-µ±Ç°ÉÏ´«ÇëÇó **Î´Ğ¯´øÎÄ¼ş¹şÏ£**¡£`code==156` Ö»µ±×÷ÉÏ´«È¥ÖØ¶ÌÂ·±£Áô£»**²»Òª**¾İ´ËÊµÏÖ ETF¡£
+å½“å‰ä¸Šä¼ è¯·æ±‚ **æœªæºå¸¦æ–‡ä»¶å“ˆå¸Œ**ã€‚`code==156` åªå½“ä½œä¸Šä¼ å»é‡çŸ­è·¯ä¿ç•™ï¼›**ä¸è¦**æ®æ­¤å®ç° ETFã€‚
 
-### 8. ÀëÏßÏÂÔØ Tool
+### 8. ç¦»çº¿ä¸‹è½½ Tool
 
-- Tool Ãû£º`GuangYaPan`
-- ÉèÖÃ¼ü£º`guangyapan_temp_dir`£¨Alist `conf.GuangYaPanTempDir`£©
-- Ä¿±ê storage ±ØĞëÊÇ `*guangyapan.GuangYaPan`
-- ÈôÏÂÔØÄ¿±ê±¾Éí¾ÍÊÇ¹âÑ¼ÅÌ ¡ú `tempDir = DstDirPath`£»·ñÔòÂäµ½ÅäÖÃµÄ temp ¸ùÏÂ
-- Status£º`0 queued / 1 running / 2 completed / 3 failed / 4 canceled / 5 partially completed`
-- ÈÎÎñ»º´æ + singleflight£¬10s TTL
+- Tool åï¼š`GuangYaPan`
+- è®¾ç½®é”®ï¼š`guangyapan_temp_dir`ï¼ˆAlist `conf.GuangYaPanTempDir`ï¼‰
+- ç›®æ ‡ storage å¿…é¡»æ˜¯ `*guangyapan.GuangYaPan`
+- è‹¥ä¸‹è½½ç›®æ ‡æœ¬èº«å°±æ˜¯å…‰é¸­ç›˜ â†’ `tempDir = DstDirPath`ï¼›å¦åˆ™è½åˆ°é…ç½®çš„ temp æ ¹ä¸‹
+- Statusï¼š`0 queued / 1 running / 2 completed / 3 failed / 4 canceled / 5 partially completed`
+- ä»»åŠ¡ç¼“å­˜ + singleflightï¼Œ10s TTL
 
-OpenList »¹ĞèÍ¬²½¸Ä£º
+OpenList è¿˜éœ€åŒæ­¥æ”¹ï¼š
 
 - `internal/conf/const.go`
 - `internal/offline_download/all.go`
-- `internal/offline_download/tool/add.go` µÄ `switch`
-- `server/handles/offline_download.go`£¨`SetGuangYaPan` + Â·ÓÉ£©
+- `internal/offline_download/tool/add.go` çš„ `switch`
+- `server/handles/offline_download.go`ï¼ˆ`SetGuangYaPan` + è·¯ç”±ï¼‰
 
-### 9. Óë OpenList / openlist-etf µÄ½Ó¿Ú²îÒì
+### 9. ä¸ OpenList / openlist-etf çš„æ¥å£å·®å¼‚
 
-| µã | Alist guangyapan | OpenList ÏÖ×´ | ÒÆÖ²²ßÂÔ |
+| ç‚¹ | Alist guangyapan | OpenList ç°çŠ¶ | ç§»æ¤ç­–ç•¥ |
 |----|------------------|---------------|----------|
-| °üÂ·¾¶ | `alist-org/alist/v3` | `OpenListTeam/OpenList/v4` | È«Á¿Ìæ»» |
-| `Config.OnlyLocal` | ÓĞ | ÒÑÉ¾³ı | ²»Òª¼Ó»Ø |
-| Writer | `error` | Ö§³Ö Result °æ | **ÓÅÏÈ Result** |
-| ETF | ÎŞ | ½ö 139 | ¹âÑ¼ÓÀ²»ÊµÏÖ |
-| ·ÖÏí×ª´æ | ÎŞ | pan123/pan115 ShareSaver | **±¾¼Æ»® Phase 3 °´¹æ·¶ÊµÏÖ** |
-| ÀëÏß Tool | ÓĞ | Í¬Ä£Ê½ | Phase 2 |
+| åŒ…è·¯å¾„ | `alist-org/alist/v3` | `OpenListTeam/OpenList/v4` | å…¨é‡æ›¿æ¢ |
+| `Config.OnlyLocal` | æœ‰ | å·²åˆ é™¤ | ä¸è¦åŠ å› |
+| Writer | `error` | æ”¯æŒ Result ç‰ˆ | **ä¼˜å…ˆ Result** |
+| ETF | æ—  | ä»… 139 | å…‰é¸­æ°¸ä¸å®ç° |
+| åˆ†äº«è½¬å­˜ | æ—  | pan123/pan115 ShareSaver | **æœ¬è®¡åˆ’ Phase 3 æŒ‰è§„èŒƒå®ç°** |
+| ç¦»çº¿ Tool | æœ‰ | åŒæ¨¡å¼ | Phase 2 |
 
-### 10. Óë 123 / 115 ×ÊÔ´³Ø¶ÔÆë
+### 10. ä¸ 123 / 115 èµ„æºæ± å¯¹é½
 
-| ÄÜÁ¦ | Phase 1 | Phase 2 | Phase 3 |
+| èƒ½åŠ› | Phase 1 | Phase 2 | Phase 3 |
 |------|---------|---------|---------|
-| ¹ÒÔØ / Link / CRUD / Put | ±ØĞè | ¡ª | ¡ª |
-| URL/BT ÀëÏßÈë¿â | ¡ª | ±ØĞè | ¡ª |
-| ·ÖÏí½âÎö + restore | Çı¶¯Ô­Óï | ¡ª | ShareSaver ½ÓÏß |
-| `.etf` | ²»×ö | ²»×ö | ²»×ö |
+| æŒ‚è½½ / Link / CRUD / Put | å¿…éœ€ | â€” | â€” |
+| URL/BT ç¦»çº¿å…¥åº“ | â€” | å¿…éœ€ | â€” |
+| åˆ†äº«è§£æ + restore | é©±åŠ¨åŸè¯­ | â€” | ShareSaver æ¥çº¿ |
+| `.etf` | ä¸åš | ä¸åš | ä¸åš |
 
-### 11. ÆäËû·çÏÕÇåµ¥
+### 11. å…¶ä»–é£é™©æ¸…å•
 
-1. ¸öÈËÅÌ vs ·ÖÏí API µÄ Header / `parentId` ²îÒì£¨¼ûÎÄÊ×³åÍ»±í£©¡£
-2. ÈÎÎñ status ¼æÈİ int Óë string¡£
-3. ÌáÈ¡Âë´íÎó / ·ÖÏíÊ§Ğ§ / ¿Õ¼ä²»×ãĞè¿É¶Á´íÎó¡£
-4. Éè±¸Ö¸ÎÆ¡¢captcha¡¢token Ë¢ĞÂ¾ºÌ¬¡£
-5. ´óÄ¿Â¼×ª´æÂÖÑ¯³¬Ê±¡£
-6. AGPL À´Ô´±£Áô¡£
+1. ä¸ªäººç›˜ vs åˆ†äº« API çš„ Header / `parentId` å·®å¼‚ï¼ˆè§æ–‡é¦–å†²çªè¡¨ï¼‰ã€‚
+2. ä»»åŠ¡ status å…¼å®¹ int ä¸ stringã€‚
+3. æå–ç é”™è¯¯ / åˆ†äº«å¤±æ•ˆ / ç©ºé—´ä¸è¶³éœ€å¯è¯»é”™è¯¯ã€‚
+4. è®¾å¤‡æŒ‡çº¹ã€captchaã€token åˆ·æ–°ç«æ€ã€‚
+5. å¤§ç›®å½•è½¬å­˜è½®è¯¢è¶…æ—¶ã€‚
+6. AGPL æ¥æºä¿ç•™ã€‚
 
 ---
 
-## ÎÄ¼ş¹æ»®
+## æ–‡ä»¶è§„åˆ’
 
-### ĞÂ½¨
+### æ–°å»º
 
 - `drivers/guangyapan/{meta,types,driver,offline,share}.go`
 - `drivers/guangyapan/{auth,upload_helpers,share}_test.go`
@@ -255,85 +255,85 @@ OpenList »¹ĞèÍ¬²½¸Ä£º
 - `internal/subscription/share_guangyapan.go`
 - `internal/subscription/share_guangyapan_test.go`
 
-### ĞŞ¸Ä
+### ä¿®æ”¹
 
 - `drivers/all.go`
-- `internal/conf/const.go`¡¢`offline_download/all.go`¡¢`tool/add.go`¡¢`server/handles/offline_download.go` + Â·ÓÉ
-- `internal/subscription/share_provider.go`£¨`ShareProviderGuangYaPan = "guangyapan"`£©
-- `ParseShareURL`¡¢storage binding¡¢telegram pan config¡¢`validateSubscriptionConfigTargets`¡¢`share_runtime` µÈ pan123/pan115 ¶ÔµÈÎ»
+- `internal/conf/const.go`ã€`offline_download/all.go`ã€`tool/add.go`ã€`server/handles/offline_download.go` + è·¯ç”±
+- `internal/subscription/share_provider.go`ï¼ˆ`ShareProviderGuangYaPan = "guangyapan"`ï¼‰
+- `ParseShareURL`ã€storage bindingã€telegram pan configã€`validateSubscriptionConfigTargets`ã€`share_runtime` ç­‰ pan123/pan115 å¯¹ç­‰ä½
 
-### Ã÷È·²»½¨
+### æ˜ç¡®ä¸å»º
 
-- ¹âÑ¼ ETF
-
----
-
-## Phase 0 ¡ª ¶ÔÆë
-
-- [ ] ¼ÇÂ¼ Alist commit SHA
-- [ ] Ëø¶¨³åÍ»±í²Ã¾ö£º¸öÈËÅÌ¸ú Alist£¬·ÖÏíÁ÷¸ú¹æ·¶
-- [ ] ÑéÊÕ¿Ú¾¶º¬·ÖÏí×ª´æ£»ÎŞ ETF
+- å…‰é¸­ ETF
 
 ---
 
-## Phase 1 ¡ª ºËĞÄÇı¶¯
+## Phase 0 â€” å¯¹é½
 
-### Task 1: meta + types + all.go ×¢²á
+- [ ] è®°å½• Alist commit SHA
+- [ ] é”å®šå†²çªè¡¨è£å†³ï¼šä¸ªäººç›˜è·Ÿ Alistï¼Œåˆ†äº«æµè·Ÿè§„èŒƒ
+- [ ] éªŒæ”¶å£å¾„å«åˆ†äº«è½¬å­˜ï¼›æ—  ETF
 
-- [ ] ¿½±´ Alist Addition/types£¬OpenList v4 import£»`root_path`£»Result ÓÑºÃÀàĞÍÔ¤Áô
+---
 
-### Task 2: ¼øÈ¨ helpers µ¥²â
+## Phase 1 â€” æ ¸å¿ƒé©±åŠ¨
 
-- [ ] phone / device_id ¹æ·¶»¯µ¥²â ¡ú ÊµÏÖ
+### Task 1: meta + types + all.go æ³¨å†Œ
 
-### Task 3: Init / token / postAPI / ÏŞÁ÷
+- [ ] æ‹·è´ Alist Addition/typesï¼ŒOpenList v4 importï¼›`root_path`ï¼›Result å‹å¥½ç±»å‹é¢„ç•™
 
-- [ ] Ë« client£»SMS Á½¶Î£»401 refresh£»500ms/path limiter
+### Task 2: é‰´æƒ helpers å•æµ‹
 
-### Task 4: GetRoot / List / Link / CRUD£¨Result °æ£©
+- [ ] phone / device_id è§„èŒƒåŒ–å•æµ‹ â†’ å®ç°
 
-- [ ] ·ÖÒ³ List£»Link£¨`signedURL`/`signedUrl`/`downloadUrl`£©£»Ğ´²Ù×÷·µ»Ø Obj
+### Task 3: Init / token / postAPI / é™æµ
+
+- [ ] åŒ clientï¼›SMS ä¸¤æ®µï¼›401 refreshï¼›500ms/path limiter
+
+### Task 4: GetRoot / List / Link / CRUDï¼ˆResult ç‰ˆï¼‰
+
+- [ ] åˆ†é¡µ Listï¼›Linkï¼ˆ`signedURL`/`signedUrl`/`downloadUrl`ï¼‰ï¼›å†™æ“ä½œè¿”å› Obj
 
 ### Task 5: OSS Put
 
-- [ ] token / multipart / code 156 / waitUploadTaskInfo£»LimitedUploadStream
+- [ ] token / multipart / code 156 / waitUploadTaskInfoï¼›LimitedUploadStream
 
 ---
 
-## Phase 2 ¡ª ÀëÏßÏÂÔØ
+## Phase 2 â€” ç¦»çº¿ä¸‹è½½
 
-### Task 6¨C7
+### Task 6â€“7
 
-- [ ] ÒÆÖ² `offline.go`
+- [ ] ç§»æ¤ `offline.go`
 - [ ] Tool + conf + add.go + Set API
-- [ ] Ã°ÑÌ£ºÀëÏßÈë¿â ¡ú Link
+- [ ] å†’çƒŸï¼šç¦»çº¿å…¥åº“ â†’ Link
 
 ---
 
-## Phase 3 ¡ª ·ÖÏí×ª´æ£¨¹æ·¶£©+ ¶©ÔÄ
+## Phase 3 â€” åˆ†äº«è½¬å­˜ï¼ˆè§„èŒƒï¼‰+ è®¢é˜…
 
 ### Task 8: `drivers/guangyapan/share.go`
 
-- [ ] µ¥²â ParseShareURL£¨`?code=`¡¢ÌáÈ¡ÂëÎÄ±¾£©
-- [ ] `GetShareSummary` / `GetShareAccessToken` / `ListShareFiles`£¨·ÖÒ³£¬¸ù `"0"`£©
-- [ ] `RestoreShare` + `WaitShareRestoreTask`£¨¼æÈİ int/string status£©
-- [ ] ·ÖÏí Header ¶ÔÆë¹æ·¶£»ÓÃ»§ 401 Ë¢ĞÂ
-- [ ] ´íÎó£ºÌáÈ¡Âë / Ê§Ğ§ / ¿Õ¼ä²»×ã
+- [ ] å•æµ‹ ParseShareURLï¼ˆ`?code=`ã€æå–ç æ–‡æœ¬ï¼‰
+- [ ] `GetShareSummary` / `GetShareAccessToken` / `ListShareFiles`ï¼ˆåˆ†é¡µï¼Œæ ¹ `"0"`ï¼‰
+- [ ] `RestoreShare` + `WaitShareRestoreTask`ï¼ˆå…¼å®¹ int/string statusï¼‰
+- [ ] åˆ†äº« Header å¯¹é½è§„èŒƒï¼›ç”¨æˆ· 401 åˆ·æ–°
+- [ ] é”™è¯¯ï¼šæå–ç  / å¤±æ•ˆ / ç©ºé—´ä¸è¶³
 
 ### Task 9: `internal/subscription/share_guangyapan.go`
 
-- [ ] `ShareProviderGuangYaPan`£»½ÓÈë `ParseShareURL`
-- [ ] ÊµÏÖ `ShareSaver`£¨EnsureDir / ListShareChildren / SaveShareItems / WaitSaveComplete£©
-- [ ] TempTransferTarget ÅäÖÃÓë binding ¶Ô±ê pan123/pan115
-- [ ] mock HTTP µ¥²â
+- [ ] `ShareProviderGuangYaPan`ï¼›æ¥å…¥ `ParseShareURL`
+- [ ] å®ç° `ShareSaver`ï¼ˆEnsureDir / ListShareChildren / SaveShareItems / WaitSaveCompleteï¼‰
+- [ ] TempTransferTarget é…ç½®ä¸ binding å¯¹æ ‡ pan123/pan115
+- [ ] mock HTTP å•æµ‹
 
-### Task 10: E2E Ã°ÑÌ
+### Task 10: E2E å†’çƒŸ
 
-- [ ] ÓĞ/ÎŞÌáÈ¡Âë·ÖÏí ¡ú ×ª´æÁÙÊ±Ä¿Â¼ ¡ú List/Link ¡ú£¨¿ÉÑ¡£©ÉÏ 139
+- [ ] æœ‰/æ— æå–ç åˆ†äº« â†’ è½¬å­˜ä¸´æ—¶ç›®å½• â†’ List/Link â†’ï¼ˆå¯é€‰ï¼‰ä¸Š 139
 
 ---
 
-## ½¨ÒéÌá½»ÇĞÆ¬
+## å»ºè®®æäº¤åˆ‡ç‰‡
 
 1. `feat(guangyapan): add storage driver with auth list link and mutations`
 2. `feat(guangyapan): add OSS upload and offline download tool`
@@ -342,21 +342,21 @@ OpenList »¹ĞèÍ¬²½¸Ä£º
 
 ---
 
-## ÑéÊÕÇåµ¥
+## éªŒæ”¶æ¸…å•
 
-### Phase 1¨C2
+### Phase 1â€“2
 
-- [ ] ¹ÒÔØ¡¢µÇÂ¼¡¢List¡¢**Ö±Á´ Link**¡¢CRUD¡¢Put¡¢ÀëÏß Tool£»ÎŞ ETF
+- [ ] æŒ‚è½½ã€ç™»å½•ã€Listã€**ç›´é“¾ Link**ã€CRUDã€Putã€ç¦»çº¿ Toolï¼›æ—  ETF
 
 ### Phase 3
 
-- [ ] ·ÖÏí URL + ÌáÈ¡Âë½âÎö
-- [ ] restore µ½ÁÙÊ±Ä¿Â¼²¢µÈÈÎÎñÍê³É
-- [ ] ¶©ÔÄ¿ÉÑ¡ `guangyapan` ×÷Îª TempTransfer Ô´
-- [ ] ´íÎóÌáÈ¡Âë / Ê§Ğ§·ÖÏí¿É¶Á
+- [ ] åˆ†äº« URL + æå–ç è§£æ
+- [ ] restore åˆ°ä¸´æ—¶ç›®å½•å¹¶ç­‰ä»»åŠ¡å®Œæˆ
+- [ ] è®¢é˜…å¯é€‰ `guangyapan` ä½œä¸º TempTransfer æº
+- [ ] é”™è¯¯æå–ç  / å¤±æ•ˆåˆ†äº«å¯è¯»
 
 ---
 
-## ¿ª·Å¾ö²ß
+## å¼€æ”¾å†³ç­–
 
-ÒÑÈ«²¿È·ÈÏ¡£³åÍ»Ä¬ÈÏ£º**¸öÈËÅÌ = Alist£¬·ÖÏíÁ÷ = ¹æ·¶**¡£
+å·²å…¨éƒ¨ç¡®è®¤ã€‚å†²çªé»˜è®¤ï¼š**ä¸ªäººç›˜ = Alistï¼Œåˆ†äº«æµ = è§„èŒƒ**ã€‚
