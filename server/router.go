@@ -262,6 +262,7 @@ func admin(g *gin.RouterGroup) {
 	subscription.POST("/telegram/send_code", handles.TelegramSubscriptionSendCode)
 	subscription.POST("/telegram/signin", handles.TelegramSubscriptionSignIn)
 	subscription.POST("/telegram/logout", handles.TelegramSubscriptionLogout)
+	subscription.POST("/pansou/status", handles.PanSouSubscriptionStatus)
 
 	scan := g.Group("/scan")
 	scan.POST("/start", handles.StartManualScan)

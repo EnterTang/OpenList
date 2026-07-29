@@ -639,6 +639,21 @@ func TelegramSubscriptionLogout(c *gin.Context) {
 	runTelegramSubscriptionAuth(c, "logout")
 }
 
+type panSouStatusReq struct {
+	BaseURL string `json:"base_url"`
+}
+
+func PanSouSubscriptionStatus(c *gin.Context) {
+	var req panSouStatusReq
+	_ = c.ShouldBindJSON(&req)
+	ok, message, latencyMs := subscription.ProbePanSouStatus(c.Request.Context(), req.BaseURL)
+	common.SuccessResp(c, gin.H{
+		"ok":         ok,
+		"message":    message,
+		"latency_ms": latencyMs,
+	})
+}
+
 func runTelegramSubscriptionAuth(c *gin.Context, action string) {
 	var req model.SubscriptionTelegramAuthReq
 	if err := c.ShouldBindJSON(&req); err != nil {
