@@ -6,9 +6,18 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	log "github.com/sirupsen/logrus"
 )
+
+func pluginProcessOptions() plugin.ProcessOptions {
+	return plugin.ProcessOptions{
+		AntiHash:  settingBool(conf.PluginAntiHashEnabled),
+		ISORename: settingBool(conf.PluginISORenameEnabled),
+		Whitelist: settingStr(conf.PluginExtensionWhitelist),
+	}
+}
 
 func maybeProcessLocalPlugin(ctx context.Context, storage driver.Driver, actualFilePath string) {
 	if ctx.Value(conf.SkipPluginKey) != nil || storage == nil {
@@ -17,12 +26,10 @@ func maybeProcessLocalPlugin(ctx context.Context, storage driver.Driver, actualF
 	if storage.Config().Name != "Local" {
 		return
 	}
-	anti := settingBool(conf.PluginAntiHashEnabled)
-	iso := settingBool(conf.PluginISORenameEnabled)
-	if !anti && !iso {
+	opts := pluginProcessOptions()
+	if !opts.AntiHash && !opts.ISORename {
 		return
 	}
-	whitelist := settingStr(conf.PluginExtensionWhitelist)
 	actualFilePath = stdpath.Clean(actualFilePath)
 	bg := context.WithoutCancel(ctx)
 	go func() {
@@ -40,12 +47,28 @@ func maybeProcessLocalPlugin(ctx context.Context, storage driver.Driver, actualF
 		if abs == "" {
 			return
 		}
-		if _, err := plugin.ProcessAbsolutePath(abs, plugin.ProcessOptions{
-			AntiHash: anti, ISORename: iso, Whitelist: whitelist,
-		}); err != nil {
+		if _, err := plugin.ProcessAbsolutePath(abs, opts); err != nil {
 			log.Errorf("[plugin] process %s: %v", abs, err)
 		}
 	}()
+}
+
+func maybeProcessUploadPlugin(ctx context.Context, storage driver.Driver, file model.FileStreamer) (model.FileStreamer, error) {
+	if ctx.Value(conf.SkipPluginKey) != nil || storage == nil || file == nil {
+		return file, nil
+	}
+	if storage.Config().Name != "139Yun" {
+		return file, nil
+	}
+	opts := pluginProcessOptions()
+	if !opts.AntiHash && !opts.ISORename {
+		return file, nil
+	}
+	out, err := plugin.ProcessStreamer(file, opts)
+	if err != nil {
+		return file, err
+	}
+	return out, nil
 }
 
 func settingBool(key string) bool {

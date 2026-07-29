@@ -202,6 +202,19 @@ func TestTrustedSourceSHA256DoesNotTreatIdentityHashAsContent(t *testing.T) {
 	require.Equal(t, strings.Repeat("A", 64), got)
 }
 
+func TestResolveClusterAdoptPathPrefersPostPluginName(t *testing.T) {
+	got := resolveClusterAdoptPath("/mobile/Show.S01E01.mkv", "/mobile/Show.S01E01.mkv.iso", "Show.S01E01.mkv", "Show.S01E01.mkv.iso")
+	require.Equal(t, "/mobile/Show.S01E01.mkv.iso", got)
+	got = resolveClusterAdoptPath("/mobile/Show.S01E01.mkv", "/mobile/Show.S01E01.mkv", "Show.S01E01.mkv", "Show.S01E01.mkv")
+	require.Equal(t, "/mobile/Show.S01E01.mkv", got)
+}
+
+func TestPostPluginAdoptMatchesIgnoresLegacySibling(t *testing.T) {
+	require.False(t, postPluginAdoptMatches("Show.S01E01.mkv", 100, "Show.S01E01.mkv.iso", 116))
+	require.True(t, postPluginAdoptMatches("Show.S01E01.mkv.iso", 116, "Show.S01E01.mkv.iso", 116))
+	require.False(t, postPluginAdoptMatches("Show.S01E01.mkv.iso", 100, "Show.S01E01.mkv.iso", 116))
+}
+
 func TestClusterMoveContextForcesNativeTaskAndCarriesAdminCreator(t *testing.T) {
 	creator := &model.User{ID: 1, Username: "admin", Role: model.ADMIN}
 	manifest := validUploadManifest(t)

@@ -22,6 +22,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -821,6 +823,17 @@ func trustedSourceSHA256(source protocol.SourceObject) (string, bool) {
 	return hash, true
 }
 
+func resolveClusterAdoptPath(targetFilePath, expectedPath, targetName, expectedName string) string {
+	if expectedName != targetName {
+		return expectedPath
+	}
+	return targetFilePath
+}
+
+func postPluginAdoptMatches(existingName string, existingSize int64, expectedName string, expectedSize int64) bool {
+	return existingName == expectedName && (expectedSize <= 0 || existingSize == expectedSize)
+}
+
 func clusterMoveContext(ctx context.Context, binding task_group.ClusterTransferBinding, creator *model.User) context.Context {
 	ctx = task_group.WithClusterTransferBinding(ctx, binding)
 	ctx = context.WithValue(ctx, conf.ForceTaskKey, struct{}{})
@@ -1040,7 +1053,16 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err != nil {
 		return fmt.Errorf("build cluster source cleanup request: %w", err)
 	}
-	existing, getErr := fs.Get(ctx, targetFilePath, &fs.GetArgs{NoLog: true})
+	pluginOpts := plugin.ProcessOptions{
+		AntiHash:  setting.GetBool(conf.PluginAntiHashEnabled),
+		ISORename: setting.GetBool(conf.PluginISORenameEnabled),
+		Whitelist: setting.GetStr(conf.PluginExtensionWhitelist),
+	}
+	expectedName := plugin.ApplyUploadName(targetName, pluginOpts)
+	expectedSize := plugin.ExpectedUploadSize(primary.Size, targetName, pluginOpts)
+	expectedPath := path.Join(targetRoot, expectedName)
+	adoptPath := resolveClusterAdoptPath(targetFilePath, expectedPath, targetName, expectedName)
+	existing, getErr := fs.Get(ctx, adoptPath, &fs.GetArgs{NoLog: true})
 	if getErr != nil && !errs.IsNotFoundError(getErr) {
 		return fmt.Errorf("inspect cluster upload reconciliation target: %w", getErr)
 	}
@@ -1049,37 +1071,48 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		if existingSHA256 == "" {
 			return errors.New("cluster target already contains an owned media object without SHA256 metadata; manual reconciliation is required")
 		}
-		expectedSHA256, trusted := trustedSourceSHA256(primary)
-		if !trusted {
-			return errors.New("cluster source object lacks a trusted size/SHA256 fingerprint; existing target requires manual reconciliation")
+		pluginApplied := plugin.ShouldProcessUpload(targetName, pluginOpts)
+		adoptOK := false
+		if pluginApplied {
+			adoptOK = postPluginAdoptMatches(existing.GetName(), existing.GetSize(), expectedName, expectedSize)
+			if !adoptOK {
+				log.Warnf("cluster job %s target %s does not match post-plugin name/size; continuing with upload", offer.JobID, adoptPath)
+			}
+		} else {
+			expectedSHA256, trusted := trustedSourceSHA256(primary)
+			if !trusted {
+				return errors.New("cluster source object lacks a trusted size/SHA256 fingerprint; existing target requires manual reconciliation")
+			}
+			if existing.GetName() != expectedName || existing.GetSize() != primary.Size || !strings.EqualFold(existingSHA256, expectedSHA256) {
+				return errors.New("cluster target object does not match the source name, size, and SHA256; refusing automatic adoption")
+			}
+			adoptOK = true
 		}
-		expectedName := targetName
-		if existing.GetName() != expectedName || existing.GetSize() != primary.Size || !strings.EqualFold(existingSHA256, expectedSHA256) {
-			return errors.New("cluster target object does not match the source name, size, and SHA256; refusing automatic adoption")
+		if adoptOK {
+			manifest.Name = existing.GetName()
+			manifest.Size = existing.GetSize()
+			manifest.SHA256 = existingSHA256
+			manifest.HashSource = "remote_object_metadata"
+			manifest.RemoteFileID = existing.GetID()
+			manifest.RemotePath = adoptPath
+			manifest.UploadReceipt = existing.GetID()
+			cleanup, cleanupErr := NewCleanupRequest(manifest, targetStorage.GetStorage().MountPath, sourceCleanup)
+			if cleanupErr != nil {
+				return cleanupErr
+			}
+			s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
+			if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
+				finishUploadStage(model.ClusterStageStatusFailed, enqueueErr.Error())
+				return fmt.Errorf("reconcile existing cluster upload: %w", enqueueErr)
+			}
+			finishUploadStage(model.ClusterStageStatusSucceeded, "")
+			return nil
 		}
-		manifest.Name = existing.GetName()
-		manifest.Size = existing.GetSize()
-		manifest.SHA256 = existingSHA256
-		manifest.HashSource = "remote_object_metadata"
-		manifest.RemoteFileID = existing.GetID()
-		manifest.RemotePath = targetFilePath
-		manifest.UploadReceipt = existing.GetID()
-		cleanup, cleanupErr := NewCleanupRequest(manifest, targetStorage.GetStorage().MountPath, sourceCleanup)
-		if cleanupErr != nil {
-			return cleanupErr
-		}
-		s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
-		if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
-			finishUploadStage(model.ClusterStageStatusFailed, enqueueErr.Error())
-			return fmt.Errorf("reconcile existing cluster upload: %w", enqueueErr)
-		}
-		finishUploadStage(model.ClusterStageStatusSucceeded, "")
-		return nil
 	}
 	finalizePayload := task_group.TransferFinalizePayload{
 		SubscriptionID: offer.TaskContext.Subscription.SubscriptionID, SubscriptionItemID: offer.TaskContext.Subscription.SubscriptionItemID,
 		SourceKey: offer.TaskContext.Subscription.SourceKey, FileHash: primary.Hash,
-		TargetDir: targetRoot, FileName: path.Base(stagedSource), TargetName: targetName,
+		TargetDir: targetRoot, FileName: path.Base(stagedSource), TargetName: expectedName,
 	}
 	binding := task_group.ClusterTransferBinding{
 		UploadManifest: &manifest, AdditionalCleanupTargets: []resultqueue.CleanupTarget{sourceCleanup}, FinalizePayload: &finalizePayload,

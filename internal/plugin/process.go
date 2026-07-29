@@ -6,12 +6,6 @@ import (
 	"path/filepath"
 )
 
-type ProcessOptions struct {
-	AntiHash  bool
-	ISORename bool
-	Whitelist string
-}
-
 func ProcessAbsolutePath(absPath string, opts ProcessOptions) (string, error) {
 	if !opts.AntiHash && !opts.ISORename {
 		return absPath, nil

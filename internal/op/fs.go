@@ -644,6 +644,15 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		dstDirPath, link = urlTreeSplitLineFormPath(stdpath.Join(dstDirPath, file.GetName()))
 		file = &stream.FileStream{Obj: &model.Object{Name: link}, Closers: utils.Closers{file}}
 	}
+	// Resolve unknown size before upload plugins that need a definite length (AntiHash).
+	if file.GetSize() < 0 {
+		log.Warnf("file size < 0, try to get full size from cache")
+		file.CacheFullAndWriter(nil, nil)
+	}
+	file, err := maybeProcessUploadPlugin(ctx, storage, file)
+	if err != nil {
+		return errors.WithMessagef(err, "upload plugin processing [%s]", file.GetName())
+	}
 	// if file exist and size = 0, delete it
 	dstDirPath = utils.FixAndCleanPath(dstDirPath)
 	dstPath := stdpath.Join(dstDirPath, file.GetName())
@@ -681,12 +690,6 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 	// if up is nil, set a default to prevent panic
 	if up == nil {
 		up = func(p float64) {}
-	}
-
-	// 如果小于0，则通过缓存获取完整大小，可能发生于流式上传
-	if file.GetSize() < 0 {
-		log.Warnf("file size < 0, try to get full size from cache")
-		file.CacheFullAndWriter(nil, nil)
 	}
 
 	var newObj model.Obj
