@@ -337,6 +337,30 @@ func TestRowLinksForTelegramPanSourcesKeepsPan123FastLinkOnlyForPan123(t *testin
 	}
 }
 
+func TestRowLinksForTelegramPanSourcesFiltersGuangyapanFromTMDBLinks(t *testing.T) {
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		GuangYaPan: model.SubscriptionTelegramPanConfig{Channels: []string{"@guangya"}},
+	})
+	row := telegramCommandRow{
+		Channel: "@guangya",
+		Text:    "TMDB ID: 682507\nhttps://www.themoviedb.org/movie/682507",
+		Buttons: []struct {
+			Text string `json:"text"`
+			URL  string `json:"url"`
+		}{
+			{Text: "点击获取光鸭云盘资源分享链接", URL: "https://www.guangyapan.com/s/1927792824295927888_adyPbY8EdLN_2AZv"},
+		},
+	}
+
+	links, sources := rowLinksForTelegramPanSources(row, cfg)
+	if got, want := providerSourceNames(sources), []string{"guangyapan"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("sources = %#v, want %#v", got, want)
+	}
+	if got, want := links, []string{"https://www.guangyapan.com/s/1927792824295927888_adyPbY8EdLN_2AZv"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("links = %#v, want %#v (should filter out TMDB link and only keep button URL)", got, want)
+	}
+}
+
 func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
 	sub := &model.Subscription{
 		Name:     "Fallback Title",

@@ -208,6 +208,7 @@ var telegramPanSourceHosts = map[string][]string{
 	"aliyun_drive": {"alipan.com", "aliyundrive.com"},
 	"pan123":       {"123pan.com"},
 	"pan115":       {"115cdn.com", "115.com"},
+	"guangyapan":   {"guangyapan.com"},
 }
 
 func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
@@ -517,6 +518,7 @@ func telegramPanSources(cfg model.SubscriptionTelegramSourceConfig) []telegramPa
 		{Name: "aliyun_drive", Config: cfg.AliyunDrive},
 		{Name: "pan123", Config: cfg.Pan123},
 		{Name: "pan115", Config: cfg.Pan115},
+		{Name: "guangyapan", Config: cfg.GuangYaPan},
 	}
 	sources := make([]telegramPanSubscriptionSource, 0, len(candidates))
 	for _, candidate := range candidates {
