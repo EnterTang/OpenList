@@ -16,6 +16,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/transport"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -795,6 +796,7 @@ func mediaTransferRetryDelay(generation uint64) time.Duration {
 }
 
 func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, message protocol.Envelope, result protocol.JobResult) error {
+	log.Infof("coordinator: handleJobResult jobID=%s, attempt=%s, gen=%d, status=%s", result.JobID, result.AttemptID, result.Generation, result.Status)
 	now := result.FinishedAt.UTC()
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -910,6 +912,7 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
 	})
 	if err != nil {
+		log.Warnf("coordinator: handleJobResult failed for job %s: %v", result.JobID, err)
 		return err
 	}
 	if storedInspect {

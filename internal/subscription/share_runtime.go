@@ -284,6 +284,29 @@ func telegramPanSourceCanSave(provider ShareProviderName, cfg model.Subscription
 	}
 }
 
+// ResolveShareInspectConfig supplements provider credentials from mounted
+// storages when the subscription config lacks tokens. This lets share.inspect
+// work on workers that have the provider mounted but didn't receive tokens
+// via subscription config.
+func ResolveShareInspectConfig(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) model.SubscriptionTelegramPanConfig {
+	cfg = normalizeTelegramPanConfig(cfg)
+	switch provider {
+	case ShareProviderGuangYaPan:
+		if strings.TrimSpace(cfg.AccessToken) == "" && strings.TrimSpace(cfg.RefreshToken) == "" {
+			cfg = guangyapanConfigWithStorageFallback(cfg)
+		}
+	case ShareProviderPan123:
+		if strings.TrimSpace(cfg.AccessToken) == "" {
+			cfg = pan123ConfigWithStorageFallback(cfg)
+		}
+	case ShareProviderAliyunDrive:
+		if strings.TrimSpace(cfg.RefreshToken) == "" {
+			cfg = aliyunDriveConfigWithStorageFallback(cfg)
+		}
+	}
+	return cfg
+}
+
 func defaultNewShareSaverForProvider(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
 	switch provider {
 	case ShareProviderQuark:

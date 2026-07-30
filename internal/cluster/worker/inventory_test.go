@@ -250,3 +250,11 @@ func TestProviderAccountInventoryDoesNotAdvertiseUnsupported115OpenShareSave(t *
 		t.Fatalf("115 Open account unexpectedly advertises share-save support: %#v", account)
 	}
 }
+
+func TestProviderAccountInventoryAdvertisesGuangYaPanShareSave(t *testing.T) {
+	storage := model.Storage{ID: 4, MountPath: "/guangya", Driver: "GuangYaPan", Status: "work"}
+	account := providerAccountInventory("node-1", storage, 1<<40, 2<<40)
+	if !account.SupportsShareSave {
+		t.Fatalf("GuangYaPan account should advertise share-save support: %#v", account)
+	}
+}

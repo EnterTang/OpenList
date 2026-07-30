@@ -141,7 +141,7 @@ func supportsETF(driver string) bool {
 
 func supportsShare(driver string) bool {
 	switch strings.ToLower(strings.TrimSpace(driver)) {
-	case "123pan", "123 open", "115 cloud", "aliyundriveopen", "quark":
+	case "123pan", "123 open", "115 cloud", "aliyundriveopen", "quark", "guangyapan":
 		return true
 	default:
 		return false

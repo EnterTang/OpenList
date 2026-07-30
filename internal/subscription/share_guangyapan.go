@@ -10,6 +10,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/pkg/errors"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type guangyapanShareProvider struct {
@@ -60,18 +62,25 @@ func (p *guangyapanShareProvider) EnsureDir(ctx context.Context, path string) (s
 }
 
 func (p *guangyapanShareProvider) ListShareChildren(ctx context.Context, ref ShareRef, parentID string) ([]ShareItem, error) {
+	log.Infof("guangyapan ListShareChildren: shareID=%s, parentID=%q", ref.ShareID, parentID)
 	if err := p.ensureDriver(ctx); err != nil {
+		log.Warnf("guangyapan ListShareChildren: ensureDriver failed: %v", err)
 		return nil, err
 	}
+	log.Infof("guangyapan ListShareChildren: calling GetShareAccessToken")
 	token, err := p.driver.GetShareAccessToken(ctx, ref.ShareID, ref.Passcode)
 	if err != nil {
+		log.Warnf("guangyapan ListShareChildren: GetShareAccessToken failed: %v", err)
 		return nil, err
 	}
 	parentID = strings.TrimSpace(parentID)
+	log.Infof("guangyapan ListShareChildren: calling ListShareFiles with parentID=%q", parentID)
 	files, err := p.driver.ListShareFiles(ctx, token, parentID)
 	if err != nil {
+		log.Warnf("guangyapan ListShareChildren: ListShareFiles failed: %v", err)
 		return nil, err
 	}
+	log.Infof("guangyapan ListShareChildren: got %d files", len(files))
 	items := make([]ShareItem, 0, len(files))
 	for _, file := range files {
 		items = append(items, ShareItem{

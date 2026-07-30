@@ -544,10 +544,13 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		} else {
 			err = s.executeMediaTransfer(jobCtx, offer)
 		}
+		log.Infof("cluster job %s execution finished, err=%v, sending result", offer.JobID, err)
 		resultCtx, cancelResult := context.WithTimeout(context.WithoutCancel(jobCtx), 30*time.Second)
 		defer cancelResult()
 		if resultErr := s.sendJobResult(resultCtx, offer, result, err); resultErr != nil {
 			log.Errorf("send cluster job %s result: %v", offer.JobID, resultErr)
+		} else {
+			log.Infof("cluster job %s result sent successfully", offer.JobID)
 		}
 	}()
 	return nil

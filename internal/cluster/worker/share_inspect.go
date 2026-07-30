@@ -13,15 +13,20 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
+
+	log "github.com/sirupsen/logrus"
 )
 
 var inspectShareTree = inspectConfiguredShareTree
 
 func (s *Service) executeShareInspect(ctx context.Context, offer protocol.JobOffer) (map[string]any, error) {
+	log.Infof("executeShareInspect: starting for job %s", offer.JobID)
 	manifest, err := inspectShareTree(ctx, offer.TaskContext.Share, offer.TaskContext.SealedManifestVersion)
 	if err != nil {
+		log.Warnf("executeShareInspect: inspectShareTree failed: %v", err)
 		return nil, err
 	}
+	log.Infof("executeShareInspect: got manifest with %d objects, marshaling", len(manifest.Objects))
 	raw, err := json.Marshal(manifest)
 	if err != nil {
 		return nil, err
@@ -30,6 +35,7 @@ func (s *Service) executeShareInspect(ctx context.Context, offer protocol.JobOff
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err
 	}
+	log.Infof("executeShareInspect: completed successfully for job %s", offer.JobID)
 	return result, nil
 }
 
@@ -45,23 +51,31 @@ func inspectConfiguredShareTree(ctx context.Context, share protocol.ShareTaskCon
 	if err != nil {
 		return protocol.ShareInspectManifest{}, err
 	}
+	log.Infof("share inspect: provider=%s, config access_token=%v, refresh_token=%v", ref.Provider, cfg.Telegram.GuangYaPan.AccessToken != "", cfg.Telegram.GuangYaPan.RefreshToken != "")
 	var provider subscription.ShareTreeLister
 	switch ref.Provider {
 	case subscription.ShareProviderQuark:
 		provider = subscription.NewQuarkShareProvider(withoutTempRoot(cfg.Telegram.Quark))
 	case subscription.ShareProviderAliyunDrive:
-		provider = subscription.NewAliyunDriveShareProvider(withoutTempRoot(cfg.Telegram.AliyunDrive))
+		provider = subscription.NewAliyunDriveShareProvider(withoutTempRoot(subscription.ResolveShareInspectConfig(subscription.ShareProviderAliyunDrive, cfg.Telegram.AliyunDrive)))
 	case subscription.ShareProviderPan123:
-		provider = subscription.NewPan123ShareProvider(withoutTempRoot(cfg.Telegram.Pan123))
+		provider = subscription.NewPan123ShareProvider(withoutTempRoot(subscription.ResolveShareInspectConfig(subscription.ShareProviderPan123, cfg.Telegram.Pan123)))
 	case subscription.ShareProviderPan115:
 		provider = subscription.NewPan115ShareProvider(withoutTempRoot(cfg.Telegram.Pan115))
+	case subscription.ShareProviderGuangYaPan:
+		resolvedCfg := subscription.ResolveShareInspectConfig(subscription.ShareProviderGuangYaPan, cfg.Telegram.GuangYaPan)
+		log.Infof("share inspect guangyapan: resolved access_token=%v, refresh_token=%v", resolvedCfg.AccessToken != "", resolvedCfg.RefreshToken != "")
+		provider = subscription.NewGuangYaPanShareProvider(withoutTempRoot(resolvedCfg))
 	default:
 		return protocol.ShareInspectManifest{}, errors.New("share provider is not supported by this worker")
 	}
+	log.Infof("share inspect: calling ListShareTree for provider %s", ref.Provider)
 	entries, err := subscription.ListShareTree(ctx, provider, ref)
 	if err != nil {
+		log.Warnf("share inspect: ListShareTree failed: %v", err)
 		return protocol.ShareInspectManifest{}, err
 	}
+	log.Infof("share inspect: ListShareTree returned %d entries", len(entries))
 	objects := make([]protocol.SourceObject, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir {
