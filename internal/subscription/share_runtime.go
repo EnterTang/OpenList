@@ -292,7 +292,7 @@ func ResolveShareInspectConfig(provider ShareProviderName, cfg model.Subscriptio
 	cfg = normalizeTelegramPanConfig(cfg)
 	switch provider {
 	case ShareProviderGuangYaPan:
-		if strings.TrimSpace(cfg.AccessToken) == "" && strings.TrimSpace(cfg.RefreshToken) == "" {
+		if strings.TrimSpace(cfg.AccessToken) == "" || strings.TrimSpace(cfg.RefreshToken) == "" {
 			cfg = guangyapanConfigWithStorageFallback(cfg)
 		}
 	case ShareProviderPan123:
