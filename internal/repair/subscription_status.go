@@ -271,7 +271,7 @@ func restoreArchivedEpisodeSnapshots(tx *gorm.DB, report *SubscriptionStatusRepo
 		if err := tx.Model(&model.ETFArchiveRecord{}).
 			Where("tmdb_id = ? AND media_type = ? AND season = ? AND episode = ? AND status IN ?",
 				subscription.TMDBID, subscription.MediaType, source.Season, source.Episode,
-				[]string{model.ETFArchiveStatusArchived, model.ETFArchiveStatusCorrected}).
+				[]string{model.ETFArchiveStatusArchived, model.ETFArchiveStatusCorrected, model.ETFArchiveStatusRelocated}).
 			Count(&archivedCount).Error; err != nil {
 			return err
 		}

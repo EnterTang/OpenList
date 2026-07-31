@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/tmdb"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -219,7 +220,7 @@ func TestCreateMobileShareDoesNotRetryOnNonRiskError(t *testing.T) {
 	}
 }
 
-func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
+func TestCreateMobileShareRetriesAfterRiskRelocate(t *testing.T) {
 	setup139Resty(t)
 	oldBaseURL := mobileShareOutLinkBaseURL
 	oldSettingValue := shareRiskSettingValue
@@ -245,15 +246,16 @@ func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
 	}
 
 	shareCalls := 0
-	var renamed []string
 	var dedicatedNames []string
+	var createdFolders []string
+	var uploadedFiles []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case mobileShareOutLinkPath:
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode body: %v", err)
-			}
+		}
 			req := body["getOutLinkReq"].(map[string]any)
 			dedicatedNames = append(dedicatedNames, req["dedicatedName"].(string))
 			shareCalls++
@@ -267,18 +269,64 @@ func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
 					"getOutLinkRes": map[string]any{
 						"getOutLinkResSet": []map[string]any{{
 							"linkID":  "link-id",
-							"linkUrl": "https://share.example/file",
+							"linkUrl": "https://share.example/folder",
 							"passwd":  "abcd",
 						}},
 					},
 				},
 			})
-		case "/file/update":
+		case "/file/list":
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode body: %v", err)
 			}
-			renamed = append(renamed, body["name"].(string))
+			switch body["parentFileId"] {
+			case "root-id":
+				write139JSON(t, w, personalListItems([]map[string]any{{
+					"fileId": "season-id", "name": "Season 1", "type": "folder",
+				}}))
+			case "season-id":
+				write139JSON(t, w, personalListItems([]map[string]any{{
+					"fileId": "ep1-id", "name": "非分之罪 S01E01.etf", "type": "file", "size": 1,
+				}}))
+			default:
+				write139JSON(t, w, personalListItems(nil))
+			}
+		case "/file/create":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body["type"] == "folder" {
+				createdFolders = append(createdFolders, body["name"].(string))
+				write139JSON(t, w, map[string]any{
+					"success": true,
+					"data": map[string]any{"fileId": "new-" + body["name"].(string)},
+				})
+			} else {
+				uploadedFiles = append(uploadedFiles, body["name"].(string))
+				write139JSON(t, w, map[string]any{
+					"success": true,
+					"data": map[string]any{"fileId": "upload-id"},
+				})
+			}
+		case "/file/getDownloadUrl":
+			write139JSON(t, w, map[string]any{
+				"success": true,
+				"data": map[string]any{"url": "http://" + r.Host + "/download/etf"},
+			})
+		case "/download/etf":
+			etfData, _ := etfmeta.Encode(&etfmeta.Info{
+				Name:       "非分之罪 S01E01.etf",
+				Size:       1,
+				SHA256:     strings.Repeat("A", 64),
+				CreateTime: "2024-01-01T00:00:00Z",
+			})
+			w.WriteHeader(http.StatusOK)
+			w.Write(etfData)
+		case "/recyclebin/batchTrash":
+			write139JSON(t, w, map[string]any{"success": true})
+		case "/recyclebin/clean", "/recyclebin/clear", "/recyclebin/empty":
 			write139JSON(t, w, map[string]any{"success": true})
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
@@ -291,34 +339,41 @@ func TestCreateMobileShareRetriesAfterRiskRename(t *testing.T) {
 		PersonalCloudHost: server.URL,
 		Addition:          Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
 	}
-	link, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "file-id", Name: "非分之罪 S01E01.etf", Path: "/"}, model.MobileShareCreateArgs{SourcePath: "/非分之罪 S01E01.etf"})
+	d.RootFolderID = "root"
+	link, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "root-id", Name: "非分之罪", Path: "/", IsFolder: true}, model.MobileShareCreateArgs{SourcePath: "/非分之罪"})
 	if err != nil {
 		t.Fatalf("CreateMobileShare returned error: %v", err)
 	}
-	if link.ShareURL != "https://share.example/file" {
-		t.Fatalf("link.ShareURL = %q, want https://share.example/file", link.ShareURL)
+	if link.ShareURL != "https://share.example/folder" {
+		t.Fatalf("link.ShareURL = %q, want https://share.example/folder", link.ShareURL)
 	}
 	if shareCalls != 2 {
 		t.Fatalf("shareCalls = %d, want 2", shareCalls)
 	}
-	if len(renamed) != 1 || renamed[0] != "Guilt S01E01.etf" {
-		t.Fatalf("renamed = %#v, want Guilt S01E01.etf", renamed)
+	if len(createdFolders) < 2 {
+		t.Fatalf("createdFolders = %#v, want at least 2 (root + Season 1)", createdFolders)
 	}
-	if len(dedicatedNames) != 2 || dedicatedNames[0] != "非分之罪 S01E01.etf" || dedicatedNames[1] != "Guilt S01E01.etf" {
-		t.Fatalf("dedicatedNames = %#v, want original then renamed retry name", dedicatedNames)
+	if createdFolders[0] != "Guilt" {
+		t.Fatalf("first created folder = %q, want Guilt", createdFolders[0])
 	}
-	if link.SourcePath != "/Guilt S01E01.etf" {
-		t.Fatalf("link.SourcePath = %q, want /Guilt S01E01.etf", link.SourcePath)
+	if len(uploadedFiles) != 1 || uploadedFiles[0] != "Guilt S01E01.etf" {
+		t.Fatalf("uploadedFiles = %#v, want [Guilt S01E01.etf]", uploadedFiles)
 	}
-	if link.SourceName != "Guilt S01E01.etf" {
-		t.Fatalf("link.SourceName = %q, want Guilt S01E01.etf", link.SourceName)
+	if len(dedicatedNames) != 2 || dedicatedNames[0] != "非分之罪" || dedicatedNames[1] != "Guilt" {
+		t.Fatalf("dedicatedNames = %#v, want original then relocated name", dedicatedNames)
+	}
+	if link.SourcePath != "/Guilt" {
+		t.Fatalf("link.SourcePath = %q, want /Guilt", link.SourcePath)
+	}
+	if link.SourceName != "Guilt" {
+		t.Fatalf("link.SourceName = %q, want Guilt", link.SourceName)
 	}
 	if link.CanonicalTitle != "Guilt" {
 		t.Fatalf("link.CanonicalTitle = %q, want Guilt", link.CanonicalTitle)
 	}
 }
 
-func TestCreateMobileShareSkipsRetryWhenRenamePlanEmpty(t *testing.T) {
+func TestCreateMobileShareSkipsRetryWhenRelocatePlanEmpty(t *testing.T) {
 	setup139Resty(t)
 	oldBaseURL := mobileShareOutLinkBaseURL
 	oldSettingValue := shareRiskSettingValue
@@ -349,8 +404,8 @@ func TestCreateMobileShareSkipsRetryWhenRenamePlanEmpty(t *testing.T) {
 		case mobileShareOutLinkPath:
 			shareCalls++
 			write139JSON(t, w, map[string]any{"success": false, "message": "个人云未知异常"})
-		case "/file/update":
-			t.Fatal("rename should not be attempted when plan is empty")
+		case "/file/create":
+			t.Fatal("folder creation should not be attempted when plan is empty")
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
@@ -362,7 +417,7 @@ func TestCreateMobileShareSkipsRetryWhenRenamePlanEmpty(t *testing.T) {
 		PersonalCloudHost: server.URL,
 		Addition:          Addition{Type: MetaPersonalNew, AutoRenameOnShareRisk: true},
 	}
-	_, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "file-id", Name: "Guilt S01E01.etf", Path: "/"}, model.MobileShareCreateArgs{})
+	_, err := d.CreateMobileShare(context.Background(), &model.Object{ID: "folder-id", Name: "Guilt", Path: "/", IsFolder: true}, model.MobileShareCreateArgs{})
 	if err == nil {
 		t.Fatal("expected error")
 	}

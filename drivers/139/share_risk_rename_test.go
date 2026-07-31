@@ -38,7 +38,7 @@ func TestDefaultShareRiskPinyinTransliteratesChineseTitle(t *testing.T) {
 	}
 }
 
-func TestBuildShareRiskRenamePlanRenamesRootFolderAndMatchingDescendants(t *testing.T) {
+func TestBuildShareRiskRelocatePlanCollectsRootFolderAndMatchingDescendants(t *testing.T) {
 	setup139Resty(t)
 	oldSettingValue := shareRiskSettingValue
 	oldTMDBResolve := shareRiskTMDBResolve
@@ -85,28 +85,28 @@ func TestBuildShareRiskRenamePlanRenamesRootFolderAndMatchingDescendants(t *test
 	defer server.Close()
 
 	d := &Yun139{PersonalCloudHost: server.URL, Addition: Addition{Type: MetaPersonalNew}}
-	plan, canonicalTitle, err := d.buildShareRiskRenamePlan(context.Background(), &model.Object{ID: "root-id", Name: "非分之罪", Path: "/", IsFolder: true}, "/非分之罪")
+	plan, err := d.buildShareRiskRelocatePlan(context.Background(), &model.Object{ID: "root-id", Name: "非分之罪", Path: "/", IsFolder: true}, "/非分之罪")
 	if err != nil {
-		t.Fatalf("buildShareRiskRenamePlan returned error: %v", err)
+		t.Fatalf("buildShareRiskRelocatePlan returned error: %v", err)
 	}
-	if canonicalTitle != "Guilt" {
-		t.Fatalf("canonicalTitle = %q, want Guilt", canonicalTitle)
+	if plan == nil {
+		t.Fatal("plan is nil")
 	}
-	if len(plan) != 2 {
-		t.Fatalf("plan len = %d, want 2", len(plan))
+	if plan.CanonicalTitle != "Guilt" {
+		t.Fatalf("canonicalTitle = %q, want Guilt", plan.CanonicalTitle)
 	}
-	if !containsRenameNode(plan, "root-id", "Guilt") {
-		t.Fatalf("plan = %#v, missing root rename", plan)
+	if plan.NewRootName != "Guilt" {
+		t.Fatalf("newRootName = %q, want Guilt", plan.NewRootName)
 	}
-	if !containsRenameNode(plan, "ep1-id", "Guilt S01E01.etf") {
-		t.Fatalf("plan = %#v, missing episode rename", plan)
+	if !containsRelocateEntry(plan.Entries, "season-id", "Season 1") {
+		t.Fatalf("entries = %#v, missing Season 1 dir", plan.Entries)
 	}
-	if containsRenameNode(plan, "season-id", "Season 1") {
-		t.Fatalf("plan = %#v, should not rename Season 1", plan)
+	if !containsRelocateEntry(plan.Entries, "ep1-id", "Guilt S01E01.etf") {
+		t.Fatalf("entries = %#v, missing episode file with safe name", plan.Entries)
 	}
 }
 
-func TestBuildShareRiskRenamePlanFallsBackToPinyin(t *testing.T) {
+func TestBuildShareRiskRelocatePlanFallsBackToPinyin(t *testing.T) {
 	oldSettingValue := shareRiskSettingValue
 	oldTMDBResolve := shareRiskTMDBResolve
 	oldPinyin := shareRiskPinyin
@@ -124,22 +124,22 @@ func TestBuildShareRiskRenamePlanFallsBackToPinyin(t *testing.T) {
 	}
 
 	d := &Yun139{Addition: Addition{Type: MetaPersonalNew}}
-	plan, canonicalTitle, err := d.buildShareRiskRenamePlan(context.Background(), &model.Object{ID: "file-id", Name: "非分之罪 S01E01.etf", Path: "/"}, "/非分之罪 S01E01.etf")
+	plan, err := d.buildShareRiskRelocatePlan(context.Background(), &model.Object{ID: "file-id", Name: "非分之罪 S01E01.etf", Path: "/"}, "/非分之罪 S01E01.etf")
 	if err != nil {
-		t.Fatalf("buildShareRiskRenamePlan returned error: %v", err)
+		t.Fatalf("buildShareRiskRelocatePlan returned error: %v", err)
 	}
-	if canonicalTitle != "Fei Fen Zhi Zui" {
-		t.Fatalf("canonicalTitle = %q, want Fei Fen Zhi Zui", canonicalTitle)
+	if plan == nil {
+		t.Fatal("plan is nil")
 	}
-	if len(plan) != 1 {
-		t.Fatalf("plan len = %d, want 1", len(plan))
+	if plan.CanonicalTitle != "Fei Fen Zhi Zui" {
+		t.Fatalf("canonicalTitle = %q, want Fei Fen Zhi Zui", plan.CanonicalTitle)
 	}
-	if plan[0].NewName != "Fei Fen Zhi Zui S01E01.etf" {
-		t.Fatalf("new name = %q, want Fei Fen Zhi Zui S01E01.etf", plan[0].NewName)
+	if plan.NewRootName != "Fei Fen Zhi Zui S01E01.etf" {
+		t.Fatalf("newRootName = %q, want Fei Fen Zhi Zui S01E01.etf", plan.NewRootName)
 	}
 }
 
-func TestBuildShareRiskRenamePlanUsesBilingualRecognizeCandidates(t *testing.T) {
+func TestBuildShareRiskRelocatePlanUsesBilingualRecognizeCandidates(t *testing.T) {
 	oldSettingValue := shareRiskSettingValue
 	oldTMDBResolve := shareRiskTMDBResolve
 	oldPinyin := shareRiskPinyin
@@ -178,68 +178,24 @@ func TestBuildShareRiskRenamePlanUsesBilingualRecognizeCandidates(t *testing.T) 
 	}
 
 	d := &Yun139{Addition: Addition{Type: MetaPersonalNew}}
-	plan, canonicalTitle, err := d.buildShareRiskRenamePlan(context.Background(), &model.Object{ID: "file-id", Name: "诊疗中 Shrinking S03E01.mkv", Path: "/"}, "/诊疗中 Shrinking S03E01.mkv")
+	plan, err := d.buildShareRiskRelocatePlan(context.Background(), &model.Object{ID: "file-id", Name: "诊疗中 Shrinking S03E01.mkv", Path: "/"}, "/诊疗中 Shrinking S03E01.mkv")
 	if err != nil {
-		t.Fatalf("buildShareRiskRenamePlan returned error: %v", err)
+		t.Fatalf("buildShareRiskRelocatePlan returned error: %v", err)
 	}
-	if canonicalTitle != "Shrinking" {
-		t.Fatalf("canonicalTitle = %q, want %q", canonicalTitle, "Shrinking")
+	if plan == nil {
+		t.Fatal("plan is nil")
 	}
-	if len(plan) != 1 {
-		t.Fatalf("plan len = %d, want 1", len(plan))
+	if plan.CanonicalTitle != "Shrinking" {
+		t.Fatalf("canonicalTitle = %q, want %q", plan.CanonicalTitle, "Shrinking")
 	}
-	if plan[0].NewName != "Shrinking S03E01.mkv" {
-		t.Fatalf("new name = %q, want %q", plan[0].NewName, "Shrinking S03E01.mkv")
-	}
-}
-
-func TestApplyShareRiskRenamePlanSortsDeepestFirst(t *testing.T) {
-	setup139Resty(t)
-	var renamed []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/file/update" {
-			t.Fatalf("unexpected path: %s", r.URL.Path)
-		}
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode body: %v", err)
-		}
-		renamed = append(renamed, body["fileId"].(string)+":"+body["name"].(string))
-		write139JSON(t, w, map[string]any{"success": true})
-	}))
-	defer server.Close()
-
-	d := &Yun139{PersonalCloudHost: server.URL, Addition: Addition{Type: MetaPersonalNew}}
-	err := d.applyShareRiskRenamePlan(context.Background(), []shareRiskRenameNode{
-		{Obj: &model.Object{ID: "root-id", Name: "非分之罪", IsFolder: true}, Depth: 0, OldName: "非分之罪", NewName: "Guilt"},
-		{Obj: &model.Object{ID: "ep1-id", Name: "非分之罪 S01E01.etf"}, Depth: 2, OldName: "非分之罪 S01E01.etf", NewName: "Guilt S01E01.etf"},
-	})
-	if err != nil {
-		t.Fatalf("applyShareRiskRenamePlan returned error: %v", err)
-	}
-	if len(renamed) != 2 {
-		t.Fatalf("renamed = %#v, want 2 renames", renamed)
-	}
-	if renamed[0] != "ep1-id:Guilt S01E01.etf" || renamed[1] != "root-id:Guilt" {
-		t.Fatalf("rename order = %#v, want deepest first", renamed)
+	if plan.NewRootName != "Shrinking S03E01.mkv" {
+		t.Fatalf("newRootName = %q, want %q", plan.NewRootName, "Shrinking S03E01.mkv")
 	}
 }
 
-func TestShareRiskApplyRenamePlanPathUsesDeepestRenameFirst(t *testing.T) {
-	plan := []shareRiskRenameNode{
-		{ParentPath: "/139_60t/ETF转存归档/tv/国产剧", Depth: 3, OldName: "非份之罪 (2026) {tmdb-276239}", NewName: "Guilt (2026) {tmdb-276239}"},
-		{ParentPath: "/139_60t/ETF转存归档/tv/国产剧/非份之罪 (2026) {tmdb-276239}/Season 1", Depth: 5, OldName: "非份之罪 S01E01.etf", NewName: "Guilt S01E01.etf"},
-	}
-	got := shareRiskApplyRenamePlanPath("/139_60t/ETF转存归档/tv/国产剧/非份之罪 (2026) {tmdb-276239}/Season 1/非份之罪 S01E01.etf", plan)
-	want := "/139_60t/ETF转存归档/tv/国产剧/Guilt (2026) {tmdb-276239}/Season 1/Guilt S01E01.etf"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-}
-
-func containsRenameNode(nodes []shareRiskRenameNode, id, newName string) bool {
-	for _, node := range nodes {
-		if node.Obj.GetID() == id && node.NewName == newName {
+func containsRelocateEntry(entries []shareRiskRelocateEntry, id, newName string) bool {
+	for _, entry := range entries {
+		if entry.Obj != nil && entry.Obj.GetID() == id && entry.NewName == newName {
 			return true
 		}
 	}

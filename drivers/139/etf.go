@@ -1083,3 +1083,158 @@ func defaultETFSettingValue(key string) (value string) {
 
 var _ driver.ETFPreviewNamer = (*Yun139)(nil)
 var _ driver.ETFDownloadRestoreController = (*Yun139)(nil)
+
+// RecreateETFFiles recreates the specified ETF files in the given folder.
+// For each ETF file, it reads the content, re-uploads it to the same parent
+// directory (generating a new cloud ID), and deletes the original file.
+// This circumvents ID-level blacklisting on the cloud storage.
+func (d *Yun139) RecreateETFFiles(ctx context.Context, folderPath string, names []string) (*model.ETFRecreateResult, error) {
+	result := &model.ETFRecreateResult{Total: len(names)}
+	if len(names) == 0 {
+		return result, nil
+	}
+	folderPath = cleanActualPath(folderPath)
+	folderObj, err := d.resolveObjByPath(ctx, folderPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve folder %s: %w", folderPath, err)
+	}
+	if !folderObj.IsDir() {
+		return nil, fmt.Errorf("path is not a folder: %s", folderPath)
+	}
+	objs, err := d.List(ctx, folderObj, model.ListArgs{Refresh: true})
+	if err != nil {
+		return nil, fmt.Errorf("list folder %s: %w", folderPath, err)
+	}
+	byName := make(map[string]model.Obj, len(objs))
+	for _, obj := range objs {
+		byName[obj.GetName()] = obj
+	}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			result.Failed++
+			result.Errors = append(result.Errors, "empty file name")
+			continue
+		}
+		obj, ok := byName[name]
+		if !ok {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("file not found: %s", name))
+			continue
+		}
+		if !etfmeta.IsName(obj.GetName()) {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("not an ETF file: %s", name))
+			continue
+		}
+		content, _, err := d.readPersonalETFContent(ctx, obj)
+		if err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("read %s: %v", name, err))
+			continue
+		}
+		if err := d.uploadPersonalBytes(ctx, folderObj.GetID(), name, content); err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("upload %s: %v", name, err))
+			continue
+		}
+		if err := d.Remove(ctx, obj); err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("delete old %s: %v", name, err))
+			continue
+		}
+		result.Succeeded++
+	}
+	return result, nil
+}
+
+// RecreateArchiveETFFiles recreates the archived ETF files for the given
+// archive record IDs. For each record, it reads the archived ETF content,
+// re-uploads it to the same archive directory (generating a new cloud ID),
+// deletes the original archived file, and updates the record path.
+func (d *Yun139) RecreateArchiveETFFiles(ctx context.Context, recordIDs []uint) (*model.ETFRecreateResult, error) {
+	result := &model.ETFRecreateResult{Total: len(recordIDs)}
+	if len(recordIDs) == 0 {
+		return result, nil
+	}
+	for _, id := range recordIDs {
+		record, err := db.GetETFArchiveRecordByID(id)
+		if err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("record %d: %v", id, err))
+			continue
+		}
+		if err := d.recreateSingleArchiveETF(ctx, record); err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("record %d (%s): %v", id, record.ArchiveETFPath, err))
+			continue
+		}
+		result.Succeeded++
+	}
+	return result, nil
+}
+
+func (d *Yun139) recreateSingleArchiveETF(ctx context.Context, record *model.ETFArchiveRecord) error {
+	archivePath := strings.TrimSpace(record.ArchiveETFPath)
+	if archivePath == "" {
+		return fmt.Errorf("archive etf path is empty")
+	}
+	mountPath := d.GetStorage().MountPath
+	actualPath := strings.TrimPrefix(archivePath, mountPath)
+	actualPath = "/" + strings.TrimLeft(actualPath, "/")
+	parentPath := path.Dir(actualPath)
+	fileName := path.Base(actualPath)
+	parentObj, err := d.resolveObjByPath(ctx, parentPath)
+	if err != nil {
+		return fmt.Errorf("resolve archive dir: %w", err)
+	}
+	oldObj, err := d.resolveObjByPath(ctx, actualPath)
+	if err != nil {
+		return fmt.Errorf("resolve old archive file: %w", err)
+	}
+	content, _, err := d.readPersonalETFContent(ctx, oldObj)
+	if err != nil {
+		return fmt.Errorf("read archive etf: %w", err)
+	}
+	if err := d.uploadPersonalBytes(ctx, parentObj.GetID(), fileName, content); err != nil {
+		return fmt.Errorf("upload new archive etf: %w", err)
+	}
+	if err := d.Remove(ctx, oldObj); err != nil {
+		return fmt.Errorf("delete old archive etf: %w", err)
+	}
+	return nil
+}
+
+// resolveObjByPath resolves a cloud object by its actual path (relative to mount path).
+// It navigates the folder tree from the root using d.personalGetFiles.
+func (d *Yun139) resolveObjByPath(ctx context.Context, actualPath string) (model.Obj, error) {
+	actualPath = cleanActualPath(actualPath)
+	mountPath := d.GetStorage().MountPath
+	if strings.HasPrefix(actualPath, mountPath+"/") || actualPath == mountPath {
+		actualPath = strings.TrimPrefix(actualPath, mountPath)
+		actualPath = cleanActualPath(actualPath)
+	}
+	if actualPath == "/" {
+		return d.personalRootFolder(), nil
+	}
+	parts := splitETFPath(actualPath)
+	current := d.personalRootFolder()
+	for _, part := range parts {
+		children, err := d.personalGetFiles(current.GetID())
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		for _, child := range children {
+			if child.GetName() == part {
+				current = child
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("path component not found: %s", part)
+		}
+	}
+	return current, nil
+}

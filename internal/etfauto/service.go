@@ -153,7 +153,7 @@ func ComputeMediaRootFingerprint(ctx context.Context, mediaRootID uint) (string,
 	var records []model.ETFArchiveRecord
 	if err := database.WithContext(ctx).
 		Where("storage_mount_path = ? AND media_type = ? AND tmdb_id = ? AND archive_etf_path LIKE ? AND status IN ?",
-			root.StorageMountPath, root.MediaType, root.TMDBID, prefix, []string{model.ETFArchiveStatusArchived, model.ETFArchiveStatusCorrected}).
+			root.StorageMountPath, root.MediaType, root.TMDBID, prefix, []string{model.ETFArchiveStatusArchived, model.ETFArchiveStatusCorrected, model.ETFArchiveStatusRelocated}).
 		Find(&records).Error; err != nil {
 		return "", errors.WithStack(err)
 	}

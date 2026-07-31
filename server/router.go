@@ -228,6 +228,8 @@ func admin(g *gin.RouterGroup) {
 	etfArchive.GET("/tmdb/search", handles.SearchETFArchiveTMDB)
 	etfArchive.POST("/manual/preview", handles.PreviewManualETFArchive)
 	etfArchive.POST("/manual/apply", handles.ApplyManualETFArchive)
+	etfArchive.POST("/recreate_archive", handles.RecreateArchiveETFFiles)
+	etfArchive.POST("/recreate_files", handles.RecreateETFFiles)
 
 	etfAuto := g.Group("/etf_auto")
 	etfAuto.GET("/roots", handles.ListETFAutoMediaRoots)

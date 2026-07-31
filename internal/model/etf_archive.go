@@ -7,6 +7,7 @@ const (
 	ETFArchiveStatusArchived  = "archived"
 	ETFArchiveStatusFailed    = "failed"
 	ETFArchiveStatusCorrected = "corrected"
+	ETFArchiveStatusRelocated = "relocated"
 )
 
 type ETFArchiveRecord struct {
@@ -108,4 +109,20 @@ type ETFManualArchiveItem struct {
 	SourceSHA256 string `json:"source_sha256"`
 	Season       int    `json:"season"`
 	Episode      int    `json:"episode"`
+}
+
+type ETFRecreateArchiveReq struct {
+	IDs []uint `json:"ids" binding:"required"`
+}
+
+type ETFRecreateFilesReq struct {
+	Path  string   `json:"path" binding:"required"`
+	Names []string `json:"names" binding:"required"`
+}
+
+type ETFRecreateResult struct {
+	Total     int      `json:"total"`
+	Succeeded int      `json:"succeeded"`
+	Failed    int      `json:"failed"`
+	Errors    []string `json:"errors,omitempty"`
 }

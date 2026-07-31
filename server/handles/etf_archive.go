@@ -23,6 +23,14 @@ type etfManualArchiver interface {
 	ApplyManualETFArchive(context.Context, string, model.ETFManualArchiveMetadata, []model.ETFManualArchiveItem) (*model.ETFManualArchivePreview, error)
 }
 
+type etfArchiveRecreator interface {
+	RecreateArchiveETFFiles(context.Context, []uint) (*model.ETFRecreateResult, error)
+}
+
+type etfFileRecreator interface {
+	RecreateETFFiles(context.Context, string, []string) (*model.ETFRecreateResult, error)
+}
+
 type listETFArchiveRecordsReq struct {
 	model.PageReq
 	Keyword     string `form:"keyword" json:"keyword"`
@@ -170,4 +178,77 @@ func etfArchiveSettingValue(key string) string {
 		return ""
 	}
 	return item.Value
+}
+
+func RecreateArchiveETFFiles(c *gin.Context) {
+	var req model.ETFRecreateArchiveReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if len(req.IDs) == 0 {
+		common.ErrorStrResp(c, "ids is required", 400)
+		return
+	}
+	records := make([]*model.ETFArchiveRecord, 0, len(req.IDs))
+	storageMountPath := ""
+	for _, id := range req.IDs {
+		record, err := db.GetETFArchiveRecordByID(id)
+		if err != nil {
+			common.ErrorResp(c, err, 404)
+			return
+		}
+		records = append(records, record)
+		if storageMountPath == "" {
+			storageMountPath = record.StorageMountPath
+		}
+	}
+	if storageMountPath == "" {
+		common.ErrorStrResp(c, "no storage mount path found", 400)
+		return
+	}
+	storage, err := op.GetStorageByMountPath(storageMountPath)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	recreator, ok := storage.(etfArchiveRecreator)
+	if !ok {
+		common.ErrorStrResp(c, "storage does not support ETF archive recreation", 400)
+		return
+	}
+	result, err := recreator.RecreateArchiveETFFiles(c.Request.Context(), req.IDs)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
+func RecreateETFFiles(c *gin.Context) {
+	var req model.ETFRecreateFilesReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if len(req.Names) == 0 {
+		common.ErrorStrResp(c, "names is required", 400)
+		return
+	}
+	storage, actualPath, err := op.GetStorageAndActualPath(req.Path)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	recreator, ok := storage.(etfFileRecreator)
+	if !ok {
+		common.ErrorStrResp(c, "storage does not support ETF file recreation", 400)
+		return
+	}
+	result, err := recreator.RecreateETFFiles(c.Request.Context(), actualPath, req.Names)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, result)
 }
