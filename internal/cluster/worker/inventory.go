@@ -84,7 +84,7 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 
 func requiresWorkerStagingRouting(provider string) bool {
 	switch normalizeControlKey(provider) {
-	case "pan123", "pan115", "quark", "aliyun_drive":
+	case "pan123", "pan115", "quark", "aliyun_drive", "guangyapan":
 		return true
 	default:
 		return false

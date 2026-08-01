@@ -14,6 +14,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	log "github.com/sirupsen/logrus"
 	"github.com/pkg/errors"
 )
 
@@ -634,6 +635,7 @@ type clusterSourceMessage struct {
 }
 
 func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []*model.SubscriptionItem, ref ShareRef, message clusterSourceMessage) (int, error) {
+	log.Warnf("[cluster-dispatch] dispatchClusterItems: sub=%d items=%d transferEnabled=%v", sub.ID, len(items), sub.TransferEnabled)
 	if sub == nil || !sub.TransferEnabled {
 		return 0, nil
 	}

@@ -149,6 +149,8 @@ func workerStagingTargetFromConfig(cfg model.SubscriptionConfig, provider string
 		target = cfg.Telegram.Quark.TempTransferTarget
 	case "aliyun_drive":
 		target = cfg.Telegram.AliyunDrive.TempTransferTarget
+	case "guangyapan":
+		target = cfg.Telegram.GuangYaPan.TempTransferTarget
 	default:
 		return model.SubscriptionStorageTarget{}, false
 	}

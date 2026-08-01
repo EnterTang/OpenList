@@ -11,6 +11,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"gorm.io/gorm"
 )
 
@@ -50,6 +51,7 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	var inventory model.ClusterNodeInventory
 	if err := db.GetDb().WithContext(ctx).Where("node_id = ?", nodeID).Order("revision DESC").First(&inventory).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.Log.Warnf("[cluster-dispatch] node=%s inventory not found", nodeID)
 			return nodeProviderAccountMatch{}, false, nil
 		}
 		return nodeProviderAccountMatch{}, false, err
@@ -59,10 +61,12 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 		return nodeProviderAccountMatch{}, false, err
 	}
 	if !capabilities.RedisDurabilityReady {
+		utils.Log.Warnf("[cluster-dispatch] node=%s redis_durability_ready=false", nodeID)
 		return nodeProviderAccountMatch{}, false, nil
 	}
 	for _, operation := range required {
 		if !containsFold(capabilities.SupportedOperations, operation) {
+			utils.Log.Warnf("[cluster-dispatch] node=%s missing operation=%s supported=%v", nodeID, operation, capabilities.SupportedOperations)
 			return nodeProviderAccountMatch{}, false, nil
 		}
 	}
@@ -74,7 +78,13 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 		stagingRequirement.RequiredBytes = expectedBytes
 	}
 	stagingRequirement.NeedShareSave = true
+	// share.save is a cloud-side copy that does not consume worker-local
+	// storage, so skip the free_bytes check for staging (mirrors share.inspect
+	// handling above). Providers such as guangyapan routinely report
+	// free_bytes=0 because the quota API is unavailable.
+	stagingRequirement.RequiredBytes = 0
 	if stagingRequirement.Provider != "" && !containsFold(capabilities.SupportedProviders, stagingRequirement.Provider) {
+		utils.Log.Warnf("[cluster-dispatch] node=%s staging provider=%s not in supported=%v", nodeID, stagingRequirement.Provider, capabilities.SupportedProviders)
 		return nodeProviderAccountMatch{}, false, nil
 	}
 	var providerAccounts []protocol.ProviderAccountInventory
@@ -118,10 +128,12 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	}
 	staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", true)
 	if !ok {
+		utils.Log.Warnf("[cluster-dispatch] node=%s staging failed: provider=%s needShareSave=%v requiredBytes=%d accounts=%d", nodeID, stagingRequirement.Provider, stagingRequirement.NeedShareSave, stagingRequirement.RequiredBytes, len(providerAccounts))
 		return nodeProviderAccountMatch{}, false, nil
 	}
 	delivery, ok := selectProviderAccount(providerAccounts, deliveryRequirement, targetPath, false)
 	if !ok {
+		utils.Log.Warnf("[cluster-dispatch] node=%s delivery failed: provider=%s needUpload=%v requiredBytes=%d targetPath=%s accounts=%d", nodeID, deliveryRequirement.Provider, deliveryRequirement.NeedUpload, deliveryRequirement.RequiredBytes, targetPath, len(providerAccounts))
 		return nodeProviderAccountMatch{}, false, nil
 	}
 	var nodeActiveJobs int64

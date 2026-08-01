@@ -216,6 +216,60 @@ func UpsertSubscriptionItem(item *model.SubscriptionItem) (*model.SubscriptionIt
 	return upsertSubscriptionItem(db, item)
 }
 
+// UpsertSubscriptionItemForceStatus behaves like UpsertSubscriptionItem but
+// never overwrites the incoming status with the existing DB status. This is
+// needed when a caller intentionally wants to reset an item's status (e.g.
+// skipped → pending) and the normal preservation logic would silently revert
+// that change.
+func UpsertSubscriptionItemForceStatus(item *model.SubscriptionItem) (*model.SubscriptionItem, bool, error) {
+	if item == nil {
+		return nil, false, errors.New("subscription item is nil")
+	}
+	var existing model.SubscriptionItem
+	err := db.Where(columnName("subscription_id")+" = ? AND "+columnName("source_key")+" = ?", item.SubscriptionID, item.SourceKey).First(&existing).Error
+	isNew := false
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		isNew = true
+	} else if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if isNew && item.Status == "" {
+		item.Status = model.SubscriptionItemStatusPending
+	}
+	err = db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "subscription_id"}, {Name: "source_key"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"source_provider",
+			"source_url",
+			"source_message_id",
+			"source_message_channel",
+			"source_message_url",
+			"source_message_text",
+			"source_path",
+			"file_id",
+			"file_path",
+			"file_name",
+			"file_size",
+			"file_hash",
+			"season",
+			"episode",
+			"target_dir",
+			"target_name",
+			"target_path",
+			"status",
+			"cluster_job_id",
+			"last_seen_at",
+			"last_error",
+			"updated_at",
+		}),
+	}).Create(item).Error
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	saved, err := getSubscriptionItem(db, item.SubscriptionID, item.SourceKey)
+	return saved, isNew, err
+}
+
 func upsertSubscriptionItem(tx *gorm.DB, item *model.SubscriptionItem) (*model.SubscriptionItem, bool, error) {
 	if item == nil {
 		return nil, false, errors.New("subscription item is nil")

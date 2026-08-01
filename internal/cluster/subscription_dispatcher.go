@@ -15,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"gorm.io/gorm"
 )
 
@@ -283,8 +284,10 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	}
 	targets, err := d.runtime.subscriptionDispatchTargets(ctx)
 	if err != nil {
+		utils.Log.Warnf("[cluster-dispatch] subscriptionDispatchTargets error: %v", err)
 		return nil, err
 	}
+	utils.Log.Warnf("[cluster-dispatch] subscriptionDispatchTargets returned %d targets", len(targets))
 	requests := make([]DispatchMediaJobRequest, 0, len(tasks))
 	results := make([]subscription.ClusterDispatchResult, len(tasks))
 	requestTaskIndexes := make([]int, 0, len(tasks))
@@ -313,13 +316,32 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	if len(requests) == 0 {
 		return results, errors.New("no subscription media task could be assigned")
 	}
-	batch, dispatchErr := d.runtime.DispatchMediaBatch(ctx, DispatchMediaBatchRequest{BatchID: subscriptionBatchID(tasks), Items: requests})
+	var dispatchErr error
 	jobsByItemID := make(map[uint]*model.ClusterJob)
-	if batch != nil {
-		for _, job := range batch.Jobs {
-			if job != nil {
-				jobsByItemID[job.SubscriptionItemID] = job
+	batchErrors := make([]string, 0, len(requests))
+	const maxBatchSize = 100
+	for start := 0; start < len(requests); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(requests) {
+			end = len(requests)
+		}
+		chunk := requests[start:end]
+		b, err := d.runtime.DispatchMediaBatch(ctx, DispatchMediaBatchRequest{BatchID: subscriptionBatchID(tasks), Items: chunk})
+		if b != nil {
+			for _, job := range b.Jobs {
+				if job != nil {
+					jobsByItemID[job.SubscriptionItemID] = job
+				}
 			}
+			batchErrors = append(batchErrors, b.Errors...)
+		} else {
+			for range chunk {
+				batchErrors = append(batchErrors, "")
+			}
+		}
+		if err != nil {
+			dispatchErr = err
+			break
 		}
 	}
 	for requestIndex, taskIndex := range requestTaskIndexes {
@@ -328,8 +350,8 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			results[taskIndex].JobID = job.ID
 			continue
 		}
-		if batch != nil && requestIndex < len(batch.Errors) {
-			results[taskIndex].Error = errors.New(batch.Errors[requestIndex])
+		if requestIndex < len(batchErrors) && batchErrors[requestIndex] != "" {
+			results[taskIndex].Error = errors.New(batchErrors[requestIndex])
 		} else if dispatchErr != nil {
 			results[taskIndex].Error = dispatchErr
 		} else {
@@ -454,11 +476,13 @@ func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchT
 }
 
 func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchTarget, task subscription.ClusterMediaTask) *dispatchTarget {
+	utils.Log.Warnf("[cluster-dispatch] chooseDispatchTarget: targets=%d task.SourceKey=%s shareProvider=%s preferredNode=%s", len(targets), task.SourceKey, task.ShareProvider, task.PreferredWorkerNodeID)
 	eligible := make([]*dispatchTarget, 0, len(targets))
 	for _, target := range targets {
 		taskContext := subscriptionMediaTaskContext(task, target.targetProfile)
 		match, ok, err := nodeInventoryProviderMatch(ctx, target.nodeID, taskContext, []string{"share.save", "mobile.upload", "result.report"}, task.SourceSize)
 		if err != nil || !ok {
+			utils.Log.Warnf("[cluster-dispatch] target node=%s rejected: ok=%v err=%v", target.nodeID, ok, err)
 			continue
 		}
 		match.ActiveJobs += target.pendingAssignments

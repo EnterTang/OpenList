@@ -205,7 +205,7 @@ func upsertClusterItems(items []*model.SubscriptionItem) ([]*model.SubscriptionI
 			saved.Status = model.SubscriptionItemStatusPending
 			saved.ClusterJobID = ""
 			saved.LastError = ""
-			saved, _, err = db.UpsertSubscriptionItem(saved)
+			saved, _, err = db.UpsertSubscriptionItemForceStatus(saved)
 			if err != nil {
 				return stored, added, changed, err
 			}
@@ -213,10 +213,12 @@ func upsertClusterItems(items []*model.SubscriptionItem) ([]*model.SubscriptionI
 		} else if saved.Status == model.SubscriptionItemStatusSkipped {
 			// Re-selected by a later inspect observation; allow reconcile to
 			// compare it again and dispatch if it is now the episode winner.
+			// Use ForceStatus so the preservation logic in UpsertSubscriptionItem
+			// does not silently revert skipped→pending.
 			saved.Status = model.SubscriptionItemStatusPending
 			saved.ClusterJobID = ""
 			saved.LastError = ""
-			saved, _, err = db.UpsertSubscriptionItem(saved)
+			saved, _, err = db.UpsertSubscriptionItemForceStatus(saved)
 			if err != nil {
 				return stored, added, changed, err
 			}

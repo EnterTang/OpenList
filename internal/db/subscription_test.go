@@ -272,6 +272,63 @@ func TestUpsertSubscriptionItemPreservesTransferredStatusOnUnchangedScan(t *test
 	}
 }
 
+func TestUpsertSubscriptionItemForceStatusResetsSkippedToPending(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	item, _, err := UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: 1,
+		SourceKey:      "source-force-reset",
+		FileHash:       "hash-a",
+		FileName:       "01.mp4",
+		Status:         model.SubscriptionItemStatusPending,
+		LastSeenAt:     time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("upsert initial item: %v", err)
+	}
+
+	item.Status = model.SubscriptionItemStatusSkipped
+	item.LastError = "skipped: larger or preferred file selected for the same episode"
+	if _, _, err := UpsertSubscriptionItem(item); err != nil {
+		t.Fatalf("mark skipped: %v", err)
+	}
+
+	// Normal UpsertSubscriptionItem preserves skipped status when incoming is pending.
+	preserved, _, err := UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: 1,
+		SourceKey:      "source-force-reset",
+		FileHash:       "hash-a",
+		FileName:       "01.mp4",
+		Status:         model.SubscriptionItemStatusPending,
+		LastSeenAt:     time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("normal upsert: %v", err)
+	}
+	if preserved.Status != model.SubscriptionItemStatusSkipped {
+		t.Fatalf("normal upsert status = %q, want skipped (preserved)", preserved.Status)
+	}
+
+	// ForceStatus should actually reset to pending.
+	forced, _, err := UpsertSubscriptionItemForceStatus(&model.SubscriptionItem{
+		SubscriptionID: 1,
+		SourceKey:      "source-force-reset",
+		FileHash:       "hash-a",
+		FileName:       "01.mp4",
+		Status:         model.SubscriptionItemStatusPending,
+		LastSeenAt:     time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("force upsert: %v", err)
+	}
+	if forced.Status != model.SubscriptionItemStatusPending {
+		t.Fatalf("force upsert status = %q, want pending", forced.Status)
+	}
+	if forced.LastError != "" {
+		t.Fatalf("force upsert last_error = %q, want empty", forced.LastError)
+	}
+}
+
 func TestUpsertSubscriptionItemResetsTransferredStatusWhenTargetPathChanges(t *testing.T) {
 	setupETFArchiveDB(t)
 
