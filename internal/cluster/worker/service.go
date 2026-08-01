@@ -59,6 +59,8 @@ type resultQueue interface {
 	Stats(context.Context) (resultqueue.Stats, error)
 }
 
+var cleanupLookupDelay = 2 * time.Second
+
 var (
 	getCleanupStorageAndActualPath = op.GetStorageAndActualPath
 	getCleanupObject               = getFreshCleanupObject
@@ -267,9 +269,28 @@ func executeCleanupTarget(ctx context.Context, target resultqueue.CleanupTarget)
 	if path.Clean(storage.GetStorage().MountPath) != path.Clean(target.StorageMountPath) {
 		return errors.New("cleanup storage mount changed; refusing deletion")
 	}
+	// Brief delay to allow cloud API eventual-consistency to surface the
+	// freshly-uploaded file in directory listings.
+	select {
+	case <-time.After(cleanupLookupDelay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	cleanupObj, err := getCleanupObject(ctx, storage, actualPath, true)
 	if err != nil {
 		if errs.IsObjectNotFound(err) {
+			// The file may have already been removed, or the cloud API may
+			// not yet reflect the upload in directory listings. If we have a
+			// remote file ID, attempt a direct removal by ID before falling
+			// back to recycle-bin-only cleanup.
+			if strings.TrimSpace(target.RemoteFileID) != "" {
+				if remover, ok := storage.(driver.Remove); ok {
+					directObj := &model.Object{ID: target.RemoteFileID, Name: target.Name}
+					if removeErr := remover.Remove(ctx, directObj); removeErr != nil && !errs.IsNotFoundError(removeErr) {
+						log.Warnf("cleanup direct remove by remote id %s failed: %v", target.RemoteFileID, removeErr)
+					}
+				}
+			}
 			if target.EmptyRecycleBin {
 				cleaner, ok := storage.(driver.RecycleEntryCleaner)
 				if !ok {

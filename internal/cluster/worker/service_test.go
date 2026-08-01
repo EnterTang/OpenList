@@ -32,8 +32,10 @@ type fakeResultQueue struct {
 }
 
 type cleanupTestDriver struct {
-	storage model.Storage
-	cleared model.Obj
+	storage     model.Storage
+	cleared     model.Obj
+	removed     model.Obj
+	removeErr   error
 }
 
 func (d *cleanupTestDriver) Config() driver.Config            { return driver.Config{} }
@@ -50,6 +52,13 @@ func (d *cleanupTestDriver) Link(context.Context, model.Obj, model.LinkArgs) (*m
 }
 func (d *cleanupTestDriver) ClearRecycleEntry(_ context.Context, obj model.Obj) error {
 	d.cleared = obj
+	return nil
+}
+func (d *cleanupTestDriver) Remove(_ context.Context, obj model.Obj) error {
+	if d.removeErr != nil {
+		return d.removeErr
+	}
+	d.removed = obj
 	return nil
 }
 
@@ -319,6 +328,8 @@ func TestExecuteCleanupTargetRefusesRemoteIDMismatch(t *testing.T) {
 	originalStorage := getCleanupStorageAndActualPath
 	originalGet := getCleanupObject
 	originalRemove := removeCleanupObjectExact
+	originalDelay := cleanupLookupDelay
+	cleanupLookupDelay = 0
 	removed := false
 	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
 		return d, "/转存至移动/Episode.mkv", nil
@@ -334,6 +345,7 @@ func TestExecuteCleanupTargetRefusesRemoteIDMismatch(t *testing.T) {
 		getCleanupStorageAndActualPath = originalStorage
 		getCleanupObject = originalGet
 		removeCleanupObjectExact = originalRemove
+		cleanupLookupDelay = originalDelay
 	})
 
 	err := executeCleanupTarget(context.Background(), resultqueue.CleanupTarget{
@@ -348,6 +360,8 @@ func TestExecuteCleanupTargetClearsRecycleEntryAfterFileAlreadyRemoved(t *testin
 	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/mobile"}}
 	originalStorage := getCleanupStorageAndActualPath
 	originalGet := getCleanupObject
+	originalDelay := cleanupLookupDelay
+	cleanupLookupDelay = 0
 	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
 		return d, "/.openlist-cluster/job-1/media-1/Episode.mkv", nil
 	}
@@ -357,6 +371,7 @@ func TestExecuteCleanupTargetClearsRecycleEntryAfterFileAlreadyRemoved(t *testin
 	t.Cleanup(func() {
 		getCleanupStorageAndActualPath = originalStorage
 		getCleanupObject = originalGet
+		cleanupLookupDelay = originalDelay
 	})
 
 	err := executeCleanupTarget(context.Background(), resultqueue.CleanupTarget{
@@ -364,8 +379,38 @@ func TestExecuteCleanupTargetClearsRecycleEntryAfterFileAlreadyRemoved(t *testin
 		RemoteFileID: "remote-file", Name: "Episode.mkv", EmptyRecycleBin: true,
 	})
 	require.NoError(t, err)
+	require.NotNil(t, d.removed)
+	require.Equal(t, "remote-file", d.removed.GetID())
 	require.NotNil(t, d.cleared)
 	require.Equal(t, "remote-file", d.cleared.GetID())
+}
+
+func TestExecuteCleanupTargetDirectRemoveByIDWhenListingMisses(t *testing.T) {
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/139"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	originalDelay := cleanupLookupDelay
+	cleanupLookupDelay = 0
+	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
+		return d, "/139/上传中转/Episode.mkv", nil
+	}
+	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
+		return nil, errs.ObjectNotFound
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+		cleanupLookupDelay = originalDelay
+	})
+
+	err := executeCleanupTarget(context.Background(), resultqueue.CleanupTarget{
+		OpenListPath: "/139/上传中转/Episode.mkv", StorageMountPath: "/139",
+		RemoteFileID: "file-id-123", Name: "Episode.mkv", EmptyRecycleBin: false,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, d.removed)
+	require.Equal(t, "file-id-123", d.removed.GetID())
+	require.Nil(t, d.cleared)
 }
 
 func TestCancelActiveCancelsConnectionBoundTasks(t *testing.T) {
