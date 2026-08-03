@@ -356,6 +356,83 @@ func (s *Service) ReconcileNodeSessions(ctx context.Context, now time.Time) (int
 	return affected, err
 }
 
+// RequeueNodeAttempts releases attempts owned by a worker process that has
+// restarted. The worker's active-task map is in memory, so those attempts
+// cannot be resumed after a process restart. Requeueing them before the new
+// session connects avoids waiting for the normal media lease timeout.
+func (s *Service) RequeueNodeAttempts(ctx context.Context, nodeID string, now time.Time) (int64, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return 0, errors.New("cluster node id is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var requeued int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var attempts []model.ClusterJobAttempt
+		if err := tx.Where("node_id = ? AND status IN ?", nodeID, []string{
+			model.ClusterAttemptStatusOffered,
+			model.ClusterAttemptStatusAccepted,
+			model.ClusterAttemptStatusRunning,
+		}).Find(&attempts).Error; err != nil {
+			return err
+		}
+		for i := range attempts {
+			attempt := &attempts[i]
+			var job model.ClusterJob
+			if err := tx.First(&job, "id = ?", attempt.JobID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				return err
+			}
+			if job.CurrentAttemptID != attempt.ID || job.CurrentGeneration != attempt.Generation {
+				continue
+			}
+			if job.Status != model.ClusterJobStatusLeased && job.Status != model.ClusterJobStatusRunning {
+				continue
+			}
+			if err := failNonTerminalAttemptStagesTx(tx, &job, "worker_restarted", "worker process restarted before completion", now); err != nil {
+				return err
+			}
+			if err := tx.Model(attempt).Updates(map[string]any{
+				"status":      model.ClusterAttemptStatusLost,
+				"finished_at": now,
+				"error_code":  "worker_restarted",
+				"error":       "worker process restarted before completion",
+			}).Error; err != nil {
+				return err
+			}
+			result := tx.Model(&model.ClusterJob{}).
+				Where("id = ? AND current_attempt_id = ? AND current_generation = ?", job.ID, attempt.ID, attempt.Generation).
+				Updates(map[string]any{
+					"status":             model.ClusterJobStatusQueued,
+					"assigned_node_id":   "",
+					"current_attempt_id": "",
+					"finished_at":        nil,
+					"last_error_code":    "worker_restarted",
+					"last_error":         "worker process restarted before completion",
+					"available_at":       now,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				continue
+			}
+			if err := tx.Model(&model.ClusterOutbox{}).
+				Where("correlation_id = ? AND message_type = ? AND status IN ?", attempt.JobID, protocol.MessageJobOffer, []string{model.ClusterMessageStatusPending, model.ClusterMessageStatusSending}).
+				Updates(map[string]any{"status": model.ClusterMessageStatusFailed, "last_error": "worker restarted; superseded by retry"}).Error; err != nil {
+				return err
+			}
+			requeued++
+		}
+		return nil
+	})
+	return requeued, err
+}
+
 func (s *Service) SweepExpiredHeartbeats(ctx context.Context, now time.Time, timeout time.Duration) (int64, error) {
 	if s.db == nil {
 		return 0, errors.New("cluster database is unavailable")

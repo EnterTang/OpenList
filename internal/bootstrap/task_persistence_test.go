@@ -14,6 +14,13 @@ import (
 	"github.com/OpenListTeam/tache"
 )
 
+func TestDefaultConfigEnablesMoveTaskPersistence(t *testing.T) {
+	config := conf.DefaultConfig(t.TempDir())
+	if !config.Tasks.Move.TaskPersistant {
+		t.Fatal("move task persistence is disabled by default")
+	}
+}
+
 func TestMoveTaskManagerPersistsOnlyOrdinaryTasksWhenLegacyFlagEnabled(t *testing.T) {
 	conf.Conf = conf.DefaultConfig(t.TempDir())
 	database := openSQLiteTestDB(t, filepath.Join(t.TempDir(), "move-persistence.db"))

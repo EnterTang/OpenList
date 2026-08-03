@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/local"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -54,6 +55,101 @@ func TestHandleTransferPayloadMarksTransferred(t *testing.T) {
 	}
 	if len(sources) != 0 {
 		t.Fatalf("episode sources after finalize success = %#v, want none", sources)
+	}
+}
+
+func TestRecoverStaleStandaloneTransferMarksExistingTargetTransferred(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "delivery"), 0o755); err != nil {
+		t.Fatalf("mkdir delivery: %v", err)
+	}
+	mountPath := "/" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	if _, err := op.CreateStorage(context.Background(), model.Storage{
+		Driver:    "Local",
+		MountPath: mountPath,
+		Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, root),
+	}); err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	item, _, err := db.UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: 4,
+		SourceKey:      "stale-existing-target",
+		FileHash:       "stale-hash",
+		FileName:       "episode.mkv",
+		TargetDir:      mountPath + "/delivery",
+		TargetName:     "episode.mkv",
+		TargetPath:     mountPath + "/delivery/episode.mkv",
+		Status:         model.SubscriptionItemStatusTransferring,
+	})
+	if err != nil {
+		t.Fatalf("upsert item: %v", err)
+	}
+	if err := db.GetDb().Model(&model.SubscriptionItem{}).Where("id = ?", item.ID).Update("updated_at", time.Now().Add(-time.Hour)).Error; err != nil {
+		t.Fatalf("age item: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "delivery", "episode.mkv"), []byte("done"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	recovered, err := RecoverStaleStandaloneTransfers(context.Background(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+	got, err := db.GetSubscriptionItem(4, item.SourceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.SubscriptionItemStatusTransferred {
+		t.Fatalf("status = %q, want transferred", got.Status)
+	}
+}
+
+func TestRecoverStaleStandaloneTransferResetsMissingTargetToPending(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	root := t.TempDir()
+	mountPath := "/" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	if _, err := op.CreateStorage(context.Background(), model.Storage{
+		Driver:    "Local",
+		MountPath: mountPath,
+		Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, root),
+	}); err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	item, _, err := db.UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: 5,
+		SourceKey:      "stale-missing-target",
+		FileHash:       "stale-hash-2",
+		FileName:       "episode.mkv",
+		TargetDir:      mountPath + "/missing/delivery",
+		TargetName:     "episode.mkv",
+		TargetPath:     mountPath + "/missing/delivery/episode.mkv",
+		Status:         model.SubscriptionItemStatusTransferring,
+	})
+	if err != nil {
+		t.Fatalf("upsert item: %v", err)
+	}
+	if err := db.GetDb().Model(&model.SubscriptionItem{}).Where("id = ?", item.ID).Update("updated_at", time.Now().Add(-time.Hour)).Error; err != nil {
+		t.Fatalf("age item: %v", err)
+	}
+
+	recovered, err := RecoverStaleStandaloneTransfers(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+	got, err := db.GetSubscriptionItem(5, item.SourceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.SubscriptionItemStatusPending || got.LastError == "" {
+		t.Fatalf("item = %#v, want pending with recovery reason", got)
 	}
 }
 

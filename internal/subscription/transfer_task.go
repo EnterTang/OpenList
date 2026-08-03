@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	stdpath "path"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -16,6 +17,100 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
+
+const standaloneTransferRecoveryAge = 5 * time.Minute
+
+func RecoverStaleStandaloneTransfers(ctx context.Context, subscriptionID uint) (int, error) {
+	var items []model.SubscriptionItem
+	var err error
+	if subscriptionID > 0 {
+		items, err = db.ListSubscriptionItems(subscriptionID)
+	} else {
+		subscriptions, listErr := db.ListActiveSubscriptions()
+		if listErr != nil {
+			return 0, listErr
+		}
+		ids := make([]uint, 0, len(subscriptions))
+		for i := range subscriptions {
+			ids = append(ids, subscriptions[i].ID)
+		}
+		items, err = db.ListSubscriptionItemsBySubscriptionIDs(ids)
+	}
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-standaloneTransferRecoveryAge)
+	recovered := 0
+	for i := range items {
+		item := &items[i]
+		if item.Status != model.SubscriptionItemStatusTransferring || strings.TrimSpace(item.ClusterJobID) != "" || item.UpdatedAt.After(cutoff) {
+			continue
+		}
+		if standaloneMoveTaskIsActive(item) {
+			continue
+		}
+		exists, probeErr := standaloneTransferTargetExists(ctx, item)
+		if probeErr != nil {
+			logrus.WithError(probeErr).WithField("subscription_item_id", item.ID).Warn("skip stale standalone transfer recovery because target probe failed")
+			continue
+		}
+		if exists {
+			if err := persistStandaloneTerminalSubscriptionItem(item, model.SubscriptionItemStatusTransferred, ""); err != nil {
+				return recovered, err
+			}
+		} else {
+			changed, err := db.ResetStandaloneSubscriptionTransfer(item, "standalone transfer was recovered after restart; retry is required")
+			if err != nil {
+				return recovered, err
+			}
+			if !changed {
+				continue
+			}
+		}
+		recovered++
+	}
+	return recovered, nil
+}
+
+func standaloneMoveTaskIsActive(item *model.SubscriptionItem) bool {
+	if item == nil || fs.MoveTaskManager == nil {
+		return false
+	}
+	sourcePath := utils.FixAndCleanPath(item.SourcePath)
+	targetDir := utils.FixAndCleanPath(item.TargetDir)
+	for _, task := range fs.MoveTaskManager.GetAll() {
+		if task == nil || task.ClusterBinding != nil {
+			continue
+		}
+		taskSourcePath := utils.FixAndCleanPath(stdpath.Join(task.SrcStorageMp, task.SrcActualPath))
+		taskTargetDir := utils.FixAndCleanPath(stdpath.Join(task.DstStorageMp, task.DstActualPath))
+		if sourcePath != "" && sourcePath == taskSourcePath && targetDir == taskTargetDir {
+			return true
+		}
+	}
+	return false
+}
+
+func standaloneTransferTargetExists(ctx context.Context, item *model.SubscriptionItem) (bool, error) {
+	if item == nil {
+		return false, nil
+	}
+	if targetPath := strings.TrimSpace(item.TargetPath); targetPath != "" {
+		obj, err := fs.Get(ctx, targetPath, &fs.GetArgs{NoLog: true})
+		if err == nil && obj != nil && !obj.IsDir() {
+			return true, nil
+		}
+		if err != nil && !errs.IsObjectNotFound(err) {
+			return false, err
+		}
+	}
+	payload := TransferFinalizePayload{
+		TargetDir:  item.TargetDir,
+		FileName:   item.FileName,
+		TargetName: item.TargetName,
+	}
+	return generatedETFExists(ctx, payload), nil
+}
 
 type TransferFinalizePayload = task_group.TransferFinalizePayload
 

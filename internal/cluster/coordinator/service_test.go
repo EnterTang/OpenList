@@ -90,6 +90,62 @@ func TestUploadManifestIsPersistedBeforeAcceptedAck(t *testing.T) {
 	}
 }
 
+func TestRequeueNodeAttemptsImmediatelyReleasesRestartedWorkerJobs(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	ctx := testTaskContext()
+	ctxHash, err := protocol.HashTaskContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(ctx, ctxHash, model.ClusterAttemptStatusRunning)
+	job.ID = "restart-job"
+	job.IdempotencyKey = job.ID
+	attempt.ID = "restart-attempt"
+	attempt.JobID = job.ID
+	attempt.NodeID = "restarted-worker"
+	job.CurrentAttemptID = attempt.ID
+	job.AssignedNodeID = attempt.NodeID
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	stage := testUploadStage(attempt)
+	stage.ID = "restart-stage"
+	stage.Status = model.ClusterStageStatusRunning
+	if err := database.Create(stage).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	requeued, err := New(database, "token").RequeueNodeAttempts(context.Background(), attempt.NodeID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 1 {
+		t.Fatalf("requeued = %d, want 1", requeued)
+	}
+
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusQueued || job.AssignedNodeID != "" || job.CurrentAttemptID != "" {
+		t.Fatalf("job after recovery = %#v, want queued without assignment", job)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != model.ClusterAttemptStatusLost || attempt.ErrorCode != "worker_restarted" {
+		t.Fatalf("attempt after recovery = %#v, want lost worker_restarted", attempt)
+	}
+	if err := database.First(stage, "id = ?", stage.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusFailed || stage.ErrorCode != "worker_restarted" {
+		t.Fatalf("stage after recovery = %#v, want failed worker_restarted", stage)
+	}
+}
+
 func TestAuthenticateRequiresTokenAndRejectsDisabledNode(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	hello := protocol.Hello{NodeID: "worker-1", EnrollmentToken: "secret"}

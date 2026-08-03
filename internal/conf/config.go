@@ -249,9 +249,9 @@ func DefaultConfig(dataDir string) *Config {
 				// TaskPersistant: true,
 			},
 			Move: TaskConfig{
-				Workers:  5,
-				MaxRetry: 2,
-				// TaskPersistant: true,
+				Workers:        5,
+				MaxRetry:       2,
+				TaskPersistant: true,
 			},
 			Decompress: TaskConfig{
 				Workers:  5,

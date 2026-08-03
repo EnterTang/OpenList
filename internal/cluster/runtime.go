@@ -204,6 +204,18 @@ func (r *Runtime) Start() error {
 			r.stopLocked()
 			return fmt.Errorf("reconcile stale cluster sessions: %w", err)
 		}
+		if r.role.RunsWorker() {
+			if nodeID := strings.TrimSpace(conf.Conf.Cluster.NodeID); nodeID != "" {
+				requeued, err := service.RequeueNodeAttempts(runtimeCtx, nodeID, time.Now().UTC())
+				if err != nil {
+					r.stopLocked()
+					return fmt.Errorf("requeue restarted worker attempts: %w", err)
+				}
+				if requeued > 0 {
+					log.Warnf("requeued %d cluster attempt(s) left by restarted worker %s", requeued, nodeID)
+				}
+			}
+		}
 		service.SetShareInspectConsumer(consumeSubscriptionShareInspect)
 		r.coordinatorService = service
 		r.hub = transport.NewHub(transport.HubOptions{

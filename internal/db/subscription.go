@@ -159,6 +159,46 @@ func ResetFailedSubscriptionItems(ctx context.Context, subscriptionID uint) (int
 	return int(reset), errors.WithStack(err)
 }
 
+// ResetStandaloneSubscriptionTransfer moves an orphaned native transfer back
+// to pending, but only if its identity still matches the stale snapshot. This
+// prevents a late task callback from overwriting a newer item or a cluster
+// transfer that has since claimed the same source.
+func ResetStandaloneSubscriptionTransfer(item *model.SubscriptionItem, reason string) (bool, error) {
+	if item == nil || item.ID == 0 {
+		return false, errors.New("subscription item is required")
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "standalone transfer was recovered after restart"
+	}
+	var changed bool
+	err := db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.SubscriptionItem{}).Where(
+			columnName("id")+" = ? AND "+columnName("subscription_id")+" = ? AND "+columnName("source_key")+" = ? AND "+columnName("file_hash")+" = ? AND "+columnName("status")+" = ? AND ("+columnName("cluster_job_id")+" = '' OR "+columnName("cluster_job_id")+" IS NULL)",
+			item.ID, item.SubscriptionID, item.SourceKey, item.FileHash, model.SubscriptionItemStatusTransferring,
+		).Updates(map[string]any{
+			"status":         model.SubscriptionItemStatusPending,
+			"cluster_job_id": "",
+			"last_error":     reason,
+			"updated_at":     time.Now(),
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		changed = true
+		return tx.Model(&model.SubscriptionEpisodeSource{}).Where(
+			columnName("source_item_id")+" = ? AND "+columnName("file_hash")+" = ? AND ("+columnName("cluster_job_id")+" = '' OR "+columnName("cluster_job_id")+" IS NULL)", item.ID, item.FileHash,
+		).Updates(map[string]any{
+			"status":         model.SubscriptionItemStatusPending,
+			"cluster_job_id": "",
+			"updated_at":     time.Now(),
+		}).Error
+	})
+	return changed, errors.WithStack(err)
+}
+
 func ListSubscriptions(filter SubscriptionFilter) ([]model.Subscription, int64, error) {
 	query := subscriptionListQuery(filter)
 	var total int64

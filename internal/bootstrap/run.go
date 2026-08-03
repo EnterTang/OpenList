@@ -96,6 +96,11 @@ func Start() {
 	LoadStorages()
 	InitTaskManager()
 	subscription.RegisterTransferTaskHooks()
+	if recovered, err := subscription.RecoverStaleStandaloneTransfers(context.Background(), 0); err != nil {
+		log.Errorf("recover stale standalone subscription transfers: %v", err)
+	} else if recovered > 0 {
+		log.Infof("recovered %d stale standalone subscription transfer(s)", recovered)
+	}
 	clusterRole := cluster.ParseRole(conf.Conf.Cluster.Role)
 	clusterReady := true
 	if err := cluster.Start(); err != nil {
