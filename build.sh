@@ -101,6 +101,61 @@ ldflags="\
 -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=$webVersion' \
 "
 
+# Generate Windows resource (.syso) with version info and application manifest.
+# This embeds version metadata and a trustInfo manifest into the .exe, which
+# helps Windows application control policies (Smart App Control, AppLocker)
+# identify the binary and reduces false-positive blocks.
+GenerateWindowsResource() {
+  if [ ! -f resource/windows.syso ]; then
+    echo "generating Windows resource (.syso) with manifest and version info"
+    if ! command -v rsrc >/dev/null 2>&1; then
+      go install github.com/akavel/rsrc@latest >/dev/null 2>&1
+    fi
+    # Parse version (e.g. v3.25.0 → 3,25,0,0) for Windows VS_VERSION_INFO
+    ver_major=$(echo "$version" | sed 's/^v//' | cut -d. -f1)
+    ver_minor=$(echo "$version" | sed 's/^v//' | cut -d. -f2)
+    ver_patch=$(echo "$version" | sed 's/^v//' | cut -d. -f3)
+    ver_build=0
+    [ -z "$ver_major" ] && ver_major=0
+    [ -z "$ver_minor" ] && ver_minor=0
+    [ -z "$ver_patch" ] && ver_patch=0
+
+    cat > resource/versioninfo.json <<EOF
+{
+  "FixedInfo": {
+    "FileVersion":    { "Major": $ver_major, "Minor": $ver_minor, "Patch": $ver_patch, "Build": $ver_build },
+    "ProductVersion": { "Major": $ver_major, "Minor": $ver_minor, "Patch": $ver_patch, "Build": $ver_build },
+    "FileFlagsMask": "3f",
+    "FileFlags ": "00",
+    "FileOS": "04000",
+    "FileType": "01",
+    "FileSubType": "00",
+  },
+  "StringTable": {
+    "CompanyName":      "OpenListTeam",
+    "FileDescription":  "OpenList - File List Program",
+    "FileVersion":      "$ver_major.$ver_minor.$ver_patch.$ver_build",
+    "InternalName":     "openlist",
+    "LegalCopyright":   "MIT License",
+    "OriginalFilename": "openlist.exe",
+    "ProductName":      "OpenList",
+    "ProductVersion":   "$version"
+  },
+  "IconPath": "",
+  "ManifestPath": "resource/app.manifest"
+}
+EOF
+    rsrc -manifest resource/app.manifest -json resource/versioninfo.json -arch amd64 -o resource/windows.syso || {
+      echo "Warning: rsrc failed, building without Windows resource" >&2
+      rm -f resource/versioninfo.json
+      return 0
+    }
+    rm -f resource/versioninfo.json
+    # Copy .syso to project root so go build automatically links it
+    cp resource/windows.syso windows.syso
+  fi
+}
+
 # Keep sqlite driver tag selection centralized to avoid target drift.
 GetBuildTagsForTarget() {
   local target="$1"
@@ -237,6 +292,7 @@ FetchWebReleaseFromAPI() {
 
 BuildWinArm64() {
   echo building for windows-arm64
+  GenerateWindowsResource
   chmod +x ./wrapper/zcc-arm64
   chmod +x ./wrapper/zcxx-arm64
   export GOOS=windows
@@ -248,6 +304,7 @@ BuildWinArm64() {
 }
 
 BuildWin7() {
+  GenerateWindowsResource
   # Setup Win7 Go compiler (patched version that supports Windows 7)
   go_version=$(go version | grep -o 'go[0-9]\+\.[0-9]\+\.[0-9]\+' | sed 's/go//')
   echo "Detected Go version: $go_version"
@@ -438,6 +495,7 @@ BuildReleaseLinuxAmd64Musl() {
 BuildReleaseWindowsAmd64() {
   mkdir -p build
   echo building for windows-amd64
+  GenerateWindowsResource
   if UseXgoDocker; then
     xgo -targets=windows/amd64 -out "$appName" -ldflags="$ldflags" -tags=jsoniter .
     mv "$appName"-windows-amd64.exe build/

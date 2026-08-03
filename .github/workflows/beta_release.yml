@@ -123,6 +123,38 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FRONTEND_REPO: ${{ vars.FRONTEND_REPO }}
 
+      - name: Generate Windows resource
+        if: startsWith(matrix.target, 'windows')
+        run: |
+          go install github.com/akavel/rsrc@latest
+          mkdir -p resource
+          printf '%s\n' \
+            '{' \
+            '  "FixedInfo": {' \
+            '    "FileVersion":    { "Major": 0, "Minor": 0, "Patch": 0, "Build": 0 },' \
+            '    "ProductVersion": { "Major": 0, "Minor": 0, "Patch": 0, "Build": 0 },' \
+            '    "FileFlagsMask": "3f",' \
+            '    "FileFlags ": "00",' \
+            '    "FileOS": "04000",' \
+            '    "FileType": "01",' \
+            '    "FileSubType": "00",' \
+            '  },' \
+            '  "StringTable": {' \
+            '    "CompanyName":      "OpenListTeam",' \
+            '    "FileDescription":  "OpenList - File List Program",' \
+            '    "FileVersion":      "0.0.0.0",' \
+            '    "InternalName":     "openlist",' \
+            '    "LegalCopyright":   "MIT License",' \
+            '    "OriginalFilename": "openlist.exe",' \
+            '    "ProductName":      "OpenList",' \
+            '    "ProductVersion":   "beta"' \
+            '  },' \
+            '  "IconPath": "",' \
+            '  "ManifestPath": "resource/app.manifest"' \
+            '}' > resource/versioninfo.json
+          rsrc -manifest resource/app.manifest -json resource/versioninfo.json -arch amd64 -o windows.syso
+          rm -f resource/versioninfo.json
+
       - name: Build
         uses: OpenListTeam/cgo-actions@v1.2.5
         with:
