@@ -89,11 +89,11 @@ secret, and logs remain beneath `<data>/redis`.
 External, remote, and custom-ACL Redis configurations remain authoritative.
 The manager also reuses an existing compatible Redis service when it satisfies
 the configured authentication checks and, when `require_aof` is enabled, the
-durability checks. A Redis process started by OpenList binds only to loopback
-with protected mode enabled, uses `appendonly yes`, `appendfsync always`, and
-`maxmemory-policy noeviction`, and receives a generated password when none is
-configured. That generated password is not written to `config.json`. OpenList
-gracefully stops only a Redis child it owns (with a bounded forced-stop
+durability checks. A Redis process started by OpenList binds only to loopback,
+disables the default RDB schedule, uses `appendonly yes`, `appendfsync always`,
+and `maxmemory-policy noeviction`, and receives a generated password when none
+is configured. That generated password is not written to `config.json`.
+OpenList gracefully stops only a Redis child it owns (with a bounded forced-stop
 fallback); reused services are left running.
 
 The embedded runtime is the Redis 7.2.14 community Windows MSYS2 port. Its

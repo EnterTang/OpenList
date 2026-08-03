@@ -69,6 +69,7 @@ func TestRenderConfig(t *testing.T) {
 		"port 6380\n" +
 		"daemonize no\n" +
 		`dir "C:/OpenList/redis data"` + "\n" +
+		"save \"\"\n" +
 		"appendonly yes\n" +
 		"appendfsync always\n" +
 		"maxmemory-policy noeviction\n" +

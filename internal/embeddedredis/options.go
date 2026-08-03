@@ -82,6 +82,10 @@ func RenderConfig(port int, dataDir, password string) ([]byte, error) {
 		"port " + strconv.Itoa(port) + "\n" +
 		"daemonize no\n" +
 		"dir " + quotedDir + "\n" +
+		// Cluster result and cleanup streams are persisted through AOF. Disable
+		// Redis' default RDB schedule so a failed snapshot cannot block writes
+		// that are already covered by the required AOF durability policy.
+		"save \"\"\n" +
 		"appendonly yes\n" +
 		"appendfsync always\n" +
 		"maxmemory-policy noeviction\n" +
