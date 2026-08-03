@@ -14,6 +14,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
 	"github.com/OpenListTeam/tache"
 	"github.com/stretchr/testify/require"
@@ -613,19 +614,61 @@ func TestDefaultMediaConcurrencyUsesConfiguredMoveWorkers(t *testing.T) {
 	original := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())
 	conf.Conf.Tasks.Move.Workers = 5
-	t.Cleanup(func() { conf.Conf = original })
+	op.Cache.SetSetting(conf.TaskMoveThreadsNum, &model.SettingItem{Key: conf.TaskMoveThreadsNum, Value: "5"})
+	t.Cleanup(func() {
+		op.Cache.ClearAll()
+		conf.Conf = original
+	})
 	if got := defaultMediaConcurrency(); got != 5 {
 		t.Fatalf("default media concurrency = %d, want 5", got)
 	}
 }
 
-func TestEffectiveMediaConcurrencyReservesInspectSlots(t *testing.T) {
+func TestEffectiveMediaConcurrencyUsesDynamicMoveSettingAsFinalLimit(t *testing.T) {
 	original := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())
 	conf.Conf.Tasks.Move.Workers = 5
-	t.Cleanup(func() { conf.Conf = original })
-	if got := effectiveMediaConcurrency(); got != 3 {
-		t.Fatalf("effective media concurrency = %d, want 3", got)
+	op.Cache.SetSetting(conf.TaskMoveThreadsNum, &model.SettingItem{Key: conf.TaskMoveThreadsNum, Value: "10"})
+	t.Cleanup(func() {
+		op.Cache.ClearAll()
+		conf.Conf = original
+	})
+	if got := effectiveMediaConcurrency(); got != 10 {
+		t.Fatalf("effective media concurrency = %d, want 10", got)
+	}
+}
+
+func TestMediaCapacityRefreshesDynamicMoveSetting(t *testing.T) {
+	original := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	conf.Conf.Tasks.Move.Workers = 5
+	op.Cache.SetSetting(conf.TaskMoveThreadsNum, &model.SettingItem{Key: conf.TaskMoveThreadsNum, Value: "5"})
+	service := New(nil, nil)
+	op.Cache.SetSetting(conf.TaskMoveThreadsNum, &model.SettingItem{Key: conf.TaskMoveThreadsNum, Value: "10"})
+	t.Cleanup(func() {
+		op.Cache.ClearAll()
+		conf.Conf = original
+	})
+
+	releaseDownload, err := service.acquireDownloadCapacity(context.Background())
+	if err != nil {
+		t.Fatalf("acquire download capacity: %v", err)
+	}
+	releaseDownload()
+	releaseUpload, err := service.acquireUploadCapacity(context.Background())
+	if err != nil {
+		t.Fatalf("acquire upload capacity: %v", err)
+	}
+	releaseUpload()
+
+	service.downloadGate.mu.Lock()
+	downloadLimit := service.downloadGate.limit
+	service.downloadGate.mu.Unlock()
+	service.uploadGate.mu.Lock()
+	uploadLimit := service.uploadGate.limit
+	service.uploadGate.mu.Unlock()
+	if downloadLimit != 10 || uploadLimit != 10 {
+		t.Fatalf("media capacity limits = download:%d upload:%d, want both 10", downloadLimit, uploadLimit)
 	}
 }
 

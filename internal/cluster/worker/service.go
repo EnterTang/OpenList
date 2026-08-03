@@ -17,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/secure"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/transport"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
@@ -130,17 +131,8 @@ func New(queue resultQueue, sender Sender) *Service {
 	}
 }
 
-const inspectConcurrencyReserve = 2
-
-func inspectConcurrencyReserveSlots() int {
-	if inspectConcurrencyReserve < 0 {
-		return 0
-	}
-	return inspectConcurrencyReserve
-}
-
 func effectiveMediaConcurrency() int {
-	limit := defaultMediaConcurrency() - inspectConcurrencyReserveSlots()
+	limit := defaultMediaConcurrency()
 	if limit < 1 {
 		return 1
 	}
@@ -148,10 +140,17 @@ func effectiveMediaConcurrency() int {
 }
 
 func defaultMediaConcurrency() int {
+	defaultWorkers := 5
 	if conf.Conf != nil && conf.Conf.Tasks.Move.Workers > 0 {
-		return conf.Conf.Tasks.Move.Workers
+		defaultWorkers = conf.Conf.Tasks.Move.Workers
 	}
-	return 5
+	if conf.Conf == nil {
+		return defaultWorkers
+	}
+	if _, cached := op.Cache.GetSetting(conf.TaskMoveThreadsNum); !cached && db.GetDb() == nil {
+		return defaultWorkers
+	}
+	return setting.GetInt(conf.TaskMoveThreadsNum, defaultWorkers)
 }
 
 // EnqueueUploadResult is the deletion barrier for Worker media. Callers may

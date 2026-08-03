@@ -462,9 +462,22 @@ func safeControlError(err error) string {
 }
 
 func (s *Service) acquireDownloadCapacity(ctx context.Context) (func(), error) {
+	s.refreshDefaultMediaConcurrency()
 	return s.downloadGate.Acquire(ctx)
 }
 
 func (s *Service) acquireUploadCapacity(ctx context.Context) (func(), error) {
+	s.refreshDefaultMediaConcurrency()
 	return s.uploadGate.Acquire(ctx)
+}
+
+func (s *Service) refreshDefaultMediaConcurrency() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.desiredConfig.DownloadConcurrency == 0 {
+		s.downloadGate.SetLimit(effectiveMediaConcurrency())
+	}
+	if s.desiredConfig.UploadConcurrency == 0 {
+		s.uploadGate.SetLimit(effectiveMediaConcurrency())
+	}
 }
