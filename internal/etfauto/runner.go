@@ -2,6 +2,7 @@ package etfauto
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -144,9 +145,38 @@ func runJob(ctx context.Context, job *model.ETFSubscriptionJob, opts RunnerOptio
 		return runCreateSubscriptionJob(ctx, job, opts)
 	case model.ETFSubscriptionJobTypeManualCheck:
 		return runManualCheckJob(ctx, job, opts)
+	case model.ETFSubscriptionJobTypeDirectImport:
+		return runDirectImportJob(ctx, job, opts)
 	default:
 		return markJobFailed(ctx, job.ID, fmt.Errorf("unsupported etf subscription job type %q", job.Type), opts)
 	}
+}
+
+func runDirectImportJob(ctx context.Context, job *model.ETFSubscriptionJob, opts RunnerOptions) error {
+	var payload RapidJSONArchivePayload
+	if err := json.Unmarshal([]byte(job.RequestPayloadJSON), &payload); err != nil {
+		return markJobFailed(ctx, job.ID, err, opts)
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+	client := NewTargetClient(job.TargetBaseURL, job.TargetAPIToken, opts.HTTPClient, opts.Timeout)
+	response, err := client.CreateRapidJSONArchive(timeoutCtx, payload)
+	if err != nil {
+		if IsDeliveryUncertain(err) && !job.TargetSupportsIdempotency {
+			return markJobUnknown(ctx, job.ID, err)
+		}
+		return markJobFailed(ctx, job.ID, err, opts)
+	}
+	var accepted struct {
+		ID     string `json:"id"`
+		TaskID string `json:"task_id"`
+	}
+	_ = json.Unmarshal([]byte(response), &accepted)
+	taskID := accepted.ID
+	if taskID == "" {
+		taskID = accepted.TaskID
+	}
+	return markDirectImportSucceeded(ctx, job.ID, taskID, response)
 }
 
 func runCreateSubscriptionJob(ctx context.Context, job *model.ETFSubscriptionJob, opts RunnerOptions) error {
@@ -346,6 +376,23 @@ func markManualCheckSucceeded(ctx context.Context, jobID uint, result *TargetTas
 			return err
 		}
 		if err := tx.Save(&root).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusSucceeded)
+	})
+}
+
+func markDirectImportSucceeded(ctx context.Context, jobID uint, taskID, response string) error {
+	return db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job model.ETFSubscriptionJob
+		if err := tx.First(&job, jobID).Error; err != nil {
+			return err
+		}
+		job.Status = model.ETFSubscriptionJobStatusSucceeded
+		job.TargetTaskID = taskID
+		job.ResponseJSON = response
+		job.LastError = ""
+		if err := tx.Save(&job).Error; err != nil {
 			return err
 		}
 		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusSucceeded)

@@ -22,6 +22,8 @@ import (
 
 type Config struct {
 	Enabled                   bool
+	ShareNotificationEnabled  bool
+	DirectImportEnabled       bool
 	TargetBaseURL             string
 	TargetAPIToken            string
 	TargetSupportsIdempotency bool
@@ -367,28 +369,41 @@ func closeBatch(ctx context.Context, batch *model.ETFMediaRootBatch) error {
 		batch.FingerprintAfterBatch = fingerprint
 		root.CurrentFingerprint = fingerprint
 		if batch.MediaRootCreated {
-			job := &model.ETFSubscriptionJob{
-				JobKey:                    "create:" + root.RootKey,
-				MediaRootID:               root.ID,
-				BatchID:                   batch.ID,
-				Type:                      model.ETFSubscriptionJobTypeCreate,
-				Status:                    model.ETFSubscriptionJobStatusPending,
-				TargetBaseURL:             root.TargetBaseURL,
-				TargetAPIToken:            root.TargetAPIToken,
-				TargetSupportsIdempotency: root.TargetSupportsIdempotency,
-				ShareType:                 normalizeShareType(root.ShareType),
-				Fingerprint:               fingerprint,
-				ClusterJobIDsJSON:         batch.ClusterJobIDsJSON,
+			if root.ShareNotificationEnabled {
+				job := &model.ETFSubscriptionJob{
+					JobKey:                    "create:" + root.RootKey,
+					MediaRootID:               root.ID,
+					BatchID:                   batch.ID,
+					Type:                      model.ETFSubscriptionJobTypeCreate,
+					Status:                    model.ETFSubscriptionJobStatusPending,
+					TargetBaseURL:             root.TargetBaseURL,
+					TargetAPIToken:            root.TargetAPIToken,
+					TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+					DirectImportEnabled:       root.DirectImportEnabled,
+					ShareType:                 normalizeShareType(root.ShareType),
+					Fingerprint:               fingerprint,
+					ClusterJobIDsJSON:         batch.ClusterJobIDsJSON,
+				}
+				if _, err := createOrMergeSubscriptionJobTx(tx, job); err != nil {
+					return err
+				}
 			}
-			if _, err := createOrMergeSubscriptionJobTx(tx, job); err != nil {
-				return err
+			if root.DirectImportEnabled {
+				if err := queueDirectImportJobTx(tx, &root, batch); err != nil {
+					return err
+				}
 			}
 		} else {
 			dirtySince := batch.FirstEventAt
 			root.DirtySince = &dirtySince
 			root.PendingChangeCount += batch.ETFCount
 			root.Status = model.ETFMediaRootStatusDirty
-			if root.TargetSubscriptionID > 0 {
+			if root.DirectImportEnabled {
+				if err := queueDirectImportJobTx(tx, &root, batch); err != nil {
+					return err
+				}
+			}
+			if root.ShareNotificationEnabled && root.TargetSubscriptionID > 0 {
 				if fingerprint == root.LastNotifiedFingerprint {
 					root.PendingChangeCount -= batch.ETFCount
 					if root.PendingChangeCount < 0 {
@@ -648,6 +663,8 @@ func upsertMediaRoot(ctx context.Context, event ArchiveEvent, cfg Config) (*mode
 		TargetBaseURL:             strings.TrimRight(strings.TrimSpace(cfg.TargetBaseURL), "/"),
 		TargetAPIToken:            strings.TrimSpace(cfg.TargetAPIToken),
 		TargetSupportsIdempotency: cfg.TargetSupportsIdempotency,
+		ShareNotificationEnabled:  cfg.ShareNotificationEnabled,
+		DirectImportEnabled:       cfg.DirectImportEnabled,
 		ShareType:                 normalizeShareType(cfg.ShareType),
 		SharePeriodUnit:           cfg.SharePeriodUnit,
 		Status:                    model.ETFMediaRootStatusCollecting,
@@ -668,6 +685,8 @@ func upsertMediaRoot(ctx context.Context, event ArchiveEvent, cfg Config) (*mode
 			"target_base_url":             root.TargetBaseURL,
 			"target_api_token":            root.TargetAPIToken,
 			"target_supports_idempotency": root.TargetSupportsIdempotency,
+			"share_notification_enabled":  root.ShareNotificationEnabled,
+			"direct_import_enabled":       root.DirectImportEnabled,
 			"share_type":                  root.ShareType,
 			"share_period_unit":           root.SharePeriodUnit,
 			"updated_at":                  time.Now(),
@@ -702,6 +721,17 @@ func upsertCollectingBatch(ctx context.Context, root *model.ETFMediaRoot, event 
 		}
 	}
 	batch.ETFCount++
+	if cfg.DirectImportEnabled {
+		payload, err := RapidJSONPayloadFromRecord(event.Record)
+		if err != nil {
+			return nil, err
+		}
+		items, err := appendRapidImportPayload(batch.DirectImportItemsJSON, payload)
+		if err != nil {
+			return nil, err
+		}
+		batch.DirectImportItemsJSON = items
+	}
 	batch.LastEventAt = event.OccurredAt
 	batch.QuietUntil = event.OccurredAt.Add(cfg.QuietWindow)
 	batch.MediaRootCreated = batch.MediaRootCreated || event.MediaRootCreated
@@ -736,6 +766,54 @@ func mergeClusterJobIDs(raw, id string) (string, error) {
 		additional = string(encoded)
 	}
 	return mergeClusterJobIDJSON(raw, additional)
+}
+
+func appendRapidImportPayload(raw string, payload RapidJSONArchivePayload) (string, error) {
+	var payloads []RapidJSONArchivePayload
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &payloads); err != nil {
+			return "", err
+		}
+	}
+	payloads = append(payloads, payload)
+	merged, err := MergeRapidJSONPayloads(payloads)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal([]RapidJSONArchivePayload{merged})
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func queueDirectImportJobTx(tx *gorm.DB, root *model.ETFMediaRoot, batch *model.ETFMediaRootBatch) error {
+	if root == nil || batch == nil || strings.TrimSpace(batch.DirectImportItemsJSON) == "" {
+		return nil
+	}
+	var payloads []RapidJSONArchivePayload
+	if err := json.Unmarshal([]byte(batch.DirectImportItemsJSON), &payloads); err != nil {
+		return err
+	}
+	if len(payloads) != 1 {
+		return errors.New("invalid direct import payload")
+	}
+	payload, err := json.Marshal(payloads[0])
+	if err != nil {
+		return err
+	}
+	job := &model.ETFSubscriptionJob{
+		JobKey:      "direct-import:" + batch.BatchKey,
+		MediaRootID: root.ID, BatchID: batch.ID,
+		Type:          model.ETFSubscriptionJobTypeDirectImport,
+		Status:        model.ETFSubscriptionJobStatusPending,
+		TargetBaseURL: root.TargetBaseURL, TargetAPIToken: root.TargetAPIToken,
+		TargetSupportsIdempotency: root.TargetSupportsIdempotency,
+		DirectImportEnabled:       true, RequestPayloadJSON: string(payload),
+		Fingerprint: batch.FingerprintAfterBatch, ClusterJobIDsJSON: batch.ClusterJobIDsJSON,
+	}
+	_, err = createOrMergeSubscriptionJobTx(tx, job)
+	return err
 }
 
 func mergeClusterJobIDJSON(values ...string) (string, error) {
@@ -1000,6 +1078,11 @@ func MediaRootKey(storageMountPath, mediaRootPath, mediaType string, tmdbID int6
 }
 
 func normalizeConfig(cfg Config) Config {
+	// Config values created before the independent direct-import switch existed
+	// represent the original share-notification behavior.
+	if !cfg.ShareNotificationEnabled && !cfg.DirectImportEnabled {
+		cfg.ShareNotificationEnabled = true
+	}
 	if cfg.QuietWindow <= 0 {
 		cfg.QuietWindow = 30 * time.Second
 	}

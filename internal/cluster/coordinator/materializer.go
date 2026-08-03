@@ -172,6 +172,7 @@ func resolveClusterMaterializationSettings(configuredRoot string) (string, etfau
 		QuietWindow:               time.Duration(conf.Conf.Cluster.QuietWindowSecond) * time.Second,
 		SharePeriodUnit:           conf.Conf.Cluster.SharePeriodUnit,
 		ShareType:                 conf.Conf.Cluster.ShareType,
+		ShareNotificationEnabled:  true,
 	}
 	root, notification = mergeClusterMaterializationSettings(root, storage.GetStorage().MountPath, notification, settings)
 	return root, notification, nil
@@ -192,6 +193,8 @@ func mergeClusterMaterializationSettings(root, mountPath string, notification et
 			QuietWindow:               time.Duration(settings.QuietWindowSeconds) * time.Second,
 			SharePeriodUnit:           settings.SharePeriodUnit,
 			ShareType:                 settings.ShareType,
+			ShareNotificationEnabled:  settings.AutoSubscriptionEnabled,
+			DirectImportEnabled:       settings.DirectImportEnabled,
 		}
 	}
 	return root, notification

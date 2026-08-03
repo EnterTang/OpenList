@@ -2,14 +2,25 @@ package handles
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfauto"
+	"github.com/OpenListTeam/OpenList/v4/internal/etfmeta"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/tmdb"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 )
@@ -41,6 +52,140 @@ type listETFArchiveRecordsReq struct {
 type correctETFArchiveRecordReq struct {
 	ID uint `json:"id" binding:"required"`
 	model.ETFArchiveCorrection
+}
+
+type directImportETFReq struct {
+	Path string `json:"path" binding:"required"`
+}
+
+func DirectImportETF(c *gin.Context) {
+	var req directImportETFReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	if !etfmeta.IsName(req.Path) {
+		common.ErrorStrResp(c, "selected file is not an ETF file", http.StatusBadRequest)
+		return
+	}
+	storage, actualPath, err := op.GetStorageAndActualPath(req.Path)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	provider, ok := storage.(driver.ETFArchiveSettingsProvider)
+	if !ok {
+		common.ErrorStrResp(c, "storage does not support ETF direct import", http.StatusBadRequest)
+		return
+	}
+	settings := provider.ETFArchiveSettings()
+	if !settings.DirectImportEnabled {
+		common.ErrorStrResp(c, "ETF direct import is disabled", http.StatusBadRequest)
+		return
+	}
+	obj, err := fs.Get(c.Request.Context(), req.Path, &fs.GetArgs{NoLog: true})
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	if obj.IsDir() {
+		common.ErrorStrResp(c, "selected path is a directory", http.StatusBadRequest)
+		return
+	}
+	content, err := readETFObject(c, req.Path, obj)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	infos, err := etfmeta.DecodeAll(content)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	archiveRecord, _ := db.FindETFArchiveRecordByETFPath(req.Path)
+	payload, err := directImportPayload(req.Path, infos, archiveRecord)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	client := etfauto.NewTargetClient(settings.TargetBaseURL, settings.TargetAPIToken, nil, 30*time.Second)
+	response, err := client.CreateRapidJSONArchive(c.Request.Context(), payload)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadGateway)
+		return
+	}
+	common.SuccessResp(c, gin.H{"message": "direct import submitted", "response": response, "path": req.Path, "actual_path": actualPath})
+}
+
+func readETFObject(c *gin.Context, reqPath string, obj model.Obj) ([]byte, error) {
+	link, _, err := fs.Link(c.Request.Context(), reqPath, model.LinkArgs{Header: c.Request.Header, Redirect: true})
+	if err != nil {
+		return nil, err
+	}
+	defer link.Close()
+	if link.RangeReader != nil && link.URL == "" {
+		reader, err := link.RangeReader.RangeRead(c.Request.Context(), http_range.Range{Start: 0, Length: obj.GetSize()})
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+		return io.ReadAll(io.LimitReader(reader, 64*1024*1024))
+	}
+	request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, link.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	for key, values := range link.Header {
+		for _, value := range values {
+			request.Header.Add(key, value)
+		}
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("read ETF returned HTTP %d", response.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(response.Body, 64*1024*1024))
+}
+
+func directImportPayload(filePath string, infos []etfmeta.Info, record *model.ETFArchiveRecord) (etfauto.RapidJSONArchivePayload, error) {
+	if len(infos) == 0 {
+		return etfauto.RapidJSONArchivePayload{}, fmt.Errorf("ETF file has no metadata records")
+	}
+	pathValue := path.Clean(filePath)
+	recognized := recognize.Recognize(path.Base(pathValue), path.Dir(pathValue))
+	if record != nil && record.TMDBID > 0 {
+		recognized.TMDBID = record.TMDBID
+		recognized.Title = record.TMDBName
+		recognized.MediaTypeHint = record.MediaType
+	}
+	if recognized.TMDBID <= 0 {
+		return etfauto.RapidJSONArchivePayload{}, fmt.Errorf("TMDB ID not found in ETF path")
+	}
+	mediaType := recognized.MediaTypeHint
+	if mediaType != "tv" && mediaType != "movie" {
+		mediaType = "movie"
+	}
+	payload := etfauto.RapidJSONArchivePayload{TMDBID: recognized.TMDBID, MediaType: mediaType, Title: recognized.Title}
+	for _, info := range infos {
+		item := etfauto.RapidJSONArchiveItem{FileName: info.Name, FilePath: info.Name, FileSize: info.Size, SHA256: info.SHA256}
+		if mediaType == "tv" {
+			itemRecognized := recognize.Recognize(info.Name, path.Dir(pathValue))
+			item.Season, item.Episode = intPtr(itemRecognized.Season), intPtr(itemRecognized.Episode)
+		}
+		payload.Items = append(payload.Items, item)
+	}
+	return payload, nil
+}
+
+func intPtr(value int) *int {
+	if value <= 0 {
+		return nil
+	}
+	return &value
 }
 
 func ListETFArchiveRecords(c *gin.Context) {

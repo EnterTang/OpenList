@@ -13,8 +13,9 @@ const (
 	ETFMediaRootBatchReasonInitialCreate  = "initial_create"
 	ETFMediaRootBatchReasonContentChanged = "content_changed"
 
-	ETFSubscriptionJobTypeCreate      = "create_subscription"
-	ETFSubscriptionJobTypeManualCheck = "manual_check"
+	ETFSubscriptionJobTypeCreate       = "create_subscription"
+	ETFSubscriptionJobTypeManualCheck  = "manual_check"
+	ETFSubscriptionJobTypeDirectImport = "direct_import"
 
 	ETFSubscriptionJobStatusPending    = "pending"
 	ETFSubscriptionJobStatusRunning    = "running"
@@ -44,6 +45,8 @@ type ETFMediaRoot struct {
 	TargetBaseURL             string     `json:"target_base_url"`
 	TargetAPIToken            string     `json:"target_api_token"`
 	TargetSupportsIdempotency bool       `json:"target_supports_idempotency"`
+	ShareNotificationEnabled  bool       `json:"share_notification_enabled"`
+	DirectImportEnabled       bool       `json:"direct_import_enabled"`
 	ShareType                 string     `json:"share_type"`
 	SharePeriodUnit           int        `json:"share_period_unit"`
 	MobileShareRecordID       uint       `json:"mobile_share_record_id" gorm:"index"`
@@ -75,6 +78,7 @@ type ETFMediaRootBatch struct {
 	MediaRootCreated      bool      `json:"media_root_created" gorm:"index"`
 	FingerprintAfterBatch string    `json:"fingerprint_after_batch" gorm:"index"`
 	ClusterJobIDsJSON     string    `json:"cluster_job_ids_json" gorm:"type:text"`
+	DirectImportItemsJSON string    `json:"direct_import_items_json" gorm:"type:text"`
 }
 
 type ETFSubscriptionJob struct {
@@ -89,6 +93,7 @@ type ETFSubscriptionJob struct {
 	TargetBaseURL             string     `json:"target_base_url"`
 	TargetAPIToken            string     `json:"target_api_token"`
 	TargetSupportsIdempotency bool       `json:"target_supports_idempotency"`
+	DirectImportEnabled       bool       `json:"direct_import_enabled"`
 	ShareType                 string     `json:"share_type"`
 	Attempts                  int        `json:"attempts"`
 	NextRetryAt               *time.Time `json:"next_retry_at" gorm:"index"`

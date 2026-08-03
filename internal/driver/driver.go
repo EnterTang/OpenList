@@ -32,6 +32,7 @@ type Meta interface {
 type ETFArchiveSettings struct {
 	RelativeRoot              string
 	AutoSubscriptionEnabled   bool
+	DirectImportEnabled       bool
 	TargetBaseURL             string
 	TargetAPIToken            string
 	TargetSupportsIdempotency bool

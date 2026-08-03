@@ -50,6 +50,7 @@ func (d *Yun139) ETFArchiveSettings() driver.ETFArchiveSettings {
 	return driver.ETFArchiveSettings{
 		RelativeRoot:              strings.Join(parts, "/"),
 		AutoSubscriptionEnabled:   d.Addition.ETFAutoSubscriptionEnabled,
+		DirectImportEnabled:       d.Addition.ETFAutoDirectImportEnabled,
 		TargetBaseURL:             strings.TrimRight(strings.TrimSpace(d.Addition.ETFAutoSubscriptionTargetBaseURL), "/"),
 		TargetAPIToken:            strings.TrimSpace(d.Addition.ETFAutoSubscriptionTargetAPIToken),
 		TargetSupportsIdempotency: d.Addition.ETFAutoSubscriptionTargetSupportsIdempotency,
@@ -483,7 +484,7 @@ func (d *Yun139) recordETFAutoSubscriptionEvent(ctx context.Context, record *mod
 	if record == nil || plan == nil || plan.meta == nil || plan.mediaRootDir == nil {
 		return
 	}
-	if !d.Addition.ETFAutoSubscriptionEnabled || strings.TrimSpace(d.Addition.ETFAutoSubscriptionTargetBaseURL) == "" {
+	if (!d.Addition.ETFAutoSubscriptionEnabled && !d.Addition.ETFAutoDirectImportEnabled) || strings.TrimSpace(d.Addition.ETFAutoSubscriptionTargetBaseURL) == "" {
 		return
 	}
 	quietSeconds := d.Addition.ETFAutoSubscriptionQuietSeconds
@@ -492,6 +493,8 @@ func (d *Yun139) recordETFAutoSubscriptionEvent(ctx context.Context, record *mod
 	}
 	cfg := etfauto.Config{
 		Enabled:                   true,
+		ShareNotificationEnabled:  d.Addition.ETFAutoSubscriptionEnabled,
+		DirectImportEnabled:       d.Addition.ETFAutoDirectImportEnabled,
 		TargetBaseURL:             d.Addition.ETFAutoSubscriptionTargetBaseURL,
 		TargetAPIToken:            d.Addition.ETFAutoSubscriptionTargetAPIToken,
 		TargetSupportsIdempotency: d.Addition.ETFAutoSubscriptionTargetSupportsIdempotency,

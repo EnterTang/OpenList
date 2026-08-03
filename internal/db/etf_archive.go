@@ -131,6 +131,19 @@ func FindETFArchiveRecordByFingerprint(storageMountPath, sourceSHA256, archiveET
 	return &record, nil
 }
 
+func FindETFArchiveRecordByETFPath(path string) (*model.ETFArchiveRecord, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var record model.ETFArchiveRecord
+	err := db.Where(columnName("local_etf_path")+" = ? OR "+columnName("archive_etf_path")+" = ?", path, path).First(&record).Error
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &record, nil
+}
+
 func ListETFArchiveRecords(filter ETFArchiveRecordFilter) ([]model.ETFArchiveRecord, int64, error) {
 	query := db.Model(&model.ETFArchiveRecord{})
 	if keyword := strings.TrimSpace(filter.Keyword); keyword != "" {

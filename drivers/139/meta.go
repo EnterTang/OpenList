@@ -34,7 +34,8 @@ type Addition struct {
 	ETFRootPath                                  string `json:"etf_root_path" label:"ETF 分类子目录" group:"ETF" collapsed:"true" help:"生成 .etf 文件时追加的固定子目录，可与媒体类型和二级分类目录一起使用。"`
 	ETFTempFolder                                string `json:"etf_temp_folder" label:"ETF 临时播放目录" group:"ETF" collapsed:"true" help:"通过 .etf 临时恢复播放文件的目录。空表示网盘根目录；/ 表示网盘根目录；temp 或 /temp 表示根目录下的 temp；/path1/path2 会按层级自动创建。"`
 	ETFExtAllowlist                              string `json:"etf_ext_allowlist" label:"ETF 文件后缀白名单" group:"ETF" collapsed:"true" help:"允许生成 .etf 的源文件后缀，使用逗号分隔；留空表示所有非 .etf 文件都允许。"`
-	ETFAutoSubscriptionEnabled                   bool   `json:"etf_auto_subscription_enabled" type:"bool" default:"false" label:"ETF 自动订阅" group:"ETF" collapsed:"true" help:"首次创建 ETF 媒体母目录后，自动创建移动云盘分享并通知目标服务创建订阅。"`
+	ETFAutoSubscriptionEnabled                   bool   `json:"etf_auto_subscription_enabled" type:"bool" default:"true" label:"创建分享链接并通知目标服务" group:"ETF" collapsed:"true" help:"ETF 生成后创建移动云盘分享，并通知目标服务创建或更新订阅。"`
+	ETFAutoDirectImportEnabled                   bool   `json:"etf_auto_direct_import_enabled" type:"bool" default:"true" label:"直接导入 ETF 秒传信息" group:"ETF" collapsed:"true" help:"ETF 生成后直接将秒传元数据导入目标服务，不创建分享链接。"`
 	ETFAutoSubscriptionTargetBaseURL             string `json:"etf_auto_subscription_target_base_url" label:"ETF 自动订阅目标地址" group:"ETF" collapsed:"true" help:"目标服务 pan139_fastlink API 地址，例如 http://localhost:8080/api/v1。"`
 	ETFAutoSubscriptionTargetAPIToken            string `json:"etf_auto_subscription_target_api_token" secret:"true" label:"ETF 自动订阅 API Token" group:"ETF" collapsed:"true" help:"调用 pan139_fastlink 公网 API 时通过 Authorization: Bearer <token> 携带，并自动使用 /subscriptions/manual 等公网路由。"`
 	ETFAutoSubscriptionTargetSupportsIdempotency bool   `json:"etf_auto_subscription_target_supports_idempotency" type:"bool" default:"false" label:"目标服务支持幂等键" group:"ETF" collapsed:"true" help:"仅在目标服务确认支持 Idempotency-Key 或可按该键查询结果时启用；启用后不确定响应可安全自动重试。"`
