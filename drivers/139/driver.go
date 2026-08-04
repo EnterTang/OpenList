@@ -630,13 +630,18 @@ func (d *Yun139) getPartSize(size int64) int64 {
 	} else {
 		partSize = 100 * utils.MB
 	}
-	if personalUploadPartCount(size, partSize) <= personalUploadPartInfoLimit {
+	if personalUploadPartCount(size, partSize) <= personalUploadURLBatchLimit {
 		return partSize
 	}
-	return (size + personalUploadPartInfoLimit - 1) / personalUploadPartInfoLimit
+	return (size + personalUploadURLBatchLimit - 1) / personalUploadURLBatchLimit
 }
 
-const personalUploadPartInfoLimit = 100
+const (
+	personalUploadURLBatchLimit         = 100
+	personalUploadBasePartSize          = 5 * utils.MB
+	personalUploadMaxConfiguredPartSize = 100 * utils.MB
+	personalUploadTargetPartCount       = 4000
+)
 
 func personalUploadPartCount(size, partSize int64) int64 {
 	if size <= 0 || partSize <= 0 {
@@ -653,7 +658,7 @@ func personalUploadPartCount(size, partSize int64) int64 {
 }
 
 func (d *Yun139) buildPersonalUploadPartInfos(size int64) []PartInfo {
-	partSize := d.getPartSize(size)
+	partSize := d.getPersonalNewPartSize(size)
 	partCount := personalUploadPartCount(size, partSize)
 	partInfos := make([]PartInfo, 0, partCount)
 	for i := int64(0); i < partCount; i++ {
@@ -668,6 +673,31 @@ func (d *Yun139) buildPersonalUploadPartInfos(size int64) []PartInfo {
 		})
 	}
 	return partInfos
+}
+
+func (d *Yun139) getPersonalNewPartSize(size int64) int64 {
+	// Match the desktop client's makeUploadSlice behavior: clamp the configured
+	// slice size to 5-100 MiB, then rebalance files that would use at least 4001
+	// slices to size/4000, rounded down to a 64-byte boundary. The rebalance is
+	// intentionally not clamped again; this is why very large files can exceed
+	// the configured 100 MiB value in the official client.
+	partSize := d.CustomUploadPartSize
+	if partSize == 0 {
+		partSize = personalUploadBasePartSize
+	}
+	if partSize < personalUploadBasePartSize {
+		partSize = personalUploadBasePartSize
+	}
+	if partSize > personalUploadMaxConfiguredPartSize {
+		partSize = personalUploadMaxConfiguredPartSize
+	}
+	if personalUploadPartCount(size, partSize) <= personalUploadTargetPartCount {
+		return partSize
+	}
+
+	partSize = size / personalUploadTargetPartCount
+	partSize -= partSize % 64
+	return partSize
 }
 
 func personalUploadNeedsPartUpload(resp PersonalUploadResp) bool {
@@ -723,7 +753,7 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 			"contentHashAlgorithm": "SHA256",
 			"contentType":          "application/octet-stream",
 			"parallelUpload":       false,
-			"partInfos":            partInfos,
+			"partInfos":            partInfos[:min(len(partInfos), personalUploadURLBatchLimit)],
 			"size":                 size,
 			"parentFileId":         dstDir.GetID(),
 			"name":                 stream.GetName(),
@@ -756,7 +786,7 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 			p := driver.NewProgress(size, up)
 
 			// 先上传前100个分片
-			firstBatchEnd := min(int64(personalUploadPartInfoLimit), int64(len(partInfos)))
+			firstBatchEnd := min(int64(personalUploadURLBatchLimit), int64(len(partInfos)))
 			err = d.uploadPersonalPartsWithRefresh(ctx, partInfos, resp.Data.PartInfos, stream, p, 1, firstBatchEnd, func(remaining []PartInfo) ([]PersonalPartInfo, error) {
 				return d.getPersonalUploadURLs(ctx, resp.Data.FileId, resp.Data.UploadId, remaining)
 			})
@@ -765,8 +795,8 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 			}
 
 			// 如果还有剩余分片，分批获取上传地址并上传
-			for i := 100; i < len(partInfos); i += 100 {
-				end := min(i+100, len(partInfos))
+			for i := personalUploadURLBatchLimit; i < len(partInfos); i += personalUploadURLBatchLimit {
+				end := min(i+personalUploadURLBatchLimit, len(partInfos))
 				batchPartInfos := partInfos[i:end]
 				moredata := base.Json{
 					"fileId":    resp.Data.FileId,

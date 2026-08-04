@@ -18,14 +18,17 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
-func TestPersonalNewUploadPartInfosCover500GiBWithinLimit(t *testing.T) {
-	const size = 500 * utils.GB
+func TestPersonalNewUploadPartInfosRebalancesAround4000Parts(t *testing.T) {
+	const size = 50 * utils.GB
 
 	d := &Yun139{}
 	partInfos := d.buildPersonalUploadPartInfos(size)
 
-	if len(partInfos) != personalUploadPartInfoLimit {
-		t.Fatalf("part count = %d, want %d", len(partInfos), personalUploadPartInfoLimit)
+	if len(partInfos) != personalUploadTargetPartCount+1 {
+		t.Fatalf("part count = %d, want %d", len(partInfos), personalUploadTargetPartCount+1)
+	}
+	if partInfos[0].PartSize != 13421760 {
+		t.Fatalf("part size = %d, want 13421760", partInfos[0].PartSize)
 	}
 
 	var total int64
@@ -40,6 +43,18 @@ func TestPersonalNewUploadPartInfosCover500GiBWithinLimit(t *testing.T) {
 	}
 	if total != size {
 		t.Fatalf("total part size = %d, want %d", total, size)
+	}
+}
+
+func TestPersonalNewUploadPartInfosTarget4000PartsFor500GiB(t *testing.T) {
+	const size = 500 * utils.GB
+
+	partInfos := (&Yun139{}).buildPersonalUploadPartInfos(size)
+	if len(partInfos) != personalUploadTargetPartCount {
+		t.Fatalf("part count = %d, want %d", len(partInfos), personalUploadTargetPartCount)
+	}
+	if partInfos[0].PartSize != 128*utils.MB {
+		t.Fatalf("part size = %d, want %d", partInfos[0].PartSize, 128*utils.MB)
 	}
 }
 
