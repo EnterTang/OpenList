@@ -121,7 +121,7 @@ func providerName(driver string) string {
 	switch strings.ToLower(strings.TrimSpace(driver)) {
 	case "aliyundriveopen", "aliyundrive":
 		return "aliyun_drive"
-	case "115 cloud", "115 open":
+	case "115 cloud", "115 open", "115 cd2":
 		return "pan115"
 	case "123pan", "123 open":
 		return "pan123"

@@ -71,6 +71,7 @@ func Init(e *gin.Engine) {
 	g.HEAD("/sad/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, handles.SharingArchiveExtract)
 
 	api := g.Group("/api")
+	api.GET("/115-cd2/oauth/callback", handles.CD2OAuthCallback)
 	auth := api.Group("", middlewares.Auth(false))
 	webauthn := api.Group("/authn", middlewares.Authn)
 

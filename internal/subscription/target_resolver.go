@@ -219,7 +219,7 @@ func providerAccountCandidateFromStorage(ctx context.Context, storage model.Stor
 		MaxSingleUploadBytes: maxUpload,
 		SupportsUpload:       supportsUpload,
 		SupportsDownload:     providerSupportsDownload(provider, storage.Driver),
-		SupportsShareSave:    providerSupportsShareSave(provider),
+		SupportsShareSave:    providerSupportsShareSave(provider, storage.Driver),
 		SupportsETF:          provider == "yidong139",
 		FreeBytes:            freeBytes,
 		HasFreeBytes:         hasFree,
@@ -323,10 +323,12 @@ func mobile139MaxSingleUploadBytes(tier string) int64 {
 	}
 }
 
-func providerSupportsShareSave(provider string) bool {
+func providerSupportsShareSave(provider, driverName string) bool {
 	switch provider {
-	case "quark", "aliyun_drive", "pan123", "pan115":
+	case "quark", "aliyun_drive", "pan123":
 		return true
+	case "pan115":
+		return strings.EqualFold(strings.TrimSpace(driverName), "115 cloud")
 	default:
 		return false
 	}
@@ -338,7 +340,7 @@ func providerSupportsDownload(provider, driverName string) bool {
 	case "pan123":
 		return driverName == "123pan" || driverName == "123 open"
 	case "pan115":
-		return driverName == "115 cloud" || driverName == "115 open"
+		return driverName == "115 cloud" || driverName == "115 open" || driverName == "115 cd2"
 	case "aliyun_drive":
 		return driverName == "aliyundrive" || driverName == "aliyundriveopen"
 	case "quark":
@@ -391,7 +393,7 @@ func storageProviderName(driverName string) string {
 		return "aliyun_drive"
 	case "123pan", "123 open":
 		return "pan123"
-	case "115 cloud", "115 open":
+	case "115 cloud", "115 open", "115 cd2":
 		return "pan115"
 	case "guangyapan":
 		return "guangyapan"

@@ -410,7 +410,7 @@ func normalizeControlKey(value string) string {
 		return "aliyun_drive"
 	case "139", "139yun", "139_cloud":
 		return "yidong139"
-	case "115", "115_cloud", "115_open":
+	case "115", "115_cloud", "115_open", "115_cd2":
 		return "pan115"
 	case "123", "123pan", "123_open":
 		return "pan123"
