@@ -256,9 +256,9 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.PluginAntiHashEnabled, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.PluginISORenameEnabled, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.PluginExtensionWhitelist, Value: "", Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "Comma-separated extensions without dots, e.g. mkv,mp4,avi. Empty means no files are processed."},
-		{Key: conf.TMDBApiKey, Value: "", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE},
-		{Key: conf.TMDBApiBaseURL, Value: "https://api.themoviedb.org/3", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE},
-		{Key: conf.TMDBLanguage, Value: "zh-CN", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE},
+		{Key: conf.TMDBApiKey, Value: "", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "TMDB API key used for media search and metadata requests."},
+		{Key: conf.TMDBApiBaseURL, Value: "https://api.themoviedb.org/3", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "TMDB API root URL, for example https://api.themoviedb.org/3. The endpoint path is appended automatically."},
+		{Key: conf.TMDBLanguage, Value: "zh-CN", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "TMDB language tag, for example zh-CN or en-US."},
 		{Key: conf.MediaCategoryRules, Value: defaultMediaCategoryRulesYAML, Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE},
 
 		// single settings
