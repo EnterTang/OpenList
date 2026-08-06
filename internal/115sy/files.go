@@ -164,12 +164,12 @@ func decodeFilePage(raw json.RawMessage) (filePage, error) {
 		Files   []RemoteItem    `json:"files"`
 		List    []RemoteItem    `json:"list"`
 		Data    json.RawMessage `json:"data"`
-		Offset  flexibleInt64   `json:"offset"`
-		Limit   flexibleInt64   `json:"limit"`
-		Count   flexibleInt64   `json:"count"`
-		Total   flexibleInt64   `json:"total"`
-		HasMore flexibleBool    `json:"has_more"`
-		Next    flexibleInt64   `json:"next_offset"`
+		Offset  flexibleInt     `json:"offset"`
+		Limit   flexibleInt     `json:"limit"`
+		Count   flexibleInt     `json:"count"`
+		Total   flexibleInt     `json:"total"`
+		HasMore *flexibleBool   `json:"has_more"`
+		Next    flexibleInt     `json:"next_offset"`
 	}
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		return filePage{}, &ProtocolError{Endpoint: EndpointFileList, Message: err.Error()}
@@ -192,17 +192,17 @@ func decodeFilePage(raw json.RawMessage) (filePage, error) {
 	}
 	page := filePage{
 		Items:      items,
-		Offset:     int64(wire.Offset),
-		Limit:      int64(wire.Limit),
-		Total:      int64(wire.Total),
-		HasMore:    bool(wire.HasMore),
-		HasMoreSet: strings.Contains(string(raw), "has_more"),
-		Next:       int64(wire.Next),
-		OffsetSet:  strings.Contains(string(raw), "offset"),
-		NextSet:    strings.Contains(string(raw), "next_offset"),
+		Offset:     wire.Offset.value,
+		Limit:      wire.Limit.value,
+		Total:      wire.Total.value,
+		HasMore:    wire.HasMore != nil && bool(*wire.HasMore),
+		HasMoreSet: wire.HasMore != nil,
+		Next:       wire.Next.value,
+		OffsetSet:  wire.Offset.set,
+		NextSet:    wire.Next.set,
 	}
 	if page.Total == 0 {
-		page.Total = int64(wire.Count)
+		page.Total = wire.Count.value
 	}
 	if page.Limit <= 0 {
 		page.Limit = maxFilePageSize

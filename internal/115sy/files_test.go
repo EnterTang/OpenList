@@ -183,6 +183,26 @@ func TestListFilesStopsWhenHasMoreIsFalseOnFullPage(t *testing.T) {
 	}
 }
 
+func TestListFilesAcceptsNextOffsetWithoutCurrentOffset(t *testing.T) {
+	var calls atomic.Int32
+	client := newTestClient(t, ClientOptions{
+		LimitRate:      1e6,
+		AndroidBaseURL: "https://android.invalid",
+		WebBaseURL:     "https://web.invalid",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			page := calls.Add(1)
+			if page == 1 {
+				return jsonResponse(req, http.StatusOK, `{"state":true,"errno":0,"data":{"items":[{"id":"one","name":"one"}],"next_offset":1,"has_more":true}}`), nil
+			}
+			return jsonResponse(req, http.StatusOK, `{"state":true,"errno":0,"data":{"items":[{"id":"two","name":"two"}],"has_more":false}}`), nil
+		})},
+	})
+	items, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 1})
+	if err != nil || len(items) != 2 || calls.Load() != 2 {
+		t.Fatalf("items/error/calls = %#v/%v/%d, want two pages", items, err, calls.Load())
+	}
+}
+
 func TestRemoteItemRecognizesLegacyDirectoryMarker(t *testing.T) {
 	var item RemoteItem
 	if err := json.Unmarshal([]byte(`{"cid":"123","name":"folder","directory":true}`), &item); err != nil {
