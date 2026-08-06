@@ -41,11 +41,18 @@ func TestLimiterClientDisablesPageCooldownWhenRateNonPositive(t *testing.T) {
 	}
 }
 
-func TestLimiterWaitCooldownCancellation(t *testing.T) {
+func TestLimiterWaitCooldownCancellationDoesNotConsumeCooldown(t *testing.T) {
 	t.Parallel()
 
-	limiter := newPageLimiter(150 * time.Millisecond)
+	const (
+		cooldown = 120 * time.Millisecond
+		buffer   = 15 * time.Millisecond
+		slack    = 20 * time.Millisecond
+	)
+
+	limiter := newPageLimiter(cooldown)
 	limiter.MarkCompleted()
+	readyAt := time.Now().Add(cooldown)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -54,15 +61,27 @@ func TestLimiterWaitCooldownCancellation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("WaitCooldown() error = %v, want deadline exceeded", err)
 	}
+
+	if sleep := time.Until(readyAt.Add(buffer)); sleep > 0 {
+		time.Sleep(sleep)
+	}
+
+	start := time.Now()
+	if err := limiter.WaitCooldown(context.Background()); err != nil {
+		t.Fatalf("WaitCooldown() after original cooldown error = %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed > slack {
+		t.Fatalf("WaitCooldown() elapsed = %v, want immediate return after original cooldown", elapsed)
+	}
 }
 
-func TestLimiterWaitCooldownReservesDistinctSlots(t *testing.T) {
+func TestLimiterWaitCooldownConcurrentCallersShareCurrentSchedule(t *testing.T) {
 	t.Parallel()
 
 	const (
 		callers  = 4
 		cooldown = 40 * time.Millisecond
-		slack    = 10 * time.Millisecond
+		slack    = 15 * time.Millisecond
 	)
 
 	limiter := newPageLimiter(cooldown)
@@ -94,18 +113,9 @@ func TestLimiterWaitCooldownReservesDistinctSlots(t *testing.T) {
 	}
 
 	slices.Sort(finishedAt)
-
-	for i := 1; i < len(finishedAt); i++ {
-		gap := finishedAt[i] - finishedAt[i-1]
-		if gap < cooldown-slack {
-			t.Fatalf("completion gap %d = %v, want at least %v; completion times: %v", i, gap, cooldown-slack, finishedAt)
-		}
-	}
-
 	totalSpan := finishedAt[len(finishedAt)-1] - finishedAt[0]
-	minSpan := time.Duration(callers-1)*cooldown - slack
-	if totalSpan < minSpan {
-		t.Fatalf("completion span = %v, want at least %v; completion times: %v", totalSpan, minSpan, finishedAt)
+	if totalSpan > slack {
+		t.Fatalf("completion span = %v, want callers to share the same scheduled cooldown; completion times: %v", totalSpan, finishedAt)
 	}
 }
 

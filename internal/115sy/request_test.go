@@ -381,8 +381,14 @@ func TestRequestRedactsSensitiveMaterialFromErrors(t *testing.T) {
 	}
 }
 
-func TestRequestCancelsDuringPageCooldown(t *testing.T) {
+func TestRequestCancelsDuringPageCooldownWithoutConsumingAnotherCooldownWindow(t *testing.T) {
 	t.Parallel()
+
+	const (
+		cooldown     = 120 * time.Millisecond
+		cancelWindow = 20 * time.Millisecond
+		buffer       = 20 * time.Millisecond
+	)
 
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -394,7 +400,7 @@ func TestRequestCancelsDuringPageCooldown(t *testing.T) {
 
 	client := newTestClient(t, ClientOptions{
 		LimitRate:      1_000_000,
-		PageCooldown:   200 * time.Millisecond,
+		PageCooldown:   cooldown,
 		WebBaseURL:     server.URL,
 		AndroidBaseURL: server.URL,
 	})
@@ -402,8 +408,9 @@ func TestRequestCancelsDuringPageCooldown(t *testing.T) {
 	if err := client.doJSON(context.Background(), OperationFileList, ProfileAndroid, http.MethodGet, EndpointFileList, nil, nil, &UserInfo{}); err != nil {
 		t.Fatalf("first doJSON() error = %v", err)
 	}
+	readyAt := time.Now().Add(cooldown)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), cancelWindow)
 	defer cancel()
 
 	err := client.doJSON(ctx, OperationFileList, ProfileAndroid, http.MethodGet, EndpointFileList, nil, nil, &UserInfo{})
@@ -412,6 +419,20 @@ func TestRequestCancelsDuringPageCooldown(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("calls = %d, want cooldown to prevent second request", calls.Load())
+	}
+
+	if sleep := time.Until(readyAt.Add(buffer)); sleep > 0 {
+		time.Sleep(sleep)
+	}
+
+	ctxThird, cancelThird := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelThird()
+
+	if err := client.doJSON(ctxThird, OperationFileList, ProfileAndroid, http.MethodGet, EndpointFileList, nil, nil, &UserInfo{}); err != nil {
+		t.Fatalf("third doJSON() error = %v, want success once original cooldown expires", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want third request to execute immediately after original cooldown", calls.Load())
 	}
 }
 
@@ -468,5 +489,50 @@ func TestRequestWaitsForResponseCompletionBeforeStartingNextPageRequest(t *testi
 	close(releaseFirstBody)
 	if err := <-firstErr; err != nil {
 		t.Fatalf("first doJSON() error = %v", err)
+	}
+}
+
+func TestRequestDisablesPageCooldownWhenRateNonPositive(t *testing.T) {
+	t.Parallel()
+
+	var callTimes []time.Time
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		callTimes = append(callTimes, time.Now())
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{"id":"u1","nickname":"no-cooldown"}}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, ClientOptions{
+		LimitRate:      0,
+		PageCooldown:   200 * time.Millisecond,
+		WebBaseURL:     server.URL,
+		AndroidBaseURL: server.URL,
+	})
+
+	start := time.Now()
+	if err := client.doJSON(context.Background(), OperationFileList, ProfileAndroid, http.MethodGet, EndpointFileList, nil, nil, &UserInfo{}); err != nil {
+		t.Fatalf("first doJSON() error = %v", err)
+	}
+	if err := client.doJSON(context.Background(), OperationFileList, ProfileAndroid, http.MethodGet, EndpointFileList, nil, nil, &UserInfo{}); err != nil {
+		t.Fatalf("second doJSON() error = %v, want no page cooldown when rate limiter disabled", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("two requests elapsed = %v, want no meaningful page cooldown delay", elapsed)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callTimes) != 2 {
+		t.Fatalf("calls = %d, want 2 immediate requests", len(callTimes))
+	}
+	if gap := callTimes[1].Sub(callTimes[0]); gap >= 100*time.Millisecond {
+		t.Fatalf("request gap = %v, want page cooldown disabled when LimitRate <= 0", gap)
 	}
 }
