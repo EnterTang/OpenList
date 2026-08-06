@@ -188,6 +188,7 @@ func (d *Pan115SY) Put(ctx context.Context, dstDir model.Obj, stream model.FileS
 		return nil, err
 	}
 	item := result.RemoteItem(parentCID)
+	item.SHA1 = hashes.SHA1
 	return d.refreshUploadedObject(ctx, parentCID, item.PickCode, item.ID, stream)
 }
 
