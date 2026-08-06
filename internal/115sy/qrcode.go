@@ -2,19 +2,17 @@ package _115sy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	endpointQRCodeStart = "/qrcode/start"
-	endpointQRCodePoll  = "/qrcode/poll"
-
-	qrFieldSource = "source"
-
 	defaultQRMaxPollCount    = 60
 	defaultQRMaxPollDuration = 2 * time.Minute
 	defaultQRPollInterval    = 2 * time.Second
@@ -38,16 +36,18 @@ type QRCodeSession struct {
 	UID     string       `json:"uid"`
 	Time    int64        `json:"time"`
 	Sign    string       `json:"sign"`
-	Token   string       `json:"token,omitempty"`
 	QRCode  string       `json:"qrcode"`
 }
 
+// QRCodePollResult mirrors qrcodeapi.115.com's integer status values:
+// 0 waiting, 1 scanned, 2 confirmed, -1 expired, -2 canceled.
 type QRCodePollResult struct {
-	Status     string      `json:"status"`
-	Pending    bool        `json:"pending"`
-	Confirmed  bool        `json:"confirmed"`
-	Cookie     string      `json:"cookie,omitempty"`
-	Credential *Credential `json:"credential,omitempty"`
+	Status    int    `json:"status"`
+	Message   string `json:"msg,omitempty"`
+	Pending   bool   `json:"-"`
+	Confirmed bool   `json:"-"`
+	Expired   bool   `json:"-"`
+	Canceled  bool   `json:"-"`
 }
 
 type QRCodeLoginOptions struct {
@@ -57,83 +57,64 @@ type QRCodeLoginOptions struct {
 	MaxPollDuration time.Duration
 }
 
-type qrStartPayload struct {
-	Source QRCodeSource `json:"source"`
-}
-
 type qrStartResponse struct {
 	UID    string `json:"uid"`
 	Time   int64  `json:"time"`
 	Sign   string `json:"sign"`
-	Token  string `json:"token,omitempty"`
 	QRCode string `json:"qrcode"`
 }
 
-type qrPollPayload struct {
-	Source QRCodeSource `json:"source"`
-	UID    string       `json:"uid"`
-	Time   int64        `json:"time"`
-	Sign   string       `json:"sign"`
-	Token  string       `json:"token,omitempty"`
+type qrPollResponse struct {
+	Status  int    `json:"status"`
+	Message string `json:"msg"`
 }
 
-type qrPollResponse struct {
-	Status     string      `json:"status"`
-	Cookie     string      `json:"cookie,omitempty"`
-	Credential *Credential `json:"credential,omitempty"`
+type qrLoginResponse struct {
+	Cookie     json.RawMessage `json:"cookie"`
+	Credential json.RawMessage `json:"credential"`
 }
 
 func (c *Client) StartQRCode(ctx context.Context, source QRCodeSource) (*QRCodeSession, error) {
-	profile := profileForQRCodeSource(source)
-	payload := qrStartPayload{Source: normalizeQRCodeSource(source)}
-
+	source = normalizeQRCodeSource(source)
 	var response qrStartResponse
-	if err := c.doJSON(ctx, OperationUserInfo, profile, http.MethodPost, endpointQRCodeStart, nil, payload, &response); err != nil {
-		return nil, newAuthError(AuthStageQRStart, profile, err)
+	if err := c.doJSON(ctx, OperationQRCodeToken, ProfileQRCode, http.MethodGet, EndpointQRCodeToken, nil, nil, &response); err != nil {
+		return nil, newAuthError(AuthStageQRStart, ProfileQRCode, err)
 	}
-
+	if strings.TrimSpace(response.UID) == "" || response.Time == 0 || strings.TrimSpace(response.Sign) == "" {
+		return nil, newAuthError(AuthStageQRStart, ProfileQRCode, errors.New("QR code token response is incomplete"))
+	}
 	return &QRCodeSession{
-		Source:  payload.Source,
-		Profile: profile,
+		Source:  source,
+		Profile: ProfileQRCode,
 		UID:     strings.TrimSpace(response.UID),
 		Time:    response.Time,
 		Sign:    strings.TrimSpace(response.Sign),
-		Token:   strings.TrimSpace(response.Token),
 		QRCode:  strings.TrimSpace(response.QRCode),
 	}, nil
 }
 
 func (c *Client) PollQRCode(ctx context.Context, session *QRCodeSession) (*QRCodePollResult, error) {
 	if session == nil {
-		return nil, newAuthError(AuthStageQRPoll, "", errors.New("missing QR code session"))
+		return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, errors.New("missing QR code session"))
 	}
-
-	profile := session.Profile
-	if profile == "" {
-		profile = profileForQRCodeSource(session.Source)
+	query := url.Values{
+		"uid":  {strings.TrimSpace(session.UID)},
+		"time": {strconv.FormatInt(session.Time, 10)},
+		"sign": {strings.TrimSpace(session.Sign)},
+		"_":    {strconv.FormatInt(time.Now().UnixNano(), 10)},
 	}
-	payload := qrPollPayload{
-		Source: normalizeQRCodeSource(session.Source),
-		UID:    strings.TrimSpace(session.UID),
-		Time:   session.Time,
-		Sign:   strings.TrimSpace(session.Sign),
-		Token:  strings.TrimSpace(session.Token),
-	}
-
 	var response qrPollResponse
-	if err := c.doJSON(ctx, OperationUserInfo, profile, http.MethodPost, endpointQRCodePoll, nil, payload, &response); err != nil {
-		return nil, newAuthError(AuthStageQRPoll, profile, err)
+	if err := c.doJSON(ctx, OperationQRCodeStatus, ProfileQRCode, http.MethodGet, EndpointQRCodeStatus, query, nil, &response); err != nil {
+		return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, err)
 	}
-
-	status := strings.ToLower(strings.TrimSpace(response.Status))
-	result := &QRCodePollResult{
-		Status:     status,
-		Pending:    status == "" || status == "pending" || status == "scanned",
-		Confirmed:  status == "confirmed" || status == "success",
-		Cookie:     strings.TrimSpace(response.Cookie),
-		Credential: response.Credential,
-	}
-	return result, nil
+	return &QRCodePollResult{
+		Status:    response.Status,
+		Message:   sanitizeRequestText(response.Message),
+		Pending:   response.Status == 0 || response.Status == 1,
+		Confirmed: response.Status == 2,
+		Expired:   response.Status == -1,
+		Canceled:  response.Status == -2,
+	}, nil
 }
 
 func (c *Client) LoginByQRCode(ctx context.Context, opts QRCodeLoginOptions) (*AuthState, error) {
@@ -158,48 +139,73 @@ func (c *Client) LoginByQRCode(ctx context.Context, opts QRCodeLoginOptions) (*A
 
 	pollCtx, cancel := context.WithTimeout(ctx, maxPollDuration)
 	defer cancel()
-
 	for attempt := 0; attempt < maxPollCount; attempt++ {
 		result, err := c.PollQRCode(pollCtx, session)
 		if err != nil {
 			return nil, err
 		}
-		if result.Confirmed {
-			rawCookie := strings.TrimSpace(result.Cookie)
-			if rawCookie == "" && result.Credential != nil {
-				rawCookie = formatCredential(*result.Credential)
+		switch {
+		case result.Confirmed:
+			rawCookie, err := c.loginQRCode(pollCtx, source, session.UID)
+			if err != nil {
+				return nil, err
 			}
-			if rawCookie == "" {
-				return nil, newAuthError(AuthStageQRImport, session.Profile, errors.New("QR code login did not return credential cookie"))
-			}
-			return c.importQRCodeCredential(pollCtx, rawCookie, session.Profile)
-		}
-		if !result.Pending {
-			return nil, newAuthError(AuthStageQRPoll, session.Profile, fmt.Errorf("QR code login ended with status %q", result.Status))
+			return c.importQRCodeCredential(pollCtx, rawCookie, ProfilePassport)
+		case result.Expired:
+			return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, errors.New("QR code expired"))
+		case result.Canceled:
+			return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, errors.New("QR code login canceled"))
+		case !result.Pending:
+			return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, fmt.Errorf("QR code login ended with status %d", result.Status))
 		}
 
 		if attempt == maxPollCount-1 {
 			break
 		}
-
 		timer := time.NewTimer(pollInterval)
 		select {
 		case <-pollCtx.Done():
 			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
+				<-timer.C
 			}
-			return nil, newAuthError(AuthStageQRPoll, session.Profile, pollCtx.Err())
+			return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, pollCtx.Err())
 		case <-timer.C:
 		}
 	}
-
 	if err := pollCtx.Err(); err != nil {
-		return nil, newAuthError(AuthStageQRPoll, session.Profile, err)
+		return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, err)
 	}
-	return nil, newAuthError(AuthStageQRPoll, session.Profile, errors.New("QR code confirmation timed out"))
+	return nil, newAuthError(AuthStageQRPoll, ProfileQRCode, errors.New("QR code confirmation timed out"))
+}
+
+func (c *Client) loginQRCode(ctx context.Context, source QRCodeSource, uid string) (string, error) {
+	var response qrLoginResponse
+	endpoint := fmt.Sprintf(EndpointQRCodeLogin, url.PathEscape(string(source)))
+	form := url.Values{"account": {strings.TrimSpace(uid)}, "app": {string(source)}}
+	if err := c.doForm(ctx, OperationQRCodeLogin, ProfilePassport, http.MethodPost, endpoint, nil, form, &response); err != nil {
+		return "", newAuthError(AuthStageQRImport, ProfilePassport, err)
+	}
+	for _, raw := range []json.RawMessage{response.Cookie, response.Credential} {
+		if cookie := decodeQRCodeCredential(raw); cookie != "" {
+			return cookie, nil
+		}
+	}
+	return "", newAuthError(AuthStageQRImport, ProfilePassport, errors.New("QR code login returned no credential"))
+}
+
+func decodeQRCodeCredential(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var cookie string
+	if json.Unmarshal(raw, &cookie) == nil {
+		return strings.TrimSpace(cookie)
+	}
+	var credential Credential
+	if json.Unmarshal(raw, &credential) != nil || credential.UID == "" || credential.CID == "" || credential.SEID == "" {
+		return ""
+	}
+	return formatCredential(credential)
 }
 
 func (c *Client) importQRCodeCredential(ctx context.Context, rawCookie string, profile Profile) (*AuthState, error) {
@@ -207,14 +213,16 @@ func (c *Client) importQRCodeCredential(ctx context.Context, rawCookie string, p
 	if err != nil {
 		return nil, newAuthError(AuthStageQRImport, profile, err)
 	}
-
 	state, err := clone.authenticateWithCookie(ctx, rawCookie, false)
 	if err != nil {
 		return nil, newAuthError(AuthStageQRImport, profile, err)
 	}
 
-	c.jar = clone.jar
-	c.httpClient.Jar = clone.jar
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if err := c.replaceCookies(rawCookie); err != nil {
+		return nil, newAuthError(AuthStageQRImport, profile, err)
+	}
 	c.rawCookie = strings.TrimSpace(rawCookie)
 	return state, nil
 }
@@ -224,13 +232,6 @@ func normalizeQRCodeSource(source QRCodeSource) QRCodeSource {
 		return QRCodeSourceAndroid
 	}
 	return QRCodeSource(strings.TrimSpace(string(source)))
-}
-
-func profileForQRCodeSource(source QRCodeSource) Profile {
-	if normalizeQRCodeSource(source) == QRCodeSourceWeb {
-		return ProfileWeb
-	}
-	return ProfileAndroid
 }
 
 func formatCredential(cred Credential) string {

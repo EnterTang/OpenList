@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	neturl "net/url"
@@ -12,12 +13,28 @@ import (
 )
 
 type responseEnvelope struct {
-	State   *bool           `json:"state"`
+	State   *responseState  `json:"state"`
 	Errno   int             `json:"errno"`
 	Error   string          `json:"error"`
 	Message string          `json:"message"`
 	Msg     string          `json:"msg"`
 	Data    json.RawMessage `json:"data"`
+}
+
+type responseState bool
+
+func (s *responseState) UnmarshalJSON(data []byte) error {
+	value := strings.TrimSpace(string(data))
+	switch value {
+	case "true", "1", `"1"`:
+		*s = true
+		return nil
+	case "false", "0", `"0"`, "null", "":
+		*s = false
+		return nil
+	default:
+		return fmt.Errorf("invalid response state %q", value)
+	}
 }
 
 var pageRequestGates sync.Map
@@ -304,6 +321,9 @@ func (c *Client) applyHeaders(req *http.Request, profile Profile, contentType st
 		base := c.baseURL(ProfileWeb)
 		req.Header.Set("Origin", base)
 		req.Header.Set("Referer", strings.TrimRight(base, "/")+"/")
+		return
+	}
+	if profile == ProfileQRCode || profile == ProfilePassport {
 		return
 	}
 

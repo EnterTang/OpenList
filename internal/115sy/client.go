@@ -5,18 +5,21 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 type ClientOptions struct {
-	HTTPClient     *http.Client
-	Cookie         string
-	UserAgent      string
-	AppVersion     string
-	LimitRate      float64
-	PageCooldown   time.Duration
-	WebBaseURL     string
-	AndroidBaseURL string
+	HTTPClient      *http.Client
+	Cookie          string
+	UserAgent       string
+	AppVersion      string
+	LimitRate       float64
+	PageCooldown    time.Duration
+	WebBaseURL      string
+	AndroidBaseURL  string
+	QRCodeBaseURL   string
+	PassportBaseURL string
 }
 
 type Client struct {
@@ -27,8 +30,12 @@ type Client struct {
 	userAgent  string
 	appVersion string
 
-	webBaseURL     string
-	androidBaseURL string
+	webBaseURL      string
+	androidBaseURL  string
+	qrCodeBaseURL   string
+	passportBaseURL string
+
+	authMu sync.RWMutex
 
 	accountLimiter *accountLimiter
 	pageLimiter    *pageLimiter
@@ -68,6 +75,14 @@ func NewClient(opts ClientOptions) (*Client, error) {
 			strings.TrimSpace(opts.AndroidBaseURL),
 			DefaultAndroidBaseURL,
 		),
+		qrCodeBaseURL: defaultBaseURL(
+			strings.TrimSpace(opts.QRCodeBaseURL),
+			DefaultQRCodeBaseURL,
+		),
+		passportBaseURL: defaultBaseURL(
+			strings.TrimSpace(opts.PassportBaseURL),
+			DefaultPassportBaseURL,
+		),
 		accountLimiter: newAccountLimiter(opts.LimitRate),
 		pageLimiter:    newPageLimiter(pageCooldown),
 	}
@@ -93,9 +108,34 @@ func (c *Client) baseURL(profile Profile) string {
 	switch profile {
 	case ProfileAndroid:
 		return c.androidBaseURL
+	case ProfileQRCode:
+		return c.qrCodeBaseURL
+	case ProfilePassport:
+		return c.passportBaseURL
 	default:
 		return c.webBaseURL
 	}
+}
+
+func (c *Client) currentRawCookie() string {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.rawCookie
+}
+
+func (c *Client) replaceCookies(raw string) error {
+	cookies := parseCookieHeader(raw)
+	for _, base := range []string{c.webBaseURL, c.androidBaseURL, c.qrCodeBaseURL, c.passportBaseURL} {
+		u, err := url.Parse(base)
+		if err != nil {
+			return err
+		}
+		for _, old := range c.jar.Cookies(u) {
+			c.jar.SetCookies(u, []*http.Cookie{{Name: old.Name, Value: "", Path: "/", MaxAge: -1}})
+		}
+		c.jar.SetCookies(u, cookies)
+	}
+	return nil
 }
 
 func (c *Client) seedCookies(raw string) error {
@@ -106,7 +146,7 @@ func (c *Client) seedCookies(raw string) error {
 	if len(cookies) == 0 {
 		return nil
 	}
-	for _, base := range []string{c.webBaseURL, c.androidBaseURL} {
+	for _, base := range []string{c.webBaseURL, c.androidBaseURL, c.qrCodeBaseURL, c.passportBaseURL} {
 		u, err := url.Parse(base)
 		if err != nil {
 			return err

@@ -133,7 +133,7 @@ func sanitizeCookieFieldName(name string) string {
 }
 
 func (c *Client) Authenticate(ctx context.Context) (*AuthState, error) {
-	state, err := c.authenticateWithCookie(ctx, c.rawCookie, true)
+	state, err := c.authenticateWithCookie(ctx, c.currentRawCookie(), true)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +162,9 @@ func (c *Client) authenticateWithCookie(ctx context.Context, raw string, seedMai
 	}
 
 	if seedMain {
+		c.authMu.Lock()
 		c.rawCookie = strings.TrimSpace(raw)
+		c.authMu.Unlock()
 	}
 
 	return &AuthState{
@@ -282,15 +284,17 @@ func (c *Client) cloneWithCookie(raw string) (*Client, error) {
 	httpClient.Jar = jar
 
 	clone := &Client{
-		httpClient:     &httpClient,
-		jar:            jar,
-		rawCookie:      strings.TrimSpace(raw),
-		userAgent:      c.userAgent,
-		appVersion:     c.appVersion,
-		webBaseURL:     c.webBaseURL,
-		androidBaseURL: c.androidBaseURL,
-		accountLimiter: c.accountLimiter,
-		pageLimiter:    c.pageLimiter,
+		httpClient:      &httpClient,
+		jar:             jar,
+		rawCookie:       strings.TrimSpace(raw),
+		userAgent:       c.userAgent,
+		appVersion:      c.appVersion,
+		webBaseURL:      c.webBaseURL,
+		androidBaseURL:  c.androidBaseURL,
+		qrCodeBaseURL:   c.qrCodeBaseURL,
+		passportBaseURL: c.passportBaseURL,
+		accountLimiter:  c.accountLimiter,
+		pageLimiter:     c.pageLimiter,
 	}
 	if err := clone.seedCookies(clone.rawCookie); err != nil {
 		return nil, err
