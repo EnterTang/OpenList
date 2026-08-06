@@ -136,14 +136,49 @@ func sanitizeErrorCause(err error) string {
 func sanitizeMessage(message string) string {
 	redacted := message
 	for _, key := range []string{"receive_code=", "security_code=", "Cookie:", "Cookie=", "UID=", "CID=", "SEID=", "KID="} {
-		if idx := strings.Index(strings.ToLower(redacted), strings.ToLower(key)); idx >= 0 {
-			end := strings.IndexAny(redacted[idx:], "&; \t\r\n\"")
-			if end == -1 {
-				redacted = redacted[:idx] + key + "[REDACTED]"
-			} else {
-				redacted = redacted[:idx] + key + "[REDACTED]" + redacted[idx+end:]
-			}
-		}
+		redacted = redactAllOccurrences(redacted, key)
 	}
 	return redacted
+}
+
+func redactAllOccurrences(message, key string) string {
+	lowerMessage := strings.ToLower(message)
+	lowerKey := strings.ToLower(key)
+	var builder strings.Builder
+	start := 0
+
+	for {
+		idx := strings.Index(lowerMessage[start:], lowerKey)
+		if idx == -1 {
+			builder.WriteString(message[start:])
+			return builder.String()
+		}
+
+		matchStart := start + idx
+		builder.WriteString(message[start:matchStart])
+		builder.WriteString(message[matchStart : matchStart+len(key)])
+
+		valueStart := matchStart + len(key)
+		trimmedValueStart := valueStart
+		for trimmedValueStart < len(message) {
+			switch message[trimmedValueStart] {
+			case ' ', '\t':
+				builder.WriteByte(message[trimmedValueStart])
+				trimmedValueStart++
+			default:
+				goto findValueEnd
+			}
+		}
+
+	findValueEnd:
+		valueEndOffset := strings.IndexAny(message[trimmedValueStart:], "&; \t\r\n\"")
+		if valueEndOffset == -1 {
+			builder.WriteString("[REDACTED]")
+			return builder.String()
+		}
+
+		valueEnd := trimmedValueStart + valueEndOffset
+		builder.WriteString("[REDACTED]")
+		start = valueEnd
+	}
 }

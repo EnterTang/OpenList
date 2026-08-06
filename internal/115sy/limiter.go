@@ -51,12 +51,14 @@ func (l *pageLimiter) WaitCooldown(ctx context.Context) error {
 	}
 
 	l.mu.Lock()
+	now := time.Now()
 	nextAllowed := l.nextAllowed
+	if nextAllowed.IsZero() || nextAllowed.Before(now) {
+		nextAllowed = now
+	}
+	l.nextAllowed = nextAllowed.Add(l.cooldown)
 	l.mu.Unlock()
 
-	if nextAllowed.IsZero() {
-		return nil
-	}
 	wait := time.Until(nextAllowed)
 	if wait <= 0 {
 		return nil
@@ -79,5 +81,8 @@ func (l *pageLimiter) MarkCompleted() {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.nextAllowed = time.Now().Add(l.cooldown)
+	nextAllowed := time.Now().Add(l.cooldown)
+	if nextAllowed.After(l.nextAllowed) {
+		l.nextAllowed = nextAllowed
+	}
 }
