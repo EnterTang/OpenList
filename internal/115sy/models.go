@@ -7,6 +7,20 @@ type Credential struct {
 	KID  string `json:"kid,omitempty"`
 }
 
+type Capacity struct {
+	Total     int64 `json:"total"`
+	Used      int64 `json:"used"`
+	Remaining int64 `json:"remaining"`
+}
+
+type AuthState struct {
+	Credential Credential `json:"credential"`
+	User       UserInfo   `json:"user"`
+	UserID     string     `json:"user_id"`
+	RootCID    string     `json:"root_cid"`
+	Capacity   Capacity   `json:"capacity"`
+}
+
 type UserInfo struct {
 	ID       string `json:"id"`
 	Nickname string `json:"nickname"`
