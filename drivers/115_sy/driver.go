@@ -9,6 +9,7 @@ import (
 
 	sy "github.com/OpenListTeam/OpenList/v4/internal/115sy"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -63,6 +64,11 @@ func (d *Pan115SY) Init(ctx context.Context) error {
 	if d.GetRootId() == "" {
 		d.RootFolderID = d.Config().DefaultRoot
 	}
+	if _, err := client.ListFiles(ctx, d.GetRootId(), sy.ListOptions{PageSize: 1}); err != nil {
+		d.client = nil
+		d.authState = nil
+		return fmt.Errorf("invalid 115-sy root cid %q: %w", d.GetRootId(), err)
+	}
 	if d.MembershipTier == "" || strings.EqualFold(d.MembershipTier, "unknown") {
 		d.runtimeMembershipTier = "ordinary"
 	}
@@ -79,7 +85,7 @@ func (d *Pan115SY) List(ctx context.Context, dir model.Obj, args model.ListArgs)
 	if d.client == nil {
 		return nil, fmt.Errorf("115-sy is not initialized")
 	}
-	cid := d.Config().DefaultRoot
+	cid := d.rootCID()
 	if dir != nil && dir.GetID() != "" {
 		cid = dir.GetID()
 	}
@@ -106,6 +112,14 @@ func (d *Pan115SY) Link(ctx context.Context, file model.Obj, args model.LinkArgs
 	if err != nil {
 		return nil, err
 	}
+	if link.Header == nil {
+		link.Header = make(map[string][]string)
+	}
+	if args.Header != nil {
+		if callerUA := args.Header.Get("User-Agent"); callerUA != "" && link.Header.Get("User-Agent") == "" {
+			link.Header.Set("User-Agent", callerUA)
+		}
+	}
 	return &model.Link{URL: link.URL, Header: link.Header}, nil
 }
 
@@ -121,18 +135,60 @@ func (d *Pan115SY) Get(ctx context.Context, remotePath string) (model.Obj, error
 	if d.client == nil {
 		return nil, fmt.Errorf("115-sy is not initialized")
 	}
-	id, err := d.client.GetIDByPath(ctx, stdpath.Clean(remotePath))
+	item, err := d.client.GetItemByPathFrom(ctx, d.rootCID(), stdpath.Clean(remotePath))
 	if err != nil {
 		return nil, err
 	}
-	if id == d.Config().DefaultRoot {
+	if item.ID == d.rootCID() {
 		return d.GetRoot(ctx)
 	}
-	item, err := d.client.GetFile(ctx, id)
+	return objectFromRemote(item), nil
+}
+
+func (d *Pan115SY) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
+	if d.client == nil {
+		return nil, fmt.Errorf("115-sy is not initialized")
+	}
+	if d.Config().NoUpload {
+		return nil, errs.UploadNotSupported
+	}
+	if up == nil {
+		up = func(float64) {}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	hashes, err := sy.ComputeUploadHashes(stream, &up)
 	if err != nil {
 		return nil, err
 	}
-	return objectFromRemote(item), nil
+	parentCID := d.rootCID()
+	if dstDir != nil && dstDir.GetID() != "" {
+		parentCID = dstDir.GetID()
+	}
+	initResp, err := d.client.RapidUpload(ctx, sy.RapidUploadRequest{
+		FileName:  stream.GetName(),
+		ParentCID: parentCID,
+		Size:      stream.GetSize(),
+		SHA1:      hashes.SHA1,
+		PreSHA1:   hashes.PreSHA1,
+	}, stream)
+	if err != nil {
+		return nil, err
+	}
+	if matched, err := initResp.RapidMatched(); err != nil {
+		return nil, err
+	} else if matched {
+		up(100)
+		return d.refreshUploadedObject(ctx, parentCID, initResp.PickCode, initResp.FileID, stream)
+	}
+
+	result, err := d.client.UploadFileByOSS(ctx, initResp, stream, up)
+	if err != nil {
+		return nil, err
+	}
+	item := result.RemoteItem(parentCID)
+	return d.refreshUploadedObject(ctx, parentCID, item.PickCode, item.ID, stream)
 }
 
 func (d *Pan115SY) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
@@ -174,6 +230,43 @@ func (d *Pan115SY) ClusterMembershipTier() string {
 	return d.runtimeMembershipTier
 }
 
+func (d *Pan115SY) rootCID() string {
+	root := d.GetRootId()
+	if strings.TrimSpace(root) == "" {
+		return d.Config().DefaultRoot
+	}
+	return root
+}
+
+func (d *Pan115SY) refreshUploadedObject(ctx context.Context, parentCID, pickcode, fid string, stream model.FileStreamer) (model.Obj, error) {
+	lookup := strings.TrimSpace(firstNonEmptyLocal(pickcode, fid))
+	if lookup != "" {
+		if item, err := d.client.GetFile(ctx, lookup); err == nil {
+			if item.ParentCID == "" {
+				item.ParentCID = parentCID
+			}
+			return objectFromRemote(item), nil
+		}
+	}
+	return objectFromRemote(sy.RemoteItem{
+		ID:        fid,
+		Name:      stream.GetName(),
+		IsDir:     false,
+		Size:      stream.GetSize(),
+		PickCode:  pickcode,
+		ParentCID: parentCID,
+	}), nil
+}
+
+func firstNonEmptyLocal(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func objectFromRemote(item sy.RemoteItem) *Obj {
 	return &Obj{
 		FID:       item.ID,
@@ -197,3 +290,4 @@ var _ driver.Move = (*Pan115SY)(nil)
 var _ driver.Rename = (*Pan115SY)(nil)
 var _ driver.Copy = (*Pan115SY)(nil)
 var _ driver.Remove = (*Pan115SY)(nil)
+var _ driver.PutResult = (*Pan115SY)(nil)

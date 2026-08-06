@@ -18,6 +18,7 @@ type ClientOptions struct {
 	PageCooldown    time.Duration
 	WebBaseURL      string
 	AndroidBaseURL  string
+	UploadBaseURL   string
 	QRCodeBaseURL   string
 	PassportBaseURL string
 }
@@ -32,15 +33,19 @@ type Client struct {
 
 	webBaseURL      string
 	androidBaseURL  string
+	uploadBaseURL   string
 	qrCodeBaseURL   string
 	passportBaseURL string
 
-	authMu sync.RWMutex
+	authMu   sync.RWMutex
+	uploadMu sync.Mutex
+	upload   UploadAvailability
 
 	accountLimiter *accountLimiter
 	pageLimiter    *pageLimiter
 	pathMu         sync.RWMutex
 	pathCache      map[string]string
+	pathItemCache  map[string]RemoteItem
 }
 
 func NewClient(opts ClientOptions) (*Client, error) {
@@ -77,6 +82,10 @@ func NewClient(opts ClientOptions) (*Client, error) {
 			strings.TrimSpace(opts.AndroidBaseURL),
 			DefaultAndroidBaseURL,
 		),
+		uploadBaseURL: defaultBaseURL(
+			strings.TrimSpace(opts.UploadBaseURL),
+			DefaultUploadBaseURL,
+		),
 		qrCodeBaseURL: defaultBaseURL(
 			strings.TrimSpace(opts.QRCodeBaseURL),
 			DefaultQRCodeBaseURL,
@@ -88,6 +97,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		accountLimiter: newAccountLimiter(opts.LimitRate),
 		pageLimiter:    newPageLimiter(pageCooldown),
 		pathCache:      make(map[string]string),
+		pathItemCache:  make(map[string]RemoteItem),
 	}
 	if client.appVersion == "" {
 		client.appVersion = DefaultAppVersion
@@ -111,6 +121,8 @@ func (c *Client) baseURL(profile Profile) string {
 	switch profile {
 	case ProfileAndroid:
 		return c.androidBaseURL
+	case ProfileUpload:
+		return c.uploadBaseURL
 	case ProfileQRCode:
 		return c.qrCodeBaseURL
 	case ProfilePassport:
@@ -128,7 +140,7 @@ func (c *Client) currentRawCookie() string {
 
 func (c *Client) replaceCookies(raw string) error {
 	cookies := parseCookieHeader(raw)
-	for _, base := range []string{c.webBaseURL, c.androidBaseURL, c.qrCodeBaseURL, c.passportBaseURL} {
+	for _, base := range []string{c.webBaseURL, c.androidBaseURL, c.uploadBaseURL, c.qrCodeBaseURL, c.passportBaseURL} {
 		u, err := url.Parse(base)
 		if err != nil {
 			return err
@@ -149,7 +161,7 @@ func (c *Client) seedCookies(raw string) error {
 	if len(cookies) == 0 {
 		return nil
 	}
-	for _, base := range []string{c.webBaseURL, c.androidBaseURL, c.qrCodeBaseURL, c.passportBaseURL} {
+	for _, base := range []string{c.webBaseURL, c.androidBaseURL, c.uploadBaseURL, c.qrCodeBaseURL, c.passportBaseURL} {
 		u, err := url.Parse(base)
 		if err != nil {
 			return err

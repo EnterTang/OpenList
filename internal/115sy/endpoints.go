@@ -5,6 +5,7 @@ type Profile string
 const (
 	ProfileWeb      Profile = "web"
 	ProfileAndroid  Profile = "android"
+	ProfileUpload   Profile = "upload"
 	ProfileQRCode   Profile = "qrcode"
 	ProfilePassport Profile = "passport"
 )
@@ -21,11 +22,15 @@ const (
 	OperationQRCodeToken
 	OperationQRCodeStatus
 	OperationQRCodeLogin
+	OperationUploadInfo
+	OperationUploadInit
+	OperationUploadOSSToken
 )
 
 const (
 	DefaultWebBaseURL      = "https://webapi.115.com"
 	DefaultAndroidBaseURL  = "https://proapi.115.com"
+	DefaultUploadBaseURL   = "https://uplb.115.com"
 	DefaultAppVersion      = "36.2.28"
 	DefaultWebUserAgent    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 	DefaultAndroidUA       = "Mozilla/5.0 (Linux; Android 13; 22101320C Build/TQ1A.230105.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/138.0.0.0 Mobile Safari/537.36"
@@ -34,23 +39,26 @@ const (
 )
 
 const (
-	EndpointUserInfo      = "/user/info"
-	EndpointFileList      = "/files"
-	EndpointShareSnapshot = "/share/snapshot"
-	EndpointShareReceive  = "/share/receive"
-	EndpointDownloadURL   = "/app/chrome/downurl"
-	EndpointOfflineAdd    = "/offline/add"
-	EndpointQRCodeToken   = "/api/1.0/web/1.0/token"
-	EndpointQRCodeStatus  = "/get/status/"
-	EndpointQRCodeLogin   = "/app/1.0/%s/1.0/login/qrcode"
-	EndpointFileInfo      = "/files/get_info"
-	EndpointDirID         = "/files/getid"
-	EndpointDirAdd        = "/files/add"
-	EndpointFileMove      = "/files/move"
-	EndpointFileRename    = "/files/batch_rename"
-	EndpointFileCopy      = "/files/copy"
-	EndpointFileDelete    = "/rb/delete"
-	EndpointCategory      = "/category/get"
+	EndpointUserInfo       = "/user/info"
+	EndpointFileList       = "/files"
+	EndpointShareSnapshot  = "/share/snapshot"
+	EndpointShareReceive   = "/share/receive"
+	EndpointDownloadURL    = "/app/chrome/downurl"
+	EndpointOfflineAdd     = "/offline/add"
+	EndpointQRCodeToken    = "/api/1.0/web/1.0/token"
+	EndpointQRCodeStatus   = "/get/status/"
+	EndpointQRCodeLogin    = "/app/1.0/%s/1.0/login/qrcode"
+	EndpointUploadInfo     = "/app/uploadinfo"
+	EndpointUploadInit     = "/4.0/initupload.php"
+	EndpointUploadOSSToken = "/3.0/gettoken.php"
+	EndpointFileInfo       = "/files/get_info"
+	EndpointDirID          = "/files/getid"
+	EndpointDirAdd         = "/files/add"
+	EndpointFileMove       = "/files/move"
+	EndpointFileRename     = "/files/batch_rename"
+	EndpointFileCopy       = "/files/copy"
+	EndpointFileDelete     = "/rb/delete"
+	EndpointCategory       = "/category/get"
 )
 
 type operationPolicy struct {
@@ -84,8 +92,8 @@ var operationPolicies = map[Operation]operationPolicy{
 		FallbackHTTP405: true,
 	},
 	OperationDownloadURL: {
-		Primary:         ProfileAndroid,
-		Fallback:        ProfileWeb,
+		Primary:         ProfileWeb,
+		Fallback:        ProfileAndroid,
 		FallbackHTTP405: true,
 	},
 	OperationOffline: {
@@ -96,6 +104,11 @@ var operationPolicies = map[Operation]operationPolicy{
 	OperationQRCodeToken:  {Primary: ProfileQRCode},
 	OperationQRCodeStatus: {Primary: ProfileQRCode},
 	OperationQRCodeLogin:  {Primary: ProfilePassport},
+	OperationUploadInfo:   {Primary: ProfileAndroid},
+	OperationUploadInit:   {Primary: ProfileUpload},
+	OperationUploadOSSToken: {
+		Primary: ProfileUpload,
+	},
 }
 
 func policyForOperation(operation Operation) operationPolicy {

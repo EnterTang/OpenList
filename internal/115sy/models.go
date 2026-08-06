@@ -44,6 +44,138 @@ type RemoteItem struct {
 	Thumbnail  string `json:"thumbnail"`
 }
 
+type UploadAvailability struct {
+	UserID           int64    `json:"user_id"`
+	UserKey          string   `json:"userkey"`
+	SizeLimit        int64    `json:"size_limit"`
+	UploadAllowed    bool     `json:"upload_allowed"`
+	UploadAllowedMsg string   `json:"upload_allowed_msg"`
+	TypeLimit        []string `json:"type_limit"`
+}
+
+func (a UploadAvailability) available() bool {
+	return a.UserID != 0 && strings.TrimSpace(a.UserKey) != ""
+}
+
+type UploadHashes struct {
+	SHA1       string
+	PreSHA1    string
+	Size       int64
+	PreHashLen int64
+}
+
+type RapidUploadRequest struct {
+	FileName  string
+	ParentCID string
+	Size      int64
+	SHA1      string
+	PreSHA1   string
+}
+
+type UploadInitResponse struct {
+	Request   string `json:"request"`
+	ErrorCode int    `json:"statuscode"`
+	ErrorMsg  string `json:"statusmsg"`
+	State     *bool  `json:"state,omitempty"`
+	Errno     int    `json:"errno,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Status    int    `json:"status"`
+	PickCode  string `json:"pickcode"`
+	Target    string `json:"target"`
+	Version   string `json:"version"`
+	FileID    string `json:"fileid"`
+	FileInfo  string `json:"fileinfo"`
+	SignKey   string `json:"sign_key"`
+	SignCheck string `json:"sign_check"`
+	Bucket    string `json:"bucket"`
+	Object    string `json:"object"`
+	Callback  struct {
+		Callback    string `json:"callback"`
+		CallbackVar string `json:"callback_var"`
+	} `json:"callback"`
+	SHA1 string `json:"-"`
+}
+
+func (r *UploadInitResponse) UnmarshalJSON(data []byte) error {
+	type uploadInitAlias UploadInitResponse
+	var raw struct {
+		uploadInitAlias
+		Status    flexibleInt    `json:"status"`
+		FileID    flexibleString `json:"fileid"`
+		ErrorCode flexibleInt    `json:"statuscode"`
+		Errno     flexibleInt    `json:"errno"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = UploadInitResponse(raw.uploadInitAlias)
+	r.Status = int(raw.Status.value)
+	r.FileID = string(raw.FileID)
+	r.ErrorCode = int(raw.ErrorCode.value)
+	r.Errno = int(raw.Errno.value)
+	return nil
+}
+
+func (r UploadInitResponse) RapidMatched() (bool, error) {
+	switch r.Status {
+	case 2:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, &ProtocolError{Endpoint: EndpointUploadInit, Message: "unexpected upload init status"}
+	}
+}
+
+func (r UploadInitResponse) needsRangeSignature() bool {
+	switch r.Status {
+	case 6, 7, 8:
+		return strings.TrimSpace(r.SignKey) != "" && strings.TrimSpace(r.SignCheck) != ""
+	default:
+		return false
+	}
+}
+
+type UploadOSSToken struct {
+	AccessKeyID     string `json:"AccessKeyID"`
+	AccessKeySecret string `json:"AccessKeySecret"`
+	SecurityToken   string `json:"SecurityToken"`
+	StatusCode      string `json:"StatusCode"`
+	Endpoint        string `json:"Endpoint,omitempty"`
+}
+
+type UploadResult struct {
+	State   bool   `json:"state"`
+	Code    int    `json:"code"`
+	Errno   int    `json:"errno"`
+	Message string `json:"message"`
+	Error   string `json:"error"`
+	Data    struct {
+		PickCode string `json:"pick_code"`
+		FileName string `json:"file_name"`
+		FileSize int64  `json:"file_size"`
+		FileID   string `json:"file_id"`
+		FID      string `json:"fid"`
+		ThumbURL string `json:"thumb_url"`
+		SHA1     string `json:"sha1"`
+		CID      string `json:"cid"`
+	} `json:"data"`
+}
+
+func (r UploadResult) RemoteItem(parentCID string) RemoteItem {
+	id := firstNonEmpty(r.Data.FileID, r.Data.FID)
+	return RemoteItem{
+		ID:        id,
+		Name:      r.Data.FileName,
+		IsDir:     false,
+		Size:      r.Data.FileSize,
+		SHA1:      r.Data.SHA1,
+		PickCode:  r.Data.PickCode,
+		ParentCID: firstNonEmpty(r.Data.CID, parentCID),
+		Thumbnail: r.Data.ThumbURL,
+	}
+}
+
 func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 	type remoteItemAlias RemoteItem
 	var raw struct {

@@ -340,10 +340,12 @@ func (c *Client) cloneForUserAgent(userAgent string) *Client {
 		appVersion:      c.appVersion,
 		webBaseURL:      c.webBaseURL,
 		androidBaseURL:  c.androidBaseURL,
+		uploadBaseURL:   c.uploadBaseURL,
 		qrCodeBaseURL:   c.qrCodeBaseURL,
 		passportBaseURL: c.passportBaseURL,
 		accountLimiter:  c.accountLimiter,
 		pageLimiter:     c.pageLimiter,
 		pathCache:       c.pathCache,
+		pathItemCache:   c.pathItemCache,
 	}
 }
