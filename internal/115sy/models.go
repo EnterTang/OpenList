@@ -2,6 +2,7 @@ package _115sy
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -409,6 +410,76 @@ type ShareItem struct {
 	Size     int64  `json:"size"`
 }
 
+type ShareTarget struct {
+	Name string `json:"name"`
+	CID  string `json:"cid"`
+}
+
+type ReceiveResult struct {
+	State   bool            `json:"state"`
+	Message string          `json:"message,omitempty"`
+	TaskID  string          `json:"task_id,omitempty"`
+	CID     string          `json:"cid,omitempty"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+type OfflineItemResult struct {
+	URL      string `json:"url"`
+	TaskID   string `json:"task_id,omitempty"`
+	Success  bool   `json:"success"`
+	Error    string `json:"error,omitempty"`
+	ErrorMsg string `json:"error_msg,omitempty"`
+}
+
+type OfflineResult struct {
+	Items []OfflineItemResult `json:"items"`
+}
+
+type OfflineTask struct {
+	ID        string  `json:"id"`
+	TaskID    string  `json:"task_id,omitempty"`
+	InfoHash  string  `json:"info_hash"`
+	Name      string  `json:"name"`
+	URL       string  `json:"url"`
+	Size      int64   `json:"size"`
+	Progress  float64 `json:"progress"`
+	Status    int     `json:"status"`
+	Error     string  `json:"error,omitempty"`
+	Message   string  `json:"message,omitempty"`
+	FileID    string  `json:"file_id,omitempty"`
+	TargetCID string  `json:"target_cid,omitempty"`
+	UpdatedAt int64   `json:"updated_at,omitempty"`
+}
+
+func (t OfflineTask) Done() bool { return t.Status == 2 || t.Status == 11 }
+
+func (t OfflineTask) Failed() bool { return t.Status < 0 || t.Status == 9 }
+
+func ParseShareTargets(raw string) ([]ShareTarget, error) {
+	parts := strings.Split(raw, ",")
+	if len(parts) == 1 && strings.TrimSpace(parts[0]) == "" {
+		return nil, fmt.Errorf("share target list is empty")
+	}
+	targets := make([]ShareTarget, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		name, cid, ok := strings.Cut(strings.TrimSpace(part), ":")
+		name, cid = strings.TrimSpace(name), strings.TrimSpace(cid)
+		if !ok || name == "" || cid == "" || cid == "0" {
+			return nil, fmt.Errorf("invalid share target %q", part)
+		}
+		if _, err := strconv.ParseInt(cid, 10, 64); err != nil {
+			return nil, fmt.Errorf("invalid share target cid %q", cid)
+		}
+		if _, exists := seen[cid]; exists {
+			continue
+		}
+		seen[cid] = struct{}{}
+		targets = append(targets, ShareTarget{Name: name, CID: cid})
+	}
+	return targets, nil
+}
+
 type ShareSnapshot struct {
 	ShareCode   string      `json:"share_code"`
 	ReceiveCode string      `json:"receive_code"`
@@ -429,11 +500,4 @@ type ReceiveShareRequest struct {
 type OfflineRequest struct {
 	TargetCID string   `json:"target_cid"`
 	URLs      []string `json:"urls"`
-}
-
-type OfflineTask struct {
-	TaskID  string `json:"task_id"`
-	URL     string `json:"url"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
 }

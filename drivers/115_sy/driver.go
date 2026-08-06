@@ -2,6 +2,7 @@ package _115_sy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	stdpath "path"
 	"strings"
@@ -216,6 +217,103 @@ func (d *Pan115SY) Remove(ctx context.Context, obj model.Obj) error {
 	return d.mutate(ctx, func() error { return d.client.Remove(ctx, obj.GetID(), "") })
 }
 
+func (d *Pan115SY) OfflineDownload(ctx context.Context, urls []string, dstDir model.Obj) ([]string, error) {
+	if d.client == nil {
+		return nil, fmt.Errorf("115-sy is not initialized")
+	}
+	targetCID := d.rootCID()
+	if dstDir != nil && dstDir.GetID() != "" {
+		targetCID = dstDir.GetID()
+	}
+	result, err := d.client.AddOfflineTasks(ctx, sy.OfflineRequest{TargetCID: targetCID, URLs: urls})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(result.Items))
+	for _, item := range result.Items {
+		if !item.Success {
+			return ids, fmt.Errorf("offline task failed for %q: %s", item.URL, firstNonEmptyLocal(item.Error, item.ErrorMsg))
+		}
+		ids = append(ids, item.TaskID)
+	}
+	return ids, nil
+}
+
+func (d *Pan115SY) OfflineList(ctx context.Context) ([]sy.OfflineTask, error) {
+	if d.client == nil {
+		return nil, fmt.Errorf("115-sy is not initialized")
+	}
+	return d.client.ListOfflineTasks(ctx)
+}
+
+func (d *Pan115SY) DeleteOfflineTasks(ctx context.Context, ids []string, deleteFiles bool) error {
+	if d.client == nil {
+		return fmt.Errorf("115-sy is not initialized")
+	}
+	return d.client.DeleteOfflineTasks(ctx, ids, deleteFiles)
+}
+
+func (d *Pan115SY) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
+	if d.client == nil {
+		return nil, fmt.Errorf("115-sy is not initialized")
+	}
+	switch args.Method {
+	case "share_parse":
+		var request struct {
+			URL string `json:"url"`
+		}
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return sy.ParseShareURL(request.URL)
+	case "share_snapshot":
+		var share sy.ShareURL
+		if err := decodeOtherData(args.Data, &share); err != nil {
+			return nil, err
+		}
+		return d.client.ShareSnapshot(ctx, share)
+	case "share_receive":
+		var request sy.ReceiveShareRequest
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return d.client.ReceiveShare(ctx, request)
+	case "offline_add":
+		var request sy.OfflineRequest
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return d.client.AddOfflineTasks(ctx, request)
+	case "offline_list":
+		return d.client.ListOfflineTasks(ctx)
+	case "offline_delete":
+		var request struct {
+			IDs         []string `json:"ids"`
+			DeleteFiles bool     `json:"delete_files"`
+		}
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return nil, d.client.DeleteOfflineTasks(ctx, request.IDs, request.DeleteFiles)
+	default:
+		return nil, errs.NotSupport
+	}
+}
+
+func decodeOtherData(data interface{}, target interface{}) error {
+	if data == nil {
+		return fmt.Errorf("115-sy operation data is required")
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("invalid 115-sy operation data: %w", err)
+	}
+	if err := json.Unmarshal(encoded, target); err != nil {
+		return fmt.Errorf("invalid 115-sy operation data: %w", err)
+	}
+	return nil
+}
+
 func (d *Pan115SY) mutate(ctx context.Context, fn func() error) error {
 	if d.client == nil {
 		return fmt.Errorf("115-sy is not initialized")
@@ -292,3 +390,4 @@ var _ driver.Rename = (*Pan115SY)(nil)
 var _ driver.Copy = (*Pan115SY)(nil)
 var _ driver.Remove = (*Pan115SY)(nil)
 var _ driver.PutResult = (*Pan115SY)(nil)
+var _ driver.Other = (*Pan115SY)(nil)

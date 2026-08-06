@@ -93,7 +93,8 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 			}
 		}
 
-		req, err := c.newRequestWithContext(ctx, currentProfile, method, endpoint, query, body, contentType)
+		requestEndpoint := endpointForProfile(operation, currentProfile, endpoint)
+		req, err := c.newRequestWithContext(ctx, currentProfile, method, requestEndpoint, query, body, contentType)
 		if err != nil {
 			releasePageGate()
 			return err
@@ -196,6 +197,26 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 		}
 		return json.Unmarshal(respBody, out)
 	}
+}
+
+func endpointForProfile(operation Operation, profile Profile, endpoint string) string {
+	switch operation {
+	case OperationShareSnapshot:
+		if profile == ProfileAndroid && endpoint == EndpointShareSnapshot {
+			return EndpointShareSnapshotApp
+		}
+		if profile == ProfileWeb && endpoint == EndpointShareSnapshotApp {
+			return EndpointShareSnapshot
+		}
+	case OperationShareReceive:
+		if profile == ProfileAndroid && endpoint == EndpointShareReceive {
+			return EndpointShareReceiveApp
+		}
+		if profile == ProfileWeb && endpoint == EndpointShareReceiveApp {
+			return EndpointShareReceive
+		}
+	}
+	return endpoint
 }
 
 func waitAccountLimiter(ctx context.Context, limiter *accountLimiter) error {
