@@ -91,7 +91,7 @@ func SecUpload(ctx context.Context, client *sy.Client, req SecUploadRequest, up 
 		if err != nil {
 			item.Error = redact(err.Error())
 		} else if req.ShareAfterUpload {
-			share, shareErr := client.CreateShare(ctx, sy.CreateShareRequest{FileIDs: []string{item.FID}})
+			share, shareErr := client.CreateShare(ctx, sy.CreateShareRequest{FileIDs: []string{firstNonEmpty(item.FID, item.PickCode)}})
 			if shareErr != nil {
 				item.Error = redact(shareErr.Error())
 			} else {
@@ -113,6 +113,15 @@ func SecUpload(ctx context.Context, client *sy.Client, req SecUploadRequest, up 
 		result.Items = append(result.Items, item)
 	}
 	return result, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 type localFileStreamer struct {
