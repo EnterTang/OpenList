@@ -1,0 +1,149 @@
+package _115sy
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+func TestListFilesPaginatesAndDeduplicatesItems(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		offset := r.URL.Query().Get("offset")
+		calls.Add(1)
+		switch offset {
+		case "0":
+			_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{"items":[{"id":"a","name":"A","parent_cid":"0"},{"id":"b","name":"B","parent_cid":"0"}],"offset":0,"limit":2,"has_more":true}}`))
+		case "2":
+			_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{"items":[{"id":"b","name":"B","parent_cid":"0"},{"id":"c","name":"C","parent_cid":"0"}],"offset":2,"limit":2,"has_more":true}}`))
+		case "4":
+			_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{"items":[],"offset":4,"limit":2,"has_more":false}}`))
+		default:
+			t.Fatalf("unexpected offset %q", offset)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(t, ClientOptions{LimitRate: 1e6, AndroidBaseURL: server.URL, WebBaseURL: server.URL})
+	items, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 2})
+	if err != nil {
+		t.Fatalf("ListFiles() error = %v", err)
+	}
+	if got := []string{items[0].ID, items[1].ID, items[2].ID}; strings.Join(got, ",") != "a,b,c" {
+		t.Fatalf("items = %v, want a,b,c", got)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("requests = %d, want 3", calls.Load())
+	}
+}
+
+func TestListFilesRejectsMalformedPagination(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty more", body: `{"state":true,"errno":0,"data":{"items":[],"has_more":true}}`},
+		{name: "repeated offset", body: `{"state":true,"errno":0,"data":{"items":[{"id":"a","name":"A"}],"offset":0,"limit":1,"next_offset":0,"has_more":true}}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			client := newTestClient(t, ClientOptions{LimitRate: 1e6, AndroidBaseURL: server.URL, WebBaseURL: server.URL})
+			_, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 1})
+			var protocolErr *ProtocolError
+			if !errors.As(err, &protocolErr) {
+				t.Fatalf("error = %v, want ProtocolError", err)
+			}
+		})
+	}
+}
+
+func TestListFilesFallsBackFromAndroid405ToWeb(t *testing.T) {
+	var calls atomic.Int32
+	client := newTestClient(t, ClientOptions{
+		LimitRate:      1e6,
+		AndroidBaseURL: "https://android.invalid",
+		WebBaseURL:     "https://web.invalid",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return jsonResponse(req, http.StatusMethodNotAllowed, `{"state":false,"errno":0,"error":"unsupported"}`), nil
+			}
+			return jsonResponse(req, http.StatusOK, `{"state":true,"errno":0,"data":[{"id":"web-item","name":"web"}]}`), nil
+		})},
+	})
+	items, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 2})
+	if err != nil || len(items) != 1 || items[0].ID != "web-item" {
+		t.Fatalf("items/error = %#v/%v, want web fallback", items, err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("requests = %d, want one fallback", calls.Load())
+	}
+}
+
+func TestFileCRUDAndCapacityUseExpectedForms(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case EndpointDirAdd:
+			_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{"file_id":"new-dir"}}`))
+		case EndpointCategory:
+			_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{"space_total":100,"space_used":25,"space_remain":75}}`))
+		default:
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{}}`))
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(t, ClientOptions{LimitRate: 1e6, WebBaseURL: server.URL, AndroidBaseURL: server.URL})
+	dir, err := client.MakeDir(context.Background(), "0", "new")
+	if err != nil || dir.ID != "new-dir" || !dir.IsDir {
+		t.Fatalf("MakeDir() = %#v, %v", dir, err)
+	}
+	if err := client.Move(context.Background(), "f", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Rename(context.Background(), "f", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Copy(context.Background(), "f", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Remove(context.Background(), "f", "0"); err != nil {
+		t.Fatal(err)
+	}
+	capacity, err := client.GetCapacity(context.Background())
+	if err != nil || capacity.Total != 100 || capacity.Used != 25 || capacity.Remaining != 75 {
+		t.Fatalf("capacity = %#v, %v", capacity, err)
+	}
+	if calls.Load() != 6 {
+		t.Fatalf("requests = %d, want 6", calls.Load())
+	}
+}
+
+func TestListFilesUsesCappedPageSize(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("limit"); got != strconv.FormatInt(maxFilePageSize, 10) {
+			t.Fatalf("limit = %q, want %d", got, maxFilePageSize)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":[]}`))
+	}))
+	defer server.Close()
+	client := newTestClient(t, ClientOptions{LimitRate: 1e6, AndroidBaseURL: server.URL, WebBaseURL: server.URL})
+	if _, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 99999}); err != nil {
+		t.Fatal(err)
+	}
+}

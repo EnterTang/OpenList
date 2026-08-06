@@ -35,7 +35,7 @@ const (
 
 const (
 	EndpointUserInfo      = "/user/info"
-	EndpointFileList      = "/files/list"
+	EndpointFileList      = "/files"
 	EndpointShareSnapshot = "/share/snapshot"
 	EndpointShareReceive  = "/share/receive"
 	EndpointDownloadURL   = "/download/url"
@@ -43,6 +43,14 @@ const (
 	EndpointQRCodeToken   = "/api/1.0/web/1.0/token"
 	EndpointQRCodeStatus  = "/get/status/"
 	EndpointQRCodeLogin   = "/app/1.0/%s/1.0/login/qrcode"
+	EndpointFileInfo      = "/files/get_info"
+	EndpointDirID         = "/files/getid"
+	EndpointDirAdd        = "/files/add"
+	EndpointFileMove      = "/files/move"
+	EndpointFileRename    = "/files/batch_rename"
+	EndpointFileCopy      = "/files/copy"
+	EndpointFileDelete    = "/rb/delete"
+	EndpointCategory      = "/category/get"
 )
 
 type operationPolicy struct {

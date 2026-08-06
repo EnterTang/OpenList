@@ -39,6 +39,8 @@ type Client struct {
 
 	accountLimiter *accountLimiter
 	pageLimiter    *pageLimiter
+	pathMu         sync.RWMutex
+	pathCache      map[string]string
 }
 
 func NewClient(opts ClientOptions) (*Client, error) {
@@ -85,6 +87,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		),
 		accountLimiter: newAccountLimiter(opts.LimitRate),
 		pageLimiter:    newPageLimiter(pageCooldown),
+		pathCache:      make(map[string]string),
 	}
 	if client.appVersion == "" {
 		client.appVersion = DefaultAppVersion
