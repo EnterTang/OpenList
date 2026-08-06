@@ -2,6 +2,7 @@ package _115_open
 
 import (
 	"context"
+	"errors"
 	"net/http"
 )
 
@@ -36,6 +37,20 @@ func (d *Open115) SetRefreshTokenHandler(handler RefreshTokenHandler) {
 // while routing a provider-specific endpoint through a custom transport.
 func (d *Open115) SetHTTPClient(client *http.Client) {
 	d.httpClient = client
+}
+
+// RefreshToken performs an explicit 115 Open token refresh and returns the
+// provider-reported lifetime. Wrappers that implement proactive refresh can
+// use the lifetime without reaching into the SDK client.
+func (d *Open115) RefreshToken(ctx context.Context) (int64, error) {
+	if d.client == nil {
+		return 0, errors.New("115 Open driver is not initialized")
+	}
+	response, err := d.client.RefreshToken(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return response.ExpiresIn, nil
 }
 
 // SetSkipUserInfoAtInit makes UserInfo optional during initialization. Some

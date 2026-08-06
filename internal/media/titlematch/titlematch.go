@@ -200,7 +200,8 @@ func TitlesCompatible(query, candidate string) bool {
 	if containsDocumentaryKeyword(candidateNormalized) {
 		return false
 	}
-	if containsCJK(queryNormalized) && strings.Contains(candidateNormalized, queryNormalized) {
+	if containsCJK(queryNormalized) && strings.Contains(candidateNormalized, queryNormalized) &&
+		cjkTitleProjection(queryNormalized) == cjkTitleProjection(candidateNormalized) {
 		return true
 	}
 	queryTerms := TokenizeMediaMatchTerms(queryNormalized)
@@ -267,6 +268,19 @@ func containsCJK(value string) bool {
 		}
 	}
 	return false
+}
+
+// cjkTitleProjection keeps only Han characters so a Chinese title can be
+// compared independently of an optional English alias. It intentionally
+// preserves the complete Chinese string: "九门" is not an alias of "老九门".
+func cjkTitleProjection(value string) string {
+	var projection []rune
+	for _, r := range value {
+		if unicode.Is(unicode.Han, r) {
+			projection = append(projection, r)
+		}
+	}
+	return string(projection)
 }
 
 func stripCollectionSuffix(value string) string {

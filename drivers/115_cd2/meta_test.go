@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
 	open115 "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
@@ -31,8 +33,8 @@ func TestCD2AuthenticationDefaultsMatchCloudDrive2(t *testing.T) {
 	if config.qrClientID != "100197353" {
 		t.Fatalf("CD2 QR client ID = %q, want the CloudDrive2 device-code client ID", config.qrClientID)
 	}
-	if config.refreshEndpoint != "https://token-server.zhenyunpan.com/refresh_access_token" {
-		t.Fatalf("CD2 refresh endpoint = %q, want the CloudDrive2 relay endpoint", config.refreshEndpoint)
+	if config.refreshEndpoint != sdk.ApiRefreshToken {
+		t.Fatalf("CD2 refresh endpoint = %q, want the official 115 refresh endpoint", config.refreshEndpoint)
 	}
 }
 
@@ -231,6 +233,91 @@ func TestCD2RefreshTransportUsesRelayAndNormalizesToken(t *testing.T) {
 	}
 	if gotAccessToken != "access-new" {
 		t.Fatalf("access token callback = %q, want access-new", gotAccessToken)
+	}
+}
+
+func TestCD2RefreshTransportPassesOfficialFormRequestThrough(t *testing.T) {
+	var gotRefreshToken string
+	client := sdk.New(sdk.WithRefreshToken("refresh-old"))
+	client.SetHttpClient(newCD2HTTPClient(sdk.ApiRefreshToken, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != sdk.ApiRefreshToken {
+			t.Fatalf("unexpected official URL: %s", req.URL)
+		}
+		if req.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+			t.Fatalf("content type = %q, want form encoding", req.Header.Get("Content-Type"))
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, err
+		}
+		gotRefreshToken = values.Get("refresh_token")
+		return jsonHTTPResponse(req, http.StatusOK, `{"state":1,"code":0,"data":{"access_token":"access-new","refresh_token":"refresh-new","expires_in":3600}}`), nil
+	})))
+
+	if _, err := client.RefreshToken(context.Background()); err != nil {
+		t.Fatalf("RefreshToken() error = %v", err)
+	}
+	if gotRefreshToken != "refresh-old" {
+		t.Fatalf("refresh token = %q, want refresh-old", gotRefreshToken)
+	}
+}
+
+func TestCD2RefreshThresholdOnlyTriggersInsideLeadWindow(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+
+	if accessTokenRefreshDue(now, now.Add(cd2RefreshLead+time.Minute).Unix()) {
+		t.Fatal("token outside the refresh lead window was considered due")
+	}
+	if !accessTokenRefreshDue(now, now.Add(cd2RefreshLead-time.Second).Unix()) {
+		t.Fatal("token inside the refresh lead window was not considered due")
+	}
+	if accessTokenRefreshDue(now, 0) {
+		t.Fatal("token without an expiry was considered due")
+	}
+}
+
+func TestCD2StartsBackgroundRefreshWhenTokenIsNearExpiry(t *testing.T) {
+	refreshStarted := make(chan struct{}, 1)
+	driver := &CD2{Addition: Addition{
+		AccessToken:          "access-old",
+		RefreshToken:         "refresh-old",
+		AccessTokenExpiresAt: time.Now().Add(cd2RefreshLead - time.Second).Unix(),
+	}}
+	driver.Addition.RootFolderID = "0"
+	driver.apiHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != sdk.ApiRefreshToken {
+			return nil, fmt.Errorf("unexpected API URL: %s", req.URL)
+		}
+		select {
+		case refreshStarted <- struct{}{}:
+		default:
+		}
+		return jsonHTTPResponse(req, http.StatusOK, `{"state":1,"code":0,"data":{"access_token":"access-new","refresh_token":"refresh-new","expires_in":3600}}`), nil
+	})}
+	defer driver.Drop(context.Background())
+
+	if err := driver.Init(context.Background()); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background refresh did not start for a near-expiry token")
+	}
+	driver.apiMu.Lock()
+	accessToken := driver.Addition.AccessToken
+	refreshToken := driver.Addition.RefreshToken
+	expiresAt := driver.Addition.AccessTokenExpiresAt
+	driver.apiMu.Unlock()
+	if accessToken != "access-new" || refreshToken != "refresh-new" {
+		t.Fatalf("tokens = (%q, %q), want refreshed token pair", accessToken, refreshToken)
+	}
+	if expiresAt <= time.Now().Unix()+int64(cd2RefreshLead/time.Second) {
+		t.Fatalf("access token expiry was not advanced after refresh: %d", expiresAt)
 	}
 }
 

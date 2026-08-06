@@ -88,6 +88,12 @@ func TestTitlesCompatibleAcceptsSingleChineseCoreTitleAgainstBilingualName(t *te
 	}
 }
 
+func TestTitlesCompatibleRejectsChineseSubstringFromLongerTitle(t *testing.T) {
+	if TitlesCompatible("九门", "老九门") {
+		t.Fatal("TitlesCompatible treated a Chinese substring as the same title")
+	}
+}
+
 func TestTitlesCompatibleRejectsDocumentaryStyleSuffixTitles(t *testing.T) {
 	if TitlesCompatible("千与千寻", "千与千寻诞生秘话") {
 		t.Fatal("TitlesCompatible returned true for documentary-style suffix title")

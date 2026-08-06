@@ -135,6 +135,30 @@ func TestFilterResourceSearchResultsRejectsDocumentaryStyleSuffixTitles(t *testi
 	}
 }
 
+func TestFilterResourceSearchResultsRejectsLongerChineseTitleSubstring(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{
+		{
+			Title: "老九门 2016",
+			Links: []model.SubscriptionResourceSearchLink{{
+				URL:      "https://www.123pan.com/s/abc-def",
+				Provider: string(ShareProviderPan123),
+			}},
+		},
+		{
+			Title: "九门 2025",
+			Links: []model.SubscriptionResourceSearchLink{{
+				URL:      "https://www.123pan.com/s/def-ghi",
+				Provider: string(ShareProviderPan123),
+			}},
+		},
+	}
+
+	filtered := filterResourceSearchResults(results, "九门", 10)
+	if len(filtered) != 1 || filtered[0].Title != "九门 2025" {
+		t.Fatalf("filtered = %#v, want only exact Chinese title", filtered)
+	}
+}
+
 func TestFilterResourceSearchResultsRejectsContentOnlyKeywordHits(t *testing.T) {
 	results := []model.SubscriptionResourceSearchResult{{
 		Title:   "完全无关标题",

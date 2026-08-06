@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -25,7 +26,7 @@ const (
 	cloudDrive2OAuthClientID  = "100195313"
 	cloudDrive2OAuthEndpoint  = "https://passportapi.115.com/open/authorize"
 	cloudDrive2OAuthRedirect  = "https://redirect115.zhenyunpan.com"
-	cloudDrive2RefreshURL     = "https://token-server.zhenyunpan.com/refresh_access_token"
+	cloudDrive2RefreshURL     = sdk.ApiRefreshToken
 	cloudDrive2Provider       = "cloud115_open"
 
 	cd2AuthModeOAuth  = "oauth"
@@ -111,6 +112,7 @@ func (d *CD2) ensureAuthentication(ctx context.Context) error {
 		}
 		d.Addition.AccessToken = tokens.AccessToken
 		d.Addition.RefreshToken = tokens.RefreshToken
+		d.Addition.AccessTokenExpiresAt = accessTokenExpiryUnix(time.Now(), tokens.ExpiresIn)
 		d.clearDeviceAuth()
 		d.persistAuthenticationState()
 		return nil
@@ -243,6 +245,12 @@ type cd2RefreshTransport struct {
 
 func (t *cd2RefreshTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.String() != sdk.ApiRefreshToken {
+		return t.base.RoundTrip(req)
+	}
+	// The official 115 endpoint expects the SDK's original form-encoded
+	// request. Only a non-official endpoint needs the legacy CD2 relay
+	// translation below.
+	if t.endpoint == sdk.ApiRefreshToken {
 		return t.base.RoundTrip(req)
 	}
 

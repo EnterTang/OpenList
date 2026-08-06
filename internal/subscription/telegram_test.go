@@ -388,6 +388,13 @@ func TestSubscriptionEntryMatchesSubscriptionName(t *testing.T) {
 	}) {
 		t.Fatal("unexpected unrelated title match")
 	}
+	if subscriptionEntryMatches(&model.Subscription{TMDBName: "九门"}, TreeEntry{
+		RootPath: "/quark/temp",
+		Path:     "/老九门/老九门.S01E01.mkv",
+		Name:     "老九门.S01E01.mkv",
+	}) {
+		t.Fatal("did not expect longer Chinese title substring match")
+	}
 }
 
 func TestSubscriptionEntryMatchesSelectedSeasons(t *testing.T) {

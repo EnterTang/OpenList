@@ -4,7 +4,9 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // OAuthCallbackPath is the public OpenList endpoint used as the state URL in
@@ -53,6 +55,10 @@ func CompleteOAuthCallback(addition *Addition, query url.Values) error {
 
 	addition.AccessToken = accessToken
 	addition.RefreshToken = refreshToken
+	addition.AccessTokenExpiresAt = 0
+	if expiresIn, err := strconv.ParseInt(strings.TrimSpace(query.Get("expires_in")), 10, 64); err == nil {
+		addition.AccessTokenExpiresAt = accessTokenExpiryUnix(time.Now(), expiresIn)
+	}
 	addition.OAuthState = ""
 	addition.OAuthURL = ""
 	return nil

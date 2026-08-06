@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	open115 "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 )
 
@@ -23,6 +23,10 @@ type CD2 struct {
 	apiMu          sync.Mutex
 	authHTTPClient *http.Client
 	apiHTTPClient  *http.Client
+	refreshStateMu sync.Mutex
+	refreshCancel  context.CancelFunc
+	refreshDone    chan struct{}
+	refreshRetryAt time.Time
 }
 
 func (d *CD2) Config() driver.Config {
@@ -34,6 +38,7 @@ func (d *CD2) GetAddition() driver.Additional {
 }
 
 func (d *CD2) Init(ctx context.Context) error {
+	d.stopTokenRefreshTask()
 	if err := d.ensureAuthentication(ctx); err != nil {
 		return err
 	}
@@ -51,7 +56,7 @@ func (d *CD2) Init(ctx context.Context) error {
 	})
 	d.delegate.SetRefreshTokenHandler(func(accessToken, refreshToken string) {
 		d.syncRefreshedTokens(accessToken, refreshToken)
-		op.MustSaveDriverStorage(d)
+		d.persistAuthenticationState()
 	})
 	addition, configuredRate := delegateAdditionForInit(d.Addition)
 	// The wrapper owns request throttling; disable the delegate's single bucket.
@@ -67,12 +72,18 @@ func (d *CD2) Init(ctx context.Context) error {
 	// The delegate did not create its limiter when the rate was zero. Restore
 	// the configured value so token refresh persistence keeps the user's setting.
 	d.delegate.Addition.LimitRate = configuredRate
+	d.startTokenRefreshTask()
 	return nil
 }
 
 func (d *CD2) syncRefreshedTokens(accessToken, refreshToken string) {
 	d.Addition.AccessToken = accessToken
 	d.Addition.RefreshToken = refreshToken
+	// The SDK callback does not expose expires_in. The explicit proactive
+	// refresh path restores it after the SDK call; reactive SDK refreshes keep
+	// the expiry unknown instead of reusing a stale timestamp.
+	d.Addition.AccessTokenExpiresAt = 0
+	d.refreshRetryAt = time.Time{}
 	if d.delegate != nil {
 		d.delegate.Addition.LimitRate = d.Addition.LimitRate
 	}
@@ -95,6 +106,7 @@ func delegateAdditionForInit(addition Addition) (open115.Addition, float64) {
 }
 
 func (d *CD2) Drop(ctx context.Context) error {
+	d.stopTokenRefreshTask()
 	d.apiMu.Lock()
 	defer d.apiMu.Unlock()
 	if d.delegate == nil {
@@ -110,6 +122,9 @@ func (d *CD2) call(ctx context.Context, fn func(*open115.Open115) error) error {
 	defer d.apiMu.Unlock()
 	if d.delegate == nil {
 		return errs.StorageNotInit
+	}
+	if err := d.refreshAccessTokenIfDueLocked(ctx); err != nil {
+		return err
 	}
 	return fn(d.delegate)
 }
