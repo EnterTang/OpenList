@@ -75,13 +75,31 @@ func (c *Client) ListFiles(ctx context.Context, cid string, opts ListOptions) ([
 			"record_open_time": {"1"},
 			"format":           {"json"},
 		}
-		var raw json.RawMessage
-		if err := c.doJSON(ctx, OperationFileList, ProfileAndroid, http.MethodGet, EndpointFileList, query, nil, &raw); err != nil {
+		var envelope responseEnvelope
+		if err := c.doJSON(ctx, OperationFileList, ProfileAndroid, http.MethodGet, EndpointFileList, query, nil, &envelope); err != nil {
 			return nil, err
 		}
-		page, err := decodeFilePage(raw)
+		page, err := decodeFilePage(envelope.Data)
 		if err != nil {
 			return nil, err
+		}
+		if envelope.Count.set {
+			page.Total = envelope.Count.value
+		}
+		if envelope.Total.set {
+			page.Total = envelope.Total.value
+		}
+		if envelope.Offset.set {
+			page.Offset, page.OffsetSet = envelope.Offset.value, true
+		}
+		if envelope.Limit.set {
+			page.Limit = envelope.Limit.value
+		}
+		if envelope.Next.set {
+			page.Next, page.NextSet = envelope.Next.value, true
+		}
+		if envelope.HasMore != nil {
+			page.HasMore, page.HasMoreSet = bool(*envelope.HasMore), true
 		}
 		if page.OffsetSet && page.Offset != offset {
 			return nil, &ProtocolError{Endpoint: EndpointFileList, Message: "server repeated pagination offset"}

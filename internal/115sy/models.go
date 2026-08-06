@@ -48,37 +48,40 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 	type remoteItemAlias RemoteItem
 	var raw struct {
 		remoteItemAlias
-		ID         flexibleString `json:"id"`
-		FileID     flexibleString `json:"file_id"`
-		FID        flexibleString `json:"fid"`
-		CID        flexibleString `json:"cid"`
-		Name       string         `json:"name"`
-		N          string         `json:"n"`
-		FileName   string         `json:"file_name"`
-		IsDir      flexibleBool   `json:"is_dir"`
-		IsFolder   flexibleBool   `json:"is_folder"`
-		Category   flexibleString `json:"category"`
-		Size       flexibleInt64  `json:"size"`
-		S          flexibleInt64  `json:"s"`
-		SHA1       string         `json:"sha1"`
-		Sha        string         `json:"sha"`
-		PickCode   string         `json:"pickcode"`
-		PC         string         `json:"pc"`
-		ParentCID  flexibleString `json:"parent_cid"`
-		ParentID   flexibleString `json:"parent_id"`
-		PID        flexibleString `json:"pid"`
-		ModifyTime flexibleInt64  `json:"modify_time"`
-		UT         flexibleInt64  `json:"utime"`
-		T          flexibleInt64  `json:"t"`
-		Thumbnail  string         `json:"thumbnail"`
-		Thumb      string         `json:"thumb"`
+		ID           flexibleString `json:"id"`
+		FileID       flexibleString `json:"file_id"`
+		FID          flexibleString `json:"fid"`
+		CID          flexibleString `json:"cid"`
+		Name         string         `json:"name"`
+		N            string         `json:"n"`
+		FileName     string         `json:"file_name"`
+		IsDir        flexibleBool   `json:"is_dir"`
+		IsFolder     flexibleBool   `json:"is_folder"`
+		Directory    flexibleBool   `json:"directory"`
+		FileCategory flexibleString `json:"file_category"`
+		FC           flexibleString `json:"fc"`
+		Category     flexibleString `json:"category"`
+		Size         flexibleInt64  `json:"size"`
+		S            flexibleInt64  `json:"s"`
+		SHA1         string         `json:"sha1"`
+		Sha          string         `json:"sha"`
+		PickCode     string         `json:"pickcode"`
+		PC           string         `json:"pc"`
+		ParentCID    flexibleString `json:"parent_cid"`
+		ParentID     flexibleString `json:"parent_id"`
+		PID          flexibleString `json:"pid"`
+		ModifyTime   flexibleInt64  `json:"modify_time"`
+		UT           flexibleInt64  `json:"utime"`
+		T            flexibleInt64  `json:"t"`
+		Thumbnail    string         `json:"thumbnail"`
+		Thumb        string         `json:"thumb"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 
 	*i = RemoteItem(raw.remoteItemAlias)
-	i.IsDir = bool(raw.IsDir) || bool(raw.IsFolder) || string(raw.Category) == "0"
+	i.IsDir = bool(raw.IsDir) || bool(raw.IsFolder) || bool(raw.Directory) || string(raw.Category) == "0" || string(raw.FileCategory) == "0" || string(raw.FC) == "0"
 	i.ID = strings.TrimSpace(firstNonEmpty(
 		string(raw.ID),
 		string(raw.FileID),

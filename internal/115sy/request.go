@@ -19,6 +19,12 @@ type responseEnvelope struct {
 	Message string          `json:"message"`
 	Msg     string          `json:"msg"`
 	Data    json.RawMessage `json:"data"`
+	Count   flexibleInt     `json:"count"`
+	Total   flexibleInt     `json:"total"`
+	Offset  flexibleInt     `json:"offset"`
+	Limit   flexibleInt     `json:"limit"`
+	Next    flexibleInt     `json:"next_offset"`
+	HasMore *flexibleBool   `json:"has_more"`
 }
 
 type responseState bool
@@ -110,7 +116,11 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 
 		respBody, readErr := io.ReadAll(resp.Body)
 		closeErr := resp.Body.Close()
-		if policy.PageCooldown {
+		fallbackEligible := false
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			fallbackEligible = shouldFallbackHTTP(policy, currentProfile, resp.StatusCode)
+		}
+		if policy.PageCooldown && readErr == nil && closeErr == nil && !fallbackEligible {
 			c.pageLimiter.MarkCompleted()
 		}
 		releasePageGate()
@@ -172,6 +182,10 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 		}
 
 		if out == nil {
+			return nil
+		}
+		if fullEnvelope, ok := out.(*responseEnvelope); ok {
+			*fullEnvelope = envelope
 			return nil
 		}
 		if len(envelope.Data) > 0 && string(envelope.Data) != "null" {

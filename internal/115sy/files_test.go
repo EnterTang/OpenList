@@ -2,6 +2,7 @@ package _115sy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -145,5 +146,32 @@ func TestListFilesUsesCappedPageSize(t *testing.T) {
 	client := newTestClient(t, ClientOptions{LimitRate: 1e6, AndroidBaseURL: server.URL, WebBaseURL: server.URL})
 	if _, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 99999}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestListFilesUsesTopLevelCountWithArrayData(t *testing.T) {
+	var calls atomic.Int32
+	client := newTestClient(t, ClientOptions{
+		LimitRate:      1e6,
+		AndroidBaseURL: "https://android.invalid",
+		WebBaseURL:     "https://web.invalid",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return jsonResponse(req, http.StatusOK, `{"state":true,"errno":0,"count":1,"offset":0,"limit":1,"data":[{"id":"one","name":"one"}]}`), nil
+		})},
+	})
+	items, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 1})
+	if err != nil || len(items) != 1 || calls.Load() != 1 {
+		t.Fatalf("items/error/calls = %#v/%v/%d, want one page from top-level count", items, err, calls.Load())
+	}
+}
+
+func TestRemoteItemRecognizesLegacyDirectoryMarker(t *testing.T) {
+	var item RemoteItem
+	if err := json.Unmarshal([]byte(`{"cid":"123","name":"folder","directory":true}`), &item); err != nil {
+		t.Fatal(err)
+	}
+	if !item.IsDir || item.ID != "123" {
+		t.Fatalf("item = %#v, want legacy directory", item)
 	}
 }
