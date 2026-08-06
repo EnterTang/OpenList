@@ -6,9 +6,11 @@ import (
 	"fmt"
 	stdpath "path"
 	"strings"
+	"sync"
 	"time"
 
 	sy "github.com/OpenListTeam/OpenList/v4/internal/115sy"
+	"github.com/OpenListTeam/OpenList/v4/internal/115sy/automation"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -20,6 +22,10 @@ type Pan115SY struct {
 	client                *sy.Client
 	authState             *sy.AuthState
 	runtimeMembershipTier string
+	automationScheduler   *automation.Scheduler
+	automationCancel      context.CancelFunc
+	automationTask        *automation.Task
+	automationMu          sync.RWMutex
 }
 
 func (d *Pan115SY) Config() driver.Config { return config }
@@ -27,6 +33,7 @@ func (d *Pan115SY) Config() driver.Config { return config }
 func (d *Pan115SY) GetAddition() driver.Additional { return &d.Addition }
 
 func (d *Pan115SY) Init(ctx context.Context) error {
+	d.stopAutomation()
 	pageCooldown := 250 * time.Millisecond
 	if raw := strings.TrimSpace(d.PageCooldown); raw != "" {
 		parsed, err := time.ParseDuration(raw)
@@ -73,13 +80,59 @@ func (d *Pan115SY) Init(ctx context.Context) error {
 	if d.MembershipTier == "" || strings.EqualFold(d.MembershipTier, "unknown") {
 		d.runtimeMembershipTier = "ordinary"
 	}
+	if raw := strings.TrimSpace(d.AutomationInterval); raw != "" {
+		interval, parseErr := time.ParseDuration(raw)
+		if parseErr != nil || interval <= 0 {
+			d.client = nil
+			d.authState = nil
+			return fmt.Errorf("invalid 115-sy automation interval %q", raw)
+		}
+		automationContext, cancel := context.WithCancel(context.Background())
+		task := &automation.Task{}
+		scheduler, scheduleErr := automation.NewScheduler(interval, func() {
+			task.Update("running", 0, nil)
+			_, syncErr := automation.StarSync(automationContext, client, d.rootCID())
+			if syncErr != nil {
+				task.Update("failed", 0, syncErr)
+				return
+			}
+			task.Update("succeeded", 100, nil)
+		})
+		if scheduleErr != nil {
+			cancel()
+			return scheduleErr
+		}
+		d.automationMu.Lock()
+		d.automationCancel = cancel
+		d.automationTask = task
+		d.automationScheduler = scheduler
+		scheduler.Start()
+		d.automationMu.Unlock()
+	}
 	return nil
 }
 
 func (d *Pan115SY) Drop(ctx context.Context) error {
+	d.stopAutomation()
 	d.client = nil
 	d.authState = nil
 	return nil
+}
+
+func (d *Pan115SY) stopAutomation() {
+	d.automationMu.Lock()
+	cancel := d.automationCancel
+	scheduler := d.automationScheduler
+	d.automationCancel = nil
+	d.automationScheduler = nil
+	d.automationTask = nil
+	d.automationMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if scheduler != nil {
+		scheduler.Stop()
+	}
 }
 
 func (d *Pan115SY) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
@@ -278,6 +331,12 @@ func (d *Pan115SY) Other(ctx context.Context, args model.OtherArgs) (interface{}
 			return nil, err
 		}
 		return d.client.ReceiveShare(ctx, request)
+	case "share_create":
+		var request sy.CreateShareRequest
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return d.client.CreateShare(ctx, request)
 	case "offline_add":
 		var request sy.OfflineRequest
 		if err := decodeOtherData(args.Data, &request); err != nil {
@@ -295,6 +354,50 @@ func (d *Pan115SY) Other(ctx context.Context, args model.OtherArgs) (interface{}
 			return nil, err
 		}
 		return nil, d.client.DeleteOfflineTasks(ctx, request.IDs, request.DeleteFiles)
+	case "tree_sync":
+		var request struct {
+			Data string `json:"data"`
+		}
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(request.Data) == "" {
+			return nil, fmt.Errorf("tree_sync data is required")
+		}
+		return automation.ParseTree(strings.NewReader(request.Data))
+	case "star_sync":
+		var request struct {
+			RootCID string `json:"root_cid"`
+		}
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return automation.StarSync(ctx, d.client, firstNonEmptyLocal(request.RootCID, d.rootCID()))
+	case "cleanup":
+		var request automation.CleanupRequest
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return automation.Clean(ctx, d.client, request)
+	case "fast_delete":
+		var request automation.FastDeleteRequest
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return automation.FastDelete(ctx, d.client, request)
+	case "sec_upload":
+		var request automation.SecUploadRequest
+		if err := decodeOtherData(args.Data, &request); err != nil {
+			return nil, err
+		}
+		return automation.SecUpload(ctx, d.client, request, nil)
+	case "automation_status":
+		d.automationMu.RLock()
+		defer d.automationMu.RUnlock()
+		if d.automationTask == nil {
+			return automation.TaskSnapshot{Status: "disabled"}, nil
+		}
+		return d.automationTask.Snapshot(), nil
 	default:
 		return nil, errs.NotSupport
 	}

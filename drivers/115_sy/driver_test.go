@@ -6,8 +6,11 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	sy "github.com/OpenListTeam/OpenList/v4/internal/115sy"
+	"github.com/OpenListTeam/OpenList/v4/internal/115sy/automation"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -65,4 +68,51 @@ func Test115SYListAndLinkPreservePickcodeAndUserAgent(t *testing.T) {
 	if sawUA != "caller-agent" {
 		t.Fatalf("User-Agent = %q, want caller-agent", sawUA)
 	}
+}
+
+func Test115SYAutomationManagementDispatch(t *testing.T) {
+	client, err := sy.NewClient(sy.ClientOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Pan115SY{client: client}
+	result, err := d.Other(context.Background(), model.OtherArgs{
+		Method: "tree_sync",
+		Data:   map[string]interface{}{"data": "id\tparent_id\tpath\tname\tis_dir\nroot\t0\t/\tRoot\ttrue\n"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, ok := result.([]automation.TreeRecord)
+	if !ok || len(records) != 1 || records[0].ID != "root" {
+		t.Fatalf("tree_sync result = %#v", result)
+	}
+	if _, err := d.Other(context.Background(), model.OtherArgs{Method: "unknown"}); err != errs.NotSupport {
+		t.Fatalf("unknown method error = %v", err)
+	}
+}
+
+func Test115SYDropStopsAutomation(t *testing.T) {
+	scheduler, err := automation.NewScheduler(time.Hour, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.Start()
+	_, cancel := context.WithCancel(context.Background())
+	d := &Pan115SY{client: clientForTest(t), automationScheduler: scheduler, automationCancel: cancel}
+	if err := d.Drop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if d.client != nil || d.automationScheduler != nil || d.automationCancel != nil {
+		t.Fatalf("driver lifecycle fields not cleared: %#v", d)
+	}
+}
+
+func clientForTest(t *testing.T) *sy.Client {
+	t.Helper()
+	client, err := sy.NewClient(sy.ClientOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }
