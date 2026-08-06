@@ -10,6 +10,7 @@ import (
 
 	_115 "github.com/OpenListTeam/OpenList/v4/drivers/115"
 	_115_open "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
+	_115_sy "github.com/OpenListTeam/OpenList/v4/drivers/115_sy"
 	_123 "github.com/OpenListTeam/OpenList/v4/drivers/123"
 	_123_open "github.com/OpenListTeam/OpenList/v4/drivers/123_open"
 	"github.com/OpenListTeam/OpenList/v4/drivers/guangyapan"
@@ -124,6 +125,12 @@ func AddURL(ctx context.Context, args *AddURLArgs) (task.TaskExtensionInfo, erro
 			tempDir = args.DstDirPath
 		} else {
 			tempDir = filepath.Join(setting.GetStr(conf.Pan115OpenTempDir), uid)
+		}
+	case "115 SY":
+		if _, ok := storage.(*_115_sy.Pan115SY); ok {
+			tempDir = args.DstDirPath
+		} else {
+			tempDir = filepath.Join(setting.GetStr(conf.Pan115SYTempDir), uid)
 		}
 	case "123 Open":
 		if _, ok := storage.(*_123_open.Open123); ok && dstDirActualPath != "/" {

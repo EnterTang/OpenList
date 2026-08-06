@@ -64,10 +64,10 @@ const (
 	PluginISORenameEnabled   = "plugin_iso_rename_enabled"
 	PluginExtensionWhitelist = "plugin_extension_whitelist"
 
-	TMDBApiKey              = "tmdb_api_key"
-	TMDBApiBaseURL          = "tmdb_api_base_url"
-	TMDBLanguage            = "tmdb_language"
-	MediaCategoryRules      = "media_category_rules"
+	TMDBApiKey         = "tmdb_api_key"
+	TMDBApiBaseURL     = "tmdb_api_base_url"
+	TMDBLanguage       = "tmdb_language"
+	MediaCategoryRules = "media_category_rules"
 
 	// index
 	SearchIndex     = "search_index"
@@ -84,7 +84,8 @@ const (
 	TransmissionSeedtime = "transmission_seedtime"
 
 	// 115
-	Pan115TempDir = "115_temp_dir"
+	Pan115TempDir   = "115_temp_dir"
+	Pan115SYTempDir = "115_sy_temp_dir"
 
 	// 123
 	Pan123TempDir = "123_temp_dir"
