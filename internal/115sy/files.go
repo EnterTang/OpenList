@@ -128,6 +128,9 @@ func (c *Client) ListFiles(ctx context.Context, cid string, opts ListOptions) ([
 		if page.Total > 0 && int64(len(items)) >= page.Total {
 			break
 		}
+		if page.HasMoreSet && !page.HasMore {
+			break
+		}
 		if !page.HasMoreSet && page.Total == 0 && int64(len(page.Items)) < limit {
 			break
 		}

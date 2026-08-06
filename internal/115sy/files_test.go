@@ -166,6 +166,23 @@ func TestListFilesUsesTopLevelCountWithArrayData(t *testing.T) {
 	}
 }
 
+func TestListFilesStopsWhenHasMoreIsFalseOnFullPage(t *testing.T) {
+	var calls atomic.Int32
+	client := newTestClient(t, ClientOptions{
+		LimitRate:      1e6,
+		AndroidBaseURL: "https://android.invalid",
+		WebBaseURL:     "https://web.invalid",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return jsonResponse(req, http.StatusOK, `{"state":true,"errno":0,"data":{"items":[{"id":"one","name":"one"}],"has_more":false}}`), nil
+		})},
+	})
+	items, err := client.ListFiles(context.Background(), "0", ListOptions{PageSize: 1})
+	if err != nil || len(items) != 1 || calls.Load() != 1 {
+		t.Fatalf("items/error/calls = %#v/%v/%d, want one page", items, err, calls.Load())
+	}
+}
+
 func TestRemoteItemRecognizesLegacyDirectoryMarker(t *testing.T) {
 	var item RemoteItem
 	if err := json.Unmarshal([]byte(`{"cid":"123","name":"folder","directory":true}`), &item); err != nil {
