@@ -1,6 +1,9 @@
 package _115_sy
 
-import "github.com/OpenListTeam/OpenList/v4/internal/driver"
+import (
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+)
 
 type Addition struct {
 	driver.RootID
@@ -22,4 +25,8 @@ var config = driver.Config{
 	Name:          "115 SY",
 	DefaultRoot:   "0",
 	LinkCacheMode: driver.LinkCacheUA,
+}
+
+func init() {
+	op.RegisterDriver(func() driver.Driver { return &Pan115SY{} })
 }

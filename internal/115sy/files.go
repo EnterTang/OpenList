@@ -285,3 +285,65 @@ func (c *Client) GetCapacity(ctx context.Context) (Capacity, error) {
 		Remaining: int64(payload.SpaceRemain),
 	}, nil
 }
+
+type DownloadLink struct {
+	URL    string
+	Header http.Header
+}
+
+type downloadPayload struct {
+	URL         json.RawMessage `json:"url"`
+	DownloadURL string          `json:"download_url"`
+	Header      http.Header     `json:"header"`
+}
+
+func (c *Client) DownloadURL(ctx context.Context, pickcode, userAgent string) (DownloadLink, error) {
+	requestClient := c
+	if strings.TrimSpace(userAgent) != "" && userAgent != c.userAgent {
+		requestClient = c.cloneForUserAgent(userAgent)
+	}
+	query := url.Values{"pick_code": {strings.TrimSpace(pickcode)}}
+	var raw json.RawMessage
+	if err := requestClient.doJSON(ctx, OperationDownloadURL, ProfileAndroid, http.MethodGet, EndpointDownloadURL, query, nil, &raw); err != nil {
+		return DownloadLink{}, err
+	}
+	var payload downloadPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is invalid"}
+	}
+	link := strings.TrimSpace(payload.DownloadURL)
+	if len(payload.URL) > 0 {
+		var direct string
+		if json.Unmarshal(payload.URL, &direct) == nil {
+			link = firstNonEmpty(link, direct)
+		} else {
+			var nested struct {
+				URL string `json:"url"`
+			}
+			if json.Unmarshal(payload.URL, &nested) == nil {
+				link = firstNonEmpty(link, nested.URL)
+			}
+		}
+	}
+	if link == "" {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is missing url"}
+	}
+	return DownloadLink{URL: link, Header: payload.Header}, nil
+}
+
+func (c *Client) cloneForUserAgent(userAgent string) *Client {
+	return &Client{
+		httpClient:      c.httpClient,
+		jar:             c.jar,
+		rawCookie:       c.currentRawCookie(),
+		userAgent:       userAgent,
+		appVersion:      c.appVersion,
+		webBaseURL:      c.webBaseURL,
+		androidBaseURL:  c.androidBaseURL,
+		qrCodeBaseURL:   c.qrCodeBaseURL,
+		passportBaseURL: c.passportBaseURL,
+		accountLimiter:  c.accountLimiter,
+		pageLimiter:     c.pageLimiter,
+		pathCache:       c.pathCache,
+	}
+}

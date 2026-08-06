@@ -38,7 +38,7 @@ const (
 	EndpointFileList      = "/files"
 	EndpointShareSnapshot = "/share/snapshot"
 	EndpointShareReceive  = "/share/receive"
-	EndpointDownloadURL   = "/download/url"
+	EndpointDownloadURL   = "/app/chrome/downurl"
 	EndpointOfflineAdd    = "/offline/add"
 	EndpointQRCodeToken   = "/api/1.0/web/1.0/token"
 	EndpointQRCodeStatus  = "/get/status/"
@@ -84,8 +84,8 @@ var operationPolicies = map[Operation]operationPolicy{
 		FallbackHTTP405: true,
 	},
 	OperationDownloadURL: {
-		Primary:         ProfileWeb,
-		Fallback:        ProfileAndroid,
+		Primary:         ProfileAndroid,
+		Fallback:        ProfileWeb,
 		FallbackHTTP405: true,
 	},
 	OperationOffline: {
