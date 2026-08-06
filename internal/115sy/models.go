@@ -497,6 +497,18 @@ type ReceiveShareRequest struct {
 	FileID      string `json:"file_id,omitempty"`
 }
 
+type CreateShareRequest struct {
+	FileIDs []string `json:"file_ids"`
+	Order   string   `json:"order,omitempty"`
+	Asc     bool     `json:"is_asc"`
+}
+
+type CreateShareResult struct {
+	ShareCode   string `json:"share_code"`
+	ReceiveCode string `json:"receive_code"`
+	ShareURL    string `json:"share_url,omitempty"`
+}
+
 type OfflineRequest struct {
 	TargetCID string   `json:"target_cid"`
 	URLs      []string `json:"urls"`

@@ -215,6 +215,12 @@ func endpointForProfile(operation Operation, profile Profile, endpoint string) s
 		if profile == ProfileWeb && endpoint == EndpointShareReceiveApp {
 			return EndpointShareReceive
 		}
+		if profile == ProfileAndroid && endpoint == EndpointShareSend {
+			return EndpointShareSendApp
+		}
+		if profile == ProfileWeb && endpoint == EndpointShareSendApp {
+			return EndpointShareSend
+		}
 	}
 	return endpoint
 }

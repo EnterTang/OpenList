@@ -45,6 +45,8 @@ const (
 	EndpointShareSnapshotApp = "/android/2.0/share/snap"
 	EndpointShareReceive     = "/share/receive"
 	EndpointShareReceiveApp  = "/android/2.0/share/receive"
+	EndpointShareSend        = "/share/send"
+	EndpointShareSendApp     = "/android/2.0/share/send"
 	EndpointDownloadURL      = "/app/chrome/downurl"
 	EndpointOfflineAdd       = "/open/offline/add_task_urls"
 	EndpointOfflineList      = "/open/offline/get_task_list"
@@ -62,6 +64,7 @@ const (
 	EndpointFileRename       = "/files/batch_rename"
 	EndpointFileCopy         = "/files/copy"
 	EndpointFileDelete       = "/rb/delete"
+	EndpointRecycleClean     = "/rb/clean"
 	EndpointCategory         = "/category/get"
 )
 

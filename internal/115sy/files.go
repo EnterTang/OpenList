@@ -266,6 +266,31 @@ func (c *Client) Remove(ctx context.Context, fid, parentCID string) error {
 	return c.mutateFile(ctx, EndpointFileDelete, url.Values{"fid[0]": {fid}})
 }
 
+func (c *Client) RemoveMany(ctx context.Context, fids []string) error {
+	form := make(url.Values)
+	index := 0
+	for _, fid := range fids {
+		fid = strings.TrimSpace(fid)
+		if fid == "" || fid == "0" {
+			continue
+		}
+		form[fmt.Sprintf("fid[%d]", index)] = []string{fid}
+		index++
+	}
+	if index == 0 {
+		return &ProtocolError{Endpoint: EndpointFileDelete, Message: "file ids are required"}
+	}
+	return c.mutateFile(ctx, EndpointFileDelete, form)
+}
+
+func (c *Client) RecyclebinClean(ctx context.Context, securityCode string) error {
+	securityCode = strings.TrimSpace(securityCode)
+	if securityCode == "" {
+		return &ProtocolError{Endpoint: EndpointRecycleClean, Message: "security code is required"}
+	}
+	return c.doForm(ctx, OperationUserInfo, ProfileWeb, http.MethodPost, EndpointRecycleClean, nil, url.Values{"password": {securityCode}}, nil)
+}
+
 func (c *Client) mutateFile(ctx context.Context, endpoint string, form url.Values) error {
 	if err := c.doForm(ctx, OperationShareReceive, ProfileWeb, http.MethodPost, endpoint, nil, form, nil); err != nil {
 		return err

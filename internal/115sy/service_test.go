@@ -61,6 +61,14 @@ func TestReceiveShareAndOfflineTasksUseExpectedForms(t *testing.T) {
 				t.Fatalf("receive form = %#v", r.Form)
 			}
 			_, _ = io.WriteString(w, `{"state":true,"errno":0,"data":{"task_id":"receive-1","cid":"1001"}}`)
+		case EndpointShareSend:
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			if r.Form.Get("file_ids") != "file" || r.Form.Get("ignore_warn") != "1" || r.Form.Get("order") != "file_name" {
+				t.Fatalf("share form = %#v", r.Form)
+			}
+			_, _ = io.WriteString(w, `{"state":true,"errno":0,"data":{"share_code":"share-1","receive_code":"pass-1","share_url":"https://115.com/s/share-1?password=pass-1"}}`)
 		case EndpointOfflineAdd:
 			if err := r.ParseForm(); err != nil {
 				t.Fatal(err)
@@ -88,6 +96,10 @@ func TestReceiveShareAndOfflineTasksUseExpectedForms(t *testing.T) {
 	received, err := client.ReceiveShare(context.Background(), ReceiveShareRequest{ShareCode: "code", ReceiveCode: "pass", TargetCID: "1001", FileID: "file"})
 	if err != nil || received.TaskID != "receive-1" {
 		t.Fatalf("received = %#v, error = %v", received, err)
+	}
+	created, err := client.CreateShare(context.Background(), CreateShareRequest{FileIDs: []string{"file", "file"}})
+	if err != nil || created.ShareCode != "share-1" || created.ReceiveCode != "pass-1" {
+		t.Fatalf("created = %#v, error = %v", created, err)
 	}
 	offline, err := client.AddOfflineTasks(context.Background(), OfflineRequest{TargetCID: "1001", URLs: []string{"magnet:?xt=urn:btih:abc", "magnet:?xt=urn:btih:abc", "https://example.com/a"}})
 	if err != nil || len(offline.Items) != 2 || !offline.Items[0].Success || offline.Items[1].Success {

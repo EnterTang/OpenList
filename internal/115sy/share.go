@@ -232,3 +232,53 @@ func (c *Client) ReceiveShare(ctx context.Context, req ReceiveShareRequest) (Rec
 	}
 	return result, nil
 }
+
+func (c *Client) CreateShare(ctx context.Context, req CreateShareRequest) (CreateShareResult, error) {
+	ids := make([]string, 0, len(req.FileIDs))
+	seen := make(map[string]struct{}, len(req.FileIDs))
+	for _, id := range req.FileIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return CreateShareResult{}, &ProtocolError{Endpoint: EndpointShareSend, Message: "file ids are required"}
+	}
+	order := strings.TrimSpace(req.Order)
+	if order == "" {
+		order = "file_name"
+	}
+	form := url.Values{
+		"file_ids":    {strings.Join(ids, ",")},
+		"ignore_warn": {"1"},
+		"is_asc":      {"1"},
+		"order":       {order},
+	}
+	var envelope responseEnvelope
+	if err := c.doForm(ctx, OperationShareReceive, ProfileWeb, http.MethodPost, EndpointShareSend, nil, form, &envelope); err != nil {
+		return CreateShareResult{}, err
+	}
+	var result CreateShareResult
+	if err := json.Unmarshal(envelope.Data, &result); err != nil {
+		return CreateShareResult{}, &ProtocolError{Endpoint: EndpointShareSend, Message: "share response is invalid"}
+	}
+	result.ShareCode = strings.TrimSpace(result.ShareCode)
+	result.ReceiveCode = strings.TrimSpace(result.ReceiveCode)
+	result.ShareURL = strings.TrimSpace(result.ShareURL)
+	if result.ShareCode == "" {
+		return CreateShareResult{}, &ProtocolError{Endpoint: EndpointShareSend, Message: "share response is missing share code"}
+	}
+	if result.ShareURL == "" {
+		result.ShareURL = "https://115.com/s/" + url.PathEscape(result.ShareCode)
+		if result.ReceiveCode != "" {
+			result.ShareURL += "?password=" + url.QueryEscape(result.ReceiveCode)
+		}
+	}
+	return result, nil
+}
