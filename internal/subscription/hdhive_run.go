@@ -137,7 +137,8 @@ func runHDHiveFederated(ctx context.Context, sub *model.Subscription, sourceCfg 
 		accessCode := strings.TrimSpace(details.AccessCode)
 		requiresUnlock := false
 		if shareURL == "" {
-			free := details.IsFreeForUser || details.UnlockPoints != nil && *details.UnlockPoints == 0
+			points := firstHDHiveUnlockPoints(details.UnlockPoints, resource.UnlockPoints)
+			free := details.IsFreeForUser || points != nil && *points == 0
 			if !free {
 				requiresUnlock = true
 				if sub.BoundShare != nil && sub.BoundShare.RequiresUnlock && sub.BoundShare.ResourceSlug != resourceRef.Slug {
@@ -146,7 +147,6 @@ func runHDHiveFederated(ctx context.Context, sub *model.Subscription, sourceCfg 
 				if !regularReady || regularCandidate {
 					continue
 				}
-				points := firstHDHiveUnlockPoints(resource.UnlockPoints, details.UnlockPoints)
 				if points == nil {
 					continue
 				}
@@ -297,7 +297,7 @@ func bindHDHiveShare(sub *model.Subscription, resourceURL string, resourceRef hd
 		ResourceURL:    resourceURL,
 		ResourceSlug:   resourceRef.Slug,
 		RequiresUnlock: requiresUnlock,
-		UnlockPoints:   firstHDHiveUnlockPoints(resource.UnlockPoints, details.UnlockPoints),
+		UnlockPoints:   firstHDHiveUnlockPoints(details.UnlockPoints, resource.UnlockPoints),
 		BoundAt:        boundAt,
 	}
 }
@@ -418,7 +418,8 @@ func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 		accessCode := strings.TrimSpace(details.AccessCode)
 		requiresUnlock := false
 		if shareURL == "" {
-			free := details.IsFreeForUser || details.UnlockPoints != nil && *details.UnlockPoints == 0
+			points := firstHDHiveUnlockPoints(details.UnlockPoints, resource.UnlockPoints)
+			free := details.IsFreeForUser || points != nil && *points == 0
 			if !free {
 				requiresUnlock = true
 				if sub.BoundShare != nil && sub.BoundShare.RequiresUnlock && sub.BoundShare.ResourceSlug != resourceRef.Slug {
@@ -427,7 +428,6 @@ func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 				if !regularReady || regularCandidate {
 					continue
 				}
-				points := firstHDHiveUnlockPoints(resource.UnlockPoints, details.UnlockPoints)
 				if points == nil {
 					continue
 				}
