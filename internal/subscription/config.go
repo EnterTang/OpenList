@@ -131,6 +131,12 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 			return err
 		}
 		sub.SourceConfig = merged
+	case model.SubscriptionSourceHDHive:
+		merged, err := mergeHDHiveSourceConfig(sub.SourceConfig, cfg.PanSou)
+		if err != nil {
+			return err
+		}
+		sub.SourceConfig = merged
 	}
 	return nil
 }
@@ -596,6 +602,34 @@ func mergePanSouSourceConfig(raw string, defaults model.SubscriptionPanSouSource
 	}
 	if isZeroPanSouSourceConfig(cfg) {
 		return strings.TrimSpace(raw), nil
+	}
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		return raw, err
+	}
+	return string(body), nil
+}
+
+func mergeHDHiveSourceConfig(raw string, defaults model.SubscriptionPanSouSourceConfig) (string, error) {
+	limit := defaults.Limit
+	if limit <= 0 {
+		limit = defaultResourceSearchLimit
+	}
+	cfg := model.SubscriptionHDHiveSourceConfig{CloudType: "all", Limit: limit}
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+			return raw, errors.WithMessage(err, "invalid hdhive source config")
+		}
+	}
+	cfg.CloudType = strings.ToLower(strings.TrimSpace(cfg.CloudType))
+	if cfg.CloudType == "" {
+		cfg.CloudType = "all"
+	}
+	if !isHDHiveCloudType(cfg.CloudType) {
+		return raw, errors.Errorf("unsupported hdhive cloud_type: %s", cfg.CloudType)
+	}
+	if cfg.Limit <= 0 {
+		cfg.Limit = limit
 	}
 	body, err := json.Marshal(cfg)
 	if err != nil {

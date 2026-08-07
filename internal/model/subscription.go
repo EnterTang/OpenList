@@ -64,6 +64,19 @@ type Subscription struct {
 	LastError                string                     `json:"last_error" gorm:"type:text"`
 	Progress                 SubscriptionProgress       `json:"progress" gorm:"-"`
 	RealtimeStatus           SubscriptionRealtimeStatus `json:"realtime_status" gorm:"-"`
+	BoundShare               *SubscriptionBoundShare    `json:"bound_share,omitempty" gorm:"serializer:json"`
+}
+
+type SubscriptionBoundShare struct {
+	SourceType     string    `json:"source_type,omitempty"`
+	Provider       string    `json:"provider,omitempty"`
+	ShareURL       string    `json:"share_url,omitempty"`
+	AccessCode     string    `json:"access_code,omitempty"`
+	ResourceURL    string    `json:"resource_url,omitempty"`
+	ResourceSlug   string    `json:"resource_slug,omitempty"`
+	RequiresUnlock bool      `json:"requires_unlock,omitempty"`
+	UnlockPoints   *int      `json:"unlock_points,omitempty"`
+	BoundAt        time.Time `json:"bound_at,omitempty"`
 }
 
 type ExternalSubscriptionRequest struct {
@@ -290,6 +303,11 @@ type SubscriptionPanSouSourceConfig struct {
 	CommandTimeoutSeconds int64    `json:"command_timeout_seconds"`
 	Limit                 int      `json:"limit"`
 	Query                 string   `json:"query"`
+}
+
+type SubscriptionHDHiveSourceConfig struct {
+	CloudType string `json:"cloud_type,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 type SubscriptionConfig struct {

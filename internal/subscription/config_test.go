@@ -62,6 +62,30 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 	}
 }
 
+func TestApplyConfigDefaultsMergesHDHiveSourceConfig(t *testing.T) {
+	sub := &model.Subscription{
+		SourceType: model.SubscriptionSourceHDHive,
+	}
+	cfg := model.SubscriptionConfig{
+		PanSou: model.SubscriptionPanSouSourceConfig{Limit: 17},
+	}
+
+	if err := ApplyConfigDefaults(sub, cfg); err != nil {
+		t.Fatalf("apply HDHive defaults: %v", err)
+	}
+
+	var source model.SubscriptionHDHiveSourceConfig
+	if err := json.Unmarshal([]byte(sub.SourceConfig), &source); err != nil {
+		t.Fatalf("decode HDHive source config: %v", err)
+	}
+	if source.CloudType != "all" {
+		t.Fatalf("cloud type = %q, want all", source.CloudType)
+	}
+	if source.Limit != 17 {
+		t.Fatalf("limit = %d, want 17", source.Limit)
+	}
+}
+
 func TestApplyConfigDefaultsMergesTelegramChannelGroups(t *testing.T) {
 	sub := &model.Subscription{
 		SourceType:   model.SubscriptionSourceTelegram,
