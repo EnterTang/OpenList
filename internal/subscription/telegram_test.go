@@ -487,6 +487,16 @@ func TestSubscriptionEntryMatchesNoisyMixedLanguagePath(t *testing.T) {
 	}
 }
 
+func TestEntrySeasonEpisodeParsesSeparatedReleaseMarkers(t *testing.T) {
+	season, episode := entrySeasonEpisode(TreeEntry{
+		Path: "/示例剧/示例剧 S02 05 1080p WEB-DL.mkv",
+		Name: "示例剧 S02 05 1080p WEB-DL.mkv",
+	})
+	if season != 2 || episode != 5 {
+		t.Fatalf("season/episode = %d/%d, want 2/5", season, episode)
+	}
+}
+
 func TestTelegramPanSourcesForTransferMergesConfiguredAndTriggered(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	oldFree := storageFreeBytesForMountPath

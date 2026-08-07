@@ -120,7 +120,7 @@ func TestSymediaClientSearchesResourcesByTMDBID(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
 				"slug":             "22c7835aacad4e3f9fee349d2d803cb1",
 				"resource_url":     "https://hdhive.com/resource/115/22c7835aacad4e3f9fee349d2d803cb1",
-				"title":            "权力的游戏",
+				"title":            "完全不相关的展示标题",
 				"pan_type":         "115",
 				"unlock_points":    10,
 				"is_unlocked":      false,
@@ -151,7 +151,7 @@ func TestSymediaClientSearchesResourcesByTMDBID(t *testing.T) {
 	if len(resources) != 1 {
 		t.Fatalf("resources = %#v, want one resource", resources)
 	}
-	if resources[0].Slug != "22c7835aacad4e3f9fee349d2d803cb1" || resources[0].PanType != "115" || resources[0].UnlockPoints == nil || *resources[0].UnlockPoints != 10 {
+	if resources[0].Slug != "22c7835aacad4e3f9fee349d2d803cb1" || resources[0].Title != "完全不相关的展示标题" || resources[0].PanType != "115" || resources[0].UnlockPoints == nil || *resources[0].UnlockPoints != 10 {
 		t.Fatalf("resource = %#v", resources[0])
 	}
 }

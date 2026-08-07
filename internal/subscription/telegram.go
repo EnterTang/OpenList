@@ -22,6 +22,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/release"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
@@ -664,8 +665,17 @@ func entrySeason(entry TreeEntry) int {
 }
 
 func entrySeasonEpisode(entry TreeEntry) (int, int) {
-	recognized := recognize.Recognize(entry.Name, parentPath(entry))
-	season, episode := recognized.Season, recognized.Episode
+	parsed := release.Parse(entry.Name)
+	season, episode := parsed.Season, parsed.EpisodeStart
+	if season <= 0 || episode <= 0 {
+		recognized := recognize.Recognize(entry.Name, parentPath(entry))
+		if season <= 0 {
+			season = recognized.Season
+		}
+		if episode <= 0 {
+			episode = recognized.Episode
+		}
+	}
 	if season <= 0 {
 		season = inferSeason(parentPath(entry))
 	}
