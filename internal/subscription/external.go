@@ -276,9 +276,9 @@ func normalizeExternalSubscriptionCreateRequest(input ExternalSubscriptionCreate
 		}
 	}
 	switch input.SourceType {
-	case model.SubscriptionSourceManual, model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou:
+	case model.SubscriptionSourceManual, model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive:
 	default:
-		return input, nil, "", "", "", invalidExternalSubscription("source_type must be manual, telegram, or pansou")
+		return input, nil, "", "", "", invalidExternalSubscription("source_type must be manual, telegram, pansou, or hdhive")
 	}
 
 	if input.MediaType == "movie" {
