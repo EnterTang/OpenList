@@ -392,6 +392,21 @@ type SubscriptionResourceUnlockResp struct {
 	PointsSpent *int   `json:"points_spent,omitempty"`
 }
 
+type SubscriptionResourceBindReq struct {
+	SubscriptionID uint   `json:"subscription_id" binding:"required"`
+	SourceType     string `json:"source_type,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	ShareURL       string `json:"share_url" binding:"required"`
+	AccessCode     string `json:"access_code,omitempty"`
+	ResourceURL    string `json:"resource_url,omitempty"`
+	RequiresUnlock bool   `json:"requires_unlock,omitempty"`
+	UnlockPoints   *int   `json:"unlock_points,omitempty"`
+}
+
+type SubscriptionResourceUnbindReq struct {
+	SubscriptionID uint `json:"subscription_id" binding:"required"`
+}
+
 type SubscriptionPreviewReq struct {
 	ID uint `json:"id" binding:"required"`
 }

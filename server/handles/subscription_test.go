@@ -269,6 +269,72 @@ func TestUnlockSubscriptionResourceRejectsInvalidHDHiveURL(t *testing.T) {
 	}
 }
 
+func TestBindAndUnbindSubscriptionResource(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+	sub := &model.Subscription{
+		Name:       "HDHive binding",
+		TMDBName:   "HDHive binding",
+		SourceType: model.SubscriptionSourceHDHive,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/subscription/resource/bind", strings.NewReader(`{"subscription_id":`+strconv.Itoa(int(sub.ID))+`,"resource_url":"https://hdhive.com/resource/115/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","share_url":"https://115.com/s/share","access_code":"abcd","provider":"pan115"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	BindSubscriptionResource(c)
+
+	resp := decodeHandleResp[model.Subscription](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("bind code = %d: %s", resp.Code, recorder.Body.String())
+	}
+	if resp.Data.BoundShare == nil || resp.Data.BoundShare.ShareURL != "https://115.com/s/share,abcd" {
+		t.Fatalf("bound share = %#v", resp.Data.BoundShare)
+	}
+	stored, err := db.GetSubscriptionByID(sub.ID)
+	if err != nil {
+		t.Fatalf("get bound subscription: %v", err)
+	}
+	if stored.BoundShare == nil || stored.BoundShare.ResourceSlug != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("stored bound share = %#v", stored.BoundShare)
+	}
+
+	recorder = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/subscription/resource/unbind", strings.NewReader(`{"subscription_id":`+strconv.Itoa(int(sub.ID))+`}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	UnbindSubscriptionResource(c)
+	resp = decodeHandleResp[model.Subscription](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("unbind code = %d: %s", resp.Code, recorder.Body.String())
+	}
+	stored, err = db.GetSubscriptionByID(sub.ID)
+	if err != nil {
+		t.Fatalf("get unbound subscription: %v", err)
+	}
+	if stored.BoundShare != nil {
+		t.Fatalf("bound share was not removed: %#v", stored.BoundShare)
+	}
+}
+
+func TestBindSubscriptionResourceDoesNotImplicitlyUnlock(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+	if err := db.CreateSubscription(&model.Subscription{ID: 99, Name: "HDHive no unlock", TMDBName: "HDHive no unlock", SourceType: model.SubscriptionSourceHDHive}); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/subscription/resource/bind", strings.NewReader(`{"subscription_id":99,"resource_url":"https://hdhive.com/resource/115/paid"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	BindSubscriptionResource(c)
+	resp := decodeHandleResp[any](t, recorder)
+	if resp.Code != 400 {
+		t.Fatalf("response = %#v, want missing share URL validation", resp)
+	}
+}
+
 func TestSubscriptionConfigSecretStatusIncludesGuangYaPanStorage(t *testing.T) {
 	setupSubscriptionHandleDB(t)
 	if err := db.CreateStorage(&model.Storage{

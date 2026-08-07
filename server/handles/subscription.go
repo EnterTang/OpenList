@@ -539,6 +539,34 @@ func UnlockSubscriptionResource(c *gin.Context) {
 	common.SuccessResp(c, result)
 }
 
+func BindSubscriptionResource(c *gin.Context) {
+	var req model.SubscriptionResourceBindReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	result, err := subscription.BindSubscriptionResource(c.Request.Context(), req)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
+func UnbindSubscriptionResource(c *gin.Context) {
+	var req model.SubscriptionResourceUnbindReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	result, err := subscription.UnbindSubscriptionResource(c.Request.Context(), req)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
 func GetSubscriptionConfig(c *gin.Context) {
 	cfg, err := subscription.GetConfig()
 	if err != nil {
