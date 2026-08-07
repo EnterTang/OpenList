@@ -42,10 +42,19 @@ func Test115SYListAndLinkPreservePickcodeAndUserAgent(t *testing.T) {
 			case sy.EndpointFileList:
 				return driverJSONResponse(req, `{"state":true,"errno":0,"data":[{"fid":"f1","pid":"0","n":"movie.mkv","s":12,"pc":"pick-1","directory":false}]}`), nil
 			case sy.EndpointDownloadURL:
-				if req.URL.Query().Get("pick_code") != "pick-1" {
-					t.Fatalf("pick_code = %q", req.URL.Query().Get("pick_code"))
+				if req.Method != http.MethodPost {
+					t.Fatalf("download method = %s, want POST", req.Method)
 				}
-				return driverJSONResponse(req, `{"state":true,"errno":0,"data":{"url":"https://cdn.invalid/movie"}}`), nil
+				if req.URL.Query().Get("pick_code") != "" {
+					t.Fatalf("pick_code query = %q, want empty", req.URL.Query().Get("pick_code"))
+				}
+				if err := req.ParseForm(); err != nil {
+					t.Fatal(err)
+				}
+				if req.Form.Get("data") == "" {
+					t.Fatal("encrypted data form field is empty")
+				}
+				return driverJSONResponse(req, `{"state":true,"errno":0,"data":""}`), nil
 			default:
 				t.Fatalf("unexpected endpoint %s", req.URL.Path)
 				return nil, nil
@@ -61,9 +70,8 @@ func Test115SYListAndLinkPreservePickcodeAndUserAgent(t *testing.T) {
 	if err != nil || len(objects) != 1 || objects[0].GetName() != "movie.mkv" {
 		t.Fatalf("List() = %#v, %v", objects, err)
 	}
-	link, err := d.Link(context.Background(), objects[0], model.LinkArgs{Header: http.Header{"User-Agent": []string{"caller-agent"}}})
-	if err != nil || link.URL != "https://cdn.invalid/movie" {
-		t.Fatalf("Link() = %#v, %v", link, err)
+	if _, err := d.Link(context.Background(), objects[0], model.LinkArgs{Header: http.Header{"User-Agent": []string{"caller-agent"}}}); err == nil || !strings.Contains(err.Error(), "download response data is not encrypted") {
+		t.Fatalf("Link() error = %v, want encrypted response validation", err)
 	}
 	if sawUA != "caller-agent" {
 		t.Fatalf("User-Agent = %q, want caller-agent", sawUA)

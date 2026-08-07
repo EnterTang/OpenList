@@ -4,6 +4,7 @@ type Profile string
 
 const (
 	ProfileWeb      Profile = "web"
+	ProfileChrome   Profile = "chrome"
 	ProfileAndroid  Profile = "android"
 	ProfileUpload   Profile = "upload"
 	ProfileQRCode   Profile = "qrcode"
@@ -101,9 +102,7 @@ var operationPolicies = map[Operation]operationPolicy{
 		FallbackHTTP405: true,
 	},
 	OperationDownloadURL: {
-		Primary:         ProfileWeb,
-		Fallback:        ProfileAndroid,
-		FallbackHTTP405: true,
+		Primary: ProfileChrome,
 	},
 	OperationOffline: {
 		Primary:         ProfileAndroid,

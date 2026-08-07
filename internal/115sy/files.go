@@ -328,33 +328,125 @@ func (c *Client) DownloadURL(ctx context.Context, pickcode, userAgent string) (D
 	if strings.TrimSpace(userAgent) != "" && userAgent != c.userAgent {
 		requestClient = c.cloneForUserAgent(userAgent)
 	}
-	query := url.Values{"pick_code": {strings.TrimSpace(pickcode)}}
-	var raw json.RawMessage
-	if err := requestClient.doJSON(ctx, OperationDownloadURL, ProfileAndroid, http.MethodGet, EndpointDownloadURL, query, nil, &raw); err != nil {
+	requestPayload := struct {
+		PickCode string `json:"pickcode"`
+		UserID   int64  `json:"user_id"`
+	}{
+		PickCode: strings.TrimSpace(pickcode),
+		UserID:   requestClient.userID(),
+	}
+	payloadJSON, err := json.Marshal(requestPayload)
+	if err != nil {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: err.Error()}
+	}
+	encrypted, err := p115RSAEncrypt(payloadJSON)
+	if err != nil {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: err.Error()}
+	}
+	form := url.Values{"data": {encrypted}}
+	var envelope responseEnvelope
+	if err := requestClient.do(ctx, OperationDownloadURL, ProfileChrome, http.MethodPost, EndpointDownloadURL, nil, []byte(form.Encode()), "application/x-www-form-urlencoded", &envelope); err != nil {
 		return DownloadLink{}, err
 	}
-	var payload downloadPayload
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is invalid"}
+	var encryptedResponse string
+	if err := json.Unmarshal(envelope.Data, &encryptedResponse); err != nil || strings.TrimSpace(encryptedResponse) == "" {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response data is not encrypted"}
 	}
-	link := strings.TrimSpace(payload.DownloadURL)
-	if len(payload.URL) > 0 {
+	decrypted, err := p115RSADecrypt(encryptedResponse)
+	if err != nil {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: err.Error()}
+	}
+	payload, err := decodeDownloadPayload(decrypted)
+	if err != nil {
+		return DownloadLink{}, err
+	}
+	link, err := payload.downloadURL()
+	if err != nil {
+		return DownloadLink{}, err
+	}
+	header := payload.Header
+	if header == nil {
+		header = make(http.Header)
+	}
+	if header.Get("User-Agent") == "" {
+		header.Set("User-Agent", requestClient.requestUserAgent(ProfileChrome))
+	}
+	return DownloadLink{URL: link, Header: header}, nil
+}
+
+func (c *Client) userID() int64 {
+	credential, err := ParseCookie(c.currentRawCookie())
+	if err != nil {
+		return 0
+	}
+	uid := strings.TrimSpace(credential.UID)
+	if prefix, _, ok := strings.Cut(uid, "_"); ok {
+		uid = prefix
+	}
+	value, err := strconv.ParseInt(uid, 10, 64)
+	if err != nil || value < 0 {
+		return 0
+	}
+	return value
+}
+
+func (c *Client) requestUserAgent(profile Profile) string {
+	if c.userAgent != "" {
+		return c.userAgent
+	}
+	return defaultUserAgent(profile)
+}
+
+func decodeDownloadPayload(raw []byte) (downloadPayload, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return downloadPayload{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is invalid"}
+	}
+
+	if _, ok := object["url"]; ok {
+		var payload downloadPayload
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return downloadPayload{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is invalid"}
+		}
+		return payload, nil
+	}
+	if _, ok := object["download_url"]; ok {
+		var payload downloadPayload
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return downloadPayload{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is invalid"}
+		}
+		return payload, nil
+	}
+
+	for _, value := range object {
+		var payload downloadPayload
+		if err := json.Unmarshal(value, &payload); err != nil {
+			continue
+		}
+		return payload, nil
+	}
+	return downloadPayload{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is missing file data"}
+}
+
+func (p downloadPayload) downloadURL() (string, error) {
+	link := strings.TrimSpace(p.DownloadURL)
+	if len(p.URL) > 0 && string(p.URL) != "null" {
 		var direct string
-		if json.Unmarshal(payload.URL, &direct) == nil {
+		if json.Unmarshal(p.URL, &direct) == nil {
 			link = firstNonEmpty(link, direct)
 		} else {
 			var nested struct {
 				URL string `json:"url"`
 			}
-			if json.Unmarshal(payload.URL, &nested) == nil {
+			if json.Unmarshal(p.URL, &nested) == nil {
 				link = firstNonEmpty(link, nested.URL)
 			}
 		}
 	}
 	if link == "" {
-		return DownloadLink{}, &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is missing url"}
+		return "", &ProtocolError{Endpoint: EndpointDownloadURL, Message: "download response is missing url"}
 	}
-	return DownloadLink{URL: link, Header: payload.Header}, nil
+	return link, nil
 }
 
 func (c *Client) cloneForUserAgent(userAgent string) *Client {

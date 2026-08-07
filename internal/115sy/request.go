@@ -376,6 +376,10 @@ func (c *Client) applyHeaders(req *http.Request, profile Profile, contentType st
 		req.Header.Set("Referer", strings.TrimRight(base, "/")+"/")
 		return
 	}
+	if profile == ProfileChrome {
+		req.Header.Set("Referer", strings.TrimRight(c.baseURL(ProfileChrome), "/"))
+		return
+	}
 	if profile == ProfileQRCode || profile == ProfilePassport {
 		return
 	}

@@ -134,6 +134,66 @@ func TestFileCRUDAndCapacityUseExpectedForms(t *testing.T) {
 	}
 }
 
+func TestDownloadURLUsesOfficialP115ClientProtocol(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != EndpointDownloadURL {
+			t.Fatalf("request = %s %s, want POST %s", r.Method, r.URL.Path, EndpointDownloadURL)
+		}
+		if got := r.URL.Query().Get("pick_code"); got != "" {
+			t.Fatalf("query pick_code = %q, want empty", got)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("data") == "" {
+			t.Fatal("encrypted data form field is empty")
+		}
+		if got := r.Header.Get("app"); got != "" {
+			t.Fatalf("app header = %q, want empty for p115client chrome endpoint", got)
+		}
+		if got, want := r.Header.Get("Referer"), "http://"+r.Host; got != want {
+			t.Fatalf("referer = %q, want %q", got, want)
+		}
+		if got := r.Form.Get("data"); got != "cmQSx279oTEKvrYXxJ6Zd4u58ZEfk3Lo+aTJlARoNpE0zEFTbBuCq4lYjUnyufJ3fJYbSkbc7GypyjIKPUyLLoETO74+xvvw3hqACiltOuHpuSR1AT+ORobpWVw/7Vi4oqz689OfDb0dJr+YPOyrfUb6qwLCDnchYEiEPhUnEz4=" {
+			t.Fatalf("encrypted data = %q, want official p115cipher fixture", got)
+		}
+		if strings.Contains(r.Form.Encode(), "pick_code") || strings.Contains(r.Form.Encode(), "pickcode") {
+			t.Fatalf("request form contains plaintext pickcode: %q", r.Form.Encode())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":""}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, ClientOptions{
+		Cookie:         "UID=8111801_R2_1786064446; CID=root; SEID=seid",
+		LimitRate:      1e6,
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if _, err := client.DownloadURL(context.Background(), "pick-code", ""); err == nil || !strings.Contains(err.Error(), "download response data is not encrypted") {
+		t.Fatalf("DownloadURL() error = %v, want encrypted response validation", err)
+	}
+}
+
+func TestP115DecodeResponseUsesOfficialResponseTransform(t *testing.T) {
+	randomKey := []byte("0123456789abcdef")
+	want := []byte(`{"123":{"file_name":"movie.mkv","url":{"url":"https://download.example/file.bin"}}}`)
+	key := p115DeriveKey(randomKey, 12)
+	encodedPayload := p115XOR(want, p115RSAKey)
+	reverseBytes(encodedPayload)
+	encodedPayload = p115XOR(encodedPayload, key)
+	raw := append(append([]byte(nil), randomKey...), encodedPayload...)
+
+	got, err := p115DecodeResponse(raw)
+	if err != nil {
+		t.Fatalf("p115DecodeResponse() error = %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("decoded response = %q, want %q", got, want)
+	}
+}
+
 func TestListFilesUsesCappedPageSize(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("limit"); got != strconv.FormatInt(maxFilePageSize, 10) {

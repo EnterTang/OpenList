@@ -119,6 +119,8 @@ func defaultBaseURL(value string, fallback string) string {
 
 func (c *Client) baseURL(profile Profile) string {
 	switch profile {
+	case ProfileChrome:
+		return c.androidBaseURL
 	case ProfileAndroid:
 		return c.androidBaseURL
 	case ProfileUpload:
