@@ -212,3 +212,13 @@ func TestRemoteItemRecognizesLegacyDirectoryMarker(t *testing.T) {
 		t.Fatalf("item = %#v, want legacy directory", item)
 	}
 }
+
+func TestRemoteItemRecognizesAndroidShortFields(t *testing.T) {
+	var item RemoteItem
+	if err := json.Unmarshal([]byte(`{"fid":"123","fn":"movie.mkv","fc":"1","fvs":"42","pc":"pick-code","pid":"0","upt":"1712345678"}`), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.ID != "123" || item.Name != "movie.mkv" || item.IsDir || item.Size != 42 || item.PickCode != "pick-code" || item.ParentCID != "0" || item.ModifyTime != 1712345678 {
+		t.Fatalf("item = %#v, want Android short fields decoded", item)
+	}
+}

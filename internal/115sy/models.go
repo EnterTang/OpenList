@@ -219,6 +219,7 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 		CID          flexibleString `json:"cid"`
 		Name         string         `json:"name"`
 		N            string         `json:"n"`
+		FN           string         `json:"fn"`
 		FileName     string         `json:"file_name"`
 		IsDir        flexibleBool   `json:"is_dir"`
 		IsFolder     flexibleBool   `json:"is_folder"`
@@ -228,6 +229,7 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 		Category     flexibleString `json:"category"`
 		Size         flexibleInt64  `json:"size"`
 		S            flexibleInt64  `json:"s"`
+		FVS          flexibleInt64  `json:"fvs"`
 		SHA1         string         `json:"sha1"`
 		Sha          string         `json:"sha"`
 		PickCode     string         `json:"pickcode"`
@@ -238,6 +240,7 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 		ModifyTime   flexibleInt64  `json:"modify_time"`
 		UT           flexibleInt64  `json:"utime"`
 		T            flexibleInt64  `json:"t"`
+		UPT          flexibleInt64  `json:"upt"`
 		Thumbnail    string         `json:"thumbnail"`
 		Thumb        string         `json:"thumb"`
 	}
@@ -254,10 +257,13 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 		string(raw.CID),
 		i.ID,
 	))
-	i.Name = firstNonEmpty(raw.Name, raw.N, raw.FileName, i.Name)
+	i.Name = firstNonEmpty(raw.Name, raw.N, raw.FN, raw.FileName, i.Name)
 	i.Size = int64(raw.Size)
 	if i.Size == 0 {
 		i.Size = int64(raw.S)
+	}
+	if i.Size == 0 {
+		i.Size = int64(raw.FVS)
 	}
 	i.SHA1 = firstNonEmpty(raw.SHA1, raw.Sha, i.SHA1)
 	i.PickCode = firstNonEmpty(raw.PickCode, raw.PC, i.PickCode)
@@ -273,6 +279,9 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 	}
 	if i.ModifyTime == 0 {
 		i.ModifyTime = int64(raw.T)
+	}
+	if i.ModifyTime == 0 {
+		i.ModifyTime = int64(raw.UPT)
 	}
 	i.Thumbnail = firstNonEmpty(raw.Thumbnail, raw.Thumb, i.Thumbnail)
 	return nil
