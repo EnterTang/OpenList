@@ -332,11 +332,7 @@ func runPanSou(ctx context.Context, sub *model.Subscription, transfer bool) ([]m
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}
-	query := telegramSearchQuery(sub)
-	if query == "" {
-		return nil, sub.LastTreeHash, 0, 0, 0, errors.New("pansou search query is required")
-	}
-	results, err := searchPanSouResources(ctx, query, cfg.Limit, cfg)
+	results, err := searchPanSouResourcesForSubscription(ctx, sub, cfg)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}

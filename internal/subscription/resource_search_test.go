@@ -1,7 +1,10 @@
 package subscription
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
@@ -244,5 +247,58 @@ func TestPanSouSearchEndpoint(t *testing.T) {
 		if got != want {
 			t.Fatalf("endpoint(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestPanSouResourceSearchForSubscriptionRanksAndFilters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/search" {
+			t.Fatalf("path = %q, want /api/search", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"title":"示例剧 S01E01-E04 4K","links":[{"url":"https://www.123pan.com/s/partial"}]},
+			{"title":"示例剧 S01 1080p 12集全 中字","links":[{"url":"https://www.123pan.com/s/complete"}]},
+			{"title":"完全无关的合集","content":"提到示例剧 https://www.123pan.com/s/noise"},
+			{"title":"示例剧 S02 1080p","links":[{"url":"https://www.123pan.com/s/wrong-season"}]}
+		]}`))
+	}))
+	defer server.Close()
+
+	results, err := searchPanSouResourcesForSubscription(context.Background(), &model.Subscription{
+		TMDBName:  "示例剧",
+		MediaType: "tv",
+		Seasons:   []int{1},
+	}, model.SubscriptionPanSouSourceConfig{BaseURL: server.URL, Limit: 10})
+	if err != nil {
+		t.Fatalf("search PanSou resources: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %#v, want partial and complete season 1 results", results)
+	}
+	if results[0].Title != "示例剧 S01 1080p 12集全 中字" {
+		t.Fatalf("first result = %#v, want complete pack first", results[0])
+	}
+}
+
+func TestFilterResourceSearchResultsDeduplicatesSharedLinksAndKeepsRicherTitle(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{
+		{
+			Title: "示例剧 S01E01 1080p",
+			Links: []model.SubscriptionResourceSearchLink{{URL: "https://www.123pan.com/s/same"}},
+		},
+		{
+			Title: "示例剧 S01 12集全 1080p 中字",
+			Links: []model.SubscriptionResourceSearchLink{{URL: "https://www.123pan.com/s/same"}},
+		},
+	}
+	target := buildResourceMatchTarget(&model.Subscription{
+		TMDBName:  "示例剧",
+		MediaType: "tv",
+		Seasons:   []int{1},
+	}, "")
+	filtered := filterResourceSearchResultsForTarget(results, target, 10)
+	if len(filtered) != 1 || filtered[0].Title != "示例剧 S01 12集全 1080p 中字" {
+		t.Fatalf("filtered = %#v, want one richer result", filtered)
 	}
 }

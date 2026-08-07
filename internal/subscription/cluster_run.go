@@ -118,8 +118,7 @@ func runPanSouCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}
-	query := telegramSearchQuery(sub)
-	results, err := searchPanSouResources(ctx, query, cfg.Limit, cfg)
+	results, err := searchPanSouResourcesForSubscription(ctx, sub, cfg)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
 	}

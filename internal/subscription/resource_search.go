@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
-	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
 )
@@ -197,6 +196,22 @@ func telegramMessageURL(row telegramCommandRow) string {
 }
 
 func searchPanSouResources(ctx context.Context, query string, limit int, cfg model.SubscriptionPanSouSourceConfig) ([]model.SubscriptionResourceSearchResult, error) {
+	return searchPanSouResourcesWithTarget(ctx, query, limit, cfg, nil)
+}
+
+func searchPanSouResourcesForSubscription(ctx context.Context, sub *model.Subscription, cfg model.SubscriptionPanSouSourceConfig) ([]model.SubscriptionResourceSearchResult, error) {
+	if sub == nil {
+		return nil, errors.New("subscription is required")
+	}
+	query := telegramSearchQuery(sub)
+	if query == "" {
+		return nil, errors.New("pansou search query is required")
+	}
+	target := buildResourceMatchTarget(sub, query)
+	return searchPanSouResourcesWithTarget(ctx, query, cfg.Limit, cfg, &target)
+}
+
+func searchPanSouResourcesWithTarget(ctx context.Context, query string, limit int, cfg model.SubscriptionPanSouSourceConfig, target *resourceMatchTarget) ([]model.SubscriptionResourceSearchResult, error) {
 	cfg = normalizePanSouSourceConfig(cfg)
 	if len(cfg.SearchCommand) > 0 && strings.TrimSpace(cfg.SearchCommand[0]) != "" {
 		stdout, err := runPanSouSearchCommand(ctx, query, limit, cfg)
@@ -207,7 +222,7 @@ func searchPanSouResources(ctx context.Context, query string, limit int, cfg mod
 		if err != nil {
 			return nil, err
 		}
-		return filterResourceSearchResults(results, query, limit), nil
+		return filterResourceSearchResultsForTarget(results, buildQueryResourceTarget(query, target), limit), nil
 	}
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		return nil, errors.New("pansou base_url or search_command is required")
@@ -220,7 +235,14 @@ func searchPanSouResources(ctx context.Context, query string, limit int, cfg mod
 	if err != nil {
 		return nil, err
 	}
-	return filterResourceSearchResults(results, query, limit), nil
+	return filterResourceSearchResultsForTarget(results, buildQueryResourceTarget(query, target), limit), nil
+}
+
+func buildQueryResourceTarget(query string, target *resourceMatchTarget) resourceMatchTarget {
+	if target != nil {
+		return *target
+	}
+	return buildResourceMatchTarget(nil, query)
 }
 
 func searchHDHiveResources(ctx context.Context, req model.SubscriptionResourceSearchReq, query string, limit int, cfg model.SubscriptionTelegramHDHiveConfig) ([]model.SubscriptionResourceSearchResult, error) {
@@ -704,16 +726,53 @@ func firstResultProvider(links []model.SubscriptionResourceSearchLink) string {
 }
 
 func filterResourceSearchResults(results []model.SubscriptionResourceSearchResult, query string, limit int) []model.SubscriptionResourceSearchResult {
-	filtered := make([]model.SubscriptionResourceSearchResult, 0, len(results))
-	for _, result := range results {
+	return filterResourceSearchResultsForTarget(results, buildResourceMatchTarget(nil, query), limit)
+}
+
+func filterResourceSearchResultsForTarget(results []model.SubscriptionResourceSearchResult, target resourceMatchTarget, limit int) []model.SubscriptionResourceSearchResult {
+	candidates := make([]resourceMatchCandidate, 0, len(results))
+	for index := range results {
+		result := results[index]
 		if len(result.Links) == 0 {
 			continue
 		}
-		if !titlematch.TitlesCompatible(query, result.Title) {
+		result.Provider = firstResultProvider(result.Links)
+		resultCopy := result
+		candidates = append(candidates, resourceMatchCandidate{
+			ID:       strconv.Itoa(index),
+			Title:    result.Title,
+			Provider: result.Provider,
+			Result:   &resultCopy,
+		})
+	}
+	ranked := rankResourceCandidates(target, candidates)
+	filtered := make([]model.SubscriptionResourceSearchResult, 0, len(ranked))
+	seenLinks := map[string]struct{}{}
+	for _, candidate := range ranked {
+		if candidate.Result == nil {
 			continue
 		}
-		result.Provider = firstResultProvider(result.Links)
-		filtered = append(filtered, result)
+		duplicate := false
+		for _, link := range candidate.Result.Links {
+			key := strings.ToLower(strings.TrimSpace(link.URL))
+			if key == "" {
+				continue
+			}
+			if _, ok := seenLinks[key]; ok {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		for _, link := range candidate.Result.Links {
+			key := strings.ToLower(strings.TrimSpace(link.URL))
+			if key != "" {
+				seenLinks[key] = struct{}{}
+			}
+		}
+		filtered = append(filtered, *candidate.Result)
 		if limit > 0 && len(filtered) >= limit {
 			break
 		}

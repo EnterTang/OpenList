@@ -40,8 +40,7 @@ type resourceMatchDecision struct {
 
 func buildResourceMatchTarget(sub *model.Subscription, query string) resourceMatchTarget {
 	target := resourceMatchTarget{
-		MediaType: strings.ToLower(strings.TrimSpace(query)),
-		Seasons:   map[int]struct{}{},
+		Seasons: map[int]struct{}{},
 	}
 	if sub != nil {
 		target.MediaType = strings.ToLower(strings.TrimSpace(sub.MediaType))
