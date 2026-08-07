@@ -5,6 +5,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_cd2"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_share"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_sy"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/123"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/123_link"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/123_open"
