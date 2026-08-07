@@ -239,6 +239,34 @@ func TestRequestReturnsBusinessErrorFromErrno(t *testing.T) {
 	}
 }
 
+func TestRequestAcceptsStringErrnoForDelete(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != EndpointFileDelete {
+			t.Fatalf("request = %s %s, want POST %s", r.Method, r.URL.Path, EndpointFileDelete)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Form.Get("fid[0]"); got != "file-under-test" {
+			t.Fatalf("fid[0] = %q, want file-under-test", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":true,"errno":"0","data":{}}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, ClientOptions{
+		LimitRate:      1e6,
+		WebBaseURL:     server.URL,
+		AndroidBaseURL: server.URL,
+	})
+	if err := client.Remove(context.Background(), "file-under-test", "0"); err != nil {
+		t.Fatalf("Remove() error = %v, want nil for string errno=0", err)
+	}
+}
+
 func TestRequestFallsBackOnHTTP405(t *testing.T) {
 	t.Parallel()
 

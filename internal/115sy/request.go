@@ -14,7 +14,7 @@ import (
 
 type responseEnvelope struct {
 	State   *responseState  `json:"state"`
-	Errno   int             `json:"errno"`
+	Errno   flexibleInt     `json:"errno"`
 	Error   string          `json:"error"`
 	Message string          `json:"message"`
 	Msg     string          `json:"msg"`
@@ -177,10 +177,11 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 			}
 		}
 
-		if envelope.Errno != 0 || (envelope.State != nil && !*envelope.State) {
+		errno := int(envelope.Errno.value)
+		if errno != 0 || (envelope.State != nil && !*envelope.State) {
 			return &BusinessError{
-				Kind:     classifyBusinessError(envelope.Errno, envelope.Error, envelope.Message, envelope.Msg),
-				Errno:    envelope.Errno,
+				Kind:     classifyBusinessError(errno, envelope.Error, envelope.Message, envelope.Msg),
+				Errno:    errno,
 				Message:  sanitizeRequestText(firstNonEmpty(envelope.Error, envelope.Message, envelope.Msg)),
 				Endpoint: endpoint,
 				Profile:  currentProfile,

@@ -282,3 +282,13 @@ func TestRemoteItemRecognizesAndroidShortFields(t *testing.T) {
 		t.Fatalf("item = %#v, want Android short fields decoded", item)
 	}
 }
+
+func TestRemoteItemRecognizesAndroidFileSizeField(t *testing.T) {
+	var item RemoteItem
+	if err := json.Unmarshal([]byte(`{"fid":"123","fn":"movie.mkv","fc":"1","fs":"9204257326","pid":"0"}`), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.Size != 9204257326 {
+		t.Fatalf("item size = %d, want 9204257326", item.Size)
+	}
+}

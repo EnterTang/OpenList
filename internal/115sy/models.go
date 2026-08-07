@@ -228,6 +228,7 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 		FC           flexibleString `json:"fc"`
 		Category     flexibleString `json:"category"`
 		Size         flexibleInt64  `json:"size"`
+		FS           flexibleInt64  `json:"fs"`
 		S            flexibleInt64  `json:"s"`
 		FVS          flexibleInt64  `json:"fvs"`
 		SHA1         string         `json:"sha1"`
@@ -259,6 +260,9 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 	))
 	i.Name = firstNonEmpty(raw.Name, raw.N, raw.FN, raw.FileName, i.Name)
 	i.Size = int64(raw.Size)
+	if i.Size == 0 {
+		i.Size = int64(raw.FS)
+	}
 	if i.Size == 0 {
 		i.Size = int64(raw.S)
 	}
