@@ -77,8 +77,8 @@ func trimMediaExtension(value string) string {
 }
 
 func titleValue(value string) string {
-	cleaned := removeSeasonEpisodePattern.ReplaceAllString(value, " ")
-	cleaned = removeCompletePattern.ReplaceAllString(cleaned, " ")
+	cleaned := removeCompletePattern.ReplaceAllString(value, " ")
+	cleaned = removeSeasonEpisodePattern.ReplaceAllString(cleaned, " ")
 	cleaned = removeLanguagePattern.ReplaceAllString(cleaned, " ")
 	if !isPureYear(strings.TrimSpace(cleaned)) {
 		cleaned = removeYearPattern.ReplaceAllString(cleaned, " ")
