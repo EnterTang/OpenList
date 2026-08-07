@@ -20,6 +20,8 @@ func runClusterBySource(ctx context.Context, sub *model.Subscription) ([]model.S
 		return runManualCluster(ctx, sub)
 	case model.SubscriptionSourcePanSou:
 		return runPanSouCluster(ctx, sub)
+	case model.SubscriptionSourceHDHive:
+		return runHDHiveCluster(ctx, sub)
 	default:
 		return nil, sub.LastTreeHash, 0, 0, 0, fmt.Errorf("unsupported subscription source type: %s", sub.SourceType)
 	}
