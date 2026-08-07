@@ -2,6 +2,7 @@ package _115sy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -212,6 +213,21 @@ type rootProbePayload struct {
 	SpaceTotal  flexibleInt64 `json:"space_total"`
 	SpaceUsed   flexibleInt64 `json:"space_used"`
 	SpaceRemain flexibleInt64 `json:"space_remain"`
+}
+
+func (p *rootProbePayload) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if strings.HasPrefix(raw, "[") {
+		*p = rootProbePayload{CID: "0"}
+		return nil
+	}
+	type rootProbePayloadAlias rootProbePayload
+	var value rootProbePayloadAlias
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*p = rootProbePayload(value)
+	return nil
 }
 
 type flexibleInt64 int64

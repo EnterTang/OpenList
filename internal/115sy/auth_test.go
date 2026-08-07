@@ -2,6 +2,7 @@ package _115sy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,24 @@ func TestCookieParseAcceptsWhitespaceAndOptionalKID(t *testing.T) {
 	}
 	if cred.UID != "user-1" || cred.CID != "root-1" || cred.SEID != "seid-1" || cred.KID != "kid-1" {
 		t.Fatalf("credential = %#v, want populated UID/CID/SEID/KID", cred)
+	}
+}
+
+func TestUserInfoAcceptsStringAndObjectResponses(t *testing.T) {
+	var stringResponse UserInfo
+	if err := json.Unmarshal([]byte(`"user-1"`), &stringResponse); err != nil || stringResponse.ID != "user-1" {
+		t.Fatalf("string user info = %#v, error = %v", stringResponse, err)
+	}
+	var objectResponse UserInfo
+	if err := json.Unmarshal([]byte(`{"user_id":"user-2","name":"Demo"}`), &objectResponse); err != nil || objectResponse.ID != "user-2" || objectResponse.Nickname != "Demo" {
+		t.Fatalf("object user info = %#v, error = %v", objectResponse, err)
+	}
+}
+
+func TestRootProbeAcceptsFileArrayResponses(t *testing.T) {
+	var payload rootProbePayload
+	if err := json.Unmarshal([]byte(`[{"fid":"file-1"}]`), &payload); err != nil || payload.CID != "0" {
+		t.Fatalf("root probe payload = %#v, error = %v", payload, err)
 	}
 }
 

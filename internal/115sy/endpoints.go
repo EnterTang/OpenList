@@ -40,7 +40,8 @@ const (
 
 const (
 	EndpointUserInfo         = "/user/info"
-	EndpointFileList         = "/files"
+	EndpointFileList         = "/android/2.0/ufile/files"
+	EndpointFileListWeb      = "/files"
 	EndpointShareSnapshot    = "/share/snap"
 	EndpointShareSnapshotApp = "/android/2.0/share/snap"
 	EndpointShareReceive     = "/share/receive"
@@ -65,7 +66,8 @@ const (
 	EndpointFileCopy         = "/files/copy"
 	EndpointFileDelete       = "/rb/delete"
 	EndpointRecycleClean     = "/rb/clean"
-	EndpointCategory         = "/category/get"
+	EndpointCategory         = "/android/2.0/category/get"
+	EndpointCategoryWeb      = "/category/get"
 )
 
 type operationPolicy struct {

@@ -161,7 +161,12 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 
 		var envelope responseEnvelope
 		if len(respBody) > 0 {
-			if err := json.Unmarshal(respBody, &envelope); err != nil {
+			trimmedBody := bytes.TrimSpace(respBody)
+			if len(trimmedBody) > 0 && trimmedBody[0] == '[' {
+				envelope.State = new(responseState)
+				*envelope.State = true
+				envelope.Data = append(json.RawMessage(nil), trimmedBody...)
+			} else if err := json.Unmarshal(respBody, &envelope); err != nil {
 				return &NetworkError{
 					Kind:     KindNetwork,
 					Method:   method,
@@ -207,6 +212,13 @@ func endpointForProfile(operation Operation, profile Profile, endpoint string) s
 		}
 		if profile == ProfileWeb && endpoint == EndpointShareSnapshotApp {
 			return EndpointShareSnapshot
+		}
+	case OperationFileList:
+		if profile == ProfileWeb && endpoint == EndpointFileList {
+			return EndpointFileListWeb
+		}
+		if profile == ProfileWeb && endpoint == EndpointCategory {
+			return EndpointCategoryWeb
 		}
 	case OperationShareReceive:
 		if profile == ProfileAndroid && endpoint == EndpointShareReceive {

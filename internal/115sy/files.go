@@ -301,7 +301,8 @@ func (c *Client) mutateFile(ctx context.Context, endpoint string, form url.Value
 
 func (c *Client) GetCapacity(ctx context.Context) (Capacity, error) {
 	var payload rootProbePayload
-	if err := c.doJSON(ctx, OperationUserInfo, ProfileWeb, http.MethodGet, EndpointCategory, nil, nil, &payload); err != nil {
+	query := url.Values{"cid": {"0"}, "aid": {"1"}}
+	if err := c.doJSON(ctx, OperationFileList, ProfileAndroid, http.MethodGet, EndpointCategory, query, nil, &payload); err != nil {
 		return Capacity{}, err
 	}
 	return Capacity{

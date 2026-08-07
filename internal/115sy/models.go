@@ -33,6 +33,38 @@ type UserInfo struct {
 	Nickname string `json:"nickname"`
 }
 
+func (u *UserInfo) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		*u = UserInfo{}
+		return nil
+	}
+	if raw[0] != '{' {
+		var value flexibleString
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		*u = UserInfo{ID: strings.TrimSpace(string(value))}
+		return nil
+	}
+	var object struct {
+		ID       flexibleString `json:"id"`
+		UserID   flexibleString `json:"user_id"`
+		UID      flexibleString `json:"uid"`
+		Nickname string         `json:"nickname"`
+		UserName string         `json:"username"`
+		Name     string         `json:"name"`
+	}
+	if err := json.Unmarshal(data, &object); err != nil {
+		return err
+	}
+	*u = UserInfo{
+		ID:       firstNonEmpty(string(object.ID), string(object.UserID), string(object.UID)),
+		Nickname: firstNonEmpty(object.Nickname, object.UserName, object.Name),
+	}
+	return nil
+}
+
 type RemoteItem struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
