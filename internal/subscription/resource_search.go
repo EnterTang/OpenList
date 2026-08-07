@@ -125,8 +125,11 @@ func normalizeResourceSearchSources(values []string) []string {
 	var sources []string
 	for _, value := range values {
 		value = strings.ToLower(strings.TrimSpace(value))
-		if value == "" || value == "all" {
+		if value == "" {
 			return []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou}
+		}
+		if value == "all" {
+			return []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive}
 		}
 		if _, ok := seen[value]; ok {
 			continue
