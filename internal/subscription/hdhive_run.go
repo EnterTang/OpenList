@@ -16,6 +16,15 @@ type hdhiveSubscriptionClient interface {
 	Share(context.Context, string) (hdhive.ResourceDetails, error)
 }
 
+type hdhiveSubscriptionResource struct {
+	resource    hdhive.Resource
+	resourceURL string
+	resourceRef hdhive.ResourceRef
+	details     hdhive.ResourceDetails
+	points      *int
+	free        bool
+}
+
 var (
 	newHDHiveSubscriptionClient = func(cfg model.SubscriptionTelegramHDHiveConfig) (hdhiveSubscriptionClient, error) {
 		return telegramHDHiveClientForConfig(cfg)
@@ -58,6 +67,46 @@ func parseHDHiveSourceConfig(raw string) (model.SubscriptionHDHiveSourceConfig, 
 	return cfg, nil
 }
 
+func loadHDHiveSubscriptionResources(ctx context.Context, client hdhiveSubscriptionClient, sourceCfg model.SubscriptionHDHiveSourceConfig, mediaType string, tmdbID int64) ([]hdhiveSubscriptionResource, error) {
+	resources, err := client.Search(ctx, strings.ToLower(strings.TrimSpace(mediaType)), tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	resources = filterHDHiveResources(resources, sourceCfg.CloudType)
+	if sourceCfg.Limit > 0 && len(resources) > sourceCfg.Limit {
+		resources = resources[:sourceCfg.Limit]
+	}
+
+	loaded := make([]hdhiveSubscriptionResource, 0, len(resources))
+	var firstErr error
+	for _, resource := range resources {
+		resourceURL := strings.TrimSpace(resource.ResourceURL)
+		if resourceURL == "" {
+			resourceURL = defaultHDHiveResourceURL(resource)
+		}
+		resourceRef, ok := hdhive.ResourceRefFromURL(resourceURL, resource.PanType)
+		if !ok {
+			continue
+		}
+		resourceURL = resourceRef.URL
+		details, shareErr := client.Share(ctx, resourceRef.Slug)
+		if shareErr != nil {
+			firstErr = firstNonNilError(firstErr, shareErr)
+			continue
+		}
+		points := firstHDHiveUnlockPoints(details.UnlockPoints, resource.UnlockPoints)
+		loaded = append(loaded, hdhiveSubscriptionResource{
+			resource:    resource,
+			resourceURL: resourceURL,
+			resourceRef: resourceRef,
+			details:     details,
+			points:      points,
+			free:        details.IsFreeForUser || points != nil && *points == 0,
+		})
+	}
+	return loaded, firstErr
+}
+
 func runHDHiveFederated(ctx context.Context, sub *model.Subscription, sourceCfg model.SubscriptionHDHiveSourceConfig, globalCfg model.SubscriptionConfig, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
 	if sub == nil {
 		return nil, "", 0, 0, 0, errors.New("subscription is nil")
@@ -93,114 +142,101 @@ func runHDHiveFederated(ctx context.Context, sub *model.Subscription, sourceCfg 
 		}
 	}
 
-	regularCandidate, regularReady := runHDHiveRegularSources(ctx, sub, globalCfg, transfer, &saved, &hashes, &added, &changed, &transferred, &firstErr)
-	regularCandidate = regularCandidate || boundCandidate
-
-	client, err := newHDHiveSubscriptionClient(globalCfg.Telegram.HDHive)
-	if err != nil {
-		if firstErr == nil {
-			firstErr = err
-		}
-		return saved, hdhiveSubscriptionHash(sub, hashes, links), added, changed, transferred, firstErr
-	}
-	resources, err := client.Search(ctx, strings.ToLower(strings.TrimSpace(sub.MediaType)), sub.TMDBID)
-	if err != nil {
-		if firstErr == nil {
-			firstErr = err
-		}
-		return saved, hdhiveSubscriptionHash(sub, hashes, links), added, changed, transferred, firstErr
-	}
-	resources = filterHDHiveResources(resources, sourceCfg.CloudType)
-	if sourceCfg.Limit > 0 && len(resources) > sourceCfg.Limit {
-		resources = resources[:sourceCfg.Limit]
+	var resources []hdhiveSubscriptionResource
+	if client, clientErr := newHDHiveSubscriptionClient(globalCfg.Telegram.HDHive); clientErr != nil {
+		firstErr = firstNonNilError(firstErr, clientErr)
+	} else {
+		loaded, loadErr := loadHDHiveSubscriptionResources(ctx, client, sourceCfg, sub.MediaType, sub.TMDBID)
+		resources = loaded
+		firstErr = firstNonNilError(firstErr, loadErr)
 	}
 
+	freeCandidate := false
 	for _, resource := range resources {
-		resourceURL := strings.TrimSpace(resource.ResourceURL)
-		if resourceURL == "" {
-			resourceURL = defaultHDHiveResourceURL(resource)
-		}
-		resourceRef, ok := hdhive.ResourceRefFromURL(resourceURL, resource.PanType)
-		if !ok {
+		if !resource.free && strings.TrimSpace(resource.details.FullURL) == "" {
 			continue
 		}
-		resourceURL = resourceRef.URL
-		details, shareErr := client.Share(ctx, resourceRef.Slug)
-		if shareErr != nil {
-			if firstErr == nil {
-				firstErr = shareErr
-			}
-			continue
-		}
+		matched, processErr := processHDHiveSubscriptionResource(ctx, sub, globalCfg, transfer, now, resource, false, true, false, &saved, &hashes, &links, &added, &changed, &transferred)
+		firstErr = firstNonNilError(firstErr, processErr)
+		freeCandidate = freeCandidate || matched
+	}
 
-		shareURL := strings.TrimSpace(details.FullURL)
-		accessCode := strings.TrimSpace(details.AccessCode)
-		requiresUnlock := false
-		if shareURL == "" {
-			points := firstHDHiveUnlockPoints(details.UnlockPoints, resource.UnlockPoints)
-			free := details.IsFreeForUser || points != nil && *points == 0
-			if !free {
-				requiresUnlock = true
-				if sub.BoundShare != nil && sub.BoundShare.RequiresUnlock && sub.BoundShare.ResourceSlug != resourceRef.Slug {
-					continue
-				}
-				if !regularReady || regularCandidate {
-					continue
-				}
-				if points == nil {
-					continue
-				}
-				if globalCfg.Telegram.HDHive.MaxUnlockPoints > 0 && (points == nil || *points > globalCfg.Telegram.HDHive.MaxUnlockPoints) {
-					continue
-				}
-			}
-			unlock, unlockErr := unlockHDHiveResourceForSubscription(ctx, resourceURL, globalCfg.Telegram.HDHive)
-			if unlockErr != nil {
-				if firstErr == nil {
-					firstErr = unlockErr
-				}
-				continue
-			}
-			shareURL = strings.TrimSpace(unlock.URL)
-			accessCode = firstNonEmpty(unlock.AccessCode, accessCode)
-		}
-		if shareURL == "" {
+	regularCandidate, regularReady := runHDHiveRegularSources(ctx, sub, globalCfg, transfer, &saved, &hashes, &added, &changed, &transferred, &firstErr)
+	candidateAvailable := boundCandidate || freeCandidate || regularCandidate
+	for _, resource := range resources {
+		if resource.free || strings.TrimSpace(resource.details.FullURL) != "" {
 			continue
 		}
-		rawShare := NormalizeSubscriptionShareURL(shareURL, accessCode)
-		if requiresUnlock {
-			bindHDHiveShare(sub, resourceURL, resourceRef, rawShare, accessCode, resource, details, true, now)
-		}
-		_, candidates, handled, inspectErr := inspectShareLinkCandidatesFn(ctx, sub, globalCfg.Telegram, rawShare, now)
-		if inspectErr != nil {
-			if firstErr == nil {
-				firstErr = inspectErr
-			}
-			continue
-		}
-		if !handled {
-			continue
-		}
-		selected := selectShareTransferCandidates(sub, candidates, globalCfg.Telegram.TransferPriority)
-		items, hash, itemAdded, itemChanged, itemTransferred, transferErr := transferSelectedShareCandidatesForSubscription(ctx, sub, selected, transfer, now, "hdhive:"+resourceURL)
-		if transferErr != nil && firstErr == nil {
-			firstErr = transferErr
-		}
-		saved = append(saved, items...)
-		added += itemAdded
-		changed += itemChanged
-		transferred += itemTransferred
-		if hash != "" {
-			hashes = append(hashes, hash)
-		}
-		links = append(links, rawShare)
-		if len(candidates) > 0 {
-			bindHDHiveShare(sub, resourceURL, resourceRef, rawShare, accessCode, resource, details, requiresUnlock, now)
-			regularCandidate = true
-		}
+		matched, processErr := processHDHiveSubscriptionResource(ctx, sub, globalCfg, transfer, now, resource, true, regularReady, candidateAvailable, &saved, &hashes, &links, &added, &changed, &transferred)
+		firstErr = firstNonNilError(firstErr, processErr)
+		candidateAvailable = candidateAvailable || matched
 	}
 
 	return saved, hdhiveSubscriptionHash(sub, hashes, links), added, changed, transferred, firstErr
+}
+
+func processHDHiveSubscriptionResource(ctx context.Context, sub *model.Subscription, globalCfg model.SubscriptionConfig, transfer bool, now time.Time, resource hdhiveSubscriptionResource, allowPaid, regularReady, candidateAvailable bool, saved *[]model.SubscriptionItem, hashes, links *[]string, added, changed, transferred *int) (bool, error) {
+	shareURL := strings.TrimSpace(resource.details.FullURL)
+	accessCode := strings.TrimSpace(resource.details.AccessCode)
+	requiresUnlock := false
+	if shareURL == "" {
+		if !resource.free {
+			if !allowPaid {
+				return false, nil
+			}
+			requiresUnlock = true
+			if sub.BoundShare != nil && sub.BoundShare.RequiresUnlock && sub.BoundShare.ResourceSlug != resource.resourceRef.Slug {
+				return false, nil
+			}
+			if !regularReady || candidateAvailable {
+				return false, nil
+			}
+			if resource.points == nil {
+				return false, nil
+			}
+			if globalCfg.Telegram.HDHive.MaxUnlockPoints > 0 && *resource.points > globalCfg.Telegram.HDHive.MaxUnlockPoints {
+				return false, nil
+			}
+		}
+		unlock, unlockErr := unlockHDHiveResourceForSubscription(ctx, resource.resourceURL, globalCfg.Telegram.HDHive)
+		if unlockErr != nil {
+			return false, unlockErr
+		}
+		shareURL = strings.TrimSpace(unlock.URL)
+		accessCode = firstNonEmpty(unlock.AccessCode, accessCode)
+	}
+	if shareURL == "" {
+		return false, nil
+	}
+	rawShare := NormalizeSubscriptionShareURL(shareURL, accessCode)
+	if requiresUnlock {
+		bindHDHiveShare(sub, resource.resourceURL, resource.resourceRef, rawShare, accessCode, resource.resource, resource.details, true, now)
+	}
+	_, candidates, handled, inspectErr := inspectShareLinkCandidatesFn(ctx, sub, globalCfg.Telegram, rawShare, now)
+	if inspectErr != nil {
+		return false, inspectErr
+	}
+	if !handled {
+		return false, nil
+	}
+	selected := selectShareTransferCandidates(sub, candidates, globalCfg.Telegram.TransferPriority)
+	items, hash, itemAdded, itemChanged, itemTransferred, transferErr := transferSelectedShareCandidatesForSubscription(ctx, sub, selected, transfer, now, "hdhive:"+resource.resourceURL)
+	*saved = append(*saved, items...)
+	*added += itemAdded
+	*changed += itemChanged
+	*transferred += itemTransferred
+	if hash != "" {
+		*hashes = append(*hashes, hash)
+	}
+	*links = append(*links, rawShare)
+	matched := len(candidates) > 0
+	if transferErr != nil {
+		return matched, transferErr
+	}
+	if matched {
+		bindHDHiveShare(sub, resource.resourceURL, resource.resourceRef, rawShare, accessCode, resource.resource, resource.details, requiresUnlock, now)
+	}
+	return matched, nil
 }
 
 func runHDHiveRegularSources(ctx context.Context, sub *model.Subscription, globalCfg model.SubscriptionConfig, transfer bool, saved *[]model.SubscriptionItem, hashes *[]string, added, changed, transferred *int, firstErr *error) (candidate, ready bool) {
@@ -341,6 +377,24 @@ func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 		}
 	}
 
+	var resources []hdhiveSubscriptionResource
+	if client, clientErr := newHDHiveSubscriptionClient(globalCfg.Telegram.HDHive); clientErr != nil {
+		firstErr = firstNonNilError(firstErr, clientErr)
+	} else {
+		resources, err = loadHDHiveSubscriptionResources(ctx, client, sourceCfg, sub.MediaType, sub.TMDBID)
+		firstErr = firstNonNilError(firstErr, err)
+	}
+
+	freeCandidate := false
+	for _, resource := range resources {
+		if !resource.free && strings.TrimSpace(resource.details.FullURL) == "" {
+			continue
+		}
+		matched, processErr := processHDHiveClusterResource(ctx, sub, globalCfg, now, resource, false, true, false, &links, &dispatched)
+		firstErr = firstNonNilError(firstErr, processErr)
+		freeCandidate = freeCandidate || matched
+	}
+
 	if hasTelegramSearchCommand(globalCfg.Telegram) || hasBuiltinTelegramConfig(globalCfg.Telegram) {
 		telegramCfg := globalCfg.Telegram
 		telegramCfg.HDHive.Enabled = false
@@ -387,80 +441,64 @@ func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 		dispatched += sourceDispatched
 	}
 
-	client, err := newHDHiveSubscriptionClient(globalCfg.Telegram.HDHive)
-	if err != nil {
-		return saved, hdhiveSubscriptionHash(sub, hashes, links), 0, 0, dispatched, firstNonNilError(firstErr, err)
-	}
-	resources, err := client.Search(ctx, strings.ToLower(strings.TrimSpace(sub.MediaType)), sub.TMDBID)
-	if err != nil {
-		return saved, hdhiveSubscriptionHash(sub, hashes, links), 0, 0, dispatched, firstNonNilError(firstErr, err)
-	}
-	resources = filterHDHiveResources(resources, sourceCfg.CloudType)
-	if sourceCfg.Limit > 0 && len(resources) > sourceCfg.Limit {
-		resources = resources[:sourceCfg.Limit]
-	}
+	candidateAvailable := regularCandidate || freeCandidate
 	for _, resource := range resources {
-		resourceURL := strings.TrimSpace(resource.ResourceURL)
-		if resourceURL == "" {
-			resourceURL = defaultHDHiveResourceURL(resource)
-		}
-		resourceRef, ok := hdhive.ResourceRefFromURL(resourceURL, resource.PanType)
-		if !ok {
+		if resource.free || strings.TrimSpace(resource.details.FullURL) != "" {
 			continue
 		}
-		resourceURL = resourceRef.URL
-		details, shareErr := client.Share(ctx, resourceRef.Slug)
-		if shareErr != nil {
-			firstErr = firstNonNilError(firstErr, shareErr)
-			continue
-		}
-		shareURL := strings.TrimSpace(details.FullURL)
-		accessCode := strings.TrimSpace(details.AccessCode)
-		requiresUnlock := false
-		if shareURL == "" {
-			points := firstHDHiveUnlockPoints(details.UnlockPoints, resource.UnlockPoints)
-			free := details.IsFreeForUser || points != nil && *points == 0
-			if !free {
-				requiresUnlock = true
-				if sub.BoundShare != nil && sub.BoundShare.RequiresUnlock && sub.BoundShare.ResourceSlug != resourceRef.Slug {
-					continue
-				}
-				if !regularReady || regularCandidate {
-					continue
-				}
-				if points == nil {
-					continue
-				}
-				if globalCfg.Telegram.HDHive.MaxUnlockPoints > 0 && *points > globalCfg.Telegram.HDHive.MaxUnlockPoints {
-					continue
-				}
-			}
-			unlock, unlockErr := unlockHDHiveResourceForSubscription(ctx, resourceURL, globalCfg.Telegram.HDHive)
-			if unlockErr != nil {
-				firstErr = firstNonNilError(firstErr, unlockErr)
-				continue
-			}
-			shareURL = strings.TrimSpace(unlock.URL)
-			accessCode = firstNonEmpty(unlock.AccessCode, accessCode)
-		}
-		if shareURL == "" {
-			continue
-		}
-		rawShare := NormalizeSubscriptionShareURL(shareURL, accessCode)
-		ref, parseErr := ParseShareURL(rawShare)
-		if parseErr != nil {
-			continue
-		}
-		if _, dispatchErr := dispatchClusterInspectObservation(ctx, sub, ref, clusterSourceMessage{ID: "hdhive:" + resourceRef.Slug, Text: rawShare}, "hdhive:"+resourceRef.Slug, 1); dispatchErr != nil {
-			firstErr = firstNonNilError(firstErr, dispatchErr)
-			continue
-		}
-		dispatched++
-		links = append(links, rawShare)
-		bindHDHiveShare(sub, resourceURL, resourceRef, rawShare, accessCode, resource, details, requiresUnlock, now)
+		matched, processErr := processHDHiveClusterResource(ctx, sub, globalCfg, now, resource, true, regularReady, candidateAvailable, &links, &dispatched)
+		firstErr = firstNonNilError(firstErr, processErr)
+		candidateAvailable = candidateAvailable || matched
 	}
 
 	return saved, hdhiveSubscriptionHash(sub, hashes, links), 0, 0, dispatched, firstErr
+}
+
+func processHDHiveClusterResource(ctx context.Context, sub *model.Subscription, globalCfg model.SubscriptionConfig, now time.Time, resource hdhiveSubscriptionResource, allowPaid, regularReady, candidateAvailable bool, links *[]string, dispatched *int) (bool, error) {
+	shareURL := strings.TrimSpace(resource.details.FullURL)
+	accessCode := strings.TrimSpace(resource.details.AccessCode)
+	requiresUnlock := false
+	if shareURL == "" {
+		if !resource.free {
+			if !allowPaid {
+				return false, nil
+			}
+			requiresUnlock = true
+			if sub.BoundShare != nil && sub.BoundShare.RequiresUnlock && sub.BoundShare.ResourceSlug != resource.resourceRef.Slug {
+				return false, nil
+			}
+			if !regularReady || candidateAvailable {
+				return false, nil
+			}
+			if resource.points == nil {
+				return false, nil
+			}
+			if globalCfg.Telegram.HDHive.MaxUnlockPoints > 0 && *resource.points > globalCfg.Telegram.HDHive.MaxUnlockPoints {
+				return false, nil
+			}
+		}
+		unlock, unlockErr := unlockHDHiveResourceForSubscription(ctx, resource.resourceURL, globalCfg.Telegram.HDHive)
+		if unlockErr != nil {
+			return false, unlockErr
+		}
+		shareURL = strings.TrimSpace(unlock.URL)
+		accessCode = firstNonEmpty(unlock.AccessCode, accessCode)
+	}
+	if shareURL == "" {
+		return false, nil
+	}
+	rawShare := NormalizeSubscriptionShareURL(shareURL, accessCode)
+	ref, parseErr := ParseShareURL(rawShare)
+	if parseErr != nil {
+		return false, nil
+	}
+	if _, dispatchErr := dispatchClusterInspectObservation(ctx, sub, ref, clusterSourceMessage{ID: "hdhive:" + resource.resourceRef.Slug, Text: rawShare}, "hdhive:"+resource.resourceRef.Slug, 1); dispatchErr != nil {
+		return false, dispatchErr
+	}
+	(*dispatched)++
+	*links = append(*links, rawShare)
+	bindHDHiveShare(sub, resource.resourceURL, resource.resourceRef, rawShare, accessCode, resource.resource, resource.details, requiresUnlock, now)
+	return true, nil
 }
 
 func firstNonNilError(first, next error) error {

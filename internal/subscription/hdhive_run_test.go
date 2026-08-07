@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,6 +131,51 @@ func TestHDHiveSubscriptionProcessesFreeResourceEvenWhenRegularSourceHasCandidat
 	}
 }
 
+func TestHDHiveSubscriptionProcessesFreeHDHiveBeforeRegularSources(t *testing.T) {
+	events := make([]string, 0, 4)
+	client := &hdhiveSubscriptionFakeClient{
+		resources: []hdhive.Resource{{
+			Slug:    "ffffffffffffffffffffffffffffffff",
+			PanType: "115",
+		}},
+		details: hdhive.ResourceDetails{UnlockPoints: intPointer(0)},
+		events:  &events,
+	}
+	cleanup := installHDHiveRunFakes(t, client)
+	defer cleanup()
+	oldInspect := inspectShareLinkCandidatesFn
+	inspectShareLinkCandidatesFn = func(ctx context.Context, sub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig, rawShare string, now time.Time) (telegramPanSubscriptionSource, []shareTransferCandidate, bool, error) {
+		if strings.Contains(rawShare, "/bound") {
+			events = append(events, "bound")
+		}
+		return oldInspect(ctx, sub, cfg, rawShare, now)
+	}
+	runTelegramForHDHiveSubscription = func(context.Context, *model.Subscription, bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+		events = append(events, "telegram")
+		return nil, "telegram-hash", 0, 0, 0, nil
+	}
+	runPanSouForHDHiveSubscription = func(context.Context, *model.Subscription, bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+		events = append(events, "pansou")
+		return nil, "pansou-hash", 0, 0, 0, nil
+	}
+	unlockHDHiveResourceForSubscription = func(context.Context, string, model.SubscriptionTelegramHDHiveConfig) (model.SubscriptionResourceUnlockResp, error) {
+		events = append(events, "hdhive-free")
+		return model.SubscriptionResourceUnlockResp{URL: "https://115.com/s/free"}, nil
+	}
+
+	sub := &model.Subscription{ID: 6, Name: "Example", TMDBName: "Example", TMDBID: 1399, MediaType: "tv", SourceType: model.SubscriptionSourceHDHive, BoundShare: &model.SubscriptionBoundShare{ShareURL: "https://115.com/s/bound"}}
+	_, _, _, _, _, err := runHDHiveFederated(context.Background(), sub, model.SubscriptionHDHiveSourceConfig{CloudType: "all", Limit: 10}, model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{SearchCommand: []string{"telegram"}},
+		PanSou:   model.SubscriptionPanSouSourceConfig{BaseURL: "https://pansou.example"},
+	}, true)
+	if err != nil {
+		t.Fatalf("run HDHive subscription: %v", err)
+	}
+	if got, want := strings.Join(events, ","), "bound,hdhive-share,hdhive-free,telegram,pansou"; got != want {
+		t.Fatalf("execution order = %q, want %q", got, want)
+	}
+}
+
 func TestHDHiveSubscriptionNeverTreatsUnknownPointsAsFree(t *testing.T) {
 	var unlockCalls int
 	client := &hdhiveSubscriptionFakeClient{
@@ -194,6 +240,7 @@ func TestHDHiveClusterDispatchesFreeShare(t *testing.T) {
 type hdhiveSubscriptionFakeClient struct {
 	resources []hdhive.Resource
 	details   hdhive.ResourceDetails
+	events    *[]string
 }
 
 type hdhiveRunTestDispatcher struct {
@@ -214,6 +261,9 @@ func (f *hdhiveSubscriptionFakeClient) Search(context.Context, string, int64) ([
 }
 
 func (f *hdhiveSubscriptionFakeClient) Share(context.Context, string) (hdhive.ResourceDetails, error) {
+	if f.events != nil {
+		*f.events = append(*f.events, "hdhive-share")
+	}
 	return f.details, nil
 }
 

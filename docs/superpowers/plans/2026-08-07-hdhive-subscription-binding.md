@@ -4,7 +4,7 @@
 
 **Goal:** Add HDHive as an automatic subscription entry while ensuring scheduled runs reuse a subscription-bound share and only attempt paid HDHive unlocks after Telegram and PanSou produce no usable candidates.
 
-**Architecture:** Keep existing `telegram` and `pansou` subscription execution unchanged for backward compatibility. A subscription whose `source_type` is `hdhive` becomes a federated entry: it first processes a persisted bound share, then re-triggers configured Telegram and PanSou searches, then resolves free HDHive resources; paid HDHive resources are eligible only when both regular sources have no usable candidate. A successful explicit or automatic HDHive unlock is persisted as the bound share so later runs do not charge the same resource again.
+**Architecture:** Keep existing `telegram` and `pansou` subscription execution unchanged for backward compatibility. A subscription whose `source_type` is `hdhive` becomes a federated entry: it first processes a persisted bound share, then resolves already-shared or free HDHive resources, then re-triggers configured Telegram and PanSou searches; paid HDHive resources are eligible only when the regular sources have no usable candidate. A successful explicit or automatic HDHive unlock is persisted as the bound share so later runs do not charge the same resource again.
 
 **Tech Stack:** Go, Gin, GORM serializers, SQLite/MySQL AutoMigrate, existing subscription share-inspection/transfer pipeline, Symedia HDHive client.
 
@@ -168,8 +168,8 @@ git commit -m "feat(subscription): expose hdhive as a source"
 Use fakes for Telegram/PanSou search, HDHive `Search`/`Share`/`Unlock`, share inspection, and transfer. Test separately that:
 
 1. A usable bound share is processed before any new HDHive unlock and prevents paid HDHive resolution when it supplies a candidate.
-2. Telegram and PanSou are invoked on every HDHive-source run when configured.
-3. A free HDHive resource is resolved even when regular sources have candidates.
+2. A free HDHive resource is resolved before configured regular sources are invoked.
+3. Telegram and PanSou are invoked on every HDHive-source run when configured.
 4. A paid HDHive resource is not resolved when either regular source has a candidate.
 5. A paid HDHive resource is resolved only after both regular sources have no candidate.
 6. A successful HDHive resolution persists the returned cloud share as the subscription bound share.
@@ -187,14 +187,12 @@ Implement the following ordered flow:
 
 ```text
 process bound share (if present)
+search HDHive by subscription media_type + tmdb_id
+process each existing/free HDHive share
 run configured Telegram search with HDHive enrichment disabled
 run configured PanSou search
-search HDHive by subscription media_type + tmdb_id
-for each HDHive resource:
-    GET share metadata
-    if an existing share URL is returned, process it
-    else if unlock_points == 0 or is_free_for_user, resolve it
-    else if unlock_points > 0 and Telegram/PanSou have no candidate, resolve it
+for each remaining paid HDHive resource:
+    if unlock_points > 0 and all earlier sources have no candidate, resolve it
     else skip without calling unlock
 after a successful HDHive resolution, save its cloud URL as BoundShare
 ```

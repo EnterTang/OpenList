@@ -5,14 +5,17 @@ Unlike the legacy single-source `telegram` and `pansou` paths, an HDHive
 subscription is a federated entry point that uses the following order:
 
 1. Process the subscription's bound cloud share.
-2. Re-run configured Telegram and PanSou searches.
-3. Resolve HDHive resources that are already shared or free for the user.
+2. Resolve HDHive resources that are already shared or free for the user.
+3. Re-run configured Telegram and PanSou searches.
 4. Resolve a paid HDHive resource only when both regular sources produced no
    usable candidate and the unlock-point value is known and within the limit.
 
 Telegram and PanSou are still retried on every HDHive-source run when they are
 configured. Free HDHive resources may also be retried on every run. Unknown
 unlock-point metadata is treated as unsafe and is never unlocked automatically.
+The free HDHive phase runs before those regular-source retries; paid HDHive
+unlock remains the final fallback and is skipped when a bound, free, Telegram,
+or PanSou candidate is already available.
 
 ## Binding API
 
