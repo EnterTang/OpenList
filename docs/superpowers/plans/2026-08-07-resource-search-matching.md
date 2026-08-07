@@ -8,6 +8,18 @@
 
 **Tech Stack:** Go, standard-library regular expressions and sorting, existing OpenList subscription models and share providers, existing internal/media/titlematch, internal/media/recognize, httptest, and the current Go test suite.
 
+## Implementation Record (2026-08-07)
+
+- Implemented on `task/storage-semantic-unification` in commits `7f79899d`, `4252e056`, `419f43b2`, and `c07ea800`.
+- Added a shared release-name parser, target-aware PanSou matching/ranking, duplicate-link suppression, automatic standalone/cluster integration, and Telegram season/episode fallback reuse.
+- Preserved HDHive's `media_type + tmdb_id` lookup semantics; its regression fixture intentionally returns an unrelated display title while requiring the TMDB-ID route.
+- Verified successfully on the merged branch:
+  - `go test ./internal/media/... ./internal/subscription ./internal/hdhive ./internal/cluster ./drivers/115_sy ./drivers/115 ./drivers/115_open`
+  - `go vet ./internal/media/release ./internal/subscription ./internal/hdhive ./internal/cluster`
+  - `go test -race ./internal/media/release ./internal/subscription ./internal/hdhive ./internal/cluster`
+  - `git diff --check`
+- `go test ./...` was run and returned non-zero because of unrelated existing/environment-dependent failures: non-constant format vet diagnostics in untouched packages, missing system `fuse.h`, an environment-specific `internal/net` proxy test, and Aria2 RPC tests requiring a service on `localhost:6800`. The changed packages remain green in the targeted command above.
+
 ## Global Constraints
 
 - Do not add a new third-party dependency.
