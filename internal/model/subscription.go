@@ -6,6 +6,7 @@ const (
 	SubscriptionSourceManual   = "manual"
 	SubscriptionSourceTelegram = "telegram"
 	SubscriptionSourcePanSou   = "pansou"
+	SubscriptionSourceHDHive   = "hdhive"
 
 	SubscriptionStatusIdle    = "idle"
 	SubscriptionStatusRunning = "running"
@@ -215,30 +216,44 @@ type SubscriptionManualSourceConfig struct {
 }
 
 type SubscriptionTelegramSourceConfig struct {
-	APIID                        int                           `json:"api_id"`
-	APIHash                      string                        `json:"api_hash"`
-	SessionFile                  string                        `json:"session_file"`
-	Channels                     []string                      `json:"channels"`
-	QuarkChannels                []string                      `json:"quark_channels,omitempty"`
-	AliyunDriveChannels          []string                      `json:"aliyun_drive_channels,omitempty"`
-	Pan123Channels               []string                      `json:"pan123_channels,omitempty"`
-	Pan115Channels               []string                      `json:"pan115_channels,omitempty"`
-	GuangYaPanChannels           []string                      `json:"guangyapan_channels,omitempty"`
-	Quark                        SubscriptionTelegramPanConfig `json:"quark"`
-	AliyunDrive                  SubscriptionTelegramPanConfig `json:"aliyun_drive"`
-	Pan123                       SubscriptionTelegramPanConfig `json:"pan123"`
-	Pan115                       SubscriptionTelegramPanConfig `json:"pan115"`
-	GuangYaPan                   SubscriptionTelegramPanConfig `json:"guangyapan"`
-	SearchCommand                []string                      `json:"search_command"`
-	AuthCommand                  []string                      `json:"auth_command"`
-	CommandEnv                   []string                      `json:"command_env"`
-	CommandTimeoutSeconds        int64                         `json:"command_timeout_seconds"`
-	Limit                        int                           `json:"limit"`
-	TransferPriority             []string                      `json:"transfer_priority,omitempty"`
-	RealtimeEnabled              bool                          `json:"realtime_enabled,omitempty"`
-	RealtimeGroups               []string                      `json:"realtime_groups,omitempty"`
-	RealtimeCandidateWaitSeconds *int                          `json:"realtime_candidate_wait_seconds,omitempty"`
-	RealtimeExpectedProviders    []string                      `json:"realtime_expected_providers,omitempty"`
+	APIID                        int                              `json:"api_id"`
+	APIHash                      string                           `json:"api_hash"`
+	SessionFile                  string                           `json:"session_file"`
+	Channels                     []string                         `json:"channels"`
+	QuarkChannels                []string                         `json:"quark_channels,omitempty"`
+	AliyunDriveChannels          []string                         `json:"aliyun_drive_channels,omitempty"`
+	Pan123Channels               []string                         `json:"pan123_channels,omitempty"`
+	Pan115Channels               []string                         `json:"pan115_channels,omitempty"`
+	GuangYaPanChannels           []string                         `json:"guangyapan_channels,omitempty"`
+	Quark                        SubscriptionTelegramPanConfig    `json:"quark"`
+	AliyunDrive                  SubscriptionTelegramPanConfig    `json:"aliyun_drive"`
+	Pan123                       SubscriptionTelegramPanConfig    `json:"pan123"`
+	Pan115                       SubscriptionTelegramPanConfig    `json:"pan115"`
+	GuangYaPan                   SubscriptionTelegramPanConfig    `json:"guangyapan"`
+	HDHive                       SubscriptionTelegramHDHiveConfig `json:"hdhive,omitempty"`
+	SearchCommand                []string                         `json:"search_command"`
+	AuthCommand                  []string                         `json:"auth_command"`
+	CommandEnv                   []string                         `json:"command_env"`
+	CommandTimeoutSeconds        int64                            `json:"command_timeout_seconds"`
+	Limit                        int                              `json:"limit"`
+	TransferPriority             []string                         `json:"transfer_priority,omitempty"`
+	RealtimeEnabled              bool                             `json:"realtime_enabled,omitempty"`
+	RealtimeGroups               []string                         `json:"realtime_groups,omitempty"`
+	RealtimeCandidateWaitSeconds *int                             `json:"realtime_candidate_wait_seconds,omitempty"`
+	RealtimeExpectedProviders    []string                         `json:"realtime_expected_providers,omitempty"`
+}
+
+// SubscriptionTelegramHDHiveConfig configures the optional HDHive resource
+// unlocker used by Telegram-backed subscriptions. Proxy credentials are
+// redacted by the subscription config API like pan provider secrets.
+type SubscriptionTelegramHDHiveConfig struct {
+	Enabled         bool   `json:"enabled,omitempty"`
+	BaseURL         string `json:"base_url,omitempty"`
+	UserID          string `json:"user_id,omitempty"`
+	ProxyUserKey    string `json:"proxy_user_key,omitempty"`
+	ProxySecret     string `json:"proxy_secret,omitempty"`
+	TimeoutSeconds  int    `json:"timeout_seconds,omitempty"`
+	MaxUnlockPoints int    `json:"max_unlock_points,omitempty"`
 }
 
 // SubscriptionRealtimeStatus is a card-ready projection derived from durable
@@ -291,9 +306,12 @@ type SubscriptionConfig struct {
 }
 
 type SubscriptionResourceSearchReq struct {
-	Query   string   `json:"query" form:"query"`
-	Sources []string `json:"sources" form:"sources"`
-	Limit   int      `json:"limit" form:"limit"`
+	Query     string   `json:"query" form:"query"`
+	Sources   []string `json:"sources" form:"sources"`
+	Limit     int      `json:"limit" form:"limit"`
+	TMDBID    int64    `json:"tmdb_id" form:"tmdb_id"`
+	MediaType string   `json:"media_type" form:"media_type"`
+	CloudType string   `json:"cloud_type" form:"cloud_type"`
 }
 
 type SubscriptionResourceSearchResp struct {
@@ -337,8 +355,23 @@ type SubscriptionResourceSearchResult struct {
 }
 
 type SubscriptionResourceSearchLink struct {
-	URL      string `json:"url"`
-	Provider string `json:"provider,omitempty"`
+	URL          string `json:"url"`
+	Provider     string `json:"provider,omitempty"`
+	Unlockable   bool   `json:"unlockable,omitempty"`
+	Unlocked     bool   `json:"unlocked,omitempty"`
+	UnlockPoints *int   `json:"unlock_points,omitempty"`
+	AccessCode   string `json:"access_code,omitempty"`
+}
+
+type SubscriptionResourceUnlockReq struct {
+	URL string `json:"url" binding:"required"`
+}
+
+type SubscriptionResourceUnlockResp struct {
+	URL         string `json:"url"`
+	AccessCode  string `json:"access_code,omitempty"`
+	FromCache   bool   `json:"from_cache,omitempty"`
+	PointsSpent *int   `json:"points_spent,omitempty"`
 }
 
 type SubscriptionPreviewReq struct {

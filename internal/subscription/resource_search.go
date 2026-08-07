@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
@@ -50,6 +51,8 @@ func SearchResources(ctx context.Context, req model.SubscriptionResourceSearchRe
 			results, searchErr = searchTelegramResources(ctx, query, limit, cfg.Telegram)
 		case model.SubscriptionSourcePanSou:
 			results, searchErr = searchPanSouResources(ctx, query, limit, cfg.PanSou)
+		case model.SubscriptionSourceHDHive:
+			results, searchErr = searchHDHiveResources(ctx, req, query, limit, cfg.Telegram.HDHive)
 		default:
 			searchErr = fmt.Errorf("unsupported resource search source: %s", source)
 		}
@@ -87,6 +90,15 @@ func ResourceSearchSourceCapabilities(cfg model.SubscriptionConfig) map[string]m
 		panSouReason = "not_configured"
 	}
 
+	hdhive := cfg.Telegram.HDHive
+	hdhiveConfigured := hdhive.Enabled && strings.TrimSpace(hdhive.BaseURL) != "" &&
+		strings.TrimSpace(hdhive.UserID) != "" && strings.TrimSpace(hdhive.ProxyUserKey) != "" &&
+		strings.TrimSpace(hdhive.ProxySecret) != ""
+	hdhiveReason := ""
+	if !hdhiveConfigured {
+		hdhiveReason = "not_configured"
+	}
+
 	return map[string]model.SubscriptionSearchSourceCapability{
 		model.SubscriptionSourceTelegram: {
 			Configured:        telegramConfigured,
@@ -97,6 +109,11 @@ func ResourceSearchSourceCapabilities(cfg model.SubscriptionConfig) map[string]m
 			Configured:        panSouConfigured,
 			Available:         panSouConfigured,
 			UnavailableReason: panSouReason,
+		},
+		model.SubscriptionSourceHDHive: {
+			Configured:        hdhiveConfigured,
+			Available:         hdhiveConfigured,
+			UnavailableReason: hdhiveReason,
 		},
 	}
 }
@@ -138,6 +155,14 @@ func searchTelegramResources(ctx context.Context, query string, limit int, cfg m
 	}
 	results := make([]model.SubscriptionResourceSearchResult, 0, min(len(rows), limit))
 	for _, row := range rows {
+		links := rowLinks(row)
+		hdhiveLinks, err := resolveTelegramHDHiveLinks(ctx, row, cfg)
+		if err != nil {
+			return nil, err
+		}
+		for _, link := range hdhiveLinks {
+			links = append(links, normalizeTelegramLinkWithAccessCode(link.URL, link.AccessCode))
+		}
 		result := model.SubscriptionResourceSearchResult{
 			SourceType: model.SubscriptionSourceTelegram,
 			Title:      resourceTitle(rowText(row)),
@@ -145,7 +170,7 @@ func searchTelegramResources(ctx context.Context, query string, limit int, cfg m
 			Channel:    normalizeTelegramChannel(row.Channel),
 			MessageURL: telegramMessageURL(row),
 			Date:       strings.TrimSpace(row.Date),
-			Links:      resourceLinksFromURLs(rowLinks(row), rowAccessCode(row)),
+			Links:      resourceLinksFromURLs(links, rowAccessCode(row)),
 		}
 		result.Provider = firstResultProvider(result.Links)
 		if result.Title == "" && len(result.Links) == 0 {
@@ -196,6 +221,134 @@ func searchPanSouResources(ctx context.Context, query string, limit int, cfg mod
 		return nil, err
 	}
 	return filterResourceSearchResults(results, query, limit), nil
+}
+
+func searchHDHiveResources(ctx context.Context, req model.SubscriptionResourceSearchReq, query string, limit int, cfg model.SubscriptionTelegramHDHiveConfig) ([]model.SubscriptionResourceSearchResult, error) {
+	if !cfg.Enabled || strings.TrimSpace(cfg.BaseURL) == "" || strings.TrimSpace(cfg.UserID) == "" || strings.TrimSpace(cfg.ProxyUserKey) == "" || strings.TrimSpace(cfg.ProxySecret) == "" {
+		return nil, errors.New("hdhive is not configured")
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(req.MediaType))
+	if mediaType != "tv" && mediaType != "movie" {
+		return nil, errors.New("hdhive search requires media_type tv or movie")
+	}
+	if req.TMDBID <= 0 {
+		return nil, errors.New("hdhive search requires a positive tmdb_id")
+	}
+	if !isHDHiveCloudType(req.CloudType) {
+		return nil, fmt.Errorf("unsupported hdhive cloud_type: %s", strings.TrimSpace(req.CloudType))
+	}
+	client, err := telegramHDHiveClientForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	resources, err := client.Search(ctx, mediaType, req.TMDBID)
+	if err != nil {
+		return nil, err
+	}
+	resources = filterHDHiveResources(resources, req.CloudType)
+	results := make([]model.SubscriptionResourceSearchResult, 0, min(len(resources), limit))
+	for _, resource := range resources {
+		if len(results) >= limit {
+			break
+		}
+		resourceURL := strings.TrimSpace(resource.ResourceURL)
+		if resourceURL == "" {
+			resourceURL = defaultHDHiveResourceURL(resource)
+		}
+		if _, ok := hdhive.ResourceRefFromURL(resourceURL, resource.PanType); !ok {
+			resourceURL = defaultHDHiveResourceURL(resource)
+		}
+		if resourceURL == "" || strings.TrimSpace(resource.Slug) == "" {
+			continue
+		}
+		results = append(results, model.SubscriptionResourceSearchResult{
+			SourceType: model.SubscriptionSourceHDHive,
+			Provider:   strings.TrimSpace(resource.PanType),
+			Title:      firstNonEmpty(resource.Title, query),
+			Content:    hdhiveResourceContent(resource),
+			Links: []model.SubscriptionResourceSearchLink{{
+				URL:        resourceURL,
+				Provider:   strings.TrimSpace(resource.PanType),
+				Unlockable: true,
+				// Search only returns metadata. Even an already-owned item still
+				// needs the share endpoint to provide its current share URL.
+				Unlocked:     false,
+				UnlockPoints: resource.UnlockPoints,
+			}},
+		})
+	}
+	return results, nil
+}
+
+func isHDHiveCloudType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "all", "channel_115", "channel_123", "channel_189", "channel_quark", "channel_alipan":
+		return true
+	default:
+		return false
+	}
+}
+
+func filterHDHiveResources(resources []hdhive.Resource, cloudType string) []hdhive.Resource {
+	cloudType = strings.ToLower(strings.TrimSpace(cloudType))
+	if cloudType == "" || cloudType == "all" {
+		return resources
+	}
+	allowed := map[string]struct{}{}
+	switch cloudType {
+	case "channel_115":
+		allowed["115"] = struct{}{}
+		allowed["ed2k"] = struct{}{}
+	case "channel_123":
+		allowed["123"] = struct{}{}
+	case "channel_189":
+		allowed["189"] = struct{}{}
+	case "channel_quark":
+		allowed["quark"] = struct{}{}
+	case "channel_alipan":
+		allowed["alipan"] = struct{}{}
+	default:
+		return nil
+	}
+	filtered := make([]hdhive.Resource, 0, len(resources))
+	for _, resource := range resources {
+		if _, ok := allowed[strings.ToLower(strings.TrimSpace(resource.PanType))]; ok {
+			filtered = append(filtered, resource)
+		}
+	}
+	return filtered
+}
+
+func defaultHDHiveResourceURL(resource hdhive.Resource) string {
+	slug := strings.TrimSpace(resource.Slug)
+	if slug == "" {
+		return ""
+	}
+	if strings.EqualFold(strings.TrimSpace(resource.PanType), "ed2k") {
+		return "https://hdhive.com/resource/" + slug
+	}
+	panType := strings.TrimSpace(resource.PanType)
+	if panType == "" {
+		panType = "189"
+	}
+	return "https://hdhive.com/resource/" + panType + "/" + slug
+}
+
+func hdhiveResourceContent(resource hdhive.Resource) string {
+	parts := make([]string, 0, 4)
+	if resource.PanType != "" {
+		parts = append(parts, "网盘: "+resource.PanType)
+	}
+	if len(resource.VideoResolution) > 0 {
+		parts = append(parts, "分辨率: "+strings.Join(resource.VideoResolution, ", "))
+	}
+	if resource.UnlockPoints != nil {
+		parts = append(parts, fmt.Sprintf("解锁积分: %d", *resource.UnlockPoints))
+	}
+	if resource.Remark != "" {
+		parts = append(parts, resource.Remark)
+	}
+	return strings.Join(parts, " · ")
 }
 
 func runPanSouSearchCommand(ctx context.Context, query string, limit int, cfg model.SubscriptionPanSouSourceConfig) ([]byte, error) {

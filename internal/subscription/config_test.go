@@ -24,6 +24,7 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 			SessionFile:   "data/telegram.session",
 			Channels:      []string{"@default"},
 			SearchCommand: []string{"node", "telegram_search.mjs"},
+			HDHive:        model.SubscriptionTelegramHDHiveConfig{Enabled: true},
 		},
 	}
 
@@ -49,6 +50,9 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 	}
 	if source.APIID != 123 || source.APIHash != "hash" || source.SessionFile != "data/telegram.session" {
 		t.Fatalf("telegram auth defaults were not merged: %#v", source)
+	}
+	if !source.HDHive.Enabled || source.HDHive.BaseURL != "https://hdhive.symedia.top" || source.HDHive.TimeoutSeconds != 15 {
+		t.Fatalf("HDHive defaults were not merged: %#v", source.HDHive)
 	}
 	if len(source.Channels) != 1 || source.Channels[0] != "@custom" {
 		t.Fatalf("subscription channel override was not preserved: %#v", source.Channels)

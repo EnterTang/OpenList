@@ -20,6 +20,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -243,6 +244,19 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 			continue
 		}
 		links, sources := rowLinksForTelegramPanSources(row, cfg)
+		hdhiveLinks, err := resolveTelegramHDHiveLinks(ctx, row, cfg)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, transferred, err
+		}
+		for _, link := range hdhiveLinks {
+			links = append(links, normalizeTelegramLinkWithAccessCode(link.URL, link.AccessCode))
+		}
+		if len(sources) == 0 && len(hdhiveLinks) > 0 {
+			// The original row intentionally excludes HDHive URLs from the
+			// normal provider filter. Reuse the channel binding for the
+			// unlocked URL so standalone transfer can inspect it normally.
+			sources = telegramPanSourcesForRow(row, cfg)
+		}
 		accessCode := rowAccessCode(row)
 		message := sourceMessageFromTelegramRow(row)
 		for _, link := range links {
@@ -919,6 +933,9 @@ func rowLinks(row telegramCommandRow) []string {
 		if value == "" {
 			return
 		}
+		if isTelegramHDHiveURL(value) {
+			return
+		}
 		value = strings.TrimRight(value, "，,;；？?)]）>")
 		if !isPan123FastLink(value) {
 			if _, err := url.ParseRequestURI(value); err != nil {
@@ -947,6 +964,11 @@ func rowLinks(row telegramCommandRow) []string {
 		appendLink(match)
 	}
 	return links
+}
+
+func isTelegramHDHiveURL(value string) bool {
+	_, ok := hdhive.ResourceRefFromURL(value, "189")
+	return ok
 }
 
 func rowLinksForTelegramPanSources(row telegramCommandRow, cfg model.SubscriptionTelegramSourceConfig) ([]string, []telegramPanSubscriptionSource) {

@@ -50,6 +50,13 @@ func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.S
 		}
 		message := sourceMessageFromTelegramRow(row)
 		links, _ := rowLinksForTelegramPanSources(row, cfg)
+		hdhiveLinks, err := resolveTelegramHDHiveLinks(ctx, row, cfg)
+		if err != nil {
+			return saved, sub.LastTreeHash, added, changed, dispatched, err
+		}
+		for _, link := range hdhiveLinks {
+			links = append(links, normalizeTelegramLinkWithAccessCode(link.URL, link.AccessCode))
+		}
 		accessCode := rowAccessCode(row)
 		for _, link := range links {
 			rawLink := normalizeTelegramLinkWithAccessCode(link, accessCode)

@@ -20,6 +20,10 @@ func DefaultConfig() model.SubscriptionConfig {
 		Telegram: model.SubscriptionTelegramSourceConfig{
 			CommandTimeoutSeconds: 30,
 			Limit:                 40,
+			HDHive: model.SubscriptionTelegramHDHiveConfig{
+				BaseURL:        "https://hdhive.symedia.top",
+				TimeoutSeconds: 15,
+			},
 		},
 		PanSou: model.SubscriptionPanSouSourceConfig{
 			CommandTimeoutSeconds: 30,
@@ -280,6 +284,7 @@ func fillTelegramSourceConfig(cfg, defaults model.SubscriptionTelegramSourceConf
 	cfg.Pan123 = fillTelegramPanConfig(cfg.Pan123, defaults.Pan123)
 	cfg.Pan115 = fillTelegramPanConfig(cfg.Pan115, defaults.Pan115)
 	cfg.GuangYaPan = fillTelegramPanConfig(cfg.GuangYaPan, defaults.GuangYaPan)
+	cfg.HDHive = fillTelegramHDHiveConfig(cfg.HDHive, defaults.HDHive)
 	if len(cfg.Channels) == 0 && !hasTelegramChannelGroups(cfg) {
 		cfg.Channels = defaults.Channels
 	}
@@ -378,6 +383,7 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 	cfg.Pan123 = normalizeTelegramPanConfig(cfg.Pan123)
 	cfg.Pan115 = normalizeTelegramPanConfig(cfg.Pan115)
 	cfg.GuangYaPan = normalizeTelegramPanConfig(cfg.GuangYaPan)
+	cfg.HDHive = normalizeTelegramHDHiveConfig(cfg.HDHive)
 	cfg.QuarkChannels = nil
 	cfg.AliyunDriveChannels = nil
 	cfg.Pan123Channels = nil
@@ -396,6 +402,51 @@ func normalizeTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) m
 		cfg.Limit = 40
 	}
 	cfg.TransferPriority = normalizeTransferPriority(cfg.TransferPriority)
+	return cfg
+}
+
+func fillTelegramHDHiveConfig(cfg, defaults model.SubscriptionTelegramHDHiveConfig) model.SubscriptionTelegramHDHiveConfig {
+	if defaults.Enabled {
+		cfg.Enabled = true
+	}
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = defaults.BaseURL
+	}
+	if cfg.UserID == "" {
+		cfg.UserID = defaults.UserID
+	}
+	if cfg.ProxyUserKey == "" {
+		cfg.ProxyUserKey = defaults.ProxyUserKey
+	}
+	if cfg.ProxySecret == "" {
+		cfg.ProxySecret = defaults.ProxySecret
+	}
+	if cfg.TimeoutSeconds <= 0 {
+		cfg.TimeoutSeconds = defaults.TimeoutSeconds
+	}
+	if cfg.MaxUnlockPoints <= 0 {
+		cfg.MaxUnlockPoints = defaults.MaxUnlockPoints
+	}
+	return normalizeTelegramHDHiveConfig(cfg)
+}
+
+func normalizeTelegramHDHiveConfig(cfg model.SubscriptionTelegramHDHiveConfig) model.SubscriptionTelegramHDHiveConfig {
+	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = "https://hdhive.symedia.top"
+	}
+	cfg.UserID = strings.TrimSpace(cfg.UserID)
+	cfg.ProxyUserKey = strings.TrimSpace(cfg.ProxyUserKey)
+	cfg.ProxySecret = strings.TrimSpace(cfg.ProxySecret)
+	if cfg.TimeoutSeconds <= 0 {
+		cfg.TimeoutSeconds = 15
+	}
+	if cfg.TimeoutSeconds > 300 {
+		cfg.TimeoutSeconds = 300
+	}
+	if cfg.MaxUnlockPoints < 0 {
+		cfg.MaxUnlockPoints = 0
+	}
 	return cfg
 }
 
@@ -444,11 +495,16 @@ func isZeroTelegramSourceConfig(cfg model.SubscriptionTelegramSourceConfig) bool
 		isZeroTelegramPanConfig(cfg.Pan123) &&
 		isZeroTelegramPanConfig(cfg.Pan115) &&
 		isZeroTelegramPanConfig(cfg.GuangYaPan) &&
+		isZeroTelegramHDHiveConfig(cfg.HDHive) &&
 		len(cfg.SearchCommand) == 0 &&
 		len(cfg.AuthCommand) == 0 &&
 		len(cfg.CommandEnv) == 0 &&
 		cfg.CommandTimeoutSeconds == 30 &&
 		cfg.Limit == 40
+}
+
+func isZeroTelegramHDHiveConfig(cfg model.SubscriptionTelegramHDHiveConfig) bool {
+	return !cfg.Enabled && cfg.BaseURL == "" && cfg.UserID == "" && cfg.ProxyUserKey == "" && cfg.ProxySecret == "" && cfg.TimeoutSeconds == 0 && cfg.MaxUnlockPoints == 0
 }
 
 func hasTelegramChannelGroups(cfg model.SubscriptionTelegramSourceConfig) bool {

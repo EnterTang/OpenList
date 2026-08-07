@@ -153,6 +153,8 @@ func TestSubscriptionConfigResponsesRedactAndPreserveSecrets(t *testing.T) {
 		apiHash      = "api-secret-value"
 		refreshToken = "refresh-secret-value"
 		accessToken  = "access-secret-value"
+		proxyUserKey = "hdhive-user-key"
+		proxySecret  = "hdhive-proxy-secret"
 	)
 	_, err := subscription.SaveConfig(model.SubscriptionConfig{
 		Telegram: model.SubscriptionTelegramSourceConfig{
@@ -162,6 +164,11 @@ func TestSubscriptionConfigResponsesRedactAndPreserveSecrets(t *testing.T) {
 			AliyunDrive: model.SubscriptionTelegramPanConfig{
 				RefreshToken: refreshToken,
 				AccessToken:  accessToken,
+			},
+			HDHive: model.SubscriptionTelegramHDHiveConfig{
+				Enabled:      true,
+				ProxyUserKey: proxyUserKey,
+				ProxySecret:  proxySecret,
 			},
 		},
 	})
@@ -175,13 +182,16 @@ func TestSubscriptionConfigResponsesRedactAndPreserveSecrets(t *testing.T) {
 	if resp.Code != 200 {
 		t.Fatalf("get config code = %d: %s", resp.Code, recorder.Body.String())
 	}
-	if strings.Contains(recorder.Body.String(), apiHash) || strings.Contains(recorder.Body.String(), refreshToken) || strings.Contains(recorder.Body.String(), accessToken) {
+	if strings.Contains(recorder.Body.String(), apiHash) || strings.Contains(recorder.Body.String(), refreshToken) || strings.Contains(recorder.Body.String(), accessToken) || strings.Contains(recorder.Body.String(), proxyUserKey) || strings.Contains(recorder.Body.String(), proxySecret) {
 		t.Fatalf("config response exposed a stored secret: %s", recorder.Body.String())
 	}
 	if resp.Data.Telegram.APIHash != "" || resp.Data.Telegram.AliyunDrive.RefreshToken != "" || resp.Data.Telegram.AliyunDrive.AccessToken != "" {
 		t.Fatalf("redacted config still contains secrets: %#v", resp.Data.Telegram)
 	}
-	if !resp.Data.SecretStatus.Configured["telegram.api_hash"] || !resp.Data.SecretStatus.Configured["telegram.aliyun_drive.refresh_token"] {
+	if resp.Data.Telegram.HDHive.ProxyUserKey != "" || resp.Data.Telegram.HDHive.ProxySecret != "" {
+		t.Fatalf("redacted HDHive config still contains secrets: %#v", resp.Data.Telegram.HDHive)
+	}
+	if !resp.Data.SecretStatus.Configured["telegram.api_hash"] || !resp.Data.SecretStatus.Configured["telegram.aliyun_drive.refresh_token"] || !resp.Data.SecretStatus.Configured["telegram.hdhive.proxy_secret"] {
 		t.Fatalf("secret configured status = %#v", resp.Data.SecretStatus)
 	}
 	if resp.Data.SecretStatus.UnchangedMarker != model.SubscriptionSecretUnchangedMarker || resp.Data.SecretStatus.ClearMarker != model.SubscriptionSecretClearMarker {
@@ -206,14 +216,14 @@ func TestSubscriptionConfigResponsesRedactAndPreserveSecrets(t *testing.T) {
 	if savedResp.Code != 200 {
 		t.Fatalf("save config code = %d: %s", savedResp.Code, recorder.Body.String())
 	}
-	if strings.Contains(recorder.Body.String(), apiHash) || strings.Contains(recorder.Body.String(), refreshToken) || strings.Contains(recorder.Body.String(), accessToken) {
+	if strings.Contains(recorder.Body.String(), apiHash) || strings.Contains(recorder.Body.String(), refreshToken) || strings.Contains(recorder.Body.String(), accessToken) || strings.Contains(recorder.Body.String(), proxyUserKey) || strings.Contains(recorder.Body.String(), proxySecret) {
 		t.Fatalf("save response exposed a stored secret: %s", recorder.Body.String())
 	}
 	stored, err := subscription.GetConfig()
 	if err != nil {
 		t.Fatalf("get saved config: %v", err)
 	}
-	if stored.Telegram.APIHash != apiHash || stored.Telegram.AliyunDrive.RefreshToken != refreshToken || stored.Telegram.AliyunDrive.AccessToken != accessToken {
+	if stored.Telegram.APIHash != apiHash || stored.Telegram.AliyunDrive.RefreshToken != refreshToken || stored.Telegram.AliyunDrive.AccessToken != accessToken || stored.Telegram.HDHive.ProxyUserKey != proxyUserKey || stored.Telegram.HDHive.ProxySecret != proxySecret {
 		t.Fatalf("redacted save overwrote credentials: %#v", stored.Telegram)
 	}
 	if !savedResp.Data.SourceCapabilities[model.SubscriptionSourcePanSou].Available {
@@ -242,6 +252,20 @@ func TestSubscriptionConfigResponsesRedactAndPreserveSecrets(t *testing.T) {
 	}
 	if stored.Telegram.APIHash != "" || stored.Telegram.AliyunDrive.RefreshToken != refreshToken {
 		t.Fatalf("explicit clear/unchanged markers not honored: %#v", stored.Telegram)
+	}
+}
+
+func TestUnlockSubscriptionResourceRejectsInvalidHDHiveURL(t *testing.T) {
+	setupSubscriptionHandleDB(t)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/admin/subscription/resource/unlock", strings.NewReader(`{"url":"https://example.com/resource/not-hdhive"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	UnlockSubscriptionResource(c)
+
+	resp := decodeHandleResp[any](t, recorder)
+	if resp.Code != 400 {
+		t.Fatalf("response = %#v, want invalid URL status", resp)
 	}
 }
 

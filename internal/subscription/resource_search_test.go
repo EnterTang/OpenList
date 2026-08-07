@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -16,6 +17,10 @@ func TestNormalizeResourceSearchSources(t *testing.T) {
 	got = normalizeResourceSearchSources(nil)
 	if !stringSlicesEqual(got, want) {
 		t.Fatalf("default sources = %#v, want %#v", got, want)
+	}
+	got = normalizeResourceSearchSources([]string{"hdhive"})
+	if !stringSlicesEqual(got, []string{model.SubscriptionSourceHDHive}) {
+		t.Fatalf("hdhive sources = %#v, want hdhive only", got)
 	}
 }
 
@@ -41,6 +46,32 @@ func TestResourceSearchSourceCapabilitiesExposeMissingPanSouConfiguration(t *tes
 	panSou = capabilities[model.SubscriptionSourcePanSou]
 	if !panSou.Configured || !panSou.Available || panSou.UnavailableReason != "" {
 		t.Fatalf("configured pansou capability = %#v", panSou)
+	}
+
+	capabilities = ResourceSearchSourceCapabilities(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{HDHive: model.SubscriptionTelegramHDHiveConfig{
+			Enabled:      true,
+			BaseURL:      "https://hdhive.example",
+			UserID:       "user-1",
+			ProxyUserKey: "user-key",
+			ProxySecret:  "secret",
+		}},
+	})
+	hdhive := capabilities[model.SubscriptionSourceHDHive]
+	if !hdhive.Configured || !hdhive.Available || hdhive.UnavailableReason != "" {
+		t.Fatalf("hdhive capability = %#v, want available", hdhive)
+	}
+}
+
+func TestFilterHDHiveResourcesByCloudType(t *testing.T) {
+	resources := []hdhive.Resource{
+		{Slug: "115-resource", PanType: "115"},
+		{Slug: "ed2k-resource", PanType: "ed2k"},
+		{Slug: "189-resource", PanType: "189"},
+	}
+	filtered := filterHDHiveResources(resources, "channel_115")
+	if len(filtered) != 2 || filtered[0].PanType != "115" || filtered[1].PanType != "ed2k" {
+		t.Fatalf("filtered = %#v, want 115 and ed2k", filtered)
 	}
 }
 

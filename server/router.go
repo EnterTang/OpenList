@@ -261,6 +261,7 @@ func admin(g *gin.RouterGroup) {
 	subscription.POST("/runs/delete", handles.DeleteSubscriptionRun)
 	subscription.POST("/runs/clear_failed", handles.ClearFailedSubscriptionRuns)
 	subscription.POST("/resource/search", handles.SearchSubscriptionResources)
+	subscription.POST("/resource/unlock", handles.UnlockSubscriptionResource)
 	subscription.GET("/config", handles.GetSubscriptionConfig)
 	subscription.POST("/config", handles.SaveSubscriptionConfig)
 	subscription.POST("/telegram/status", handles.TelegramSubscriptionStatus)

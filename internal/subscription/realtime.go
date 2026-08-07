@@ -118,6 +118,13 @@ func processRealtimeTelegramEvent(ctx context.Context, event *model.Subscription
 		return "", nil
 	}
 	links, _ := rowLinksForTelegramPanSources(row, cfg)
+	hdhiveLinks, err := resolveTelegramHDHiveLinks(ctx, row, cfg)
+	if err != nil {
+		return "", err
+	}
+	for _, link := range hdhiveLinks {
+		links = append(links, normalizeTelegramLinkWithAccessCode(link.URL, link.AccessCode))
+	}
 	if len(links) == 0 {
 		links = rowLinks(row)
 	}

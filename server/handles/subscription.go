@@ -520,6 +520,25 @@ func SearchSubscriptionResources(c *gin.Context) {
 	common.SuccessResp(c, result)
 }
 
+func UnlockSubscriptionResource(c *gin.Context) {
+	var req model.SubscriptionResourceUnlockReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	cfg, err := subscription.GetConfig()
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	result, err := subscription.UnlockHDHiveResource(c.Request.Context(), req.URL, cfg.Telegram.HDHive)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
 func GetSubscriptionConfig(c *gin.Context) {
 	cfg, err := subscription.GetConfig()
 	if err != nil {
@@ -553,22 +572,24 @@ func subscriptionConfigResponse(cfg model.SubscriptionConfig) model.Subscription
 	capabilities := subscription.ResourceSearchSourceCapabilities(cfg)
 	guangyaAccessFromStorage, guangyaRefreshFromStorage := subscription.GuangYaPanStorageCredentialsConfigured()
 	configured := map[string]bool{
-		"telegram.api_hash":                     cfg.Telegram.APIHash != "",
-		"telegram.quark.cookie":                 cfg.Telegram.Quark.Cookie != "",
-		"telegram.quark.refresh_token":          cfg.Telegram.Quark.RefreshToken != "",
-		"telegram.quark.access_token":           cfg.Telegram.Quark.AccessToken != "",
-		"telegram.aliyun_drive.cookie":          cfg.Telegram.AliyunDrive.Cookie != "",
-		"telegram.aliyun_drive.refresh_token":   cfg.Telegram.AliyunDrive.RefreshToken != "",
-		"telegram.aliyun_drive.access_token":    cfg.Telegram.AliyunDrive.AccessToken != "",
-		"telegram.pan123.cookie":                cfg.Telegram.Pan123.Cookie != "",
-		"telegram.pan123.refresh_token":         cfg.Telegram.Pan123.RefreshToken != "",
-		"telegram.pan123.access_token":          cfg.Telegram.Pan123.AccessToken != "",
-		"telegram.pan115.cookie":                cfg.Telegram.Pan115.Cookie != "",
-		"telegram.pan115.refresh_token":         cfg.Telegram.Pan115.RefreshToken != "",
-		"telegram.pan115.access_token":          cfg.Telegram.Pan115.AccessToken != "",
-		"telegram.guangyapan.cookie":            cfg.Telegram.GuangYaPan.Cookie != "",
-		"telegram.guangyapan.refresh_token":     cfg.Telegram.GuangYaPan.RefreshToken != "" || guangyaRefreshFromStorage,
-		"telegram.guangyapan.access_token":      cfg.Telegram.GuangYaPan.AccessToken != "" || guangyaAccessFromStorage,
+		"telegram.api_hash":                   cfg.Telegram.APIHash != "",
+		"telegram.quark.cookie":               cfg.Telegram.Quark.Cookie != "",
+		"telegram.quark.refresh_token":        cfg.Telegram.Quark.RefreshToken != "",
+		"telegram.quark.access_token":         cfg.Telegram.Quark.AccessToken != "",
+		"telegram.aliyun_drive.cookie":        cfg.Telegram.AliyunDrive.Cookie != "",
+		"telegram.aliyun_drive.refresh_token": cfg.Telegram.AliyunDrive.RefreshToken != "",
+		"telegram.aliyun_drive.access_token":  cfg.Telegram.AliyunDrive.AccessToken != "",
+		"telegram.pan123.cookie":              cfg.Telegram.Pan123.Cookie != "",
+		"telegram.pan123.refresh_token":       cfg.Telegram.Pan123.RefreshToken != "",
+		"telegram.pan123.access_token":        cfg.Telegram.Pan123.AccessToken != "",
+		"telegram.pan115.cookie":              cfg.Telegram.Pan115.Cookie != "",
+		"telegram.pan115.refresh_token":       cfg.Telegram.Pan115.RefreshToken != "",
+		"telegram.pan115.access_token":        cfg.Telegram.Pan115.AccessToken != "",
+		"telegram.guangyapan.cookie":          cfg.Telegram.GuangYaPan.Cookie != "",
+		"telegram.guangyapan.refresh_token":   cfg.Telegram.GuangYaPan.RefreshToken != "" || guangyaRefreshFromStorage,
+		"telegram.guangyapan.access_token":    cfg.Telegram.GuangYaPan.AccessToken != "" || guangyaAccessFromStorage,
+		"telegram.hdhive.proxy_user_key":      cfg.Telegram.HDHive.ProxyUserKey != "",
+		"telegram.hdhive.proxy_secret":        cfg.Telegram.HDHive.ProxySecret != "",
 	}
 	redactSubscriptionConfigSecrets(&cfg)
 	return model.SubscriptionConfigResponse{
@@ -592,6 +613,8 @@ func mergeSubscriptionConfigSecrets(next *model.SubscriptionConfig, current mode
 	mergeSubscriptionPanSecrets(&next.Telegram.Pan123, current.Telegram.Pan123)
 	mergeSubscriptionPanSecrets(&next.Telegram.Pan115, current.Telegram.Pan115)
 	mergeSubscriptionPanSecrets(&next.Telegram.GuangYaPan, current.Telegram.GuangYaPan)
+	next.Telegram.HDHive.ProxyUserKey = mergeSubscriptionSecret(next.Telegram.HDHive.ProxyUserKey, current.Telegram.HDHive.ProxyUserKey)
+	next.Telegram.HDHive.ProxySecret = mergeSubscriptionSecret(next.Telegram.HDHive.ProxySecret, current.Telegram.HDHive.ProxySecret)
 }
 
 func mergeSubscriptionPanSecrets(next *model.SubscriptionTelegramPanConfig, current model.SubscriptionTelegramPanConfig) {
@@ -621,6 +644,8 @@ func redactSubscriptionConfigSecrets(cfg *model.SubscriptionConfig) {
 	redactSubscriptionPanSecrets(&cfg.Telegram.Pan123)
 	redactSubscriptionPanSecrets(&cfg.Telegram.Pan115)
 	redactSubscriptionPanSecrets(&cfg.Telegram.GuangYaPan)
+	cfg.Telegram.HDHive.ProxyUserKey = ""
+	cfg.Telegram.HDHive.ProxySecret = ""
 }
 
 func redactSubscriptionPanSecrets(cfg *model.SubscriptionTelegramPanConfig) {
