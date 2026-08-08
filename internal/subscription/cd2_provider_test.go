@@ -12,6 +12,16 @@ func TestStorageProviderNameTreats115CD2As115(t *testing.T) {
 	}
 }
 
+func TestStorageProviderNameTreats115SYAliasesAs115(t *testing.T) {
+	for _, driver := range []string{"115_sy", "115 sy"} {
+		t.Run(driver, func(t *testing.T) {
+			if got := storageProviderName(driver); got != "pan115" {
+				t.Fatalf("storageProviderName(%s) = %q, want pan115", driver, got)
+			}
+		})
+	}
+}
+
 func TestProviderSupportsDownloadFor115CD2(t *testing.T) {
 	if !providerSupportsDownload("pan115", "115 CD2") {
 		t.Fatal("115 CD2 should support pan115 downloads")

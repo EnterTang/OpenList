@@ -10,7 +10,7 @@ import (
 )
 
 func NormalizeSubscriptionStorageTarget(target model.SubscriptionStorageTarget) model.SubscriptionStorageTarget {
-	target.Provider = strings.ToLower(strings.TrimSpace(target.Provider))
+	target.Provider = normalizeSubscriptionStorageProvider(target.Provider)
 	rawFolder := strings.TrimSpace(target.Folder)
 	if migrated, ok := MigrateLegacyPathTarget(rawFolder); ok {
 		if target.Provider == "" {
@@ -29,6 +29,15 @@ func NormalizeSubscriptionStorageTarget(target model.SubscriptionStorageTarget) 
 	}
 	target.Folder = strings.Trim(cleaned, "/")
 	return target
+}
+
+func normalizeSubscriptionStorageProvider(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "115 sy", "115_sy":
+		return "pan115"
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
 }
 
 func ValidateSubscriptionStorageTarget(target model.SubscriptionStorageTarget) error {

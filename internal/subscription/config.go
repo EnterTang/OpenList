@@ -354,7 +354,7 @@ func normalizeTransferPriorityName(value string) string {
 		return "aliyun_drive"
 	case "123", "pan123":
 		return "pan123"
-	case "115", "pan115", "115 cd2", "115_cd2":
+	case "115", "pan115", "115 cd2", "115_cd2", "115 sy", "115_sy":
 		return "pan115"
 	case "guangya", "guangyapan":
 		return "guangyapan"

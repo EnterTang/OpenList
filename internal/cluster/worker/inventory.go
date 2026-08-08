@@ -121,7 +121,7 @@ func providerName(driver string) string {
 	switch strings.ToLower(strings.TrimSpace(driver)) {
 	case "aliyundriveopen", "aliyundrive":
 		return "aliyun_drive"
-	case "115 cloud", "115 open", "115 cd2", "115 sy":
+	case "115 cloud", "115 open", "115 cd2", "115 sy", "115_sy":
 		return "pan115"
 	case "123pan", "123 open":
 		return "pan123"
@@ -141,7 +141,7 @@ func supportsETF(driver string) bool {
 
 func supportsShare(driver string) bool {
 	switch strings.ToLower(strings.TrimSpace(driver)) {
-	case "123pan", "123 open", "115 cloud", "115 sy", "aliyundriveopen", "quark", "guangyapan":
+	case "123pan", "123 open", "115 cloud", "115 sy", "115_sy", "aliyundriveopen", "quark", "guangyapan":
 		return true
 	default:
 		return false

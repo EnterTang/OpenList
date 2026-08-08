@@ -66,6 +66,17 @@ func TestNormalizeSubscriptionStorageTargetCleansRelativeFolder(t *testing.T) {
 	}
 }
 
+func TestNormalizeSubscriptionStorageTargetCanonicalizes115SYAliases(t *testing.T) {
+	for _, provider := range []string{"115_sy", "115 sy"} {
+		t.Run(provider, func(t *testing.T) {
+			target := NormalizeSubscriptionStorageTarget(model.SubscriptionStorageTarget{Provider: provider})
+			if target.Provider != "pan115" {
+				t.Fatalf("provider = %q, want pan115", target.Provider)
+			}
+		})
+	}
+}
+
 func TestNormalizeConfigMigratesDefaultTargetRootToProviderTarget(t *testing.T) {
 	cfg := normalizeConfig(model.SubscriptionConfig{
 		DefaultTargetRoot: "/139_60t/剧集",

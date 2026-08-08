@@ -393,7 +393,7 @@ func storageProviderName(driverName string) string {
 		return "aliyun_drive"
 	case "123pan", "123 open":
 		return "pan123"
-	case "115 cloud", "115 open", "115 cd2":
+	case "115 cloud", "115 open", "115 cd2", "115 sy", "115_sy":
 		return "pan115"
 	case "guangyapan":
 		return "guangyapan"
