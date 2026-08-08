@@ -175,22 +175,24 @@ type pan115SnapResp struct {
 }
 
 type pan115File struct {
-	FID      string `json:"fid"`
-	CID      string `json:"cid"`
-	Name     string `json:"n"`
-	Size     int64  `json:"s"`
-	UpdateAt string `json:"t"`
-	Icon     string `json:"ico"`
+	FID      json.Number `json:"fid"`
+	CID      json.Number `json:"cid"`
+	Name     string      `json:"n"`
+	Size     int64       `json:"s"`
+	UpdateAt string      `json:"t"`
+	Icon     string      `json:"ico"`
 }
 
 func (f pan115File) shareItem(parentID string) ShareItem {
-	isDir := f.FID == ""
-	id := f.FID
+	fid := f.FID.String()
+	cid := f.CID.String()
+	isDir := fid == ""
+	id := fid
 	if isDir {
-		id = f.CID
+		id = cid
 	}
 	if parentID == "" {
-		parentID = f.CID
+		parentID = cid
 		if isDir {
 			parentID = "0"
 		}
