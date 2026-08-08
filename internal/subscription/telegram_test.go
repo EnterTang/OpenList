@@ -182,6 +182,37 @@ func TestTelegramSearchQueryUsesSubscriptionNames(t *testing.T) {
 	}
 }
 
+func TestTelegramSearchQueryRemovesInvisibleFormatting(t *testing.T) {
+	got := telegramSearchQuery(&model.Subscription{TMDBName: "吾凰在上之凤御四方\u200b"})
+	if got != "吾凰在上之凤御四方" {
+		t.Fatalf("query = %q, want zero-width formatting removed", got)
+	}
+}
+
+func TestTelegramMessageWithInvisibleTitleFormattingMatchesAndExtractsFastLink(t *testing.T) {
+	sub := &model.Subscription{
+		Name:     "吾凰在上之凤御四方\u200b",
+		TMDBName: "吾凰在上之凤御四方\u200b",
+	}
+	row := telegramCommandRow{
+		MsgID:   int64(85844),
+		Channel: "@Pan123Movie",
+		Text:    "吾凰在上之凤御四方\u200b S01 E07\n\n🔗分享链接 : 123FSLinkV2$61ab6a031a48151568ed69feaaea4bcf#1365680001#吾凰在上之凤御四方\u200b.2026.S01E07.mp4",
+	}
+	if !telegramRowMatchesSubscription(sub, row) {
+		t.Fatal("telegram row should match the subscription title")
+	}
+	links, sources := rowLinksForTelegramPanSources(row, model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{Channels: []string{"@Pan123Movie"}},
+	})
+	if len(links) != 1 || len(sources) != 1 || sources[0].Name != "pan123" {
+		t.Fatalf("links/sources = %#v/%#v, want one pan123 fast link", links, sources)
+	}
+	if _, err := ParseShareURL(links[0]); err != nil {
+		t.Fatalf("parse extracted fast link: %v", err)
+	}
+}
+
 func TestTelegramLegacyCursorDoesNotSkipChannelScopedRows(t *testing.T) {
 	cursor := parseTelegramCursor("66656")
 	pan123Row := telegramCommandRow{MsgID: int64(47100), Channel: "Pan123Movie"}

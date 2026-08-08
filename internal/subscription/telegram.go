@@ -521,10 +521,20 @@ func telegramSearchQuery(sub *model.Subscription) string {
 	if sub == nil {
 		return ""
 	}
-	if query := strings.TrimSpace(sub.TMDBName); query != "" {
+	if query := sanitizeTelegramSearchQuery(sub.TMDBName); query != "" {
 		return query
 	}
-	return strings.TrimSpace(sub.Name)
+	return sanitizeTelegramSearchQuery(sub.Name)
+}
+
+func sanitizeTelegramSearchQuery(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, value)
+	return strings.TrimSpace(value)
 }
 
 func telegramPanSources(cfg model.SubscriptionTelegramSourceConfig) []telegramPanSubscriptionSource {
@@ -596,7 +606,18 @@ func subscriptionEntryMatches(sub *model.Subscription, entry TreeEntry) bool {
 // accepting a share. Share trees often name files only by episode, so title
 // matching belongs to the message rather than boundShareEntryMatches.
 func telegramRowMatchesSubscription(sub *model.Subscription, row telegramCommandRow) bool {
-	return subscriptionTitleMatches(sub, rowText(row))
+	text := rowText(row)
+	if subscriptionTitleMatches(sub, text) {
+		return true
+	}
+	for _, line := range strings.FieldsFunc(text, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	}) {
+		if subscriptionTitleMatches(sub, line) {
+			return true
+		}
+	}
+	return false
 }
 
 func subscriptionTitleMatches(sub *model.Subscription, haystacks ...string) bool {
@@ -736,10 +757,12 @@ func subscriptionMatchNeedles(sub *model.Subscription) []string {
 	if sub == nil {
 		return nil
 	}
-	candidates := []string{sub.TMDBName, sub.Name}
+	tmdbName := sanitizeTelegramSearchQuery(sub.TMDBName)
+	name := sanitizeTelegramSearchQuery(sub.Name)
+	candidates := []string{tmdbName, name}
 	if sub.TMDBYear > 0 {
-		for _, title := range []string{sub.TMDBName, sub.Name} {
-			if strings.TrimSpace(title) != "" {
+		for _, title := range []string{tmdbName, name} {
+			if title != "" {
 				candidates = append(candidates, fmt.Sprintf("%s %d", title, sub.TMDBYear))
 			}
 		}
