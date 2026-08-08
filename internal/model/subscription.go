@@ -7,6 +7,7 @@ const (
 	SubscriptionSourceTelegram = "telegram"
 	SubscriptionSourcePanSou   = "pansou"
 	SubscriptionSourceHDHive   = "hdhive"
+	SubscriptionSourceAuto     = "auto"
 
 	SubscriptionStatusIdle    = "idle"
 	SubscriptionStatusRunning = "running"

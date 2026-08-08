@@ -619,7 +619,7 @@ func clusterInspectTransferPriority(sub *model.Subscription) []string {
 		if cfg, err := parseTelegramConfig(sub.SourceConfig); err == nil {
 			return cfg.TransferPriority
 		}
-	case model.SubscriptionSourcePanSou:
+	case model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive, model.SubscriptionSourceAuto:
 		if cfg, err := GetConfig(); err == nil {
 			return cfg.Telegram.TransferPriority
 		}

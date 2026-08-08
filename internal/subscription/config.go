@@ -131,7 +131,7 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 			return err
 		}
 		sub.SourceConfig = merged
-	case model.SubscriptionSourceHDHive:
+	case model.SubscriptionSourceHDHive, model.SubscriptionSourceAuto:
 		merged, err := mergeHDHiveSourceConfig(sub.SourceConfig, cfg.PanSou)
 		if err != nil {
 			return err
