@@ -29,3 +29,36 @@ func TestResourceRefFromURLUsesDefaultSiteID(t *testing.T) {
 		t.Fatalf("ref = %#v, want default site and slug", ref)
 	}
 }
+
+func TestExtractResourceRefsWithNonNumericSiteID(t *testing.T) {
+	refs := ExtractResourceRefs(
+		"",
+		[]string{
+			"https://hdhive.com/resource/quark/dd83f28049d1499eaac9a5aad1034c0c",
+			"https://hdhive.com/resource/baidu/050be101ae17456184b580b60b1e727e",
+			"https://www.hdhive.com/resource/XUNLEI/eed6e9155aac4f929c554b163de2206d",
+		},
+		"189",
+	)
+
+	if len(refs) != 3 {
+		t.Fatalf("refs = %#v, want three unique resources", refs)
+	}
+	expected := map[string]string{
+		"quark":  "dd83f28049d1499eaac9a5aad1034c0c",
+		"baidu":  "050be101ae17456184b580b60b1e727e",
+		"xunlei": "eed6e9155aac4f929c554b163de2206d",
+	}
+	for _, ref := range refs {
+		want, ok := expected[ref.SiteID]
+		if !ok {
+			t.Fatalf("unexpected site id %q", ref.SiteID)
+		}
+		if ref.Slug != want {
+			t.Fatalf("site %q: slug = %q, want %q", ref.SiteID, ref.Slug, want)
+		}
+		if ref.URL != "https://hdhive.com/resource/"+ref.SiteID+"/"+ref.Slug {
+			t.Fatalf("site %q: url = %q, want normalized url", ref.SiteID, ref.URL)
+		}
+	}
+}

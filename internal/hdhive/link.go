@@ -7,7 +7,7 @@ import (
 
 const defaultSiteID = "189"
 
-var resourcePattern = regexp.MustCompile(`(?i)https?://(?:www\.)?hdhive\.com/resource/(?:(\d+)/)?([a-f0-9-]{32,36})`)
+var resourcePattern = regexp.MustCompile(`(?i)https?://(?:www\.)?hdhive\.com/resource/(?:([a-z0-9-]+)/)?([a-f0-9-]{32,36})`)
 
 // ResourceRef is the stable HDHive resource identity used by the unlock API.
 // SiteID is kept separate from Slug because HDHive can host resources for
@@ -71,20 +71,24 @@ func normalizeSlug(raw string) string {
 }
 
 func normalizeSiteID(raw, fallback string) string {
-	if value := strings.TrimSpace(raw); value != "" && allDigits(value) {
+	if value := normalizeSiteIDValue(raw); value != "" {
 		return value
 	}
-	if value := strings.TrimSpace(fallback); value != "" && allDigits(value) {
+	if value := normalizeSiteIDValue(fallback); value != "" {
 		return value
 	}
 	return defaultSiteID
 }
 
-func allDigits(value string) bool {
+func normalizeSiteIDValue(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
 	for _, r := range value {
-		if r < '0' || r > '9' {
-			return false
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || r == '-') {
+			return ""
 		}
 	}
-	return value != ""
+	return value
 }
