@@ -493,6 +493,9 @@ func processHDHiveClusterResource(ctx context.Context, sub *model.Subscription, 
 		return false, nil
 	}
 	if _, dispatchErr := dispatchClusterInspectObservation(ctx, sub, ref, clusterSourceMessage{ID: "hdhive:" + resource.resourceRef.Slug, Text: rawShare}, "hdhive:"+resource.resourceRef.Slug, 1); dispatchErr != nil {
+		if strings.Contains(dispatchErr.Error(), "no compatible cluster worker is connected") {
+			return false, nil
+		}
 		return false, dispatchErr
 	}
 	(*dispatched)++

@@ -1044,7 +1044,9 @@ func (r *Runtime) DispatchShareInspect(ctx context.Context, req DispatchShareIns
 	idempotencyKey := strings.TrimSpace(req.IdempotencyKey)
 	var existing model.ClusterJob
 	if err := db.GetDb().WithContext(ctx).First(&existing, "idempotency_key = ?", idempotencyKey).Error; err == nil {
-		return &existing, nil
+		if existing.Status != model.ClusterJobStatusFailed && existing.Status != model.ClusterJobStatusDeadLetter {
+			return &existing, nil
+		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
@@ -1126,6 +1128,17 @@ func (r *Runtime) DispatchShareInspect(ctx context.Context, req DispatchShareIns
 	}
 	r.outboxMu.Lock()
 	persistErr := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if existing.ID != "" {
+			if err := tx.Where("job_id = ?", existing.ID).Delete(&model.ClusterJobAttempt{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("job_id = ?", existing.ID).Delete(&model.ClusterShareInspectManifest{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id = ?", existing.ID).Delete(&model.ClusterJob{}).Error; err != nil {
+				return err
+			}
+		}
 		if err := tx.Create(job).Error; err != nil {
 			return err
 		}
