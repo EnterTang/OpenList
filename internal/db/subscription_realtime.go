@@ -164,3 +164,34 @@ func ListSubscriptionTelegramEventsBySubscriptionIDs(subscriptionIDs []uint) ([]
 	err := db.Where("subscription_id IN ?", subscriptionIDs).Order("created_at DESC, id DESC").Find(&items).Error
 	return items, errors.WithStack(err)
 }
+
+// ListLatestSubscriptionTelegramEventsBySubscriptionIDs avoids loading the
+// complete event history when the caller only needs the card's latest event.
+func ListLatestSubscriptionTelegramEventsBySubscriptionIDs(subscriptionIDs []uint) ([]model.SubscriptionTelegramEvent, error) {
+	if len(subscriptionIDs) == 0 {
+		return []model.SubscriptionTelegramEvent{}, nil
+	}
+
+	table := modelTableName("SubscriptionTelegramEvent")
+	current := "current_events"
+	newer := "newer_events"
+	currentSubscriptionID := qualifiedColumnName(current, "subscription_id")
+	newerSubscriptionID := qualifiedColumnName(newer, "subscription_id")
+	currentCreatedAt := qualifiedColumnName(current, "created_at")
+	newerCreatedAt := qualifiedColumnName(newer, "created_at")
+	currentID := qualifiedColumnName(current, "id")
+	newerID := qualifiedColumnName(newer, "id")
+	latestCondition := "NOT EXISTS (SELECT 1 FROM " + table + " AS " + newer +
+		" WHERE " + newerSubscriptionID + " = " + currentSubscriptionID +
+		" AND (" + newerCreatedAt + " > " + currentCreatedAt +
+		" OR (" + newerCreatedAt + " = " + currentCreatedAt +
+		" AND " + newerID + " > " + currentID + ")) )"
+
+	var items []model.SubscriptionTelegramEvent
+	err := db.Table(table+" AS "+current).
+		Select(current+".*").
+		Where(currentSubscriptionID+" IN ?", subscriptionIDs).
+		Where(latestCondition).
+		Find(&items).Error
+	return items, errors.WithStack(err)
+}

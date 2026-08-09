@@ -214,6 +214,33 @@ func TestSubscriptionTaskBoardHonorsConfiguredTablePrefix(t *testing.T) {
 	}
 }
 
+func TestListLatestSubscriptionTelegramEventsBySubscriptionIDs(t *testing.T) {
+	setupPrefixedSubscriptionDB(t)
+
+	subscription := model.Subscription{Name: "Realtime history", TMDBName: "Realtime history"}
+	if err := CreateSubscription(&subscription); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	now := time.Now().UTC()
+	events := []model.SubscriptionTelegramEvent{
+		{SubscriptionID: subscription.ID, Channel: "source", MessageID: "old", CreatedAt: now.Add(-time.Minute)},
+		{SubscriptionID: subscription.ID, Channel: "source", MessageID: "new", CreatedAt: now},
+	}
+	for i := range events {
+		if err := db.Create(&events[i]).Error; err != nil {
+			t.Fatalf("create event %q: %v", events[i].MessageID, err)
+		}
+	}
+
+	latest, err := ListLatestSubscriptionTelegramEventsBySubscriptionIDs([]uint{subscription.ID})
+	if err != nil {
+		t.Fatalf("list latest event: %v", err)
+	}
+	if len(latest) != 1 || latest[0].MessageID != "new" {
+		t.Fatalf("latest events = %#v, want only new event", latest)
+	}
+}
+
 func TestUpsertSubscriptionItemPreservesTransferredStatusOnUnchangedScan(t *testing.T) {
 	setupETFArchiveDB(t)
 

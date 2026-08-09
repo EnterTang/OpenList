@@ -413,6 +413,7 @@ func TestSearchCandidatesLocalizesEnglishFallbackResult(t *testing.T) {
 }
 
 func TestSearchCandidatesNumericIDFetchesDetailsWithPoster(t *testing.T) {
+	searchRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/tv/296206":
@@ -429,6 +430,7 @@ func TestSearchCandidatesNumericIDFetchesDetailsWithPoster(t *testing.T) {
 		case "/movie/296206":
 			http.Error(w, "not found", http.StatusNotFound)
 		case "/search/multi":
+			searchRequests++
 			writeJSON(t, w, map[string]any{"results": []map[string]any{}})
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
@@ -445,6 +447,9 @@ func TestSearchCandidatesNumericIDFetchesDetailsWithPoster(t *testing.T) {
 	}
 	if got[0].PosterURL != "https://image.tmdb.org/t/p/w185/poster.jpg" {
 		t.Fatalf("PosterURL = %q", got[0].PosterURL)
+	}
+	if searchRequests != 0 {
+		t.Fatalf("numeric ID triggered %d search requests, want 0", searchRequests)
 	}
 }
 

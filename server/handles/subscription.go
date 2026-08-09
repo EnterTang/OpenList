@@ -21,8 +21,15 @@ import (
 
 const (
 	tmdbEpisodeRefreshInterval = 24 * time.Hour
+	tmdbEpisodeRefreshRetry    = 15 * time.Minute
+	tmdbEpisodeRefreshTimeout  = 2 * time.Minute
 	tmdbEpisodeRefreshWorkers  = 4
 	subscriptionDeleteTimeout  = 15 * time.Second
+)
+
+var (
+	subscriptionEpisodeHydrationInFlight sync.Map // subscription ID -> struct{}
+	subscriptionEpisodeHydrationAttempt  sync.Map // subscription ID -> time.Time
 )
 
 type listSubscriptionsReq struct {
@@ -70,12 +77,12 @@ func ListSubscriptions(c *gin.Context) {
 		Page:       req.Page,
 		PerPage:    req.PerPage,
 	}
-	hydrateSubscriptionEpisodeEnds(c.Request.Context(), filter)
 	items, total, err := subscription.ListSubscriptionsWithProgress(filter, archiveStatus, time.Now())
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
+	scheduleSubscriptionEpisodeEndHydration(items)
 	common.SuccessResp(c, common.PageResp{Content: items, Total: total})
 }
 
@@ -90,13 +97,9 @@ func resolveSubscriptionArchiveStatus(value string) (string, error) {
 	return value, nil
 }
 
-func hydrateSubscriptionEpisodeEnds(ctx context.Context, filter db.SubscriptionFilter) {
+func scheduleSubscriptionEpisodeEndHydration(items []model.Subscription) {
 	apiKey := etfArchiveSettingValue(conf.TMDBApiKey)
 	if apiKey == "" {
-		return
-	}
-	items, err := db.ListAllSubscriptions(filter)
-	if err != nil {
 		return
 	}
 	config := tmdb.Config{
@@ -106,25 +109,63 @@ func hydrateSubscriptionEpisodeEnds(ctx context.Context, filter db.SubscriptionF
 		CategoryRules: etfArchiveSettingValue(conf.MediaCategoryRules),
 	}
 	now := time.Now()
-	sem := make(chan struct{}, tmdbEpisodeRefreshWorkers)
-	var group sync.WaitGroup
+	pending := make([]model.Subscription, 0)
 	for i := range items {
 		item := &items[i]
 		if !shouldHydrateSubscriptionEpisodeEnd(item, now) {
 			continue
 		}
+		if attempt, ok := subscriptionEpisodeHydrationAttempt.Load(item.ID); ok {
+			if lastAttempt, ok := attempt.(time.Time); ok && now.Sub(lastAttempt) < tmdbEpisodeRefreshRetry {
+				continue
+			}
+		}
+		if _, loaded := subscriptionEpisodeHydrationInFlight.LoadOrStore(item.ID, struct{}{}); loaded {
+			continue
+		}
+		subscriptionEpisodeHydrationAttempt.Store(item.ID, now)
+		pending = append(pending, *item)
+	}
+	if len(pending) == 0 {
+		return
+	}
+	go func(items []model.Subscription) {
+		defer func() {
+			for _, item := range items {
+				subscriptionEpisodeHydrationInFlight.Delete(item.ID)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), tmdbEpisodeRefreshTimeout)
+		defer cancel()
+		hydrateSubscriptionEpisodeEnds(ctx, items, config)
+	}(pending)
+}
+
+func hydrateSubscriptionEpisodeEnds(ctx context.Context, items []model.Subscription, config tmdb.Config) {
+	sem := make(chan struct{}, tmdbEpisodeRefreshWorkers)
+	var group sync.WaitGroup
+	checkedAt := time.Now()
+	for i := range items {
+		item := &items[i]
 		group.Add(1)
 		sem <- struct{}{}
 		go func(item *model.Subscription) {
 			defer group.Done()
 			defer func() { <-sem }()
-			query := strings.TrimSpace(item.TMDBName)
+			var candidates []model.ETFArchiveTMDBCandidate
+			var err error
 			if item.TMDBID > 0 {
-				query = strconv.FormatInt(item.TMDBID, 10)
-			}
-			candidates, err := tmdb.SearchCandidates(ctx, config, query)
-			if err != nil {
-				return
+				candidate, fetchErr := tmdb.FetchCandidateByID(ctx, config, item.TMDBID, "tv")
+				if fetchErr != nil {
+					return
+				}
+				candidates = []model.ETFArchiveTMDBCandidate{*candidate}
+			} else {
+				query := strings.TrimSpace(item.TMDBName)
+				candidates, err = tmdb.SearchCandidates(ctx, config, query)
+				if err != nil {
+					return
+				}
 			}
 			episodeEnd := item.LatestSeasonEpisodeEnd
 			var discoveredTMDBID *int64
@@ -137,8 +178,10 @@ func hydrateSubscriptionEpisodeEnds(ctx context.Context, filter db.SubscriptionF
 					episodeEnd = end
 				}
 			}
-			checkedAt := now
-			_, _ = db.UpdateSubscriptionTMDBEpisodeEnd(item, discoveredTMDBID, episodeEnd, checkedAt)
+			updated, _ := db.UpdateSubscriptionTMDBEpisodeEnd(item, discoveredTMDBID, episodeEnd, checkedAt)
+			if updated {
+				subscriptionEpisodeHydrationAttempt.Delete(item.ID)
+			}
 		}(item)
 	}
 	group.Wait()

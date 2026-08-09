@@ -18,7 +18,7 @@ func ListSubscriptionsWithProgress(filter db.SubscriptionFilter, archiveStatus s
 	for _, item := range items {
 		subscriptionIDs = append(subscriptionIDs, item.ID)
 	}
-	subscriptionItems, err := db.ListSubscriptionItemsBySubscriptionIDs(subscriptionIDs)
+	subscriptionItems, err := db.ListSubscriptionProgressItemsBySubscriptionIDs(subscriptionIDs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -26,7 +26,7 @@ func ListSubscriptionsWithProgress(filter db.SubscriptionFilter, archiveStatus s
 	for _, item := range subscriptionItems {
 		itemsBySubscription[item.SubscriptionID] = append(itemsBySubscription[item.SubscriptionID], item)
 	}
-	events, err := db.ListSubscriptionTelegramEventsBySubscriptionIDs(subscriptionIDs)
+	events, err := db.ListLatestSubscriptionTelegramEventsBySubscriptionIDs(subscriptionIDs)
 	if err != nil {
 		return nil, 0, err
 	}

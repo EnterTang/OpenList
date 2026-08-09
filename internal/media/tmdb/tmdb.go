@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/category"
@@ -21,6 +22,8 @@ import (
 )
 
 const defaultBaseURL = "https://api.themoviedb.org/3"
+
+const tmdbRequestTimeout = 15 * time.Second
 
 type Config struct {
 	APIKey        string
@@ -164,26 +167,44 @@ func Resolve(ctx context.Context, cfg Config, recognized recognize.Result) (*Met
 	return best, nil
 }
 
+func FetchCandidateByID(ctx context.Context, cfg Config, id int64, mediaType string) (*model.ETFArchiveTMDBCandidate, error) {
+	if id <= 0 {
+		return nil, errors.New("tmdb id must be positive")
+	}
+	if mediaType != "tv" && mediaType != "movie" {
+		return nil, fmt.Errorf("unsupported tmdb media type %q", mediaType)
+	}
+	cfg = normalizeConfig(cfg)
+	item, err := requestItem(ctx, cfg, "/"+mediaType+"/"+strconv.FormatInt(id, 10), nil)
+	if err != nil {
+		return nil, err
+	}
+	item.MediaType = mediaType
+	candidate := tmdbCandidate(cfg, *item)
+	return &candidate, nil
+}
+
 func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ETFArchiveTMDBCandidate, error) {
 	cfg = normalizeConfig(cfg)
+	if id, ok := parseNumericID(query); ok {
+		candidates := make([]model.ETFArchiveTMDBCandidate, 0, 2)
+		for _, mediaType := range []string{"tv", "movie"} {
+			candidate, err := FetchCandidateByID(ctx, cfg, id, mediaType)
+			if err != nil {
+				continue
+			}
+			candidates = append(candidates, *candidate)
+		}
+		if len(candidates) > 0 {
+			return candidates, nil
+		}
+	}
 	queries := recognize.BuildQueryCandidates(query)
 	if len(queries) == 0 {
 		queries = []string{strings.TrimSpace(query)}
 	}
 	items := make([]tmdbItem, 0)
 	seen := map[string]struct{}{}
-	if id, ok := parseNumericID(query); ok {
-		for _, mediaType := range []string{"tv", "movie"} {
-			item, err := requestItem(ctx, cfg, "/"+mediaType+"/"+strconv.FormatInt(id, 10), nil)
-			if err != nil {
-				continue
-			}
-			item.MediaType = mediaType
-			key := mediaType + ":" + strconv.FormatInt(item.ID, 10)
-			seen[key] = struct{}{}
-			items = append(items, *item)
-		}
-	}
 	for _, q := range queries {
 		found, err := searchAllLanguages(ctx, cfg, q)
 		if err != nil {
@@ -204,26 +225,30 @@ func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ET
 	candidates := make([]model.ETFArchiveTMDBCandidate, 0, len(items))
 	for _, item := range items {
 		item = hydrateCandidateItem(ctx, cfg, item)
-		meta := item.metadata()
-		applyCategory(meta, cfg.CategoryRules)
-		seasons := item.seasonInfos()
-		candidates = append(candidates, model.ETFArchiveTMDBCandidate{
-			TMDBID:           meta.TMDBID,
-			Name:             meta.Name,
-			OriginalName:     item.originalDisplayName(),
-			Year:             meta.Year,
-			MediaType:        meta.MediaType,
-			Category:         meta.Category,
-			PosterPath:       item.PosterPath,
-			PosterURL:        posterURL(item.PosterPath),
-			GenreIDs:         meta.GenreIDs,
-			OriginCountry:    meta.OriginCountry,
-			OriginalLanguage: meta.OriginalLanguage,
-			Seasons:          seasons,
-			SeasonMap:        seasonInfoMap(seasons),
-		})
+		candidates = append(candidates, tmdbCandidate(cfg, item))
 	}
 	return candidates, nil
+}
+
+func tmdbCandidate(cfg Config, item tmdbItem) model.ETFArchiveTMDBCandidate {
+	meta := item.metadata()
+	applyCategory(meta, cfg.CategoryRules)
+	seasons := item.seasonInfos()
+	return model.ETFArchiveTMDBCandidate{
+		TMDBID:           meta.TMDBID,
+		Name:             meta.Name,
+		OriginalName:     item.originalDisplayName(),
+		Year:             meta.Year,
+		MediaType:        meta.MediaType,
+		Category:         meta.Category,
+		PosterPath:       item.PosterPath,
+		PosterURL:        posterURL(item.PosterPath),
+		GenreIDs:         meta.GenreIDs,
+		OriginCountry:    meta.OriginCountry,
+		OriginalLanguage: meta.OriginalLanguage,
+		Seasons:          seasons,
+		SeasonMap:        seasonInfoMap(seasons),
+	}
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -377,6 +402,11 @@ func requestItem(ctx context.Context, cfg Config, endpoint string, params url.Va
 }
 
 func request(ctx context.Context, cfg Config, endpoint string, params url.Values, out any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, tmdbRequestTimeout)
+	defer cancel()
 	u, err := url.Parse(cfg.BaseURL)
 	if err != nil {
 		return fmt.Errorf("tmdb base url: %w", err)
@@ -392,7 +422,7 @@ func request(ctx context.Context, cfg Config, endpoint string, params url.Values
 	}
 	u.RawQuery = query.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return err
 	}

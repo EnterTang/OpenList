@@ -405,6 +405,32 @@ func ListSubscriptionItemsBySubscriptionIDs(subscriptionIDs []uint) ([]model.Sub
 	return items, errors.WithStack(err)
 }
 
+// ListSubscriptionProgressItemsBySubscriptionIDs returns only the fields
+// needed to calculate list-card progress and realtime status. The full item
+// query above is still used by transfer recovery and detail views.
+func ListSubscriptionProgressItemsBySubscriptionIDs(subscriptionIDs []uint) ([]model.SubscriptionItem, error) {
+	if len(subscriptionIDs) == 0 {
+		return nil, nil
+	}
+	columns := []string{
+		columnName("id"),
+		columnName("created_at"),
+		columnName("updated_at"),
+		columnName("subscription_id"),
+		columnName("season"),
+		columnName("episode"),
+		columnName("status"),
+		columnName("last_error"),
+	}
+	var items []model.SubscriptionItem
+	err := db.Model(&model.SubscriptionItem{}).
+		Select(strings.Join(columns, ", ")).
+		Where(columnName("subscription_id")+" IN ?", subscriptionIDs).
+		Order(columnName("subscription_id") + ", " + columnName("season") + ", " + columnName("episode") + ", " + columnName("id")).
+		Find(&items).Error
+	return items, errors.WithStack(err)
+}
+
 func UpsertSubscriptionEpisodeSource(item *model.SubscriptionEpisodeSource) (*model.SubscriptionEpisodeSource, error) {
 	return upsertSubscriptionEpisodeSource(db, item)
 }
