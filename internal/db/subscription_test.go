@@ -216,6 +216,9 @@ func TestSubscriptionTaskBoardHonorsConfiguredTablePrefix(t *testing.T) {
 
 func TestListLatestSubscriptionTelegramEventsBySubscriptionIDs(t *testing.T) {
 	setupPrefixedSubscriptionDB(t)
+	if !db.Migrator().HasIndex(&model.SubscriptionTelegramEvent{}, "idx_subscription_telegram_events_latest") {
+		t.Fatal("missing latest subscription Telegram event index")
+	}
 
 	subscription := model.Subscription{Name: "Realtime history", TMDBName: "Realtime history"}
 	if err := CreateSubscription(&subscription); err != nil {

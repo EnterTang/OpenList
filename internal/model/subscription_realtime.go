@@ -20,10 +20,10 @@ const (
 // updates, reconnect catch-up, and the polling scheduler from creating a second
 // realtime observation for the same subscription message.
 type SubscriptionTelegramEvent struct {
-	ID             uint       `json:"id" gorm:"primarykey"`
-	CreatedAt      time.Time  `json:"created_at"`
+	ID             uint       `json:"id" gorm:"primarykey;index:idx_subscription_telegram_events_latest,priority:3"`
+	CreatedAt      time.Time  `json:"created_at" gorm:"index:idx_subscription_telegram_events_latest,priority:2"`
 	UpdatedAt      time.Time  `json:"updated_at"`
-	SubscriptionID uint       `json:"subscription_id" gorm:"uniqueIndex:idx_subscription_telegram_event_message;index"`
+	SubscriptionID uint       `json:"subscription_id" gorm:"uniqueIndex:idx_subscription_telegram_event_message;index;index:idx_subscription_telegram_events_latest,priority:1"`
 	Channel        string     `json:"channel" gorm:"uniqueIndex:idx_subscription_telegram_event_message;size:191"`
 	MessageID      string     `json:"message_id" gorm:"uniqueIndex:idx_subscription_telegram_event_message;size:64"`
 	PayloadJSON    string     `json:"-" gorm:"type:text"`
