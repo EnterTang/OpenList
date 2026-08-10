@@ -33,6 +33,9 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 		if err != nil {
 			return protocol.InventoryReport{}, err
 		}
+		if snapshot.lookupKind == inventoryStorageLookupStaticStorageOnly {
+			applyInventoryStatus(&snapshot.Mount, &snapshot.Account, inventoryStatusStorageUnavailable)
+		}
 		// Healthy provider credentials still require worker-local subscription
 		// routing. Otherwise the coordinator could assign a provider-only task
 		// that the worker must reject because it has no share-provider staging

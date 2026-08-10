@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	internaldriver "github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/glebarez/sqlite"
@@ -278,6 +280,62 @@ func TestResolveDeliveryTargetRootRequiresWorkerConfigForProviderOnlyTask(t *tes
 		DeliveryTarget: protocol.ProviderTargetRequirement{Provider: "yidong139", NeedUpload: true},
 	})
 	require.ErrorContains(t, err, "worker local yidong139 delivery folder is required")
+}
+
+func TestResolveProviderTargetRequirementFallsBackOnlyForUnregisteredDriver(t *testing.T) {
+	storage := model.Storage{ID: 7, MountPath: "/worker-pan123", Driver: "123pan", Status: "work"}
+	oldList := listInventoryStorages
+	oldLookup := getInventoryStorageByMountPath
+	oldEnsure := ensureResolvedProviderFolder
+	t.Cleanup(func() {
+		listInventoryStorages = oldList
+		getInventoryStorageByMountPath = oldLookup
+		ensureResolvedProviderFolder = oldEnsure
+	})
+	listInventoryStorages = func() ([]model.Storage, error) { return []model.Storage{storage}, nil }
+	ensureResolvedProviderFolder = func(_ context.Context, target subscription.ResolvedProviderTarget) (subscription.ResolvedProviderTarget, error) {
+		return target, nil
+	}
+
+	for _, tc := range []struct {
+		name       string
+		lookupErr  error
+		wantTarget bool
+	}{
+		{
+			name:       "driver not registered falls back to static storage",
+			lookupErr:  errors.New("no mount path for an storage is: /worker-pan123"),
+			wantTarget: true,
+		},
+		{
+			name:       "reauthorization failure remains unavailable",
+			lookupErr:  errors.New("refresh_token unauthorized: cookie=secret-cookie"),
+			wantTarget: false,
+		},
+		{
+			name:       "initialization failure remains unavailable",
+			lookupErr:  errors.New("failed init storage: upstream timeout"),
+			wantTarget: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			getInventoryStorageByMountPath = func(string) (internaldriver.Driver, error) {
+				return nil, tc.lookupErr
+			}
+			service := New(&fakeResultQueue{}, nil)
+			resolved, err := service.resolveProviderTargetRequirement(t.Context(), protocol.ProviderTargetRequirement{
+				Provider: "pan123",
+				Folder:   "stage",
+			})
+			if tc.wantTarget {
+				require.NoError(t, err)
+				require.Equal(t, "/worker-pan123/stage", resolved.FullPath)
+				require.Equal(t, storage.ID, resolved.StorageID)
+				return
+			}
+			require.ErrorContains(t, err, "no compatible provider account")
+		})
+	}
 }
 
 func setWorkerSubscriptionConfig(t *testing.T, cfg model.SubscriptionConfig) {

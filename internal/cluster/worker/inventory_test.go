@@ -406,6 +406,48 @@ func TestBuildInventoryMarks115CD2ReauthorizationFailuresUnavailable(t *testing.
 	}
 }
 
+func TestBuildInventoryKeepsUnregisteredDriverUnavailable(t *testing.T) {
+	oldList := listInventoryStorages
+	oldConfig := getInventorySubscriptionConfig
+	oldHydrate := hydrateInventoryStorage
+	oldLookup := getInventoryStorageByMountPath
+	defer func() {
+		listInventoryStorages = oldList
+		getInventorySubscriptionConfig = oldConfig
+		hydrateInventoryStorage = oldHydrate
+		getInventoryStorageByMountPath = oldLookup
+	}()
+
+	storage := model.Storage{ID: 123, MountPath: "/123-static", Driver: "123pan", Status: op.WORK}
+	listInventoryStorages = func() ([]model.Storage, error) { return []model.Storage{storage}, nil }
+	getInventorySubscriptionConfig = func() (model.SubscriptionConfig, error) {
+		return model.SubscriptionConfig{}, nil
+	}
+	hydrateInventoryStorage = defaultHydrateInventoryStorage
+	getInventoryStorageByMountPath = func(mountPath string) (internaldriver.Driver, error) {
+		if mountPath != storage.MountPath {
+			t.Fatalf("lookup mount path = %q, want %q", mountPath, storage.MountPath)
+		}
+		return nil, errors.New("no mount path for an storage is: /123-static")
+	}
+
+	report, err := BuildInventory(context.Background(), "node-1", true)
+	if err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+	if len(report.ProviderAccounts) != 1 || len(report.Mounts) != 1 {
+		t.Fatalf("inventory sizes accounts=%d mounts=%d, want 1/1", len(report.ProviderAccounts), len(report.Mounts))
+	}
+	account := report.ProviderAccounts[0]
+	if account.Status != inventoryStatusStorageUnavailable || account.SupportsDownload || account.SupportsUpload || account.SupportsShareSave || account.SupportsETF {
+		t.Fatalf("unregistered driver account must be unavailable: %#v", account)
+	}
+	mount := report.Mounts[0]
+	if mount.Status != inventoryStatusStorageUnavailable || !mount.ReadOnly || mount.CanUpload || mount.CanShare || mount.SupportsETF {
+		t.Fatalf("unregistered driver mount must be unavailable: %#v", mount)
+	}
+}
+
 type inventoryStatusDriver struct {
 	storage model.Storage
 	config  internaldriver.Config

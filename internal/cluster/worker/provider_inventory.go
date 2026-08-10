@@ -25,9 +25,19 @@ const (
 	inventoryStatusReauthorizationRequired = "reauthorization_required"
 )
 
+type inventoryStorageLookupKind uint8
+
+const (
+	inventoryStorageLookupOK inventoryStorageLookupKind = iota
+	inventoryStorageLookupStaticStorageOnly
+	inventoryStorageLookupReauthorizationRequired
+	inventoryStorageLookupUnavailable
+)
+
 type inventoryStorageSnapshot struct {
-	Mount   protocol.MountInventory
-	Account protocol.ProviderAccountInventory
+	Mount      protocol.MountInventory
+	Account    protocol.ProviderAccountInventory
+	lookupKind inventoryStorageLookupKind
 }
 
 type clusterMembershipTierReporter interface {
@@ -43,8 +53,15 @@ func defaultHydrateInventoryStorage(ctx context.Context, nodeID string, storage 
 	account := providerAccountInventory(nodeID, storage, 0, 0)
 	driver, driverErr := getInventoryStorageByMountPath(storage.MountPath)
 	if driverErr != nil {
-		applyInventoryStatus(&mount, &account, inventoryReportedStorageStatusFromError(driverErr))
-		return inventoryStorageSnapshot{Mount: mount, Account: account}, nil
+		lookupKind := inventoryStorageLookupKindFromError(driverErr)
+		if lookupKind != inventoryStorageLookupStaticStorageOnly {
+			applyInventoryStatus(&mount, &account, inventoryReportedStorageStatusFromError(driverErr))
+		}
+		return inventoryStorageSnapshot{
+			Mount:      mount,
+			Account:    account,
+			lookupKind: lookupKind,
+		}, nil
 	}
 
 	liveStorage := *driver.GetStorage()
@@ -276,13 +293,28 @@ func applyInventoryStatus(mount *protocol.MountInventory, account *protocol.Prov
 }
 
 func inventoryReportedStorageStatusFromError(err error) string {
-	if err == nil {
-		return inventoryStatusStorageUnavailable
-	}
-	if inventoryStatusRequiresReauthorization(err.Error()) {
+	if inventoryStorageLookupKindFromError(err) == inventoryStorageLookupReauthorizationRequired {
 		return inventoryStatusReauthorizationRequired
 	}
 	return inventoryStatusStorageUnavailable
+}
+
+func inventoryStorageLookupKindFromError(err error) inventoryStorageLookupKind {
+	if err == nil {
+		return inventoryStorageLookupUnavailable
+	}
+	message := err.Error()
+	if inventoryStatusRequiresReauthorization(message) {
+		return inventoryStorageLookupReauthorizationRequired
+	}
+	if inventoryStorageLookupIsMissingDriver(message) {
+		return inventoryStorageLookupStaticStorageOnly
+	}
+	return inventoryStorageLookupUnavailable
+}
+
+func inventoryStorageLookupIsMissingDriver(message string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(message)), "no mount path for an storage is:")
 }
 
 func inventoryReportedStorageStatus(status string) string {
