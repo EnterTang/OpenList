@@ -272,6 +272,8 @@ type TaskContext struct {
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
+	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
+	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`
 	StagingTarget         ProviderTargetRequirement `json:"staging_target,omitempty"`
 	DeliveryTarget        ProviderTargetRequirement `json:"delivery_target,omitempty"`
 	TargetProfile         string                    `json:"target_profile"`

@@ -69,6 +69,9 @@ func (c TaskContext) Validate() error {
 			return fmt.Errorf("source object %d requires provider and source file id", i)
 		}
 	}
+	if err := validateShareSaveBatch(c); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -217,4 +220,39 @@ func isSHA256(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
+}
+
+func validateShareSaveBatch(c TaskContext) error {
+	hasKey := strings.TrimSpace(c.ShareSaveKey) != ""
+	hasObjects := len(c.ShareSaveObjects) > 0
+	if !hasKey && !hasObjects {
+		return nil
+	}
+	if !hasKey {
+		return errors.New("share save key is required when share save objects are present")
+	}
+	if !hasObjects {
+		return errors.New("share save objects are required when share save key is present")
+	}
+	seen := make(map[string]struct{}, len(c.ShareSaveObjects))
+	for i, object := range c.ShareSaveObjects {
+		if strings.TrimSpace(object.Provider) == "" || strings.TrimSpace(object.SourceFileID) == "" {
+			return fmt.Errorf("share save object %d requires provider and source file id", i)
+		}
+		key := shareSaveObjectKey(object)
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("share save object %d duplicates source object id", i)
+		}
+		seen[key] = struct{}{}
+	}
+	for _, object := range c.SourceObjects {
+		if _, ok := seen[shareSaveObjectKey(object)]; !ok {
+			return errors.New("share save objects must include current source object")
+		}
+	}
+	return nil
+}
+
+func shareSaveObjectKey(object SourceObject) string {
+	return strings.TrimSpace(object.Provider) + "\x00" + strings.TrimSpace(object.SourceFileID)
 }

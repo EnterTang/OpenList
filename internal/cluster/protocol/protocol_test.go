@@ -107,6 +107,79 @@ func TestShareInspectOfferAllowsMetadataOnlyTaskContext(t *testing.T) {
 	}
 }
 
+func TestTaskContextValidate_AllowsShareSaveBatchWithOnePrimarySource(t *testing.T) {
+	context := testTaskContext()
+	context.ShareSaveKey = "share-save-batch:abc123"
+	context.ShareSaveObjects = []SourceObject{
+		{
+			Provider:           "aliyun_drive",
+			SourceFileID:       "share-file-14",
+			SourceRelativePath: "Season 01/Example.S01E14.mkv",
+			Size:               123456780,
+		},
+		context.SourceObjects[0],
+	}
+
+	if err := context.Validate(); err != nil {
+		t.Fatalf("validate task context with share-save batch: %v", err)
+	}
+}
+
+func TestTaskContextValidate_StillRejectsMultiplePrimarySourceObjects(t *testing.T) {
+	context := testTaskContext()
+	context.ShareSaveKey = "share-save-batch:abc123"
+	context.ShareSaveObjects = []SourceObject{
+		context.SourceObjects[0],
+		{
+			Provider:           "aliyun_drive",
+			SourceFileID:       "share-file-14",
+			SourceRelativePath: "Season 01/Example.S01E14.mkv",
+		},
+	}
+	context.SourceObjects = append(context.SourceObjects, SourceObject{
+		Provider:           "aliyun_drive",
+		SourceFileID:       "share-file-14",
+		SourceRelativePath: "Season 01/Example.S01E14.mkv",
+	})
+	hash, err := HashTaskContext(context)
+	if err != nil {
+		t.Fatalf("hash task context: %v", err)
+	}
+	offer := JobOffer{
+		AttemptRef: AttemptRef{
+			JobID:      "job-1",
+			AttemptID:  "attempt-1",
+			Generation: 1,
+			LeaseToken: "lease-token",
+		},
+		IdempotencyKey:  "subscription:1:episode:13",
+		JobType:         "media.transfer",
+		LeaseUntil:      time.Now().Add(time.Minute),
+		TaskContext:     context,
+		TaskContextHash: hash,
+	}
+
+	if err := offer.Validate(); err == nil || !strings.Contains(err.Error(), "separate child jobs") {
+		t.Fatalf("validate offer error = %v, want multiple-primary rejection", err)
+	}
+}
+
+func TestTaskContextValidate_RejectsShareSaveBatchMissingPrimarySource(t *testing.T) {
+	context := testTaskContext()
+	context.ShareSaveKey = "share-save-batch:abc123"
+	context.ShareSaveObjects = []SourceObject{
+		{
+			Provider:           "aliyun_drive",
+			SourceFileID:       "share-file-14",
+			SourceRelativePath: "Season 01/Example.S01E14.mkv",
+		},
+	}
+
+	if err := context.Validate(); err == nil || !strings.Contains(err.Error(), "must include current source object") {
+		t.Fatalf("validate task context error = %v, want missing-primary rejection", err)
+	}
+}
+
 func TestUploadETFManifestCarriesAndValidatesCoordinatorContext(t *testing.T) {
 	context := testTaskContext()
 	hash, err := HashTaskContext(context)

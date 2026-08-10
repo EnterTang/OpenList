@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +100,126 @@ func TestDispatcherWireContextPreservesWorkerProviderAccountBindings(t *testing.
 	}
 }
 
+func TestDispatchSubscriptionMedia_AttachesSameShareSaveBatchToSiblingTasks(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	configureProviderPipelineDB(t, database)
+	createProviderPipelineInventory(t, database, "worker-a", preferredWorkerTestAccounts(500))
+
+	transport := &providerPipelineTransport{nodes: []string{"worker-a"}}
+	dispatcher := subscriptionDispatcher{runtime: &Runtime{dispatchTransport: transport}}
+
+	first := validProviderPipelineTask(20 << 30)
+	first.IdempotencyKey = "batch-task-1"
+	first.SubscriptionItemID = 201
+	first.SourceKey = "source-1"
+	first.SourceFileID = "file-1"
+	first.SourceRelativePath = "Season 01/Example.S01E01.mkv"
+	first.SharePasscode = "2468"
+	first.ShareRefFingerprint = "share-ref-1"
+	first.PreferredWorkerNodeID = "worker-a"
+
+	second := first
+	second.IdempotencyKey = "batch-task-2"
+	second.SubscriptionItemID = 202
+	second.SourceKey = "source-2"
+	second.SourceFileID = "file-2"
+	second.SourceRelativePath = "Season 01/Example.S01E02.mkv"
+	second.LogicalTargetPath = "/legacy/episode-2.mkv"
+
+	results, err := dispatcher.DispatchSubscriptionMedia(t.Context(), []subscription.ClusterMediaTask{second, first})
+	if err != nil {
+		t.Fatalf("dispatch sibling tasks: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("dispatch results = %#v", results)
+	}
+	offers := decodeMediaOffersBySourceFileID(t, transport.sent)
+	if len(offers) != 2 {
+		t.Fatalf("offers = %#v, want 2", offers)
+	}
+
+	offerOne := offers["file-1"]
+	offerTwo := offers["file-2"]
+	if offerOne.TaskContext.ShareSaveKey == "" || offerOne.TaskContext.ShareSaveKey != offerTwo.TaskContext.ShareSaveKey {
+		t.Fatalf("share-save keys = %q and %q, want same non-empty key", offerOne.TaskContext.ShareSaveKey, offerTwo.TaskContext.ShareSaveKey)
+	}
+	if strings.Contains(offerOne.TaskContext.ShareSaveKey, first.SharePasscode) {
+		t.Fatalf("share-save key leaked passcode: %q", offerOne.TaskContext.ShareSaveKey)
+	}
+	if len(offerOne.TaskContext.SourceObjects) != 1 || offerOne.TaskContext.SourceObjects[0].SourceFileID != "file-1" {
+		t.Fatalf("offer one primary source objects = %#v", offerOne.TaskContext.SourceObjects)
+	}
+	if len(offerTwo.TaskContext.SourceObjects) != 1 || offerTwo.TaskContext.SourceObjects[0].SourceFileID != "file-2" {
+		t.Fatalf("offer two primary source objects = %#v", offerTwo.TaskContext.SourceObjects)
+	}
+	assertShareSaveObjects(t, offerOne.TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
+	assertShareSaveObjects(t, offerTwo.TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
+}
+
+func TestDispatchSubscriptionMedia_SeparatesShareSaveBatchByShareAndTarget(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	configureProviderPipelineDB(t, database)
+	createProviderPipelineInventory(t, database, "worker-a", preferredWorkerTestAccounts(500))
+	createProviderPipelineInventory(t, database, "worker-b", preferredWorkerTestAccounts(500))
+
+	transport := &providerPipelineTransport{nodes: []string{"worker-a", "worker-b"}}
+	dispatcher := subscriptionDispatcher{runtime: &Runtime{dispatchTransport: transport}}
+
+	sameShareWorkerA := validProviderPipelineTask(20 << 30)
+	sameShareWorkerA.IdempotencyKey = "group-task-a"
+	sameShareWorkerA.SubscriptionItemID = 301
+	sameShareWorkerA.SourceKey = "source-a"
+	sameShareWorkerA.SourceFileID = "file-a"
+	sameShareWorkerA.SharePasscode = "2468"
+	sameShareWorkerA.ShareRefFingerprint = "share-ref-1"
+	sameShareWorkerA.PreferredWorkerNodeID = "worker-a"
+
+	differentShareWorkerA := sameShareWorkerA
+	differentShareWorkerA.IdempotencyKey = "group-task-b"
+	differentShareWorkerA.SubscriptionItemID = 302
+	differentShareWorkerA.SourceKey = "source-b"
+	differentShareWorkerA.SourceFileID = "file-b"
+	differentShareWorkerA.ShareURL = "https://www.123pan.com/s/other"
+	differentShareWorkerA.ShareRefFingerprint = "share-ref-2"
+	differentShareWorkerA.LogicalTargetPath = "/legacy/episode-b.mkv"
+
+	sameShareWorkerB := sameShareWorkerA
+	sameShareWorkerB.IdempotencyKey = "group-task-c"
+	sameShareWorkerB.SubscriptionItemID = 303
+	sameShareWorkerB.SourceKey = "source-c"
+	sameShareWorkerB.SourceFileID = "file-c"
+	sameShareWorkerB.PreferredWorkerNodeID = "worker-b"
+	sameShareWorkerB.LogicalTargetPath = "/legacy/episode-c.mkv"
+
+	if _, err := dispatcher.DispatchSubscriptionMedia(t.Context(), []subscription.ClusterMediaTask{
+		sameShareWorkerA,
+		differentShareWorkerA,
+		sameShareWorkerB,
+	}); err != nil {
+		t.Fatalf("dispatch grouped tasks: %v", err)
+	}
+	offers := decodeMediaOffersBySourceFileID(t, transport.sent)
+	if len(offers) != 3 {
+		t.Fatalf("offers = %#v, want 3", offers)
+	}
+
+	keyShareA := offers["file-a"].TaskContext.ShareSaveKey
+	keyShareB := offers["file-b"].TaskContext.ShareSaveKey
+	keyWorkerB := offers["file-c"].TaskContext.ShareSaveKey
+	if keyShareA == "" || keyShareB == "" || keyWorkerB == "" {
+		t.Fatalf("share-save keys must all be set: a=%q b=%q c=%q", keyShareA, keyShareB, keyWorkerB)
+	}
+	if keyShareA == keyShareB {
+		t.Fatalf("different share should not reuse batch key: %q", keyShareA)
+	}
+	if keyShareA == keyWorkerB {
+		t.Fatalf("different worker target should not reuse batch key: %q", keyShareA)
+	}
+	assertShareSaveObjects(t, offers["file-a"].TaskContext.ShareSaveObjects, []string{"file-a"})
+	assertShareSaveObjects(t, offers["file-b"].TaskContext.ShareSaveObjects, []string{"file-b"})
+	assertShareSaveObjects(t, offers["file-c"].TaskContext.ShareSaveObjects, []string{"file-c"})
+}
+
 func TestConsumeSubscriptionShareInspectWaitsForObservationAndSelectsLargest(t *testing.T) {
 	database := openClusterRuntimeTestDB(t)
 	originalConfig := conf.Conf
@@ -173,6 +294,37 @@ func TestConsumeSubscriptionShareInspectWaitsForObservationAndSelectsLargest(t *
 	}
 	if recordOne.Status != model.ClusterShareInspectStatusConsumed || recordOne.ConsumedAt == nil {
 		t.Fatalf("first record = %#v, want consumed with batch", recordOne)
+	}
+}
+
+func decodeMediaOffersBySourceFileID(t *testing.T, messages []protocol.Envelope) map[string]protocol.JobOffer {
+	t.Helper()
+	offers := make(map[string]protocol.JobOffer, len(messages))
+	for _, message := range messages {
+		if message.Type != protocol.MessageJobOffer {
+			continue
+		}
+		offer, err := protocol.DecodePayload[protocol.JobOffer](message)
+		if err != nil {
+			t.Fatalf("decode offer: %v", err)
+		}
+		if len(offer.TaskContext.SourceObjects) != 1 {
+			t.Fatalf("offer primary source objects = %#v, want exactly one", offer.TaskContext.SourceObjects)
+		}
+		offers[offer.TaskContext.SourceObjects[0].SourceFileID] = offer
+	}
+	return offers
+}
+
+func assertShareSaveObjects(t *testing.T, objects []protocol.SourceObject, wantFileIDs []string) {
+	t.Helper()
+	if len(objects) != len(wantFileIDs) {
+		t.Fatalf("share-save objects len = %d, want %d (%#v)", len(objects), len(wantFileIDs), objects)
+	}
+	for i, want := range wantFileIDs {
+		if objects[i].SourceFileID != want {
+			t.Fatalf("share-save objects[%d] = %q, want %q; full=%#v", i, objects[i].SourceFileID, want, objects)
+		}
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -313,6 +315,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 		})
 		requestTaskIndexes = append(requestTaskIndexes, i)
 	}
+	attachShareSaveBatchContext(requests)
 	if len(requests) == 0 {
 		return results, errors.New("no subscription media task could be assigned")
 	}
@@ -548,6 +551,94 @@ func subscriptionBatchID(tasks []subscription.ClusterMediaTask) string {
 func sha256Bytes(value string) []byte {
 	sum := sha256.Sum256([]byte(value))
 	return sum[:]
+}
+
+func attachShareSaveBatchContext(requests []DispatchMediaJobRequest) {
+	groups := make(map[string][]int, len(requests))
+	for i := range requests {
+		context := &requests[i].TaskContext
+		if !context.StagingTarget.NeedShareSave || len(context.SourceObjects) == 0 {
+			continue
+		}
+		key := shareSaveBatchKey(requests[i])
+		context.ShareSaveKey = key
+		groups[key] = append(groups[key], i)
+	}
+	for key, indexes := range groups {
+		objects := shareSaveBatchObjects(requests, indexes)
+		for _, index := range indexes {
+			requests[index].TaskContext.ShareSaveKey = key
+			requests[index].TaskContext.ShareSaveObjects = append([]protocol.SourceObject(nil), objects...)
+		}
+	}
+}
+
+func shareSaveBatchKey(request DispatchMediaJobRequest) string {
+	context := request.TaskContext
+	normalizedURL := normalizeShareSaveURL(context.Share.URL)
+	passcodeHash := fmt.Sprintf("%x", sha256Bytes(strings.TrimSpace(context.Share.Passcode)))
+	raw := strings.Join([]string{
+		strings.TrimSpace(context.Share.Provider),
+		normalizedURL,
+		strings.TrimSpace(context.Subscription.ShareRefFingerprint),
+		passcodeHash,
+		strings.TrimSpace(request.NodeID),
+		strings.TrimSpace(context.TargetProfile),
+		strings.TrimSpace(context.StagingTarget.Provider),
+		fmt.Sprint(context.StagingTarget.StorageID),
+		strings.TrimSpace(context.StagingTarget.NodeMountID),
+		strings.TrimSpace(context.StagingTarget.AccountFingerprint),
+	}, "\x00")
+	return fmt.Sprintf("share-save-batch:%x", sha256Bytes(raw))
+}
+
+func shareSaveBatchObjects(requests []DispatchMediaJobRequest, indexes []int) []protocol.SourceObject {
+	byID := make(map[string]protocol.SourceObject, len(indexes))
+	for _, index := range indexes {
+		for _, object := range requests[index].TaskContext.SourceObjects {
+			byID[shareSaveBatchObjectStableKey(object)] = object
+		}
+	}
+	objects := make([]protocol.SourceObject, 0, len(byID))
+	for _, object := range byID {
+		objects = append(objects, object)
+	}
+	sort.SliceStable(objects, func(i, j int) bool {
+		return shareSaveBatchObjectStableKey(objects[i]) < shareSaveBatchObjectStableKey(objects[j])
+	})
+	return objects
+}
+
+func shareSaveBatchObjectStableKey(object protocol.SourceObject) string {
+	return strings.Join([]string{
+		strings.TrimSpace(object.Provider),
+		strings.TrimSpace(object.SourceFileID),
+		strings.TrimSpace(object.SourceRelativePath),
+		fmt.Sprint(object.Size),
+		strings.TrimSpace(object.Hash),
+		object.ModifiedAt.UTC().Format(time.RFC3339Nano),
+	}, "\x00")
+}
+
+func normalizeShareSaveURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	cleanedPath := strings.TrimSuffix(path.Clean(parsed.Path), "/")
+	if cleanedPath == "." {
+		cleanedPath = ""
+	}
+	parsed.Path = cleanedPath
+	return parsed.String()
 }
 
 func max64(a, b int64) int64 {
