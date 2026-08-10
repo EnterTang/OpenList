@@ -7,22 +7,33 @@ import (
 )
 
 type Database struct {
-	Type        string `json:"type" env:"TYPE"`
-	Host        string `json:"host" env:"HOST"`
-	Port        int    `json:"port" env:"PORT"`
-	User        string `json:"user" env:"USER"`
-	Password    string `json:"password" env:"PASS"`
-	Name        string `json:"name" env:"NAME"`
-	DBFile      string `json:"db_file" env:"FILE"`
-	TablePrefix string `json:"table_prefix" env:"TABLE_PREFIX"`
-	SSLMode     string `json:"ssl_mode" env:"SSL_MODE"`
-	DSN         string `json:"dsn" env:"DSN"`
+	Type                   string `json:"type" env:"TYPE"`
+	Host                   string `json:"host" env:"HOST"`
+	Port                   int    `json:"port" env:"PORT"`
+	User                   string `json:"user" env:"USER"`
+	Password               string `json:"password" env:"PASS"`
+	Name                   string `json:"name" env:"NAME"`
+	DBFile                 string `json:"db_file" env:"FILE"`
+	TablePrefix            string `json:"table_prefix" env:"TABLE_PREFIX"`
+	SSLMode                string `json:"ssl_mode" env:"SSL_MODE"`
+	DSN                    string `json:"dsn" env:"DSN"`
+	MaxOpenConns           int    `json:"max_open_conns" env:"MAX_OPEN_CONNS"`
+	MaxIdleConns           int    `json:"max_idle_conns" env:"MAX_IDLE_CONNS"`
+	ConnMaxLifetimeMinutes int    `json:"conn_max_lifetime_minutes" env:"CONN_MAX_LIFETIME_MINUTES"`
 }
 
 type Meilisearch struct {
 	Host   string `json:"host" env:"HOST"`
 	APIKey string `json:"api_key" env:"API_KEY"`
 	Index  string `json:"index" env:"INDEX"`
+}
+
+type SubscriptionRetentionConfig struct {
+	Enabled            bool `json:"enabled" env:"ENABLED"`
+	IntervalMinutes    int  `json:"interval_minutes" env:"INTERVAL_MINUTES"`
+	BatchSize          int  `json:"batch_size" env:"BATCH_SIZE"`
+	EventTerminalDays  int  `json:"event_terminal_days" env:"EVENT_TERMINAL_DAYS"`
+	InboxProcessedDays int  `json:"inbox_processed_days" env:"INBOX_PROCESSED_DAYS"`
 }
 
 type Scheme struct {
@@ -150,35 +161,36 @@ type ExternalSubscription struct {
 }
 
 type Config struct {
-	Force                 bool                 `json:"force" env:"FORCE"`
-	SiteURL               string               `json:"site_url" env:"SITE_URL"`
-	Cdn                   string               `json:"cdn" env:"CDN"`
-	JwtSecret             string               `json:"jwt_secret" env:"JWT_SECRET"`
-	TokenExpiresIn        int                  `json:"token_expires_in" env:"TOKEN_EXPIRES_IN"`
-	Database              Database             `json:"database" envPrefix:"DB_"`
-	Meilisearch           Meilisearch          `json:"meilisearch" envPrefix:"MEILISEARCH_"`
-	Scheme                Scheme               `json:"scheme"`
-	TempDir               string               `json:"temp_dir" env:"TEMP_DIR"`
-	BleveDir              string               `json:"bleve_dir" env:"BLEVE_DIR"`
-	DistDir               string               `json:"dist_dir"`
-	Log                   LogConfig            `json:"log" envPrefix:"LOG_"`
-	DelayedStart          int                  `json:"delayed_start" env:"DELAYED_START"`
-	AutoMemoryLimit       int                  `json:"auto_memory_limit" env:"AUTO_MEMORY_LIMIT"`
-	MinFreeMemory         int                  `json:"min_free_memory" env:"MIN_FREE_MEMORY"`
-	MaxBlockLimit         int                  `json:"max_block_limit" env:"MAX_BLOCK_LIMIT"`
-	MaxConnections        int                  `json:"max_connections" env:"MAX_CONNECTIONS"`
-	MaxConcurrency        int                  `json:"max_concurrency" env:"MAX_CONCURRENCY"`
-	TlsInsecureSkipVerify bool                 `json:"tls_insecure_skip_verify" env:"TLS_INSECURE_SKIP_VERIFY"`
-	Tasks                 TasksConfig          `json:"tasks" envPrefix:"TASKS_"`
-	Cors                  Cors                 `json:"cors" envPrefix:"CORS_"`
-	S3                    S3                   `json:"s3" envPrefix:"S3_"`
-	FTP                   FTP                  `json:"ftp" envPrefix:"FTP_"`
-	SFTP                  SFTP                 `json:"sftp" envPrefix:"SFTP_"`
-	MCP                   MCP                  `json:"mcp" envPrefix:"MCP_"`
-	Cluster               Cluster              `json:"cluster" envPrefix:"CLUSTER_"`
-	ExternalSubscription  ExternalSubscription `json:"external_subscription" envPrefix:"EXTERNAL_SUBSCRIPTION_"`
-	LastLaunchedVersion   string               `json:"last_launched_version"`
-	ProxyAddress          string               `json:"proxy_address" env:"PROXY_ADDRESS"`
+	Force                 bool                        `json:"force" env:"FORCE"`
+	SiteURL               string                      `json:"site_url" env:"SITE_URL"`
+	Cdn                   string                      `json:"cdn" env:"CDN"`
+	JwtSecret             string                      `json:"jwt_secret" env:"JWT_SECRET"`
+	TokenExpiresIn        int                         `json:"token_expires_in" env:"TOKEN_EXPIRES_IN"`
+	Database              Database                    `json:"database" envPrefix:"DB_"`
+	Meilisearch           Meilisearch                 `json:"meilisearch" envPrefix:"MEILISEARCH_"`
+	SubscriptionRetention SubscriptionRetentionConfig `json:"subscription_retention" envPrefix:"SUBSCRIPTION_RETENTION_"`
+	Scheme                Scheme                      `json:"scheme"`
+	TempDir               string                      `json:"temp_dir" env:"TEMP_DIR"`
+	BleveDir              string                      `json:"bleve_dir" env:"BLEVE_DIR"`
+	DistDir               string                      `json:"dist_dir"`
+	Log                   LogConfig                   `json:"log" envPrefix:"LOG_"`
+	DelayedStart          int                         `json:"delayed_start" env:"DELAYED_START"`
+	AutoMemoryLimit       int                         `json:"auto_memory_limit" env:"AUTO_MEMORY_LIMIT"`
+	MinFreeMemory         int                         `json:"min_free_memory" env:"MIN_FREE_MEMORY"`
+	MaxBlockLimit         int                         `json:"max_block_limit" env:"MAX_BLOCK_LIMIT"`
+	MaxConnections        int                         `json:"max_connections" env:"MAX_CONNECTIONS"`
+	MaxConcurrency        int                         `json:"max_concurrency" env:"MAX_CONCURRENCY"`
+	TlsInsecureSkipVerify bool                        `json:"tls_insecure_skip_verify" env:"TLS_INSECURE_SKIP_VERIFY"`
+	Tasks                 TasksConfig                 `json:"tasks" envPrefix:"TASKS_"`
+	Cors                  Cors                        `json:"cors" envPrefix:"CORS_"`
+	S3                    S3                          `json:"s3" envPrefix:"S3_"`
+	FTP                   FTP                         `json:"ftp" envPrefix:"FTP_"`
+	SFTP                  SFTP                        `json:"sftp" envPrefix:"SFTP_"`
+	MCP                   MCP                         `json:"mcp" envPrefix:"MCP_"`
+	Cluster               Cluster                     `json:"cluster" envPrefix:"CLUSTER_"`
+	ExternalSubscription  ExternalSubscription        `json:"external_subscription" envPrefix:"EXTERNAL_SUBSCRIPTION_"`
+	LastLaunchedVersion   string                      `json:"last_launched_version"`
+	ProxyAddress          string                      `json:"proxy_address" env:"PROXY_ADDRESS"`
 }
 
 func DefaultConfig(dataDir string) *Config {
@@ -208,6 +220,13 @@ func DefaultConfig(dataDir string) *Config {
 		Meilisearch: Meilisearch{
 			Host:  "http://localhost:7700",
 			Index: "openlist",
+		},
+		SubscriptionRetention: SubscriptionRetentionConfig{
+			Enabled:            true,
+			IntervalMinutes:    60,
+			BatchSize:          1000,
+			EventTerminalDays:  7,
+			InboxProcessedDays: 14,
 		},
 		BleveDir: indexDir,
 		Log: LogConfig{

@@ -83,5 +83,29 @@ func InitDB() {
 	if err != nil {
 		log.Fatalf("failed to connect database:%s", err.Error())
 	}
+	if !flags.Dev && conf.Conf.Database.Type == "postgres" {
+		sqlDB, sqlErr := dB.DB()
+		if sqlErr != nil {
+			log.Fatalf("failed to configure database pool: %s", sqlErr.Error())
+		}
+		maxOpen := conf.Conf.Database.MaxOpenConns
+		if maxOpen <= 0 {
+			maxOpen = 20
+		}
+		maxIdle := conf.Conf.Database.MaxIdleConns
+		if maxIdle <= 0 || maxIdle > maxOpen {
+			maxIdle = maxOpen / 2
+			if maxIdle < 1 {
+				maxIdle = 1
+			}
+		}
+		lifetimeMinutes := conf.Conf.Database.ConnMaxLifetimeMinutes
+		if lifetimeMinutes <= 0 {
+			lifetimeMinutes = 30
+		}
+		sqlDB.SetMaxOpenConns(maxOpen)
+		sqlDB.SetMaxIdleConns(maxIdle)
+		sqlDB.SetConnMaxLifetime(time.Duration(lifetimeMinutes) * time.Minute)
+	}
 	db.Init(dB)
 }

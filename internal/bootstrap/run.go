@@ -113,6 +113,7 @@ func Start() {
 	}
 	if clusterReady && clusterRole.RunsCoordinator() {
 		subscription.StartTelegramRealtimeListener()
+		subscription.StartRetentionScheduler()
 	}
 	if !flags.Debug && !flags.Dev {
 		gin.SetMode(gin.ReleaseMode)

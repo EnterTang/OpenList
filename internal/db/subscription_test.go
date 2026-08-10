@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,78 @@ func TestListLatestSubscriptionTelegramEventsBySubscriptionIDs(t *testing.T) {
 	}
 	if len(latest) != 1 || latest[0].MessageID != "new" {
 		t.Fatalf("latest events = %#v, want only new event", latest)
+	}
+}
+
+func TestListLatestSubscriptionTelegramEventsUsesIDAsTieBreaker(t *testing.T) {
+	setupPrefixedSubscriptionDB(t)
+	subscriptions := []model.Subscription{
+		{Name: "Tie breaker", TMDBName: "Tie breaker"},
+		{Name: "Independent latest", TMDBName: "Independent latest"},
+	}
+	if err := db.Create(&subscriptions).Error; err != nil {
+		t.Fatalf("create subscriptions: %v", err)
+	}
+	createdAt := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	events := []model.SubscriptionTelegramEvent{
+		{SubscriptionID: subscriptions[0].ID, Channel: "source", MessageID: "older", CreatedAt: createdAt.Add(-time.Minute)},
+		{SubscriptionID: subscriptions[0].ID, Channel: "source", MessageID: "same-low", CreatedAt: createdAt},
+		{SubscriptionID: subscriptions[0].ID, Channel: "source", MessageID: "same-high", CreatedAt: createdAt},
+		{SubscriptionID: subscriptions[1].ID, Channel: "source", MessageID: "other-latest", CreatedAt: createdAt.Add(-time.Hour)},
+	}
+	if err := db.Create(&events).Error; err != nil {
+		t.Fatalf("create tie-breaker events: %v", err)
+	}
+
+	latest, err := ListLatestSubscriptionTelegramEventsBySubscriptionIDs([]uint{subscriptions[0].ID, subscriptions[1].ID, subscriptions[0].ID})
+	if err != nil {
+		t.Fatalf("list latest tie-breaker events: %v", err)
+	}
+	if len(latest) != 2 {
+		t.Fatalf("latest events = %#v, want one per subscription", latest)
+	}
+	bySubscription := make(map[uint]string, len(latest))
+	for _, event := range latest {
+		bySubscription[event.SubscriptionID] = event.MessageID
+	}
+	if bySubscription[subscriptions[0].ID] != "same-high" || bySubscription[subscriptions[1].ID] != "other-latest" {
+		t.Fatalf("latest events by subscription = %#v", bySubscription)
+	}
+}
+
+func TestListLatestSubscriptionTelegramEventsAvoidsQuadraticHistoryScan(t *testing.T) {
+	setupPrefixedSubscriptionDB(t)
+	subscription := model.Subscription{Name: "Large realtime history", TMDBName: "Large realtime history"}
+	if err := CreateSubscription(&subscription); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	const eventCount = 25000
+	createdAt := time.Now().UTC().Add(-eventCount * time.Second)
+	events := make([]model.SubscriptionTelegramEvent, eventCount)
+	for i := range events {
+		events[i] = model.SubscriptionTelegramEvent{
+			SubscriptionID: subscription.ID,
+			Channel:        "source",
+			MessageID:      "message-" + strconv.Itoa(i),
+			CreatedAt:      createdAt.Add(time.Duration(i) * time.Second),
+			Status:         model.SubscriptionTelegramEventStatusProcessed,
+		}
+	}
+	if err := db.CreateInBatches(&events, 1000).Error; err != nil {
+		t.Fatalf("create event history: %v", err)
+	}
+
+	started := time.Now()
+	latest, err := ListLatestSubscriptionTelegramEventsBySubscriptionIDs([]uint{subscription.ID})
+	if err != nil {
+		t.Fatalf("list latest event: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("latest event query took %s for %d events", elapsed, eventCount)
+	}
+	if len(latest) != 1 || latest[0].MessageID != "message-24999" {
+		t.Fatalf("latest events = %#v, want message-24999", latest)
 	}
 }
 

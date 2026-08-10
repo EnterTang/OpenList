@@ -239,8 +239,8 @@ type ClusterInbox struct {
 	CorrelationID string     `json:"correlation_id" gorm:"size:64;index"`
 	MessageType   string     `json:"message_type" gorm:"size:64;index"`
 	PayloadHash   string     `json:"payload_hash" gorm:"size:64"`
-	Status        string     `json:"status" gorm:"size:32;index"`
+	Status        string     `json:"status" gorm:"size:32;index;index:idx_cluster_inbox_retention,priority:1"`
 	ReceivedAt    time.Time  `json:"received_at" gorm:"index"`
-	ProcessedAt   *time.Time `json:"processed_at"`
+	ProcessedAt   *time.Time `json:"processed_at" gorm:"index:idx_cluster_inbox_retention,priority:2"`
 	Error         string     `json:"error" gorm:"type:text"`
 }

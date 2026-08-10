@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -171,27 +172,38 @@ func ListLatestSubscriptionTelegramEventsBySubscriptionIDs(subscriptionIDs []uin
 	if len(subscriptionIDs) == 0 {
 		return []model.SubscriptionTelegramEvent{}, nil
 	}
+	uniqueSubscriptionIDs := make([]uint, 0, len(subscriptionIDs))
+	seen := make(map[uint]struct{}, len(subscriptionIDs))
+	for _, subscriptionID := range subscriptionIDs {
+		if _, ok := seen[subscriptionID]; ok {
+			continue
+		}
+		seen[subscriptionID] = struct{}{}
+		uniqueSubscriptionIDs = append(uniqueSubscriptionIDs, subscriptionID)
+	}
 
 	table := modelTableName("SubscriptionTelegramEvent")
-	current := "current_events"
-	newer := "newer_events"
-	currentSubscriptionID := qualifiedColumnName(current, "subscription_id")
-	newerSubscriptionID := qualifiedColumnName(newer, "subscription_id")
-	currentCreatedAt := qualifiedColumnName(current, "created_at")
-	newerCreatedAt := qualifiedColumnName(newer, "created_at")
-	currentID := qualifiedColumnName(current, "id")
-	newerID := qualifiedColumnName(newer, "id")
-	latestCondition := "NOT EXISTS (SELECT 1 FROM " + table + " AS " + newer +
-		" WHERE " + newerSubscriptionID + " = " + currentSubscriptionID +
-		" AND (" + newerCreatedAt + " > " + currentCreatedAt +
-		" OR (" + newerCreatedAt + " = " + currentCreatedAt +
-		" AND " + newerID + " > " + currentID + ")) )"
+	requestedSubscriptions := requestedSubscriptionIDsQuery(uniqueSubscriptionIDs)
+	latest := "latest_events"
 
 	var items []model.SubscriptionTelegramEvent
-	err := db.Table(table+" AS "+current).
-		Select(current+".*").
-		Where(currentSubscriptionID+" IN ?", subscriptionIDs).
-		Where(latestCondition).
+	err := db.Table(table+" AS current_events").
+		Select("current_events.*").
+		Joins("JOIN (?) AS requested_subscriptions ON requested_subscriptions.subscription_id = current_events.subscription_id", requestedSubscriptions).
+		Where("current_events.id = (SELECT " + latest + ".id FROM " + table + " AS " + latest + " WHERE " + latest + ".subscription_id = requested_subscriptions.subscription_id ORDER BY " + latest + ".created_at DESC, " + latest + ".id DESC LIMIT 1)").
 		Find(&items).Error
 	return items, errors.WithStack(err)
+}
+
+func requestedSubscriptionIDsQuery(subscriptionIDs []uint) *gorm.DB {
+	var query strings.Builder
+	query.WriteString("SELECT ? AS subscription_id")
+	args := make([]any, 0, len(subscriptionIDs))
+	for i, subscriptionID := range subscriptionIDs {
+		if i > 0 {
+			query.WriteString(" UNION ALL SELECT ?")
+		}
+		args = append(args, subscriptionID)
+	}
+	return db.Raw(query.String(), args...)
 }
