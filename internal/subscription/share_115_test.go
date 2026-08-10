@@ -32,7 +32,7 @@ func TestDecodePan115JSON_ReportsHTTPMetadataForHTMLResponse(t *testing.T) {
 		t.Fatal("expected decode error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"decode 115 response", "status=403", "content-type=text/html", "kind=html", "body_len="} {
+	for _, want := range []string{"decode 115 response", "status=403", "content-type=text/html", "kind=html", "body_len=", `first_non_space="<"`} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error = %q, want substring %q", msg, want)
 		}
