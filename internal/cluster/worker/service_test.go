@@ -348,8 +348,8 @@ func TestMediaTransfer_CollisionBatchUsesDistinctPartitionRootsAndCleanupOwnersh
 		return []string{path.Join(saveRoot, "episode.mkv")}, nil
 	}
 
-	offerA := testMediaTransferOffer(shareSaveObjects[0], []protocol.SourceObject{shareSaveObjects[0]}, "share-save-batch-collision:partition-a")
-	offerB := testMediaTransferOffer(shareSaveObjects[1], []protocol.SourceObject{shareSaveObjects[1]}, "share-save-batch-collision:partition-b")
+	offerA := testMediaTransferOffer(shareSaveObjects[0], []protocol.SourceObject{shareSaveObjects[0]}, "share-save-batch-collision:"+strings.Repeat("a", 64))
+	offerB := testMediaTransferOffer(shareSaveObjects[1], []protocol.SourceObject{shareSaveObjects[1]}, "share-save-batch-collision:"+strings.Repeat("b", 64))
 
 	stagedPathA, reusedA, err := service.prepareMediaTransferShareSave(context.Background(), offerA, mediaTransferShareSaveTempRoot(offerA.TaskContext, tempRoot))
 	require.NoError(t, err)
@@ -400,6 +400,12 @@ func TestMediaTransfer_CollisionBatchUsesDistinctPartitionRootsAndCleanupOwnersh
 
 	_, err = NewSourceCleanupTarget(context.Background(), manifest, rootB, stagedPathA)
 	require.ErrorContains(t, err, "direct file in the staging root")
+}
+
+func TestMediaTransferShareSaveTempRootRejectsMalformedCollisionKey(t *testing.T) {
+	root := "/123/share-save"
+	task := protocol.TaskContext{ShareSaveKey: "share-save-batch-collision:../../outside"}
+	require.Equal(t, root, mediaTransferShareSaveTempRoot(task, root))
 }
 
 func TestExecuteCleanupTargetRefusesRemoteIDMismatch(t *testing.T) {

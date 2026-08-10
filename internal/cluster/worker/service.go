@@ -1361,7 +1361,10 @@ func shareSaveBatchCollisionID(key string) (string, bool) {
 		return "", false
 	}
 	collisionID := strings.TrimSpace(strings.TrimPrefix(key, shareSaveBatchCollisionKeyPrefix))
-	if collisionID == "" {
+	if len(collisionID) != sha256.Size*2 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(collisionID); err != nil {
 		return "", false
 	}
 	return collisionID, true
