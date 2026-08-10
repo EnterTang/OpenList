@@ -337,6 +337,8 @@ type UploadETFManifest struct {
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
+	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
+	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`
 	MobileAccountBinding  string                    `json:"mobile_account_binding"`
 	RemoteFileID          string                    `json:"remote_file_id"`
 	RemoteParentID        string                    `json:"remote_parent_id,omitempty"`

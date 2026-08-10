@@ -1070,6 +1070,8 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		Share:                 offer.TaskContext.Share,
 		Media:                 offer.TaskContext.Media,
 		SourceObjects:         offer.TaskContext.SourceObjects,
+		ShareSaveKey:          offer.TaskContext.ShareSaveKey,
+		ShareSaveObjects:      offer.TaskContext.ShareSaveObjects,
 		MobileAccountBinding:  targetStorage.GetStorage().MountPath,
 	}
 	sourceCleanup, err := NewSourceCleanupTarget(ctx, manifest, requestedTempRoot, stagedSource)

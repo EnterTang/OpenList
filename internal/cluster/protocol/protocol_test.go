@@ -182,6 +182,16 @@ func TestTaskContextValidate_RejectsShareSaveBatchMissingPrimarySource(t *testin
 
 func TestUploadETFManifestCarriesAndValidatesCoordinatorContext(t *testing.T) {
 	context := testTaskContext()
+	context.ShareSaveKey = "share-save-batch:abc123"
+	context.ShareSaveObjects = []SourceObject{
+		context.SourceObjects[0],
+		{
+			Provider:           "aliyun_drive",
+			SourceFileID:       "share-file-14",
+			SourceRelativePath: "Season 01/Example.S01E14.mkv",
+			Size:               123456780,
+		},
+	}
 	hash, err := HashTaskContext(context)
 	if err != nil {
 		t.Fatalf("hash task context: %v", err)
@@ -207,6 +217,8 @@ func TestUploadETFManifestCarriesAndValidatesCoordinatorContext(t *testing.T) {
 		Share:                 context.Share,
 		Media:                 context.Media,
 		SourceObjects:         context.SourceObjects,
+		ShareSaveKey:          context.ShareSaveKey,
+		ShareSaveObjects:      context.ShareSaveObjects,
 		MobileAccountBinding:  "mobile-worker-a",
 		RemoteFileID:          "mobile-file-1",
 		RemoteParentID:        "mobile-parent-1",
@@ -226,6 +238,13 @@ func TestUploadETFManifestCarriesAndValidatesCoordinatorContext(t *testing.T) {
 	}
 	if len(payloadHash) != 64 {
 		t.Fatalf("payload hash length = %d, want 64", len(payloadHash))
+	}
+	reconstructedHash, err := HashTaskContext(manifest.TaskContext())
+	if err != nil {
+		t.Fatalf("hash reconstructed task context: %v", err)
+	}
+	if reconstructedHash != hash {
+		t.Fatalf("reconstructed hash = %q, want %q", reconstructedHash, hash)
 	}
 
 	manifest.Subscription.SubscriptionItemID++
@@ -314,6 +333,21 @@ func testTaskContext() TaskContext {
 				SourceFileID:       "share-file-13",
 				SourceRelativePath: "Season 01/Example.S01E13.mkv",
 				Size:               123456789,
+			},
+		},
+		ShareSaveKey: "share-save-batch:abc123",
+		ShareSaveObjects: []SourceObject{
+			{
+				Provider:           "aliyun_drive",
+				SourceFileID:       "share-file-13",
+				SourceRelativePath: "Season 01/Example.S01E13.mkv",
+				Size:               123456789,
+			},
+			{
+				Provider:           "aliyun_drive",
+				SourceFileID:       "share-file-14",
+				SourceRelativePath: "Season 01/Example.S01E14.mkv",
+				Size:               123456780,
 			},
 		},
 		StagingTarget: ProviderTargetRequirement{

@@ -33,10 +33,10 @@ type fakeResultQueue struct {
 }
 
 type cleanupTestDriver struct {
-	storage     model.Storage
-	cleared     model.Obj
-	removed     model.Obj
-	removeErr   error
+	storage   model.Storage
+	cleared   model.Obj
+	removed   model.Obj
+	removeErr error
 }
 
 func (d *cleanupTestDriver) Config() driver.Config            { return driver.Config{} }
@@ -104,7 +104,9 @@ func (q *fakeResultQueue) ReleaseAttempt(context.Context, string) error {
 	q.claimed = false
 	return nil
 }
-func (q *fakeResultQueue) CleanupBacklog(context.Context) (int64, error) { return q.cleanupBacklog, nil }
+func (q *fakeResultQueue) CleanupBacklog(context.Context) (int64, error) {
+	return q.cleanupBacklog, nil
+}
 
 func (*fakeResultQueue) EnsureGroup(context.Context) error { return nil }
 func (*fakeResultQueue) Reclaim(context.Context, time.Duration, string, int64) ([]resultqueue.Result, string, error) {
@@ -582,6 +584,11 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 			LogicalTargetPath: "/139_60t/上传中转/tv/国产剧/Show/Season 1/Show.S01E01.mkv",
 		},
 		SourceObjects: []protocol.SourceObject{{Provider: "aliyundrive", SourceFileID: "file-1"}},
+		ShareSaveKey:  "share-save-batch:abc123",
+		ShareSaveObjects: []protocol.SourceObject{
+			{Provider: "aliyundrive", SourceFileID: "file-1"},
+			{Provider: "aliyundrive", SourceFileID: "file-2"},
+		},
 		TargetProfile: "/mobile",
 	}
 	hash, err := protocol.HashTaskContext(taskContext)
@@ -600,6 +607,8 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 		Share:                 taskContext.Share,
 		Media:                 taskContext.Media,
 		SourceObjects:         taskContext.SourceObjects,
+		ShareSaveKey:          taskContext.ShareSaveKey,
+		ShareSaveObjects:      taskContext.ShareSaveObjects,
 		MobileAccountBinding:  "/mobile",
 		RemoteFileID:          "remote-1",
 		RemotePath:            "/mobile/upload/tv/国产剧/Show/Season 1/Show.S01E01.mkv",
@@ -608,6 +617,13 @@ func validUploadManifest(t *testing.T) protocol.UploadETFManifest {
 		SHA256:                strings.Repeat("A", 64),
 		HashSource:            "mobile_provider_response",
 	}
+}
+
+func TestValidUploadManifestReconstructsShareSaveTaskContextHash(t *testing.T) {
+	manifest := validUploadManifest(t)
+	got, err := protocol.HashTaskContext(manifest.TaskContext())
+	require.NoError(t, err)
+	require.Equal(t, manifest.TaskContextHash, got)
 }
 
 func TestDefaultMediaConcurrencyUsesConfiguredMoveWorkers(t *testing.T) {
