@@ -33,6 +33,7 @@ type SubscriptionRunFilter struct {
 var ErrStaleSubscriptionTerminalCallback = errors.New("stale subscription terminal callback")
 
 type SubscriptionTerminalItemRequest struct {
+	Context              context.Context
 	ItemID               uint
 	SubscriptionID       uint
 	SourceKey            string
@@ -613,61 +614,63 @@ func PersistSubscriptionTerminalItem(request SubscriptionTerminalItemRequest) (*
 		return nil, errors.New("terminal subscription item status is required")
 	}
 	var savedItem *model.SubscriptionItem
-	err := db.Transaction(func(tx *gorm.DB) error {
-		identity := subscriptionTerminalItemIdentityQuery(tx, request)
-		if request.RecoverySource != nil {
-			var current model.SubscriptionItem
-			if err := identity.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return ErrStaleSubscriptionTerminalCallback
+	err := withSQLiteBusyRetry(request.Context, func(ctx context.Context) error {
+		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			identity := subscriptionTerminalItemIdentityQuery(tx, request)
+			if request.RecoverySource != nil {
+				var current model.SubscriptionItem
+				if err := identity.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current).Error; err != nil {
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						return ErrStaleSubscriptionTerminalCallback
+					}
+					return errors.WithStack(err)
 				}
-				return errors.WithStack(err)
+				source := request.RecoverySource
+				if source.SelectedAt.IsZero() {
+					source.SelectedAt = time.Now()
+				}
+				source.SourceItemID = request.ItemID
+				source.FileHash = request.ExpectedFileHash
+				source.Status = request.TerminalStatus
+				if err := tx.Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "subscription_id"}, {Name: "season"}, {Name: "episode"}},
+					DoNothing: true,
+				}).Create(source).Error; err != nil {
+					return errors.WithStack(err)
+				}
 			}
-			source := request.RecoverySource
-			if source.SelectedAt.IsZero() {
-				source.SelectedAt = time.Now()
-			}
-			source.SourceItemID = request.ItemID
-			source.FileHash = request.ExpectedFileHash
-			source.Status = request.TerminalStatus
-			if err := tx.Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "subscription_id"}, {Name: "season"}, {Name: "episode"}},
-				DoNothing: true,
-			}).Create(source).Error; err != nil {
-				return errors.WithStack(err)
-			}
-		}
-		updatedAt := time.Now()
-		updates := map[string]any{
-			"status":     request.TerminalStatus,
-			"last_error": request.TerminalLastError,
-			"updated_at": updatedAt,
-		}
-		if request.TerminalClusterJobID != nil {
-			updates["cluster_job_id"] = *request.TerminalClusterJobID
-		}
-		result := subscriptionTerminalItemIdentityQuery(tx, request).Updates(updates)
-		if result.Error != nil {
-			return errors.WithStack(result.Error)
-		}
-		if result.RowsAffected == 0 {
-			return ErrStaleSubscriptionTerminalCallback
-		}
-		if err := tx.Model(&model.SubscriptionEpisodeSource{}).
-			Where(
-				columnName("source_item_id")+" = ? AND "+columnName("file_hash")+" = ?",
-				request.ItemID,
-				request.ExpectedFileHash,
-			).
-			Updates(map[string]any{
+			updatedAt := time.Now()
+			updates := map[string]any{
 				"status":     request.TerminalStatus,
+				"last_error": request.TerminalLastError,
 				"updated_at": updatedAt,
-			}).Error; err != nil {
-			return errors.WithStack(err)
-		}
-		var err error
-		savedItem, err = getSubscriptionItem(tx, request.SubscriptionID, request.SourceKey)
-		return err
+			}
+			if request.TerminalClusterJobID != nil {
+				updates["cluster_job_id"] = *request.TerminalClusterJobID
+			}
+			result := subscriptionTerminalItemIdentityQuery(tx, request).Updates(updates)
+			if result.Error != nil {
+				return errors.WithStack(result.Error)
+			}
+			if result.RowsAffected == 0 {
+				return ErrStaleSubscriptionTerminalCallback
+			}
+			if err := tx.Model(&model.SubscriptionEpisodeSource{}).
+				Where(
+					columnName("source_item_id")+" = ? AND "+columnName("file_hash")+" = ?",
+					request.ItemID,
+					request.ExpectedFileHash,
+				).
+				Updates(map[string]any{
+					"status":     request.TerminalStatus,
+					"updated_at": updatedAt,
+				}).Error; err != nil {
+				return errors.WithStack(err)
+			}
+			var err error
+			savedItem, err = getSubscriptionItem(tx, request.SubscriptionID, request.SourceKey)
+			return err
+		})
 	})
 	if err != nil {
 		if errors.Is(err, ErrStaleSubscriptionTerminalCallback) {

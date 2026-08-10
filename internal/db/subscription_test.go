@@ -15,6 +15,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 func setupPrefixedSubscriptionDB(t *testing.T) {
@@ -1109,6 +1110,67 @@ func TestPersistSubscriptionTerminalItemRejectsStaleFileHashWithoutWritingSnapsh
 	}
 	if len(sources) != 0 {
 		t.Fatalf("stale recovery source was written: %#v", sources)
+	}
+}
+
+func TestPersistSubscriptionTerminalItemRetriesTransientSQLiteBusy(t *testing.T) {
+	setupETFArchiveDB(t)
+
+	sub := &model.Subscription{
+		Name:       "Transient busy terminal subscription",
+		TMDBName:   "Transient busy terminal subscription",
+		SourceType: model.SubscriptionSourceManual,
+	}
+	if err := CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	item, _, err := UpsertSubscriptionItem(&model.SubscriptionItem{
+		SubscriptionID: sub.ID,
+		SourceKey:      "terminal-busy",
+		FileHash:       "busy-hash",
+		Status:         model.SubscriptionItemStatusPending,
+		LastSeenAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create pending item: %v", err)
+	}
+
+	callbackName := "test:busy_retry_terminal_item_update"
+	attempts := 0
+	if err := db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != modelTableName("SubscriptionItem") {
+			return
+		}
+		attempts++
+		if attempts < 3 {
+			tx.AddError(newTestSQLiteError(sqlite3.SQLITE_BUSY))
+		}
+	}); err != nil {
+		t.Fatalf("register busy callback: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Callback().Update().Remove(callbackName); err != nil {
+			t.Fatalf("remove busy callback: %v", err)
+		}
+	})
+
+	saved, err := PersistSubscriptionTerminalItem(SubscriptionTerminalItemRequest{
+		ItemID:            item.ID,
+		SubscriptionID:    item.SubscriptionID,
+		SourceKey:         item.SourceKey,
+		ExpectedFileHash:  item.FileHash,
+		ExpectedStatus:    model.SubscriptionItemStatusPending,
+		TerminalStatus:    model.SubscriptionItemStatusTransferred,
+		TerminalLastError: "",
+	})
+	if err != nil {
+		t.Fatalf("persist terminal item: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if saved.Status != model.SubscriptionItemStatusTransferred {
+		t.Fatalf("saved status = %q, want transferred", saved.Status)
 	}
 }
 
