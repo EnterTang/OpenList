@@ -117,7 +117,7 @@ type Service struct {
 	shareSaveSaver        func(context.Context, string, string, string, []string) ([]string, error)
 	shareSaveBatchSaver   func(context.Context, string, string, string, []string) ([]string, error)
 	stagedSourceFinder    func(context.Context, string, protocol.SourceObject) (string, bool)
-	shareSaveFlights      singleflight.Group[[]string]
+	shareSaveFlights      singleflight.Group[mediaTransferShareSaveBatchResult]
 	shareSaveFlightMu     sync.Mutex
 	shareSaveFlightCalls  map[string]int
 	shareSaveFlightJoined func(string)
@@ -1161,45 +1161,33 @@ func (s *Service) prepareMediaTransferShareSave(ctx context.Context, offer proto
 	if primary.SourceFileID == "" {
 		return "", false, errors.New("cluster media task has no source object")
 	}
-	if stagedSource, reused := s.findStagedSource(ctx, requestedTempRoot, primary); reused {
-		return stagedSource, true, nil
-	}
-
 	shareSaveObjects := mediaTransferShareSaveObjects(offer.TaskContext, primary)
 	if strings.TrimSpace(offer.TaskContext.ShareSaveKey) != "" && len(shareSaveObjects) > 0 {
-		if !s.allShareSaveObjectsStaged(ctx, requestedTempRoot, shareSaveObjects) {
-			key := mediaTransferShareSaveSingleflightKey(offer.TaskContext, requestedTempRoot)
-			saved, saveErr := s.waitMediaTransferShareSaveBatch(ctx, key, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, mediaTransferShareSaveFileIDs(shareSaveObjects))
-			if saveErr != nil {
-				if err := ctx.Err(); err != nil {
-					return "", false, err
-				}
-				// A previous cancelled attempt may have left the object in staging.
-				if fallback, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
-					log.Warnf("cluster job %s share-save batch reported %v; reusing existing staged object %s", offer.JobID, saveErr, fallback)
-					return fallback, true, nil
-				}
-				return "", false, fmt.Errorf("save cluster share selection batch: %w", saveErr)
-			}
+		key := mediaTransferShareSaveSingleflightKey(offer.TaskContext, requestedTempRoot)
+		prepared, saveErr := s.waitMediaTransferShareSaveBatch(ctx, key, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, shareSaveObjects)
+		if saveErr != nil {
 			if err := ctx.Err(); err != nil {
 				return "", false, err
 			}
-			if stagedSource, ok := matchMediaTransferStagedPath(requestedTempRoot, primary, saved); ok {
-				return stagedSource, false, nil
+			// A previous cancelled attempt may have left the object in staging.
+			if fallback, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
+				log.Warnf("cluster job %s share-save batch reported %v; reusing existing staged object %s", offer.JobID, saveErr, fallback)
+				return fallback, true, nil
 			}
+			return "", false, fmt.Errorf("save cluster share selection batch: %w", saveErr)
 		}
 		if err := ctx.Err(); err != nil {
 			return "", false, err
 		}
-		if stagedSource, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
-			return stagedSource, false, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return "", false, err
+		if stagedSource, reused, ok := prepared.stagedSource(requestedTempRoot, primary); ok {
+			return stagedSource, reused, nil
 		}
 		return "", false, fmt.Errorf("cluster staged source for %s was not found after share-save batch preparation", primary.SourceFileID)
 	}
 
+	if stagedSource, reused := s.findStagedSource(ctx, requestedTempRoot, primary); reused {
+		return stagedSource, true, nil
+	}
 	saved, saveErr := s.saveClusterShareSelection(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, []string{primary.SourceFileID})
 	if saveErr != nil {
 		// A previous cancelled attempt may have left the object in staging.
@@ -1215,25 +1203,56 @@ func (s *Service) prepareMediaTransferShareSave(ctx context.Context, offer proto
 	return saved[0], false, nil
 }
 
-func (s *Service) waitMediaTransferShareSaveBatch(ctx context.Context, key, rawURL, passcode, tempRoot string, selectedFileIDs []string) ([]string, error) {
+type mediaTransferShareSaveBatchResult struct {
+	stagedPaths map[string]string
+	savedPaths  []string
+}
+
+func (r mediaTransferShareSaveBatchResult) stagedSource(tempRoot string, primary protocol.SourceObject) (string, bool, bool) {
+	if stagedPath, ok := r.stagedPaths[strings.TrimSpace(primary.SourceFileID)]; ok {
+		return stagedPath, true, true
+	}
+	if stagedPath, ok := matchMediaTransferStagedPath(tempRoot, primary, r.savedPaths); ok {
+		return stagedPath, false, true
+	}
+	return "", false, false
+}
+
+func (s *Service) waitMediaTransferShareSaveBatch(ctx context.Context, key, rawURL, passcode, tempRoot string, objects []protocol.SourceObject) (mediaTransferShareSaveBatchResult, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return mediaTransferShareSaveBatchResult{}, err
 	}
 	joined, done := s.beginShareSaveFlightCall(key)
 	defer done()
 	sharedCtx := context.WithoutCancel(ctx)
-	resultCh := s.shareSaveFlights.DoChan(key, func() ([]string, error) {
-		return s.saveClusterShareSelectionBatch(sharedCtx, rawURL, passcode, tempRoot, selectedFileIDs)
+	resultCh := s.shareSaveFlights.DoChan(key, func() (mediaTransferShareSaveBatchResult, error) {
+		stagedPaths := make(map[string]string, len(objects))
+		missingObjects := make([]protocol.SourceObject, 0, len(objects))
+		for _, object := range objects {
+			if stagedPath, ok := s.findStagedSource(sharedCtx, tempRoot, object); ok {
+				stagedPaths[strings.TrimSpace(object.SourceFileID)] = stagedPath
+				continue
+			}
+			missingObjects = append(missingObjects, object)
+		}
+		if len(missingObjects) == 0 {
+			return mediaTransferShareSaveBatchResult{stagedPaths: stagedPaths}, nil
+		}
+		savedPaths, err := s.saveClusterShareSelectionBatch(sharedCtx, rawURL, passcode, tempRoot, mediaTransferShareSaveFileIDs(missingObjects))
+		if err != nil {
+			return mediaTransferShareSaveBatchResult{}, err
+		}
+		return mediaTransferShareSaveBatchResult{stagedPaths: stagedPaths, savedPaths: savedPaths}, nil
 	})
 	if joined && s.shareSaveFlightJoined != nil {
 		s.shareSaveFlightJoined(key)
 	}
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return mediaTransferShareSaveBatchResult{}, ctx.Err()
 	case result := <-resultCh:
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return mediaTransferShareSaveBatchResult{}, err
 		}
 		return result.Val, result.Err
 	}
@@ -1277,18 +1296,6 @@ func (s *Service) findStagedSource(ctx context.Context, tempRoot string, primary
 		return s.stagedSourceFinder(ctx, tempRoot, primary)
 	}
 	return findExistingStagedSource(ctx, tempRoot, primary)
-}
-
-func (s *Service) allShareSaveObjectsStaged(ctx context.Context, tempRoot string, objects []protocol.SourceObject) bool {
-	if len(objects) == 0 {
-		return false
-	}
-	for _, object := range objects {
-		if _, ok := s.findStagedSource(ctx, tempRoot, object); !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func mediaTransferShareSaveObjects(task protocol.TaskContext, primary protocol.SourceObject) []protocol.SourceObject {

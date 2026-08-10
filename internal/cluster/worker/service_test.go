@@ -715,6 +715,53 @@ func TestMediaTransfer_BatchShareSaveUsesSingleflight(t *testing.T) {
 	}
 }
 
+func TestMediaTransfer_BatchShareSaveOnlySavesMissingFiles(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Show.S01E01.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Show.S01E02.mkv", Size: 102},
+		{Provider: "pan115", SourceFileID: "file-3", SourceRelativePath: "Show.S01E03.mkv", Size: 103},
+	}
+	service := New(&fakeResultQueue{}, nil)
+
+	staged := map[string]string{
+		shareSaveObjects[0].SourceFileID: testStagedSourcePath(tempRoot, shareSaveObjects[0]),
+	}
+	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
+		stagedPath, ok := staged[primary.SourceFileID]
+		return stagedPath, ok
+	}
+
+	var (
+		callCount int
+		gotIDs    []string
+	)
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, _ string, selectedFileIDs []string) ([]string, error) {
+		callCount++
+		gotIDs = append([]string(nil), selectedFileIDs...)
+
+		paths := make([]string, 0, len(selectedFileIDs))
+		for _, object := range shareSaveObjects[1:] {
+			stagedPath := testStagedSourcePath(tempRoot, object)
+			staged[object.SourceFileID] = stagedPath
+			paths = append(paths, stagedPath)
+		}
+		return paths, nil
+	}
+
+	stagedPath, reused, err := service.prepareMediaTransferShareSave(
+		context.Background(),
+		testMediaTransferOffer(shareSaveObjects[0], shareSaveObjects, "share-save-batch:partial"),
+		tempRoot,
+	)
+
+	require.NoError(t, err)
+	require.True(t, reused)
+	require.Equal(t, staged[shareSaveObjects[0].SourceFileID], stagedPath)
+	require.Equal(t, 1, callCount)
+	require.Equal(t, []string{"file-2", "file-3"}, gotIDs)
+}
+
 func TestMediaTransfer_BatchShareSaveFailureFansOutAndAllowsRetry(t *testing.T) {
 	tempRoot := "/worker-staging/share-save"
 	shareSaveObjects := []protocol.SourceObject{
@@ -724,13 +771,11 @@ func TestMediaTransfer_BatchShareSaveFailureFansOutAndAllowsRetry(t *testing.T) 
 	service := New(&fakeResultQueue{}, nil)
 
 	var (
-		mu             sync.Mutex
-		callCount      int
-		staged         = make(map[string]string, len(shareSaveObjects))
-		initialLookups = make(map[string]struct{}, len(shareSaveObjects))
+		mu        sync.Mutex
+		callCount int
+		staged    = make(map[string]string, len(shareSaveObjects))
 	)
 	firstRelease := make(chan struct{})
-	initialReady := make(chan struct{})
 	saverEntered := make(chan struct{})
 	waiterJoined := make(chan struct{})
 	service.shareSaveFlightJoined = func(_ string) {
@@ -743,17 +788,6 @@ func TestMediaTransfer_BatchShareSaveFailureFansOutAndAllowsRetry(t *testing.T) 
 	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
 		mu.Lock()
 		stagedPath, ok := staged[primary.SourceFileID]
-		if !ok && len(staged) == 0 {
-			if _, seen := initialLookups[primary.SourceFileID]; !seen {
-				initialLookups[primary.SourceFileID] = struct{}{}
-				if len(initialLookups) == len(shareSaveObjects) {
-					close(initialReady)
-				}
-			}
-			mu.Unlock()
-			<-initialReady
-			return "", false
-		}
 		mu.Unlock()
 		return stagedPath, ok
 	}
@@ -822,6 +856,105 @@ func TestMediaTransfer_BatchShareSaveFailureFansOutAndAllowsRetry(t *testing.T) 
 	mu.Lock()
 	require.Equal(t, 2, callCount)
 	mu.Unlock()
+}
+
+func TestMediaTransfer_BatchShareSaveConcurrentLookupsProbeEachObjectOncePerBatch(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Show.S01E01.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Show.S01E02.mkv", Size: 102},
+		{Provider: "pan115", SourceFileID: "file-3", SourceRelativePath: "Show.S01E03.mkv", Size: 103},
+	}
+	service := New(&fakeResultQueue{}, nil)
+
+	var (
+		mu        sync.Mutex
+		callCount int
+		lookups   = make(map[string]int, len(shareSaveObjects))
+		waiters   int
+	)
+	saverEntered := make(chan struct{})
+	releaseSaver := make(chan struct{})
+	waiterJoined := make(chan struct{}, len(shareSaveObjects))
+	service.shareSaveFlightJoined = func(_ string) {
+		select {
+		case waiterJoined <- struct{}{}:
+		default:
+		}
+	}
+	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
+		mu.Lock()
+		lookups[primary.SourceFileID]++
+		mu.Unlock()
+		return "", false
+	}
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, _ string, selectedFileIDs []string) ([]string, error) {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		select {
+		case <-saverEntered:
+		default:
+			close(saverEntered)
+		}
+		<-releaseSaver
+
+		paths := make([]string, 0, len(selectedFileIDs))
+		for _, object := range shareSaveObjects {
+			paths = append(paths, testStagedSourcePath(tempRoot, object))
+		}
+		return paths, nil
+	}
+
+	type result struct {
+		sourceFileID string
+		stagedPath   string
+		err          error
+	}
+	results := make(chan result, len(shareSaveObjects))
+	for _, primary := range shareSaveObjects {
+		primary := primary
+		go func() {
+			stagedPath, _, err := service.prepareMediaTransferShareSave(
+				context.Background(),
+				testMediaTransferOffer(primary, shareSaveObjects, "share-save-batch:lookup-once"),
+				tempRoot,
+			)
+			results <- result{sourceFileID: primary.SourceFileID, stagedPath: stagedPath, err: err}
+		}()
+	}
+
+	select {
+	case <-saverEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch saver was not entered")
+	}
+	for waiters < len(shareSaveObjects)-1 {
+		select {
+		case <-waiterJoined:
+			waiters++
+		case <-time.After(2 * time.Second):
+			t.Fatal("followers did not join the in-flight singleflight wait")
+		}
+	}
+	close(releaseSaver)
+
+	gotPaths := make(map[string]string, len(shareSaveObjects))
+	for range shareSaveObjects {
+		result := <-results
+		require.NoError(t, result.err)
+		gotPaths[result.sourceFileID] = result.stagedPath
+	}
+
+	mu.Lock()
+	require.Equal(t, 1, callCount)
+	for _, object := range shareSaveObjects {
+		require.Equal(t, 1, lookups[object.SourceFileID], object.SourceFileID)
+	}
+	mu.Unlock()
+	for _, object := range shareSaveObjects {
+		require.Equal(t, testStagedSourcePath(tempRoot, object), gotPaths[object.SourceFileID])
+	}
 }
 
 func TestMediaTransfer_BatchShareSaveSkipsWhenAllFilesAlreadyStaged(t *testing.T) {
