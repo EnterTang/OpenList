@@ -432,7 +432,7 @@ func projectExternalSubscriptionStatus(request *model.ExternalSubscriptionReques
 	}
 	for _, item := range items {
 		switch item.Status {
-		case model.SubscriptionItemStatusNotifying, model.SubscriptionItemStatusTransferring:
+		case model.SubscriptionItemStatusPending, model.SubscriptionItemStatusNotifying, model.SubscriptionItemStatusTransferring:
 			return "running", item.Status
 		}
 	}

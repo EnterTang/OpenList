@@ -60,6 +60,24 @@ func TestProjectExternalSubscriptionStatus(t *testing.T) {
 			wantCompleted: false,
 		},
 		{
+			name: "pending delivery keeps external status running",
+			items: []model.SubscriptionItem{
+				{SourceKey: "pending-item", Status: model.SubscriptionItemStatusPending},
+			},
+			wantStatus:    "running",
+			wantMessage:   model.SubscriptionItemStatusPending,
+			wantCompleted: false,
+		},
+		{
+			name: "notifying delivery keeps external status running",
+			items: []model.SubscriptionItem{
+				{SourceKey: "notifying-item", Status: model.SubscriptionItemStatusNotifying},
+			},
+			wantStatus:    "running",
+			wantMessage:   model.SubscriptionItemStatusNotifying,
+			wantCompleted: false,
+		},
+		{
 			name: "success remains completed without failed or active items",
 			items: []model.SubscriptionItem{
 				{SourceKey: "transferred-item", Status: model.SubscriptionItemStatusTransferred},
