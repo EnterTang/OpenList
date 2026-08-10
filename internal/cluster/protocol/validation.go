@@ -97,6 +97,9 @@ func (o JobOffer) Validate() error {
 		}
 		return validateTaskContextHash(o.TaskContext, o.TaskContextHash)
 	}
+	if o.JobType == "media.transfer" && len(o.TaskContext.SourceObjects) > 1 {
+		return errors.New("media.transfer requires exactly one source object; split multiple media files into separate child jobs")
+	}
 	if err := o.TaskContext.Validate(); err != nil {
 		return fmt.Errorf("invalid task context: %w", err)
 	}
