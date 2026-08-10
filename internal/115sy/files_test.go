@@ -209,6 +209,17 @@ func TestListFilesUsesCappedPageSize(t *testing.T) {
 	}
 }
 
+func TestRemoteItemAcceptsFormattedModifyTime(t *testing.T) {
+	var item RemoteItem
+	if err := json.Unmarshal([]byte(`{"id":"file-1","name":"file","modify_time":"2026-08-07 13:33"}`), &item); err != nil {
+		t.Fatalf("unmarshal formatted modify_time: %v", err)
+	}
+	want := int64(1786080780)
+	if item.ModifyTime != want {
+		t.Fatalf("modify_time = %d, want %d", item.ModifyTime, want)
+	}
+}
+
 func TestListFilesUsesTopLevelCountWithArrayData(t *testing.T) {
 	var calls atomic.Int32
 	client := newTestClient(t, ClientOptions{

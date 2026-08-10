@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Credential struct {
@@ -75,6 +76,37 @@ type RemoteItem struct {
 	ParentCID  string `json:"parent_cid"`
 	ModifyTime int64  `json:"modify_time"`
 	Thumbnail  string `json:"thumbnail"`
+}
+
+var pan115Location = time.FixedZone("Asia/Shanghai", 8*60*60)
+
+type flexibleTimestamp int64
+
+func (v *flexibleTimestamp) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		*v = 0
+		return nil
+	}
+	raw = strings.Trim(raw, `"`)
+	if raw == "" {
+		*v = 0
+		return nil
+	}
+
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err == nil {
+		*v = flexibleTimestamp(n)
+		return nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04", "2006-01-02 15:04:05"} {
+		parsed, parseErr := time.ParseInLocation(layout, raw, pan115Location)
+		if parseErr == nil {
+			*v = flexibleTimestamp(parsed.Unix())
+			return nil
+		}
+	}
+	return err
 }
 
 type UploadAvailability struct {
@@ -213,37 +245,37 @@ func (i *RemoteItem) UnmarshalJSON(data []byte) error {
 	type remoteItemAlias RemoteItem
 	var raw struct {
 		remoteItemAlias
-		ID           flexibleString `json:"id"`
-		FileID       flexibleString `json:"file_id"`
-		FID          flexibleString `json:"fid"`
-		CID          flexibleString `json:"cid"`
-		Name         string         `json:"name"`
-		N            string         `json:"n"`
-		FN           string         `json:"fn"`
-		FileName     string         `json:"file_name"`
-		IsDir        flexibleBool   `json:"is_dir"`
-		IsFolder     flexibleBool   `json:"is_folder"`
-		Directory    flexibleBool   `json:"directory"`
-		FileCategory flexibleString `json:"file_category"`
-		FC           flexibleString `json:"fc"`
-		Category     flexibleString `json:"category"`
-		Size         flexibleInt64  `json:"size"`
-		FS           flexibleInt64  `json:"fs"`
-		S            flexibleInt64  `json:"s"`
-		FVS          flexibleInt64  `json:"fvs"`
-		SHA1         string         `json:"sha1"`
-		Sha          string         `json:"sha"`
-		PickCode     string         `json:"pickcode"`
-		PC           string         `json:"pc"`
-		ParentCID    flexibleString `json:"parent_cid"`
-		ParentID     flexibleString `json:"parent_id"`
-		PID          flexibleString `json:"pid"`
-		ModifyTime   flexibleInt64  `json:"modify_time"`
-		UT           flexibleInt64  `json:"utime"`
-		T            flexibleInt64  `json:"t"`
-		UPT          flexibleInt64  `json:"upt"`
-		Thumbnail    string         `json:"thumbnail"`
-		Thumb        string         `json:"thumb"`
+		ID           flexibleString    `json:"id"`
+		FileID       flexibleString    `json:"file_id"`
+		FID          flexibleString    `json:"fid"`
+		CID          flexibleString    `json:"cid"`
+		Name         string            `json:"name"`
+		N            string            `json:"n"`
+		FN           string            `json:"fn"`
+		FileName     string            `json:"file_name"`
+		IsDir        flexibleBool      `json:"is_dir"`
+		IsFolder     flexibleBool      `json:"is_folder"`
+		Directory    flexibleBool      `json:"directory"`
+		FileCategory flexibleString    `json:"file_category"`
+		FC           flexibleString    `json:"fc"`
+		Category     flexibleString    `json:"category"`
+		Size         flexibleInt64     `json:"size"`
+		FS           flexibleInt64     `json:"fs"`
+		S            flexibleInt64     `json:"s"`
+		FVS          flexibleInt64     `json:"fvs"`
+		SHA1         string            `json:"sha1"`
+		Sha          string            `json:"sha"`
+		PickCode     string            `json:"pickcode"`
+		PC           string            `json:"pc"`
+		ParentCID    flexibleString    `json:"parent_cid"`
+		ParentID     flexibleString    `json:"parent_id"`
+		PID          flexibleString    `json:"pid"`
+		ModifyTime   flexibleTimestamp `json:"modify_time"`
+		UT           flexibleTimestamp `json:"utime"`
+		T            flexibleTimestamp `json:"t"`
+		UPT          flexibleTimestamp `json:"upt"`
+		Thumbnail    string            `json:"thumbnail"`
+		Thumb        string            `json:"thumb"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
