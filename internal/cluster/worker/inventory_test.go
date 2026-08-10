@@ -2,9 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
+	internaldriver "github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
 
 func TestBuildInventoryIncludesProviderAccounts(t *testing.T) {
@@ -257,4 +261,184 @@ func TestProviderAccountInventoryAdvertisesGuangYaPanShareSave(t *testing.T) {
 	if !account.SupportsShareSave {
 		t.Fatalf("GuangYaPan account should advertise share-save support: %#v", account)
 	}
+}
+
+func TestDefaultHydrateInventoryStorageClassifiesDriverInitializationFailures(t *testing.T) {
+	previousLookup := getInventoryStorageByMountPath
+	defer func() {
+		getInventoryStorageByMountPath = previousLookup
+	}()
+
+	baseStorage := model.Storage{
+		ID:        115,
+		MountPath: "/115-cd2",
+		Driver:    "115 CD2",
+		Status:    op.WORK,
+	}
+
+	for _, tc := range []struct {
+		name       string
+		lookupErr  error
+		driver     *inventoryStatusDriver
+		wantStatus string
+	}{
+		{
+			name:       "lookup refresh token invalid",
+			lookupErr:  errors.New("refresh_token invalid: token=secret-cookie"),
+			wantStatus: "reauthorization_required",
+		},
+		{
+			name:       "lookup generic initialization failure",
+			lookupErr:  errors.New("failed init storage: upstream timeout cookie=secret-cookie"),
+			wantStatus: "storage_unavailable",
+		},
+		{
+			name: "driver status refresh token invalid",
+			driver: &inventoryStatusDriver{
+				storage: func() model.Storage {
+					storage := baseStorage
+					storage.Status = "authorization expired for refresh token secret-cookie"
+					return storage
+				}(),
+			},
+			wantStatus: "reauthorization_required",
+		},
+		{
+			name: "driver status disabled remains stable",
+			driver: &inventoryStatusDriver{
+				storage: func() model.Storage {
+					storage := baseStorage
+					storage.Status = op.DISABLED
+					return storage
+				}(),
+			},
+			wantStatus: op.DISABLED,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			getInventoryStorageByMountPath = func(mountPath string) (internaldriver.Driver, error) {
+				if mountPath != baseStorage.MountPath {
+					t.Fatalf("lookup mount path = %q, want %q", mountPath, baseStorage.MountPath)
+				}
+				if tc.lookupErr != nil {
+					return nil, tc.lookupErr
+				}
+				return tc.driver, nil
+			}
+
+			snapshot, err := defaultHydrateInventoryStorage(context.Background(), "node-1", baseStorage)
+			if err != nil {
+				t.Fatalf("hydrate inventory storage: %v", err)
+			}
+			if snapshot.Account.Provider != "pan115" {
+				t.Fatalf("provider = %q, want pan115", snapshot.Account.Provider)
+			}
+			if snapshot.Account.Status != tc.wantStatus {
+				t.Fatalf("account status = %q, want %q", snapshot.Account.Status, tc.wantStatus)
+			}
+			if snapshot.Mount.Status != tc.wantStatus {
+				t.Fatalf("mount status = %q, want %q", snapshot.Mount.Status, tc.wantStatus)
+			}
+			if snapshot.Account.SupportsDownload || snapshot.Account.SupportsUpload || snapshot.Account.SupportsShareSave || snapshot.Account.SupportsETF {
+				t.Fatalf("account capabilities should all be false for unhealthy storage: %#v", snapshot.Account)
+			}
+			if !snapshot.Mount.ReadOnly || snapshot.Mount.CanUpload || snapshot.Mount.CanShare || snapshot.Mount.SupportsETF {
+				t.Fatalf("mount capabilities should all be unhealthy: %#v", snapshot.Mount)
+			}
+			for _, value := range []string{snapshot.Account.Status, snapshot.Mount.Status} {
+				if strings.Contains(value, "secret-cookie") || strings.Contains(strings.ToLower(value), "token=") {
+					t.Fatalf("status leaked sensitive detail: %q", value)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildInventoryMarks115CD2ReauthorizationFailuresUnavailable(t *testing.T) {
+	oldList := listInventoryStorages
+	oldConfig := getInventorySubscriptionConfig
+	oldHydrate := hydrateInventoryStorage
+	previousLookup := getInventoryStorageByMountPath
+	defer func() {
+		listInventoryStorages = oldList
+		getInventorySubscriptionConfig = oldConfig
+		hydrateInventoryStorage = oldHydrate
+		getInventoryStorageByMountPath = previousLookup
+	}()
+
+	storage := model.Storage{ID: 115, MountPath: "/115-cd2", Driver: "115 CD2", Status: op.WORK}
+	listInventoryStorages = func() ([]model.Storage, error) { return []model.Storage{storage}, nil }
+	hydrateInventoryStorage = defaultHydrateInventoryStorage
+	getInventorySubscriptionConfig = func() (model.SubscriptionConfig, error) {
+		return model.SubscriptionConfig{Telegram: model.SubscriptionTelegramSourceConfig{
+			Pan115: model.SubscriptionTelegramPanConfig{
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan115", Folder: "worker-staging"},
+			},
+		}}, nil
+	}
+	getInventoryStorageByMountPath = func(mountPath string) (internaldriver.Driver, error) {
+		if mountPath != storage.MountPath {
+			t.Fatalf("lookup mount path = %q, want %q", mountPath, storage.MountPath)
+		}
+		return nil, errors.New("refresh token unauthorized: cookie=secret-cookie")
+	}
+
+	report, err := BuildInventory(context.Background(), "node-1", true)
+	if err != nil {
+		t.Fatalf("build inventory: %v", err)
+	}
+	if len(report.ProviderAccounts) != 1 || len(report.Mounts) != 1 {
+		t.Fatalf("inventory sizes accounts=%d mounts=%d, want 1/1", len(report.ProviderAccounts), len(report.Mounts))
+	}
+	account := report.ProviderAccounts[0]
+	if account.Provider != "pan115" {
+		t.Fatalf("provider = %q, want pan115", account.Provider)
+	}
+	if account.Status != "reauthorization_required" {
+		t.Fatalf("account status = %q, want reauthorization_required", account.Status)
+	}
+	if account.SupportsShareSave || account.SupportsDownload || account.SupportsUpload || account.SupportsETF {
+		t.Fatalf("unhealthy CD2 account should not advertise capabilities: %#v", account)
+	}
+	mount := report.Mounts[0]
+	if mount.Status != "reauthorization_required" || !mount.ReadOnly || mount.CanShare || mount.CanUpload || mount.SupportsETF {
+		t.Fatalf("unhealthy CD2 mount = %#v", mount)
+	}
+}
+
+type inventoryStatusDriver struct {
+	storage model.Storage
+	config  internaldriver.Config
+}
+
+func (d *inventoryStatusDriver) Config() internaldriver.Config {
+	return d.config
+}
+
+func (d *inventoryStatusDriver) GetStorage() *model.Storage {
+	return &d.storage
+}
+
+func (d *inventoryStatusDriver) SetStorage(storage model.Storage) {
+	d.storage = storage
+}
+
+func (d *inventoryStatusDriver) GetAddition() internaldriver.Additional {
+	return nil
+}
+
+func (d *inventoryStatusDriver) Init(context.Context) error {
+	return nil
+}
+
+func (d *inventoryStatusDriver) Drop(context.Context) error {
+	return nil
+}
+
+func (d *inventoryStatusDriver) List(context.Context, model.Obj, model.ListArgs) ([]model.Obj, error) {
+	return nil, nil
+}
+
+func (d *inventoryStatusDriver) Link(context.Context, model.Obj, model.LinkArgs) (*model.Link, error) {
+	return nil, nil
 }

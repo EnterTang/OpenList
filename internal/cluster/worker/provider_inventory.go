@@ -20,6 +20,11 @@ var (
 	getInventoryStorageByMountPath = op.GetStorageByMountPath
 )
 
+const (
+	inventoryStatusStorageUnavailable      = "storage_unavailable"
+	inventoryStatusReauthorizationRequired = "reauthorization_required"
+)
+
 type inventoryStorageSnapshot struct {
 	Mount   protocol.MountInventory
 	Account protocol.ProviderAccountInventory
@@ -36,29 +41,43 @@ type clusterMembershipDetailsReporter interface {
 func defaultHydrateInventoryStorage(ctx context.Context, nodeID string, storage model.Storage) (inventoryStorageSnapshot, error) {
 	mount := providerMountInventory(nodeID, storage)
 	account := providerAccountInventory(nodeID, storage, 0, 0)
-	if driver, driverErr := getInventoryStorageByMountPath(storage.MountPath); driverErr == nil {
-		healthy := storageHealthy(*driver.GetStorage())
-		writable := healthy && !driver.Config().NoUpload
-		mount.ReadOnly = !writable
-		mount.CanUpload = writable
-		mount.CanShare = healthy && supportsShare(storage.Driver)
-		mount.SupportsETF = writable && supportsETFAccount(storage)
-		account.Status = driver.GetStorage().Status
-		account.SupportsUpload = writable
-		account.SupportsDownload = healthy
-		account.SupportsShareSave = healthy && supportsShare(storage.Driver)
-		account.SupportsETF = writable && supportsETFAccount(storage)
-		if details, detailsErr := op.GetStorageDetails(ctx, driver); detailsErr == nil && details != nil {
-			mount.TotalBytes = details.TotalSpace
-			mount.FreeBytes = details.FreeSpace()
-			account.TotalBytes = details.TotalSpace
-			account.FreeBytes = details.FreeSpace()
-		}
-		if reporter, ok := driver.(clusterMembershipDetailsReporter); ok {
-			applyRuntimeMembership(&account, reporter.ClusterMembershipDetails())
-		} else if reporter, ok := driver.(clusterMembershipTierReporter); ok {
-			applyRuntimeMembership(&account, model.MembershipDetails{Tier: reporter.ClusterMembershipTier()})
-		}
+	driver, driverErr := getInventoryStorageByMountPath(storage.MountPath)
+	if driverErr != nil {
+		applyInventoryStatus(&mount, &account, inventoryReportedStorageStatusFromError(driverErr))
+		return inventoryStorageSnapshot{Mount: mount, Account: account}, nil
+	}
+
+	liveStorage := *driver.GetStorage()
+	reportedStatus := inventoryReportedStorageStatus(liveStorage.Status)
+	healthy := !liveStorage.Disabled && strings.EqualFold(strings.TrimSpace(reportedStatus), op.WORK)
+	writable := healthy && !driver.Config().NoUpload
+
+	mount.Status = reportedStatus
+	mount.ReadOnly = !writable
+	mount.CanUpload = writable
+	mount.CanShare = healthy && supportsShare(liveStorage.Driver)
+	mount.SupportsETF = writable && supportsETFAccount(liveStorage)
+
+	account.Status = reportedStatus
+	account.SupportsUpload = writable
+	account.SupportsDownload = healthy
+	account.SupportsShareSave = healthy && supportsShare(liveStorage.Driver)
+	account.SupportsETF = writable && supportsETFAccount(liveStorage)
+
+	if !healthy {
+		return inventoryStorageSnapshot{Mount: mount, Account: account}, nil
+	}
+
+	if details, detailsErr := op.GetStorageDetails(ctx, driver); detailsErr == nil && details != nil {
+		mount.TotalBytes = details.TotalSpace
+		mount.FreeBytes = details.FreeSpace()
+		account.TotalBytes = details.TotalSpace
+		account.FreeBytes = details.FreeSpace()
+	}
+	if reporter, ok := driver.(clusterMembershipDetailsReporter); ok {
+		applyRuntimeMembership(&account, reporter.ClusterMembershipDetails())
+	} else if reporter, ok := driver.(clusterMembershipTierReporter); ok {
+		applyRuntimeMembership(&account, model.MembershipDetails{Tier: reporter.ClusterMembershipTier()})
 	}
 	return inventoryStorageSnapshot{Mount: mount, Account: account}, nil
 }
@@ -80,7 +99,8 @@ func applyRuntimeMembership(account *protocol.ProviderAccountInventory, membersh
 
 func providerMountInventory(nodeID string, storage model.Storage) protocol.MountInventory {
 	provider := providerName(storage.Driver)
-	healthy := storageHealthy(storage)
+	status := inventoryReportedStorageStatus(storage.Status)
+	healthy := !storage.Disabled && strings.EqualFold(strings.TrimSpace(status), op.WORK)
 	alias := accountAlias(storage, provider)
 	return protocol.MountInventory{
 		NodeMountID:        stableMountID(nodeID, storage.ID, storage.MountPath),
@@ -89,7 +109,7 @@ func providerMountInventory(nodeID string, storage model.Storage) protocol.Mount
 		MountPath:          storage.MountPath,
 		AccountAlias:       alias,
 		AccountFingerprint: accountFingerprint(storage, provider),
-		Status:             storage.Status,
+		Status:             status,
 		ReadOnly:           storage.Disabled || !healthy,
 		CanUpload:          !storage.Disabled && healthy,
 		CanShare:           !storage.Disabled && healthy && supportsShare(storage.Driver),
@@ -100,7 +120,8 @@ func providerMountInventory(nodeID string, storage model.Storage) protocol.Mount
 func providerAccountInventory(nodeID string, storage model.Storage, freeBytes, totalBytes int64) protocol.ProviderAccountInventory {
 	provider := providerName(storage.Driver)
 	tier := providerMembershipTier(storage, provider)
-	healthy := storageHealthy(storage)
+	status := inventoryReportedStorageStatus(storage.Status)
+	healthy := !storage.Disabled && strings.EqualFold(strings.TrimSpace(status), op.WORK)
 	return protocol.ProviderAccountInventory{
 		StorageID:            storage.ID,
 		NodeMountID:          stableMountID(nodeID, storage.ID, storage.MountPath),
@@ -108,7 +129,7 @@ func providerAccountInventory(nodeID string, storage model.Storage, freeBytes, t
 		MountPath:            storage.MountPath,
 		AccountAlias:         accountAlias(storage, provider),
 		AccountFingerprint:   accountFingerprint(storage, provider),
-		Status:               storage.Status,
+		Status:               status,
 		MembershipTier:       tier,
 		MembershipWeight:     providerMembershipWeight(tier),
 		MaxSingleUploadBytes: mobileProviderUploadLimit(provider, tier),
@@ -195,7 +216,7 @@ func providerMembershipWeight(tier string) int {
 }
 
 func storageHealthy(storage model.Storage) bool {
-	return !storage.Disabled && strings.EqualFold(strings.TrimSpace(storage.Status), op.WORK)
+	return !storage.Disabled && strings.EqualFold(strings.TrimSpace(inventoryReportedStorageStatus(storage.Status)), op.WORK)
 }
 
 func supportsETFAccount(storage model.Storage) bool {
@@ -238,4 +259,105 @@ func storageAdditionValues(storage model.Storage) map[string]any {
 	values := make(map[string]any)
 	_ = json.Unmarshal([]byte(storage.Addition), &values)
 	return values
+}
+
+func applyInventoryStatus(mount *protocol.MountInventory, account *protocol.ProviderAccountInventory, status string) {
+	mount.Status = status
+	mount.ReadOnly = true
+	mount.CanUpload = false
+	mount.CanShare = false
+	mount.SupportsETF = false
+
+	account.Status = status
+	account.SupportsUpload = false
+	account.SupportsDownload = false
+	account.SupportsShareSave = false
+	account.SupportsETF = false
+}
+
+func inventoryReportedStorageStatusFromError(err error) string {
+	if err == nil {
+		return inventoryStatusStorageUnavailable
+	}
+	if inventoryStatusRequiresReauthorization(err.Error()) {
+		return inventoryStatusReauthorizationRequired
+	}
+	return inventoryStatusStorageUnavailable
+}
+
+func inventoryReportedStorageStatus(status string) string {
+	trimmed := strings.TrimSpace(status)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.EqualFold(trimmed, op.WORK) {
+		return op.WORK
+	}
+	if strings.EqualFold(trimmed, op.DISABLED) {
+		return op.DISABLED
+	}
+	if inventoryStatusRequiresReauthorization(trimmed) {
+		return inventoryStatusReauthorizationRequired
+	}
+	if inventoryStatusLooksLikeInitializationError(trimmed) {
+		return inventoryStatusStorageUnavailable
+	}
+	return trimmed
+}
+
+func inventoryStatusRequiresReauthorization(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	for _, marker := range []string{
+		"refresh",
+		"token",
+		"auth",
+		"unauthor",
+		"unauthorization",
+		"authorization",
+		"unauthorized",
+		"reauthor",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func inventoryStatusLooksLikeInitializationError(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	if !inventoryStatusIsStableToken(lower) {
+		return true
+	}
+	for _, marker := range []string{
+		"failed",
+		"panic",
+		"timeout",
+		"unavailable",
+		"expired",
+		"invalid",
+		"cookie",
+		"session",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func inventoryStatusIsStableToken(value string) bool {
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
