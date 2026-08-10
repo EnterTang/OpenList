@@ -294,7 +294,7 @@ func TestDispatchSubscriptionMedia_SeparatesShareSaveBatchByShareAndTarget(t *te
 	assertShareSaveObjects(t, offers["file-c"].TaskContext.ShareSaveObjects, []string{"file-c"})
 }
 
-func TestAttachShareSaveBatchContext_SeparatesByDeliveryBinding(t *testing.T) {
+func TestAttachShareSaveBatchContext_MergesAcrossDeliveryBinding(t *testing.T) {
 	task := validProviderPipelineTask(20 << 30)
 	task.SharePasscode = "2468"
 	task.ShareRefFingerprint = "share-ref-1"
@@ -330,8 +330,51 @@ func TestAttachShareSaveBatchContext_SeparatesByDeliveryBinding(t *testing.T) {
 	if requests[0].TaskContext.ShareSaveKey == "" || requests[1].TaskContext.ShareSaveKey == "" {
 		t.Fatalf("share-save keys must be set: %#v", requests)
 	}
+	if requests[0].TaskContext.ShareSaveKey != requests[1].TaskContext.ShareSaveKey {
+		t.Fatalf("different delivery bindings should still share one batch key: %q != %q", requests[0].TaskContext.ShareSaveKey, requests[1].TaskContext.ShareSaveKey)
+	}
+	assertShareSaveObjects(t, requests[0].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
+	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
+}
+
+func TestAttachShareSaveBatchContext_SeparatesByStagingBinding(t *testing.T) {
+	task := validProviderPipelineTask(20 << 30)
+	task.SharePasscode = "2468"
+	task.ShareRefFingerprint = "share-ref-1"
+
+	firstContext := subscriptionMediaTaskContext(task, "mobile-primary")
+	firstContext.StagingTarget.StorageID = 11
+	firstContext.StagingTarget.NodeMountID = "staging-a"
+	firstContext.StagingTarget.AccountFingerprint = "staging-fp-a"
+	firstContext.DeliveryTarget.StorageID = 21
+	firstContext.DeliveryTarget.NodeMountID = "delivery-a"
+	firstContext.DeliveryTarget.AccountFingerprint = "delivery-fp-a"
+
+	secondTask := task
+	secondTask.SourceFileID = "file-2"
+	secondTask.SourceKey = "source-2"
+	secondTask.SubscriptionItemID = task.SubscriptionItemID + 1
+	secondTask.IdempotencyKey = "staging-binding-task-2"
+	secondTask.LogicalTargetPath = "/legacy/episode-2.mkv"
+	secondContext := subscriptionMediaTaskContext(secondTask, "mobile-primary")
+	secondContext.StagingTarget.StorageID = 12
+	secondContext.StagingTarget.NodeMountID = "staging-b"
+	secondContext.StagingTarget.AccountFingerprint = "staging-fp-b"
+	secondContext.DeliveryTarget.StorageID = 21
+	secondContext.DeliveryTarget.NodeMountID = "delivery-a"
+	secondContext.DeliveryTarget.AccountFingerprint = "delivery-fp-a"
+
+	requests := []DispatchMediaJobRequest{
+		{NodeID: "worker-a", TaskContext: firstContext},
+		{NodeID: "worker-a", TaskContext: secondContext},
+	}
+	attachShareSaveBatchContext(requests)
+
+	if requests[0].TaskContext.ShareSaveKey == "" || requests[1].TaskContext.ShareSaveKey == "" {
+		t.Fatalf("share-save keys must be set: %#v", requests)
+	}
 	if requests[0].TaskContext.ShareSaveKey == requests[1].TaskContext.ShareSaveKey {
-		t.Fatalf("different delivery bindings should produce different batch keys: %q", requests[0].TaskContext.ShareSaveKey)
+		t.Fatalf("different staging bindings should produce different batch keys: %q", requests[0].TaskContext.ShareSaveKey)
 	}
 	assertShareSaveObjects(t, requests[0].TaskContext.ShareSaveObjects, []string{"file-1"})
 	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-2"})

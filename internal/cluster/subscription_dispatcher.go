@@ -629,10 +629,6 @@ func shareSaveBatchKey(request DispatchMediaJobRequest) string {
 		fmt.Sprint(context.StagingTarget.StorageID),
 		strings.TrimSpace(context.StagingTarget.NodeMountID),
 		strings.TrimSpace(context.StagingTarget.AccountFingerprint),
-		strings.TrimSpace(context.DeliveryTarget.Provider),
-		fmt.Sprint(context.DeliveryTarget.StorageID),
-		strings.TrimSpace(context.DeliveryTarget.NodeMountID),
-		strings.TrimSpace(context.DeliveryTarget.AccountFingerprint),
 	}, "\x00")
 	return fmt.Sprintf("share-save-batch:%x", sha256Bytes(raw))
 }
