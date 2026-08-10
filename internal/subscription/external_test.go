@@ -34,11 +34,16 @@ func TestNormalizeExternalSubscriptionAcceptsHDHiveSource(t *testing.T) {
 
 func TestProjectExternalSubscriptionStatus(t *testing.T) {
 	tests := []struct {
-		name          string
-		items         []model.SubscriptionItem
-		wantStatus    string
-		wantMessage   string
-		wantCompleted bool
+		name               string
+		items              []model.SubscriptionItem
+		subscriptionStatus string
+		subscriptionError  string
+		requestStatus      string
+		requestMessage     string
+		requestError       string
+		wantStatus         string
+		wantMessage        string
+		wantCompleted      bool
 	}{
 		{
 			name: "failed item overrides discovery success",
@@ -105,28 +110,80 @@ func TestProjectExternalSubscriptionStatus(t *testing.T) {
 			wantMessage:   "saving share failed",
 			wantCompleted: false,
 		},
+		{
+			name:               "request completed cannot complete unknown discovery",
+			subscriptionStatus: "unknown",
+			requestStatus:      "completed",
+			requestMessage:     "completed",
+			wantStatus:         "pending",
+			wantMessage:        "completed",
+			wantCompleted:      false,
+		},
+		{
+			name:               "subscription running fallback remains running",
+			subscriptionStatus: model.SubscriptionStatusRunning,
+			requestStatus:      "completed",
+			requestMessage:     "completed",
+			wantStatus:         "running",
+			wantMessage:        "processing",
+			wantCompleted:      false,
+		},
+		{
+			name:               "subscription failed fallback remains failed",
+			subscriptionStatus: model.SubscriptionStatusFailed,
+			subscriptionError:  "discovery failed",
+			requestStatus:      "completed",
+			requestMessage:     "completed",
+			wantStatus:         "failed",
+			wantMessage:        "discovery failed",
+			wantCompleted:      false,
+		},
+		{
+			name:               "request failed fallback remains failed",
+			subscriptionStatus: model.SubscriptionStatusIdle,
+			requestStatus:      "failed",
+			requestMessage:     "request failed",
+			requestError:       "request failed error",
+			wantStatus:         "failed",
+			wantMessage:        "request failed",
+			wantCompleted:      false,
+		},
 	}
 
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			setupSubscriptionRuntimeDB(t)
+			subscriptionStatus := tc.subscriptionStatus
+			if subscriptionStatus == "" {
+				subscriptionStatus = model.SubscriptionStatusSuccess
+			}
+			requestStatus := tc.requestStatus
+			if requestStatus == "" {
+				requestStatus = "completed"
+			}
+			requestMessage := tc.requestMessage
+			if requestMessage == "" {
+				requestMessage = requestStatus
+			}
 
 			request := &model.ExternalSubscriptionRequest{
 				IdempotencyKey:     t.Name(),
 				LookupKey:          "tv:" + t.Name(),
 				RequestFingerprint: "fingerprint:" + t.Name(),
 				RequestJSON:        "{}",
-				LastStatus:         "completed",
-				LastMessage:        "completed",
+				LastStatus:         requestStatus,
+				LastMessage:        requestMessage,
 				ProgressJSON:       "{}",
 				SeasonsJSON:        "[]",
+				LastError:          tc.requestError,
 			}
 			subscription := &model.Subscription{
 				Name:       t.Name(),
 				MediaType:  "tv",
 				TMDBID:     1399,
-				LastStatus: model.SubscriptionStatusSuccess,
+				LastStatus: subscriptionStatus,
+				LastError:  tc.subscriptionError,
 			}
 			if err := db.CreateExternalSubscriptionRequest(context.Background(), request, subscription); err != nil {
 				t.Fatalf("create external subscription request: %v", err)

@@ -453,8 +453,10 @@ func projectExternalSubscriptionStatus(request *model.ExternalSubscriptionReques
 	}
 	status := strings.ToLower(strings.TrimSpace(request.LastStatus))
 	switch status {
-	case "running", "failed", "completed":
+	case "running", "failed":
 		return status, firstNonEmptyString(request.LastMessage, status)
+	case "completed":
+		return "pending", firstNonEmptyString(request.LastMessage, "queued")
 	default:
 		return "pending", firstNonEmptyString(request.LastMessage, "queued")
 	}
