@@ -21,7 +21,9 @@ import (
 const pan115WebURL = "https://115cdn.com"
 
 const (
-	pan115RequestInterval    = 500 * time.Millisecond
+	// 115 share APIs are sensitive to burst traffic. Keep one process-wide
+	// schedule for all share/list/receive requests and retries.
+	pan115RequestInterval    = time.Second
 	pan115MaxRequestAttempts = 3
 	pan115RetryBaseDelay     = time.Second
 )
