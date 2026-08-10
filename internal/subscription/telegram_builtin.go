@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,9 +23,16 @@ var (
 	builtinTelegramSearch = runBuiltinTelegramSearch
 )
 
+const (
+	builtinTelegramRetryMaxAttempts = 3
+	builtinTelegramRetryInitialWait = 100 * time.Millisecond
+	builtinTelegramRetryMaxWait     = 200 * time.Millisecond
+	builtinTelegramTimeoutMessage   = "telegram request timed out"
+)
+
 func runBuiltinTelegramAuth(ctx context.Context, cfg model.SubscriptionTelegramSourceConfig, action string, payload telegramAuthPayload) (telegramAuthCommandResp, error) {
 	var result telegramAuthCommandResp
-	err := runBuiltinTelegramClient(ctx, cfg, func(ctx context.Context, client *telegram.Client) error {
+	err := runBuiltinTelegramClient(ctx, cfg, false, func(ctx context.Context, client *telegram.Client) error {
 		switch action {
 		case "status":
 			status, err := client.Auth().Status(ctx)
@@ -110,7 +118,7 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 	}
 	perChannelLimit := telegramBuiltinPerChannelLimit(limit, len(channels))
 	var rows []telegramCommandRow
-	err := runBuiltinTelegramClient(ctx, cfg, func(ctx context.Context, client *telegram.Client) error {
+	err := runBuiltinTelegramClient(ctx, cfg, true, func(ctx context.Context, client *telegram.Client) error {
 		status, err := client.Auth().Status(ctx)
 		if err != nil {
 			return formatBuiltinTelegramError(err)
@@ -156,7 +164,7 @@ func telegramBuiltinPerChannelLimit(limit, channelCount int) int {
 	return limit
 }
 
-func runBuiltinTelegramClient(ctx context.Context, cfg model.SubscriptionTelegramSourceConfig, fn func(context.Context, *telegram.Client) error) error {
+func runBuiltinTelegramClient(ctx context.Context, cfg model.SubscriptionTelegramSourceConfig, allowRetry bool, fn func(context.Context, *telegram.Client) error) error {
 	if cfg.APIID <= 0 || strings.TrimSpace(cfg.APIHash) == "" {
 		return errors.New("telegram API ID and API hash are required")
 	}
@@ -176,20 +184,125 @@ func runBuiltinTelegramClient(ctx context.Context, cfg model.SubscriptionTelegra
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := telegram.NewClient(cfg.APIID, cfg.APIHash, telegram.Options{
-		SessionStorage: &session.FileStorage{Path: sessionFile},
-		NoUpdates:      true,
-		Device:         telegram.DeviceTDesktopWindows(),
-	})
-	if err := client.Run(ctx, func(ctx context.Context) error {
-		return fn(ctx, client)
-	}); err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return errors.New("telegram request timed out")
+	return runBuiltinTelegramRetryLoop(ctx, allowRetry, func(ctx context.Context) error {
+		client := telegram.NewClient(cfg.APIID, cfg.APIHash, telegram.Options{
+			SessionStorage: &session.FileStorage{Path: sessionFile},
+			NoUpdates:      true,
+			Device:         telegram.DeviceTDesktopWindows(),
+		})
+		return client.Run(ctx, func(ctx context.Context) error {
+			return fn(ctx, client)
+		})
+	}, sleepBuiltinTelegramRetry)
+}
+
+func runBuiltinTelegramRetryLoop(ctx context.Context, allowRetry bool, run func(context.Context) error, sleep func(context.Context, time.Duration) error) error {
+	var lastErr error
+	for attempt := 1; attempt <= builtinTelegramRetryMaxAttempts; attempt++ {
+		err := run(ctx)
+		if err == nil {
+			return nil
 		}
-		return formatBuiltinTelegramError(err)
+		lastErr = err
+		if !allowRetry || attempt >= builtinTelegramRetryMaxAttempts || !shouldRetryBuiltinTelegramError(err) {
+			return finalizeBuiltinTelegramClientError(ctx, err)
+		}
+		if err := sleep(ctx, builtinTelegramRetryDelay(attempt+1)); err != nil {
+			return finalizeBuiltinTelegramClientError(ctx, err)
+		}
 	}
-	return nil
+	return finalizeBuiltinTelegramClientError(ctx, lastErr)
+}
+
+func builtinTelegramRetryDelay(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 0
+	}
+	delay := builtinTelegramRetryInitialWait
+	for current := 2; current < attempt; current++ {
+		if delay >= builtinTelegramRetryMaxWait {
+			return builtinTelegramRetryMaxWait
+		}
+		delay *= 2
+	}
+	if delay > builtinTelegramRetryMaxWait {
+		return builtinTelegramRetryMaxWait
+	}
+	return delay
+}
+
+func sleepBuiltinTelegramRetry(ctx context.Context, wait time.Duration) error {
+	if wait <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func shouldRetryBuiltinTelegramError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || auth.IsUnauthorized(err) || isBuiltinTelegramPermanentError(err) {
+		return false
+	}
+	if isBuiltinTelegramTimeoutError(err) {
+		return true
+	}
+	var temporary interface{ Temporary() bool }
+	return errors.As(err, &temporary) && temporary.Temporary()
+}
+
+func isBuiltinTelegramTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isBuiltinTelegramPermanentError(err error) bool {
+	switch err.Error() {
+	case "telegram API ID and API hash are required",
+		"telegram session is busy",
+		"Telegram API ID/API hash is invalid",
+		"phone number is invalid",
+		"phone number is banned by Telegram",
+		"verification code requests are too frequent",
+		"verification code expired",
+		"verification code is invalid",
+		"telegram account has two-step verification enabled; password login is not supported yet",
+		"telegram channel username is invalid or not found",
+		"telegram channel is private or not joined",
+		"telegram is not logged in":
+		return true
+	default:
+		return false
+	}
+}
+
+func finalizeBuiltinTelegramClientError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	if isBuiltinTelegramTimeoutError(err) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errors.New(builtinTelegramTimeoutMessage)
+	}
+	return formatBuiltinTelegramError(err)
 }
 
 func defaultTelegramSessionFile(cfg model.SubscriptionTelegramSourceConfig) string {
