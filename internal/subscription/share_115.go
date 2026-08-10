@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
@@ -18,19 +20,66 @@ import (
 
 const pan115WebURL = "https://115cdn.com"
 
+const (
+	pan115RequestInterval    = 500 * time.Millisecond
+	pan115MaxRequestAttempts = 3
+	pan115RetryBaseDelay     = time.Second
+)
+
+var pan115RequestLimiter = newPan115RateLimiter(pan115RequestInterval)
+
+type pan115RateLimiter struct {
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time
+}
+
+func newPan115RateLimiter(interval time.Duration) *pan115RateLimiter {
+	return &pan115RateLimiter{interval: interval}
+}
+
+func (l *pan115RateLimiter) wait(ctx context.Context) error {
+	if l == nil || l.interval <= 0 {
+		return nil
+	}
+	l.mu.Lock()
+	now := time.Now()
+	waitUntil := now
+	if l.next.After(waitUntil) {
+		waitUntil = l.next
+	}
+	l.next = waitUntil.Add(l.interval)
+	l.mu.Unlock()
+
+	if delay := time.Until(waitUntil); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
 const pan115ClusterErrorCodeShareSaveCredentialsInvalid = "share_save_credentials_invalid"
 
 type pan115ShareProvider struct {
-	cfg    model.SubscriptionTelegramPanConfig
-	webURL string
-	client *resty.Client
+	cfg            model.SubscriptionTelegramPanConfig
+	webURL         string
+	client         *resty.Client
+	limiter        *pan115RateLimiter
+	retryBaseDelay time.Duration
 }
 
 func NewPan115ShareProvider(cfg model.SubscriptionTelegramPanConfig) ShareSaver {
 	return &pan115ShareProvider{
-		cfg:    normalizeTelegramPanConfig(cfg),
-		webURL: pan115WebURL,
-		client: newShareHTTPClient(),
+		cfg:            normalizeTelegramPanConfig(cfg),
+		webURL:         pan115WebURL,
+		client:         newShareHTTPClient(),
+		limiter:        pan115RequestLimiter,
+		retryBaseDelay: pan115RetryBaseDelay,
 	}
 }
 
@@ -69,19 +118,21 @@ func (p *pan115ShareProvider) EnsureDir(ctx context.Context, path string) (strin
 
 func (p *pan115ShareProvider) ListShareChildren(ctx context.Context, ref ShareRef, parentID string) ([]ShareItem, error) {
 	var resp pan115SnapResp
-	httpResp, err := p.client.R().
-		SetContext(ctx).
-		SetHeader("Referer", pan115ShareReferer(p.webURL, ref)).
-		SetQueryParams(map[string]string{
-			"share_code":   ref.ShareID,
-			"receive_code": ref.Passcode,
-			"cid":          parentID,
-			"offset":       "0",
-			"limit":        "50",
-			"asc":          "0",
-			"format":       "json",
-		}).
-		Get(p.webURL + "/webapi/share/snap")
+	httpResp, err := p.doRequest(ctx, func() (*resty.Response, error) {
+		return p.client.R().
+			SetContext(ctx).
+			SetHeader("Referer", pan115ShareReferer(p.webURL, ref)).
+			SetQueryParams(map[string]string{
+				"share_code":   ref.ShareID,
+				"receive_code": ref.Passcode,
+				"cid":          parentID,
+				"offset":       "0",
+				"limit":        "50",
+				"asc":          "0",
+				"format":       "json",
+			}).
+			Get(p.webURL + "/webapi/share/snap")
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -116,18 +167,20 @@ func (p *pan115ShareProvider) SaveShareItems(ctx context.Context, ref ShareRef, 
 		return nil, errors.New("115 share item ids are empty")
 	}
 	var resp pan115ReceiveResp
-	httpResp, err := p.client.R().
-		SetContext(ctx).
-		SetHeader("Cookie", p.cfg.Cookie).
-		SetHeader("Origin", p.webURL).
-		SetHeader("Referer", pan115ShareReferer(p.webURL, ref)).
-		SetFormData(map[string]string{
-			"cid":          firstNonEmpty(dstDirID, "0"),
-			"share_code":   ref.ShareID,
-			"receive_code": ref.Passcode,
-			"file_id":      strings.Join(fileIDs, ","),
-		}).
-		Post(p.webURL + "/webapi/share/receive")
+	httpResp, err := p.doRequest(ctx, func() (*resty.Response, error) {
+		return p.client.R().
+			SetContext(ctx).
+			SetHeader("Cookie", p.cfg.Cookie).
+			SetHeader("Origin", p.webURL).
+			SetHeader("Referer", pan115ShareReferer(p.webURL, ref)).
+			SetFormData(map[string]string{
+				"cid":          firstNonEmpty(dstDirID, "0"),
+				"share_code":   ref.ShareID,
+				"receive_code": ref.Passcode,
+				"file_id":      strings.Join(fileIDs, ","),
+			}).
+			Post(p.webURL + "/webapi/share/receive")
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +191,98 @@ func (p *pan115ShareProvider) SaveShareItems(ctx context.Context, ref ShareRef, 
 		return nil, pan115Error(resp.Error)
 	}
 	return []string{"pan115_sync_" + ref.ShareID}, nil
+}
+
+func (p *pan115ShareProvider) doRequest(ctx context.Context, request func() (*resty.Response, error)) (*resty.Response, error) {
+	if p == nil || p.client == nil {
+		return nil, errors.New("115 HTTP client is not initialized")
+	}
+	var lastErr error
+	for attempt := 0; attempt < pan115MaxRequestAttempts; attempt++ {
+		if err := p.limiter.wait(ctx); err != nil {
+			return nil, err
+		}
+		response, err := request()
+		if !pan115ShouldRetryResponse(ctx, response, err) {
+			return response, err
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = errors.Errorf("115 request temporarily unavailable: status=%d", response.StatusCode())
+		}
+		if attempt+1 == pan115MaxRequestAttempts {
+			if response != nil && pan115ResponseKind(response.Header().Get("Content-Type"), response.Body()) == "html" {
+				return response, nil
+			}
+			return nil, lastErr
+		}
+		if err := waitPan115Retry(ctx, p.retryDelay(attempt, response)); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func pan115ShouldRetryResponse(ctx context.Context, response *resty.Response, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	if response == nil {
+		return true
+	}
+	status := response.StatusCode()
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError ||
+		pan115ResponseKind(response.Header().Get("Content-Type"), response.Body()) == "html"
+}
+
+func (p *pan115ShareProvider) retryDelay(attempt int, response *resty.Response) time.Duration {
+	if response != nil {
+		if delay := parsePan115RetryAfter(response.Header().Get("Retry-After")); delay > 0 {
+			return delay
+		}
+	}
+	base := p.retryBaseDelay
+	if base <= 0 {
+		return 0
+	}
+	if attempt > 5 {
+		attempt = 5
+	}
+	return base * time.Duration(1<<attempt)
+}
+
+func waitPan115Retry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func parsePan115RetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(when); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 func (p *pan115ShareProvider) WaitSaveComplete(ctx context.Context, taskIDs []string) error {

@@ -84,7 +84,8 @@ func ReconcileUnknownJobs(ctx context.Context, opts RunnerOptions) (int, error) 
 	}
 	var jobs []model.ETFSubscriptionJob
 	if err := database.WithContext(ctx).
-		Where("status = ? AND type = ?", model.ETFSubscriptionJobStatusUnknown, model.ETFSubscriptionJobTypeCreate).
+		Where("status = ? AND type = ? AND (next_retry_at IS NULL OR next_retry_at <= ?)",
+			model.ETFSubscriptionJobStatusUnknown, model.ETFSubscriptionJobTypeCreate, opts.Now).
 		Order("updated_at ASC").
 		Limit(opts.Limit).
 		Find(&jobs).Error; err != nil {
@@ -100,7 +101,14 @@ func ReconcileUnknownJobs(ctx context.Context, opts RunnerOptions) (int, error) 
 		client := NewTargetClient(job.TargetBaseURL, job.TargetAPIToken, opts.HTTPClient, opts.Timeout)
 		lookup, err := client.LookupSubscription(ctx, root.MediaType, root.TMDBID)
 		if err != nil {
-			return reconciled, err
+			delay := unknownReconcileBackoff(job.Attempts, opts.RetryDelay)
+			if retryAfter := targetHTTPRetryAfter(err); retryAfter > delay {
+				delay = retryAfter
+			}
+			if err := deferUnknownJob(ctx, job.ID, err, opts.Now, delay); err != nil {
+				return reconciled, err
+			}
+			continue
 		}
 		if lookup.Exists {
 			if err := MarkCreateSubscriptionSucceeded(ctx, job.ID, CreateSubscriptionResult{
@@ -119,9 +127,55 @@ func ReconcileUnknownJobs(ctx context.Context, opts RunnerOptions) (int, error) 
 				return reconciled, err
 			}
 			reconciled++
+			continue
+		}
+		if err := deferUnknownJob(ctx, job.ID,
+			errors.New("target subscription was not found; automatic retry is disabled because the target does not support idempotency"),
+			opts.Now, unknownJobManualReviewDelay); err != nil {
+			return reconciled, err
 		}
 	}
 	return reconciled, nil
+}
+
+const unknownJobManualReviewDelay = 24 * time.Hour
+
+func unknownReconcileBackoff(attempts int, base time.Duration) time.Duration {
+	if base <= 0 {
+		base = 30 * time.Second
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+	shift := attempts - 1
+	if shift > 6 {
+		shift = 6
+	}
+	delay := base * time.Duration(1<<shift)
+	if delay > time.Hour {
+		return time.Hour
+	}
+	return delay
+}
+
+func deferUnknownJob(ctx context.Context, jobID uint, cause error, now time.Time, delay time.Duration) error {
+	if cause == nil {
+		cause = errors.New("unknown target delivery outcome")
+	}
+	nextRetryAt := now.Add(delay)
+	return db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job model.ETFSubscriptionJob
+		if err := tx.First(&job, "id = ? AND status = ?", jobID, model.ETFSubscriptionJobStatusUnknown).Error; err != nil {
+			return err
+		}
+		job.Attempts++
+		job.NextRetryAt = &nextRetryAt
+		job.LastError = cause.Error()
+		if err := tx.Save(&job).Error; err != nil {
+			return err
+		}
+		return updateClusterJobNotificationStatus(tx, job.ClusterJobIDsJSON, model.ClusterNotificationStatusUnknown)
+	})
 }
 
 func retryUnknownJobTx(ctx context.Context, jobID uint) error {

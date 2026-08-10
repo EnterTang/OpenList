@@ -96,6 +96,34 @@ func TestPan115ShareProviderListsChildren(t *testing.T) {
 	}
 }
 
+func TestPan115ShareProviderRetriesRateLimitedResponse(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate limit exceeded"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"state":true,"data":{"count":0,"list":[]}}`))
+	}))
+	defer server.Close()
+
+	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1;CID=2"}).(*pan115ShareProvider)
+	provider.webURL = server.URL
+	provider.limiter = newPan115RateLimiter(0)
+	provider.retryBaseDelay = 0
+	ref := ShareRef{Provider: ShareProviderPan115, RawURL: server.URL + "/s/share?password=code", ShareID: "share", Passcode: "code"}
+
+	items, err := provider.ListShareChildren(context.Background(), ref, "")
+	if err != nil {
+		t.Fatalf("list children after rate limit: %v", err)
+	}
+	if len(items) != 0 || requestCount != 2 {
+		t.Fatalf("items=%#v request count=%d, want one retry and empty result", items, requestCount)
+	}
+}
+
 func TestPan115FileShareItemAcceptsNumberAndStringIDs(t *testing.T) {
 	t.Run("string ids", func(t *testing.T) {
 		var file pan115File

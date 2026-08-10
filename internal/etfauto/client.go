@@ -59,6 +59,24 @@ func IsDeliveryUncertain(err error) bool {
 	return errors.As(err, &target)
 }
 
+type targetHTTPError struct {
+	statusCode int
+	body       string
+	retryAfter time.Duration
+}
+
+func (e *targetHTTPError) Error() string {
+	return fmt.Sprintf("target service returned %d: %s", e.statusCode, e.body)
+}
+
+func targetHTTPRetryAfter(err error) time.Duration {
+	var targetErr *targetHTTPError
+	if errors.As(err, &targetErr) {
+		return targetErr.retryAfter
+	}
+	return 0
+}
+
 func NewTargetClient(baseURL, apiToken string, httpClient *http.Client, timeout time.Duration) *TargetClient {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	apiToken = strings.TrimSpace(apiToken)
@@ -204,13 +222,33 @@ func (c *TargetClient) do(req *http.Request) ([]byte, error) {
 		return nil, &DeliveryUncertainError{Err: readErr}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("target service returned %d: %s", resp.StatusCode, string(raw))
+		err := &targetHTTPError{
+			statusCode: resp.StatusCode,
+			body:       string(raw),
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 		if resp.StatusCode >= 500 {
 			return nil, &DeliveryUncertainError{Err: err}
 		}
 		return nil, err
 	}
 	return raw, nil
+}
+
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(when); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 func parseTargetTaskResult(raw []byte) (*TargetTaskResult, error) {

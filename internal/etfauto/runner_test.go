@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -349,6 +350,102 @@ func TestProcessOnceReconcilesUnknownCreateByLookupWithoutAnotherPost(t *testing
 	}
 	if clusterJob.NotificationStatus != model.ClusterNotificationStatusSucceeded {
 		t.Fatalf("cluster notification = %q", clusterJob.NotificationStatus)
+	}
+}
+
+func TestProcessOnceDefersUnknownLookupRateLimit(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	lookupRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lookupRequests++
+		http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	root := model.ETFMediaRoot{
+		RootKey: "unknown-rate-limit", MediaType: "tv", TMDBID: 308874,
+		Status: model.ETFMediaRootStatusCollecting, TargetBaseURL: server.URL + "/api/v1",
+	}
+	if err := db.GetDb().Create(&root).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := model.ETFSubscriptionJob{
+		JobKey: "notification-unknown-rate-limit", MediaRootID: root.ID,
+		Type: model.ETFSubscriptionJobTypeCreate, Status: model.ETFSubscriptionJobStatusUnknown,
+		TargetBaseURL: root.TargetBaseURL, Attempts: 1,
+	}
+	if err := db.GetDb().Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := ProcessOnce(ctx, RunnerOptions{
+		HTTPClient: server.Client(), RetryDelay: 15 * time.Second, Now: now,
+	})
+	if err != nil {
+		t.Fatalf("process once: %v", err)
+	}
+	if result.ReconciledUnknown != 0 || lookupRequests != 1 {
+		t.Fatalf("result=%#v lookup requests=%d, want deferred lookup", result, lookupRequests)
+	}
+	if err := db.GetDb().First(&job, job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ETFSubscriptionJobStatusUnknown || job.Attempts != 2 || job.NextRetryAt == nil {
+		t.Fatalf("job=%#v, want deferred unknown job", job)
+	}
+	if want := now.Add(15 * time.Second); !job.NextRetryAt.Equal(want) {
+		t.Fatalf("next retry at = %s, want %s", job.NextRetryAt, want)
+	}
+
+	result, err = ProcessOnce(ctx, RunnerOptions{
+		HTTPClient: server.Client(), RetryDelay: 15 * time.Second, Now: now.Add(10 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("process before retry window: %v", err)
+	}
+	if result.ReconciledUnknown != 0 || lookupRequests != 1 {
+		t.Fatalf("result=%#v lookup requests=%d, want no early retry", result, lookupRequests)
+	}
+}
+
+func TestProcessOnceDefersMissingUnknownNonIdempotentJobForManualReview(t *testing.T) {
+	setupETFSubscriptionDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"exists": false})
+	}))
+	defer server.Close()
+
+	root := model.ETFMediaRoot{
+		RootKey: "unknown-manual-review", MediaType: "movie", TMDBID: 12345,
+		Status: model.ETFMediaRootStatusCollecting, TargetBaseURL: server.URL + "/api/v1",
+	}
+	if err := db.GetDb().Create(&root).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := model.ETFSubscriptionJob{
+		JobKey: "notification-unknown-manual-review", MediaRootID: root.ID,
+		Type: model.ETFSubscriptionJobTypeCreate, Status: model.ETFSubscriptionJobStatusUnknown,
+		TargetBaseURL: root.TargetBaseURL,
+	}
+	if err := db.GetDb().Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ReconcileUnknownJobs(ctx, RunnerOptions{HTTPClient: server.Client(), Now: now}); err != nil {
+		t.Fatalf("reconcile unknown jobs: %v", err)
+	}
+	if err := db.GetDb().First(&job, job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.NextRetryAt == nil || !job.NextRetryAt.Equal(now.Add(unknownJobManualReviewDelay)) {
+		t.Fatalf("job next retry at = %v, want manual review delay", job.NextRetryAt)
+	}
+	if !strings.Contains(job.LastError, "automatic retry is disabled") {
+		t.Fatalf("job last error = %q, want manual-review explanation", job.LastError)
 	}
 }
 
