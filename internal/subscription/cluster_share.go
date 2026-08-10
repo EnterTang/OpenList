@@ -13,6 +13,14 @@ import (
 // only the file IDs assigned to one cluster media task. It returns the local
 // OpenList paths inside the worker's provider staging mount.
 func SaveClusterShareSelection(ctx context.Context, rawURL, passcode, tempRoot string, selectedFileIDs []string) ([]string, error) {
+	return SaveClusterShareSelectionBatch(ctx, rawURL, passcode, tempRoot, selectedFileIDs)
+}
+
+// SaveClusterShareSelectionBatch reuses the subscription share providers to save
+// a batch of file IDs assigned to one cluster media task with a single share
+// tree walk. It returns the local OpenList paths inside the worker's provider
+// staging mount.
+func SaveClusterShareSelectionBatch(ctx context.Context, rawURL, passcode, tempRoot string, selectedFileIDs []string) ([]string, error) {
 	ref, err := ParseShareURL(rawURL)
 	if err != nil {
 		return nil, err

@@ -71,6 +71,9 @@ func saveSharePairsToTemp(ctx context.Context, provider ShareSaver, ref ShareRef
 	if len(pairs) == 0 {
 		return nil, nil
 	}
+	if provider.Name() == ShareProviderPan115 && opts.Flatten {
+		return savePan115SharePairsToTemp(ctx, provider, ref, pairs, opts)
+	}
 	dstDirID, err := provider.EnsureDir(ctx, tempRoot)
 	if err != nil {
 		return nil, err
@@ -108,6 +111,30 @@ func saveSharePairsToTemp(ctx context.Context, provider ShareSaver, ref ShareRef
 			if err := provider.WaitSaveComplete(ctx, taskIDs); err != nil {
 				return selected, err
 			}
+		}
+	}
+	return selected, nil
+}
+
+func savePan115SharePairsToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, pairs []shareTreePair, opts SaveShareOptions) ([]TreeEntry, error) {
+	tempRoot := cleanConfigPath(opts.TempRoot)
+	dstDirID, err := provider.EnsureDir(ctx, tempRoot)
+	if err != nil {
+		return nil, err
+	}
+	selected := make([]TreeEntry, 0, len(pairs))
+	items := make([]ShareItem, 0, len(pairs))
+	for _, pair := range pairs {
+		selected = append(selected, pair.entry)
+		items = append(items, pair.item)
+	}
+	taskIDs, err := provider.SaveShareItems(ctx, ref, "", items, dstDirID)
+	if err != nil {
+		return selected, err
+	}
+	if len(taskIDs) > 0 {
+		if err := provider.WaitSaveComplete(ctx, taskIDs); err != nil {
+			return selected, err
 		}
 	}
 	return selected, nil
