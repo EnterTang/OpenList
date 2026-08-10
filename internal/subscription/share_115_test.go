@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,7 +10,39 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/go-resty/resty/v2"
 )
+
+func TestDecodePan115JSON_ReportsHTTPMetadataForHTMLResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("\n<html><body>login required token=secret-value</body></html>"))
+	}))
+	defer server.Close()
+
+	resp, err := resty.New().R().Get(server.URL)
+	if err != nil {
+		t.Fatalf("get response: %v", err)
+	}
+
+	var out map[string]any
+	err = decodePan115JSON(resp, &out)
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"decode 115 response", "status=403", "content-type=text/html", "kind=html", "body_len="} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error = %q, want substring %q", msg, want)
+		}
+	}
+	for _, forbidden := range []string{"login required", "secret-value", "<html>"} {
+		if strings.Contains(msg, forbidden) {
+			t.Fatalf("error = %q, should not include response body secret %q", msg, forbidden)
+		}
+	}
+}
 
 func TestPan115ShareProviderListsChildren(t *testing.T) {
 	var snapCalled bool
@@ -28,7 +61,7 @@ func TestPan115ShareProviderListsChildren(t *testing.T) {
 				"state":true,
 				"data":{"count":2,"list":[
 					{"fid":"file-1","cid":"0","n":"Movie.mkv","s":1024,"t":"1700000000","ico":"mkv"},
-					{"cid":"dir-1","n":"Season 1","t":"1700000001"}
+					{"cid":1001,"n":"Season 1","t":"1700000001"}
 				]}
 			}`))
 		default:
@@ -57,9 +90,35 @@ func TestPan115ShareProviderListsChildren(t *testing.T) {
 	if items[0].Size != 1024 || !items[0].Modified.Equal(time.Unix(1700000000, 0)) {
 		t.Fatalf("file metadata = %#v", items[0])
 	}
-	if items[1].ID != "dir-1" || !items[1].IsDir {
+	if items[1].ID != "1001" || items[1].ParentID != "0" || !items[1].IsDir {
 		t.Fatalf("dir item = %#v", items[1])
 	}
+}
+
+func TestPan115FileShareItemAcceptsNumberAndStringIDs(t *testing.T) {
+	t.Run("string ids", func(t *testing.T) {
+		var file pan115File
+		if err := json.Unmarshal([]byte(`{"fid":"file-1","cid":"0","n":"Movie.mkv","s":1024,"t":"1700000000"}`), &file); err != nil {
+			t.Fatalf("unmarshal string ids: %v", err)
+		}
+
+		item := file.shareItem("")
+		if item.ID != "file-1" || item.ParentID != "0" || item.IsDir {
+			t.Fatalf("string-id item = %#v", item)
+		}
+	})
+
+	t.Run("numeric ids", func(t *testing.T) {
+		var dir pan115File
+		if err := json.Unmarshal([]byte(`{"cid":123,"n":"Season 1","t":"1700000001"}`), &dir); err != nil {
+			t.Fatalf("unmarshal numeric ids: %v", err)
+		}
+
+		item := dir.shareItem("")
+		if item.ID != "123" || item.ParentID != "0" || !item.IsDir {
+			t.Fatalf("numeric-id item = %#v", item)
+		}
+	})
 }
 
 func TestPan115ShareProviderSavesItems(t *testing.T) {

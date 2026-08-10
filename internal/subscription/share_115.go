@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"strconv"
 	"strings"
 	"time"
@@ -153,7 +154,15 @@ func decodePan115JSON(resp *resty.Response, out any) error {
 		return errors.New("empty 115 response")
 	}
 	if err := json.Unmarshal(resp.Body(), out); err != nil {
-		return errors.WithMessage(err, "decode 115 response")
+		contentType := strings.TrimSpace(resp.Header().Get("Content-Type"))
+		return errors.Wrapf(err,
+			"decode 115 response: status=%d content-type=%s body_len=%d first_non_space=%q kind=%s",
+			resp.StatusCode(),
+			firstNonEmpty(contentType, "unknown"),
+			len(resp.Body()),
+			pan115FirstNonSpace(resp.Body()),
+			pan115ResponseKind(contentType, resp.Body()),
+		)
 	}
 	return nil
 }
@@ -174,13 +183,41 @@ type pan115SnapResp struct {
 	} `json:"data"`
 }
 
+type pan115ID string
+
+func (id *pan115ID) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*id = ""
+		return nil
+	}
+	if strings.HasPrefix(trimmed, `"`) {
+		var value string
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		*id = pan115ID(strings.TrimSpace(value))
+		return nil
+	}
+	var value json.Number
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*id = pan115ID(value.String())
+	return nil
+}
+
+func (id pan115ID) String() string {
+	return string(id)
+}
+
 type pan115File struct {
-	FID      json.Number `json:"fid"`
-	CID      json.Number `json:"cid"`
-	Name     string      `json:"n"`
-	Size     int64       `json:"s"`
-	UpdateAt string      `json:"t"`
-	Icon     string      `json:"ico"`
+	FID      pan115ID `json:"fid"`
+	CID      pan115ID `json:"cid"`
+	Name     string   `json:"n"`
+	Size     int64    `json:"s"`
+	UpdateAt string   `json:"t"`
+	Icon     string   `json:"ico"`
 }
 
 func (f pan115File) shareItem(parentID string) ShareItem {
@@ -227,6 +264,37 @@ func parsePan115Time(value string) time.Time {
 		return parsed
 	}
 	return time.Time{}
+}
+
+func pan115FirstNonSpace(body []byte) string {
+	for _, b := range body {
+		if b <= ' ' {
+			continue
+		}
+		return string([]byte{b})
+	}
+	return ""
+}
+
+func pan115ResponseKind(contentType string, body []byte) string {
+	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil {
+		switch mediaType {
+		case "application/json", "text/json":
+			return "json"
+		case "text/html", "application/xhtml+xml":
+			return "html"
+		}
+	}
+	switch pan115FirstNonSpace(body) {
+	case "{", "[":
+		return "json"
+	case "<":
+		return "html"
+	case "":
+		return "empty"
+	default:
+		return "text"
+	}
 }
 
 var _ ShareSaver = (*pan115ShareProvider)(nil)
