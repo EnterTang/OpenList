@@ -596,23 +596,94 @@ func sha256Bytes(value string) []byte {
 }
 
 func attachShareSaveBatchContext(requests []DispatchMediaJobRequest) {
-	groups := make(map[string][]int, len(requests))
+	baseGroups := make(map[string][]int, len(requests))
 	for i := range requests {
 		context := &requests[i].TaskContext
 		if !context.StagingTarget.NeedShareSave || len(context.SourceObjects) == 0 {
 			continue
 		}
-		key := shareSaveBatchKey(requests[i])
-		context.ShareSaveKey = key
-		groups[key] = append(groups[key], i)
+		baseKey := shareSaveBatchKey(requests[i])
+		baseGroups[baseKey] = append(baseGroups[baseKey], i)
 	}
-	for key, indexes := range groups {
-		objects := shareSaveBatchObjects(requests, indexes)
-		for _, index := range indexes {
-			requests[index].TaskContext.ShareSaveKey = key
-			requests[index].TaskContext.ShareSaveObjects = append([]protocol.SourceObject(nil), objects...)
+	for baseKey, indexes := range baseGroups {
+		for key, partitionIndexes := range shareSaveBatchPartitions(requests, baseKey, indexes) {
+			objects := shareSaveBatchObjects(requests, partitionIndexes)
+			for _, index := range partitionIndexes {
+				requests[index].TaskContext.ShareSaveKey = key
+				requests[index].TaskContext.ShareSaveObjects = append([]protocol.SourceObject(nil), objects...)
+			}
 		}
 	}
+}
+
+func shareSaveBatchPartitions(requests []DispatchMediaJobRequest, baseKey string, indexes []int) map[string][]int {
+	partitions := make(map[string][]int, len(indexes))
+	collisionKeys := shareSaveBatchCollisionKeys(requests, baseKey, indexes)
+	for _, index := range indexes {
+		key := baseKey
+		for _, object := range requests[index].TaskContext.SourceObjects {
+			if collisionKey, ok := collisionKeys[protocol.ShareSaveObjectIdentityKey(object)]; ok {
+				key = collisionKey
+				break
+			}
+		}
+		partitions[key] = append(partitions[key], index)
+	}
+	return partitions
+}
+
+func shareSaveBatchCollisionKeys(requests []DispatchMediaJobRequest, baseKey string, indexes []int) map[string]string {
+	byIdentity := shareSaveBatchCanonicalObjectsByIdentity(requests, indexes)
+	identitiesByBasename := make(map[string][]string, len(byIdentity))
+	for identity, object := range byIdentity {
+		basename := path.Base(strings.TrimSpace(object.SourceRelativePath))
+		identitiesByBasename[basename] = append(identitiesByBasename[basename], identity)
+	}
+	collisionKeys := make(map[string]string)
+	for _, identities := range identitiesByBasename {
+		if len(identities) < 2 {
+			continue
+		}
+		sort.Strings(identities)
+		for _, identity := range identities {
+			collisionKeys[identity] = shareSaveBatchCollisionKey(baseKey, identity)
+		}
+	}
+	return collisionKeys
+}
+
+func shareSaveBatchCollisionKey(baseKey, identity string) string {
+	return fmt.Sprintf("share-save-batch:%x", sha256Bytes(strings.Join([]string{
+		baseKey,
+		"collision",
+		identity,
+	}, "\x00")))
+}
+
+func shareSaveBatchCanonicalObjectsByIdentity(requests []DispatchMediaJobRequest, indexes []int) map[string]protocol.SourceObject {
+	byIdentity := make(map[string]protocol.SourceObject, len(indexes))
+	for _, index := range indexes {
+		for _, object := range requests[index].TaskContext.SourceObjects {
+			identity := protocol.ShareSaveObjectIdentityKey(object)
+			canonical, exists := byIdentity[identity]
+			if !exists || shareSaveBatchObjectCanonicalKey(object) < shareSaveBatchObjectCanonicalKey(canonical) {
+				byIdentity[identity] = object
+			}
+		}
+	}
+	return byIdentity
+}
+
+func shareSaveBatchObjects(requests []DispatchMediaJobRequest, indexes []int) []protocol.SourceObject {
+	byIdentity := shareSaveBatchCanonicalObjectsByIdentity(requests, indexes)
+	objects := make([]protocol.SourceObject, 0, len(byIdentity))
+	for _, object := range byIdentity {
+		objects = append(objects, object)
+	}
+	sort.SliceStable(objects, func(i, j int) bool {
+		return protocol.ShareSaveObjectIdentityKey(objects[i]) < protocol.ShareSaveObjectIdentityKey(objects[j])
+	})
+	return objects
 }
 
 func shareSaveBatchKey(request DispatchMediaJobRequest) string {
@@ -631,27 +702,6 @@ func shareSaveBatchKey(request DispatchMediaJobRequest) string {
 		strings.TrimSpace(context.StagingTarget.AccountFingerprint),
 	}, "\x00")
 	return fmt.Sprintf("share-save-batch:%x", sha256Bytes(raw))
-}
-
-func shareSaveBatchObjects(requests []DispatchMediaJobRequest, indexes []int) []protocol.SourceObject {
-	byIdentity := make(map[string]protocol.SourceObject, len(indexes))
-	for _, index := range indexes {
-		for _, object := range requests[index].TaskContext.SourceObjects {
-			identity := protocol.ShareSaveObjectIdentityKey(object)
-			canonical, exists := byIdentity[identity]
-			if !exists || shareSaveBatchObjectCanonicalKey(object) < shareSaveBatchObjectCanonicalKey(canonical) {
-				byIdentity[identity] = object
-			}
-		}
-	}
-	objects := make([]protocol.SourceObject, 0, len(byIdentity))
-	for _, object := range byIdentity {
-		objects = append(objects, object)
-	}
-	sort.SliceStable(objects, func(i, j int) bool {
-		return protocol.ShareSaveObjectIdentityKey(objects[i]) < protocol.ShareSaveObjectIdentityKey(objects[j])
-	})
-	return objects
 }
 
 func shareSaveBatchObjectCanonicalKey(object protocol.SourceObject) string {

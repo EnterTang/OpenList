@@ -298,6 +298,7 @@ func TestAttachShareSaveBatchContext_MergesAcrossDeliveryBinding(t *testing.T) {
 	task := validProviderPipelineTask(20 << 30)
 	task.SharePasscode = "2468"
 	task.ShareRefFingerprint = "share-ref-1"
+	task.SourceRelativePath = "Season 01/episode-1.mkv"
 
 	firstContext := subscriptionMediaTaskContext(task, "mobile-primary")
 	firstContext.StagingTarget.StorageID = 11
@@ -312,6 +313,7 @@ func TestAttachShareSaveBatchContext_MergesAcrossDeliveryBinding(t *testing.T) {
 	secondTask.SourceKey = "source-2"
 	secondTask.SubscriptionItemID = task.SubscriptionItemID + 1
 	secondTask.IdempotencyKey = "delivery-binding-task-2"
+	secondTask.SourceRelativePath = "Season 02/episode-2.mkv"
 	secondTask.LogicalTargetPath = "/legacy/episode-2.mkv"
 	secondContext := subscriptionMediaTaskContext(secondTask, "mobile-primary")
 	secondContext.StagingTarget.StorageID = 11
@@ -335,6 +337,51 @@ func TestAttachShareSaveBatchContext_MergesAcrossDeliveryBinding(t *testing.T) {
 	}
 	assertShareSaveObjects(t, requests[0].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
 	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
+}
+
+func TestAttachShareSaveBatchContext_SeparatesCollidingBasenamesAcrossDeliveryBinding(t *testing.T) {
+	task := validProviderPipelineTask(20 << 30)
+	task.SharePasscode = "2468"
+	task.ShareRefFingerprint = "share-ref-1"
+	task.SourceRelativePath = "Season 01/episode.mkv"
+
+	firstContext := subscriptionMediaTaskContext(task, "mobile-primary")
+	firstContext.StagingTarget.StorageID = 11
+	firstContext.StagingTarget.NodeMountID = "staging-a"
+	firstContext.StagingTarget.AccountFingerprint = "staging-fp"
+	firstContext.DeliveryTarget.StorageID = 21
+	firstContext.DeliveryTarget.NodeMountID = "delivery-a"
+	firstContext.DeliveryTarget.AccountFingerprint = "delivery-fp-a"
+
+	secondTask := task
+	secondTask.SourceFileID = "file-2"
+	secondTask.SourceKey = "source-2"
+	secondTask.SubscriptionItemID = task.SubscriptionItemID + 1
+	secondTask.IdempotencyKey = "delivery-binding-collision-task-2"
+	secondTask.SourceRelativePath = "Season 02/episode.mkv"
+	secondTask.LogicalTargetPath = "/legacy/episode-copy.mkv"
+	secondContext := subscriptionMediaTaskContext(secondTask, "mobile-primary")
+	secondContext.StagingTarget.StorageID = 11
+	secondContext.StagingTarget.NodeMountID = "staging-a"
+	secondContext.StagingTarget.AccountFingerprint = "staging-fp"
+	secondContext.DeliveryTarget.StorageID = 22
+	secondContext.DeliveryTarget.NodeMountID = "delivery-b"
+	secondContext.DeliveryTarget.AccountFingerprint = "delivery-fp-b"
+
+	requests := []DispatchMediaJobRequest{
+		{NodeID: "worker-a", TaskContext: firstContext},
+		{NodeID: "worker-a", TaskContext: secondContext},
+	}
+	attachShareSaveBatchContext(requests)
+
+	if requests[0].TaskContext.ShareSaveKey == "" || requests[1].TaskContext.ShareSaveKey == "" {
+		t.Fatalf("share-save keys must be set: %#v", requests)
+	}
+	if requests[0].TaskContext.ShareSaveKey == requests[1].TaskContext.ShareSaveKey {
+		t.Fatalf("colliding basenames across delivery bindings should not share one batch key: %q", requests[0].TaskContext.ShareSaveKey)
+	}
+	assertShareSaveObjects(t, requests[0].TaskContext.ShareSaveObjects, []string{"file-1"})
+	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-2"})
 }
 
 func TestAttachShareSaveBatchContext_SeparatesByStagingBinding(t *testing.T) {
@@ -384,6 +431,7 @@ func TestAttachShareSaveBatchContext_MergesAcrossTargetProfileAliases(t *testing
 	task := validProviderPipelineTask(20 << 30)
 	task.SharePasscode = "2468"
 	task.ShareRefFingerprint = "share-ref-1"
+	task.SourceRelativePath = "Season 01/episode-1.mkv"
 
 	firstContext := subscriptionMediaTaskContext(task, "mobile-primary")
 	firstContext.StagingTarget.StorageID = 11
@@ -398,6 +446,7 @@ func TestAttachShareSaveBatchContext_MergesAcrossTargetProfileAliases(t *testing
 	secondTask.SourceKey = "source-2"
 	secondTask.SubscriptionItemID = task.SubscriptionItemID + 1
 	secondTask.IdempotencyKey = "target-profile-alias-task-2"
+	secondTask.SourceRelativePath = "Season 02/episode-2.mkv"
 	secondTask.LogicalTargetPath = "/legacy/episode-2.mkv"
 	secondContext := subscriptionMediaTaskContext(secondTask, "mobile-secondary-alias")
 	secondContext.StagingTarget.StorageID = 11
