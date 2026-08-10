@@ -156,6 +156,80 @@ func TestDispatchSubscriptionMedia_AttachesSameShareSaveBatchToSiblingTasks(t *t
 	assertShareSaveObjects(t, offerTwo.TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
 }
 
+func TestDispatchSubscriptionMedia_PreflightFailsWithoutCoordinatorOrConnectedWorker(t *testing.T) {
+	task := validProviderPipelineTask(20 << 30)
+
+	for _, tt := range []struct {
+		name      string
+		runtime   *Runtime
+		wantError string
+	}{
+		{
+			name:      "coordinator disabled",
+			runtime:   &Runtime{},
+			wantError: "cluster coordinator is disabled",
+		},
+		{
+			name:      "no connected worker",
+			runtime:   &Runtime{dispatchTransport: &providerPipelineTransport{}},
+			wantError: "no cluster worker is connected",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			database := openClusterRuntimeTestDB(t)
+			configureProviderPipelineDB(t, database)
+
+			results, err := (subscriptionDispatcher{runtime: tt.runtime}).DispatchSubscriptionMedia(t.Context(), []subscription.ClusterMediaTask{task})
+			if err == nil || err.Error() != tt.wantError {
+				t.Fatalf("dispatch error = %v, want %q", err, tt.wantError)
+			}
+			if results != nil {
+				t.Fatalf("dispatch results = %#v, want nil on preflight failure", results)
+			}
+			assertProviderPipelineCount(t, database, &model.ClusterJob{}, 0)
+			assertProviderPipelineCount(t, database, &model.ClusterJobAttempt{}, 0)
+			assertProviderPipelineCount(t, database, &model.ClusterOutbox{}, 0)
+		})
+	}
+}
+
+func TestDispatchSubscriptionMedia_PreflightRejectsPartialBatchWhenAnyTaskHasNoCompatibleWorker(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	configureProviderPipelineDB(t, database)
+	createProviderPipelineInventory(t, database, "worker-a", preferredWorkerTestAccounts(500))
+
+	transport := &providerPipelineTransport{nodes: []string{"worker-a"}}
+	dispatcher := subscriptionDispatcher{runtime: &Runtime{dispatchTransport: transport}}
+
+	assignable := validProviderPipelineTask(20 << 30)
+	assignable.IdempotencyKey = "preflight-ok"
+	assignable.SubscriptionItemID = 401
+	assignable.SourceKey = "source-ok"
+	assignable.SourceFileID = "file-ok"
+
+	incompatible := validProviderPipelineTask(600 << 30)
+	incompatible.IdempotencyKey = "preflight-incompatible"
+	incompatible.SubscriptionItemID = 402
+	incompatible.SourceKey = "source-incompatible"
+	incompatible.SourceFileID = "file-incompatible"
+	incompatible.LogicalTargetPath = "/legacy/episode-2.mkv"
+
+	results, err := dispatcher.DispatchSubscriptionMedia(t.Context(), []subscription.ClusterMediaTask{assignable, incompatible})
+	wantError := `subscription media task "source-incompatible" has no connected compatible cluster worker`
+	if err == nil || err.Error() != wantError {
+		t.Fatalf("dispatch error = %v, want %q", err, wantError)
+	}
+	if results != nil {
+		t.Fatalf("dispatch results = %#v, want nil when preflight rejects the batch", results)
+	}
+	if len(transport.sent) != 0 {
+		t.Fatalf("transport sent = %#v, want zero worker offers on preflight failure", transport.sent)
+	}
+	assertProviderPipelineCount(t, database, &model.ClusterJob{}, 0)
+	assertProviderPipelineCount(t, database, &model.ClusterJobAttempt{}, 0)
+	assertProviderPipelineCount(t, database, &model.ClusterOutbox{}, 0)
+}
+
 func TestDispatchSubscriptionMedia_SeparatesShareSaveBatchByShareAndTarget(t *testing.T) {
 	database := openClusterRuntimeTestDB(t)
 	configureProviderPipelineDB(t, database)

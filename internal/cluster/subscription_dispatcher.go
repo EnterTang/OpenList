@@ -35,6 +35,13 @@ type dispatchTarget struct {
 	match              nodeProviderAccountMatch
 }
 
+type plannedSubscriptionDispatch struct {
+	taskIndex     int
+	nodeID        string
+	targetProfile string
+	match         nodeProviderAccountMatch
+}
+
 func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context, task subscription.ClusterInspectTask) (string, error) {
 	job, err := d.runtime.DispatchShareInspect(ctx, DispatchShareInspectRequest{
 		IdempotencyKey: task.IdempotencyKey,
@@ -284,27 +291,23 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	if d.runtime == nil || len(tasks) == 0 {
 		return nil, errors.New("cluster subscription dispatcher is unavailable")
 	}
-	targets, err := d.runtime.subscriptionDispatchTargets(ctx)
+	planned, err := d.planSubscriptionMediaDispatch(ctx, tasks)
 	if err != nil {
-		utils.Log.Warnf("[cluster-dispatch] subscriptionDispatchTargets error: %v", err)
+		utils.Log.Warnf("[cluster-dispatch] subscription media preflight failed: %v", err)
 		return nil, err
 	}
-	utils.Log.Warnf("[cluster-dispatch] subscriptionDispatchTargets returned %d targets", len(targets))
 	requests := make([]DispatchMediaJobRequest, 0, len(tasks))
 	results := make([]subscription.ClusterDispatchResult, len(tasks))
-	requestTaskIndexes := make([]int, 0, len(tasks))
+	requestTaskIndexes := make([]int, 0, len(planned))
 	for i, task := range tasks {
 		results[i].SourceKey = task.SourceKey
-		target := d.runtime.chooseDispatchTarget(ctx, targets, task)
-		if target == nil {
-			results[i].Error = errors.New("no connected cluster worker has a compatible writable ETF target")
-			continue
-		}
-		target.pendingAssignments++
-		taskContext := subscriptionMediaTaskContext(task, target.targetProfile)
-		bindTaskContextProviderAccounts(&taskContext, target.match)
+	}
+	for _, plan := range planned {
+		task := tasks[plan.taskIndex]
+		taskContext := subscriptionMediaTaskContext(task, plan.targetProfile)
+		bindTaskContextProviderAccounts(&taskContext, plan.match)
 		requests = append(requests, DispatchMediaJobRequest{
-			NodeID:         target.nodeID,
+			NodeID:         plan.nodeID,
 			IdempotencyKey: task.IdempotencyKey,
 			ExpectedBytes:  task.SourceSize,
 			LeaseDuration:  mediaJobLeaseDuration,
@@ -313,7 +316,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			},
 			TaskContext: taskContext,
 		})
-		requestTaskIndexes = append(requestTaskIndexes, i)
+		requestTaskIndexes = append(requestTaskIndexes, plan.taskIndex)
 	}
 	attachShareSaveBatchContext(requests)
 	if len(requests) == 0 {
@@ -364,6 +367,39 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	return results, dispatchErr
 }
 
+func (d subscriptionDispatcher) planSubscriptionMediaDispatch(ctx context.Context, tasks []subscription.ClusterMediaTask) ([]plannedSubscriptionDispatch, error) {
+	targets, err := d.runtime.subscriptionDispatchTargets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	utils.Log.Warnf("[cluster-dispatch] subscriptionDispatchTargets returned %d targets", len(targets))
+	planned := make([]plannedSubscriptionDispatch, 0, len(tasks))
+	for i, task := range tasks {
+		target := d.runtime.chooseDispatchTarget(ctx, targets, task)
+		if target == nil {
+			return nil, fmt.Errorf("subscription media task %q has no connected compatible cluster worker", subscriptionDispatchTaskKey(task, i))
+		}
+		planned = append(planned, plannedSubscriptionDispatch{
+			taskIndex:     i,
+			nodeID:        target.nodeID,
+			targetProfile: target.targetProfile,
+			match:         target.match,
+		})
+		target.pendingAssignments++
+	}
+	return planned, nil
+}
+
+func subscriptionDispatchTaskKey(task subscription.ClusterMediaTask, index int) string {
+	if key := strings.TrimSpace(task.SourceKey); key != "" {
+		return key
+	}
+	if fileID := strings.TrimSpace(task.SourceFileID); fileID != "" {
+		return fileID
+	}
+	return fmt.Sprintf("task[%d]", index)
+}
+
 func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProfile string) protocol.TaskContext {
 	staging := protocol.ProviderTargetRequirement{
 		Provider:      strings.TrimSpace(task.ShareProvider),
@@ -399,6 +435,12 @@ func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProf
 }
 
 func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchTarget, error) {
+	if r == nil {
+		return nil, errors.New("cluster coordinator is disabled")
+	}
+	if r.dispatchTransport == nil && r.hub == nil {
+		return nil, errors.New("cluster coordinator is disabled")
+	}
 	dispatchTransport := r.mediaDispatchTransport()
 	if dispatchTransport == nil {
 		return nil, errors.New("cluster coordinator is disabled")
