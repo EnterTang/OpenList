@@ -418,23 +418,30 @@ func existingExternalSubscription(ctx context.Context, idempotencyKey, lookupKey
 }
 
 func projectExternalSubscriptionStatus(request *model.ExternalSubscriptionRequest, subscription *model.Subscription, items []model.SubscriptionItem) (string, string) {
+	var activeMessage string
+	var failedMessage string
 	hasFailedItem := false
-	for _, item := range items {
-		if item.Status == model.SubscriptionItemStatusFailed {
-			hasFailedItem = true
-			if message := strings.TrimSpace(item.LastError); message != "" {
-				return "failed", message
-			}
-		}
-	}
-	if hasFailedItem {
-		return "failed", externalSubscriptionDeliveryFailedMessage
-	}
 	for _, item := range items {
 		switch item.Status {
 		case model.SubscriptionItemStatusPending, model.SubscriptionItemStatusNotifying, model.SubscriptionItemStatusTransferring:
-			return "running", item.Status
+			if activeMessage == "" {
+				activeMessage = item.Status
+			}
+		case model.SubscriptionItemStatusFailed:
+			hasFailedItem = true
+			if failedMessage == "" {
+				failedMessage = strings.TrimSpace(item.LastError)
+			}
 		}
+	}
+	if activeMessage != "" {
+		return "running", activeMessage
+	}
+	if hasFailedItem {
+		if failedMessage != "" {
+			return "failed", failedMessage
+		}
+		return "failed", externalSubscriptionDeliveryFailedMessage
 	}
 	switch subscription.LastStatus {
 	case model.SubscriptionStatusRunning:

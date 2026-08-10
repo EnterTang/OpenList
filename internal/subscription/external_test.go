@@ -46,13 +46,33 @@ func TestProjectExternalSubscriptionStatus(t *testing.T) {
 		wantCompleted      bool
 	}{
 		{
-			name: "failed item overrides discovery success",
+			name: "failed and transferring items remain running while delivery is active",
 			items: []model.SubscriptionItem{
 				{SourceKey: "transferring-item", Status: model.SubscriptionItemStatusTransferring},
 				{SourceKey: "failed-item", Status: model.SubscriptionItemStatusFailed, LastError: "upload failed"},
 			},
-			wantStatus:    "failed",
-			wantMessage:   "upload failed",
+			wantStatus:    "running",
+			wantMessage:   model.SubscriptionItemStatusTransferring,
+			wantCompleted: false,
+		},
+		{
+			name: "failed and pending items remain running while delivery is active",
+			items: []model.SubscriptionItem{
+				{SourceKey: "pending-item", Status: model.SubscriptionItemStatusPending},
+				{SourceKey: "failed-item", Status: model.SubscriptionItemStatusFailed, LastError: "upload failed"},
+			},
+			wantStatus:    "running",
+			wantMessage:   model.SubscriptionItemStatusPending,
+			wantCompleted: false,
+		},
+		{
+			name: "failed and notifying items remain running while delivery is active",
+			items: []model.SubscriptionItem{
+				{SourceKey: "notifying-item", Status: model.SubscriptionItemStatusNotifying},
+				{SourceKey: "failed-item", Status: model.SubscriptionItemStatusFailed, LastError: "upload failed"},
+			},
+			wantStatus:    "running",
+			wantMessage:   model.SubscriptionItemStatusNotifying,
 			wantCompleted: false,
 		},
 		{
