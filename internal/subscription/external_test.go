@@ -1,9 +1,11 @@
 package subscription
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -27,5 +29,106 @@ func TestNormalizeExternalSubscriptionAcceptsHDHiveSource(t *testing.T) {
 	}
 	if source.CloudType != "all" || source.Limit <= 0 {
 		t.Fatalf("source config = %#v", source)
+	}
+}
+
+func TestProjectExternalSubscriptionStatus(t *testing.T) {
+	tests := []struct {
+		name          string
+		items         []model.SubscriptionItem
+		wantStatus    string
+		wantMessage   string
+		wantCompleted bool
+	}{
+		{
+			name: "failed item overrides discovery success",
+			items: []model.SubscriptionItem{
+				{SourceKey: "transferring-item", Status: model.SubscriptionItemStatusTransferring},
+				{SourceKey: "failed-item", Status: model.SubscriptionItemStatusFailed, LastError: "upload failed"},
+			},
+			wantStatus:    "failed",
+			wantMessage:   "upload failed",
+			wantCompleted: false,
+		},
+		{
+			name: "active transfer keeps external status running",
+			items: []model.SubscriptionItem{
+				{SourceKey: "transferring-item", Status: model.SubscriptionItemStatusTransferring},
+			},
+			wantStatus:    "running",
+			wantMessage:   model.SubscriptionItemStatusTransferring,
+			wantCompleted: false,
+		},
+		{
+			name: "success remains completed without failed or active items",
+			items: []model.SubscriptionItem{
+				{SourceKey: "transferred-item", Status: model.SubscriptionItemStatusTransferred},
+			},
+			wantStatus:    "completed",
+			wantMessage:   "completed",
+			wantCompleted: true,
+		},
+		{
+			name: "failed item without error uses fallback",
+			items: []model.SubscriptionItem{
+				{SourceKey: "failed-item", Status: model.SubscriptionItemStatusFailed},
+			},
+			wantStatus:    "failed",
+			wantMessage:   externalSubscriptionDeliveryFailedMessage,
+			wantCompleted: false,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			setupSubscriptionRuntimeDB(t)
+
+			request := &model.ExternalSubscriptionRequest{
+				IdempotencyKey:     t.Name(),
+				LookupKey:          "tv:" + t.Name(),
+				RequestFingerprint: "fingerprint:" + t.Name(),
+				RequestJSON:        "{}",
+				LastStatus:         "completed",
+				LastMessage:        "completed",
+				ProgressJSON:       "{}",
+				SeasonsJSON:        "[]",
+			}
+			subscription := &model.Subscription{
+				Name:       t.Name(),
+				MediaType:  "tv",
+				TMDBID:     1399,
+				LastStatus: model.SubscriptionStatusSuccess,
+			}
+			if err := db.CreateExternalSubscriptionRequest(context.Background(), request, subscription); err != nil {
+				t.Fatalf("create external subscription request: %v", err)
+			}
+			for _, item := range tc.items {
+				item.SubscriptionID = subscription.ID
+				if _, _, err := db.UpsertSubscriptionItem(&item); err != nil {
+					t.Fatalf("upsert item %s: %v", item.SourceKey, err)
+				}
+			}
+
+			response, err := ProjectExternalSubscription(context.Background(), request.ID)
+			if err != nil {
+				t.Fatalf("project external subscription: %v", err)
+			}
+			if response.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q", response.Status, tc.wantStatus)
+			}
+			if response.TaskStatus != tc.wantStatus {
+				t.Fatalf("task status = %q, want %q", response.TaskStatus, tc.wantStatus)
+			}
+			if response.LastStatus != tc.wantStatus {
+				t.Fatalf("last status = %q, want %q", response.LastStatus, tc.wantStatus)
+			}
+			if response.LastMessage != tc.wantMessage {
+				t.Fatalf("last message = %q, want %q", response.LastMessage, tc.wantMessage)
+			}
+			if response.Completed != tc.wantCompleted {
+				t.Fatalf("completed = %v, want %v", response.Completed, tc.wantCompleted)
+			}
+		})
 	}
 }

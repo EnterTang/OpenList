@@ -20,7 +20,10 @@ import (
 	"gorm.io/gorm"
 )
 
-const externalSubscriptionIdempotencyKeyMaxLength = 191
+const (
+	externalSubscriptionIdempotencyKeyMaxLength = 191
+	externalSubscriptionDeliveryFailedMessage   = "delivery failed"
+)
 
 var (
 	ErrExternalSubscriptionInvalid  = errors.New("invalid external subscription request")
@@ -160,7 +163,7 @@ func ProjectExternalSubscription(ctx context.Context, externalID uint) (*Externa
 	if err != nil {
 		return nil, err
 	}
-	status, message := projectExternalSubscriptionStatus(request, subscription)
+	status, message := projectExternalSubscriptionStatus(request, subscription, items)
 	taskID := strconv.FormatUint(uint64(request.ID), 10)
 	return &ExternalSubscriptionResponse{
 		ID:                     request.ID,
@@ -414,7 +417,22 @@ func existingExternalSubscription(ctx context.Context, idempotencyKey, lookupKey
 	return nil, false, err
 }
 
-func projectExternalSubscriptionStatus(request *model.ExternalSubscriptionRequest, subscription *model.Subscription) (string, string) {
+func projectExternalSubscriptionStatus(request *model.ExternalSubscriptionRequest, subscription *model.Subscription, items []model.SubscriptionItem) (string, string) {
+	for _, item := range items {
+		if item.Status == model.SubscriptionItemStatusFailed {
+			message := strings.TrimSpace(item.LastError)
+			if message == "" {
+				message = externalSubscriptionDeliveryFailedMessage
+			}
+			return "failed", message
+		}
+	}
+	for _, item := range items {
+		switch item.Status {
+		case model.SubscriptionItemStatusNotifying, model.SubscriptionItemStatusTransferring:
+			return "running", item.Status
+		}
+	}
 	switch subscription.LastStatus {
 	case model.SubscriptionStatusRunning:
 		return "running", "processing"
