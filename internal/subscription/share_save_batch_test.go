@@ -21,6 +21,19 @@ type pan115BatchTestProvider struct {
 	waitedTaskIDs  []string
 }
 
+type recordedSaveCall struct {
+	parentID string
+	dstDirID string
+	itemIDs  []string
+}
+
+type groupingBoundaryTestProvider struct {
+	fakeShareTreeProvider
+	ensureDirCalls []string
+	saveCalls      []recordedSaveCall
+	waitedTaskIDs  []string
+}
+
 func (p *pan115BatchTestProvider) EnsureDir(ctx context.Context, path string) (string, error) {
 	p.ensureDirCalls = append(p.ensureDirCalls, path)
 	return "dst-dir", nil
@@ -32,6 +45,29 @@ func (p *pan115BatchTestProvider) ListShareChildren(ctx context.Context, ref Sha
 }
 
 func (p *pan115BatchTestProvider) WaitSaveComplete(ctx context.Context, taskIDs []string) error {
+	p.waitedTaskIDs = append(p.waitedTaskIDs, taskIDs...)
+	return nil
+}
+
+func (p *groupingBoundaryTestProvider) EnsureDir(ctx context.Context, path string) (string, error) {
+	p.ensureDirCalls = append(p.ensureDirCalls, path)
+	return "dir:" + path, nil
+}
+
+func (p *groupingBoundaryTestProvider) SaveShareItems(ctx context.Context, ref ShareRef, parentID string, items []ShareItem, dstDirID string) ([]string, error) {
+	call := recordedSaveCall{
+		parentID: parentID,
+		dstDirID: dstDirID,
+		itemIDs:  make([]string, 0, len(items)),
+	}
+	for _, item := range items {
+		call.itemIDs = append(call.itemIDs, item.ID)
+	}
+	p.saveCalls = append(p.saveCalls, call)
+	return []string{"task-" + parentID}, nil
+}
+
+func (p *groupingBoundaryTestProvider) WaitSaveComplete(ctx context.Context, taskIDs []string) error {
 	p.waitedTaskIDs = append(p.waitedTaskIDs, taskIDs...)
 	return nil
 }
@@ -166,4 +202,44 @@ func TestSaveShareToTempPan115BatchesAcrossParentsIntoSingleReceiveRequest(t *te
 	require.Equal(t, []string{"file-1", "file-2", "file-3"}, gotFileIDs)
 	require.Equal(t, []string{"/tmp/pan115"}, provider.ensureDirCalls)
 	require.Equal(t, []string{"pan115_sync_swssal13zrk"}, provider.waitedTaskIDs)
+}
+
+func TestSaveShareToTempFlattenNonPan115PreservesParentGroupingBoundaries(t *testing.T) {
+	provider := &groupingBoundaryTestProvider{
+		fakeShareTreeProvider: fakeShareTreeProvider{
+			name: ShareProviderQuark,
+			children: map[string][]ShareItem{
+				"": {
+					{ID: "dir-1", Name: "Season 1", IsDir: true},
+					{ID: "dir-2", Name: "Season 2", IsDir: true},
+				},
+				"dir-1": {
+					{ID: "file-1", ParentID: "dir-1", Name: "Episode1.mkv"},
+				},
+				"dir-2": {
+					{ID: "file-2", ParentID: "dir-2", Name: "Episode2.mkv"},
+					{ID: "file-3", ParentID: "dir-2", Name: "Episode3.mkv"},
+				},
+			},
+		},
+	}
+
+	entries, err := SaveShareToTemp(context.Background(), provider, ShareRef{
+		Provider: ShareProviderQuark,
+		RawURL:   "https://pan.quark.cn/s/bc18e4ea5fb8",
+	}, SaveShareOptions{
+		TempRoot: "/tmp/quark",
+		Flatten:  true,
+		Match: func(entry TreeEntry) bool {
+			return entry.ID == "file-1" || entry.ID == "file-2" || entry.ID == "file-3"
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+	require.Equal(t, []string{"/tmp/quark"}, provider.ensureDirCalls)
+	require.Equal(t, []recordedSaveCall{
+		{parentID: "dir-1", dstDirID: "dir:/tmp/quark", itemIDs: []string{"file-1"}},
+		{parentID: "dir-2", dstDirID: "dir:/tmp/quark", itemIDs: []string{"file-2", "file-3"}},
+	}, provider.saveCalls)
+	require.Equal(t, []string{"task-dir-1", "task-dir-2"}, provider.waitedTaskIDs)
 }
