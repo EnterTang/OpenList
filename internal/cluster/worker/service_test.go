@@ -328,6 +328,80 @@ func TestNewSourceCleanupTargetRequiresExactRemoteID(t *testing.T) {
 	require.True(t, target.ExactFile)
 }
 
+func TestMediaTransfer_CollisionBatchUsesDistinctPartitionRootsAndCleanupOwnership(t *testing.T) {
+	tempRoot := "/123/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Season 01/episode.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Season 02/episode.mkv", Size: 102},
+	}
+	service := New(&fakeResultQueue{}, nil)
+	service.stagedSourceFinder = func(context.Context, string, protocol.SourceObject) (string, bool) {
+		return "", false
+	}
+
+	var savedRoots []string
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, saveRoot string, selectedFileIDs []string) ([]string, error) {
+		savedRoots = append(savedRoots, saveRoot)
+		if len(selectedFileIDs) != 1 {
+			t.Fatalf("selected file ids = %#v, want one collision-partition file", selectedFileIDs)
+		}
+		return []string{path.Join(saveRoot, "episode.mkv")}, nil
+	}
+
+	offerA := testMediaTransferOffer(shareSaveObjects[0], []protocol.SourceObject{shareSaveObjects[0]}, "share-save-batch-collision:partition-a")
+	offerB := testMediaTransferOffer(shareSaveObjects[1], []protocol.SourceObject{shareSaveObjects[1]}, "share-save-batch-collision:partition-b")
+
+	stagedPathA, reusedA, err := service.prepareMediaTransferShareSave(context.Background(), offerA, mediaTransferShareSaveTempRoot(offerA.TaskContext, tempRoot))
+	require.NoError(t, err)
+	require.False(t, reusedA)
+
+	stagedPathB, reusedB, err := service.prepareMediaTransferShareSave(context.Background(), offerB, mediaTransferShareSaveTempRoot(offerB.TaskContext, tempRoot))
+	require.NoError(t, err)
+	require.False(t, reusedB)
+
+	rootA := mediaTransferShareSaveTempRoot(offerA.TaskContext, tempRoot)
+	rootB := mediaTransferShareSaveTempRoot(offerB.TaskContext, tempRoot)
+	require.NotEqual(t, rootA, rootB)
+	require.Equal(t, []string{rootA, rootB}, savedRoots)
+	require.Equal(t, path.Join(rootA, "episode.mkv"), stagedPathA)
+	require.Equal(t, path.Join(rootB, "episode.mkv"), stagedPathB)
+
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/123"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	getCleanupStorageAndActualPath = func(sourcePath string) (driver.Driver, string, error) {
+		return d, strings.TrimPrefix(sourcePath, "/123"), nil
+	}
+	getCleanupObject = func(_ context.Context, _ driver.Driver, actualPath string, _ ...bool) (model.Obj, error) {
+		switch actualPath {
+		case strings.TrimPrefix(stagedPathA, "/123"):
+			return &model.Object{ID: "source-a", Name: "episode.mkv"}, nil
+		case strings.TrimPrefix(stagedPathB, "/123"):
+			return &model.Object{ID: "source-b", Name: "episode.mkv"}, nil
+		default:
+			return nil, errs.ObjectNotFound
+		}
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+	})
+
+	manifest := validUploadManifest(t)
+	targetA, err := NewSourceCleanupTarget(context.Background(), manifest, rootA, stagedPathA)
+	require.NoError(t, err)
+	require.Equal(t, rootA, targetA.OwnedRootPath)
+	require.Equal(t, "source-a", targetA.RemoteFileID)
+
+	targetB, err := NewSourceCleanupTarget(context.Background(), manifest, rootB, stagedPathB)
+	require.NoError(t, err)
+	require.Equal(t, rootB, targetB.OwnedRootPath)
+	require.Equal(t, "source-b", targetB.RemoteFileID)
+
+	_, err = NewSourceCleanupTarget(context.Background(), manifest, rootB, stagedPathA)
+	require.ErrorContains(t, err, "direct file in the staging root")
+}
+
 func TestExecuteCleanupTargetRefusesRemoteIDMismatch(t *testing.T) {
 	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/123"}}
 	originalStorage := getCleanupStorageAndActualPath

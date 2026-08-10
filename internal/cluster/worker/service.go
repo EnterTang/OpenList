@@ -63,6 +63,8 @@ type resultQueue interface {
 
 var cleanupLookupDelay = 2 * time.Second
 
+const shareSaveBatchCollisionKeyPrefix = "share-save-batch-collision:"
+
 var (
 	getCleanupStorageAndActualPath = op.GetStorageAndActualPath
 	getCleanupObject               = getFreshCleanupObject
@@ -989,17 +991,18 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err != nil {
 		return fmt.Errorf("resolve cluster staging temp root: %w", err)
 	}
+	stagingTempRoot := mediaTransferShareSaveTempRoot(offer.TaskContext, requestedTempRoot)
 	if s.mediaTransferBoundary != nil {
 		return s.mediaTransferBoundary(ctx, offer, resolvedMediaTransferTargets{
-			StagingRoot: requestedTempRoot, DeliveryRoot: targetRootBase, DeliveryMount: targetBindingMount,
+			StagingRoot: stagingTempRoot, DeliveryRoot: targetRootBase, DeliveryMount: targetBindingMount,
 		})
 	}
-	stagingStorage, _, err := op.GetStorageAndActualPath(requestedTempRoot)
+	stagingStorage, _, err := op.GetStorageAndActualPath(stagingTempRoot)
 	if err != nil {
 		return fmt.Errorf("resolve cluster staging account: %w", err)
 	}
 	s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
-	stagedSource, reused, err := s.prepareMediaTransferShareSave(ctx, offer, requestedTempRoot)
+	stagedSource, reused, err := s.prepareMediaTransferShareSave(ctx, offer, stagingTempRoot)
 	if err != nil {
 		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
 		return err
@@ -1066,7 +1069,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		ShareSaveObjects:      offer.TaskContext.ShareSaveObjects,
 		MobileAccountBinding:  targetStorage.GetStorage().MountPath,
 	}
-	sourceCleanup, err := NewSourceCleanupTarget(ctx, manifest, requestedTempRoot, stagedSource)
+	sourceCleanup, err := NewSourceCleanupTarget(ctx, manifest, stagingTempRoot, stagedSource)
 	if err != nil {
 		return fmt.Errorf("build cluster source cleanup request: %w", err)
 	}
@@ -1341,6 +1344,27 @@ func mediaTransferShareSaveSingleflightKey(task protocol.TaskContext, requestedT
 		strings.TrimSpace(task.StagingTarget.NodeMountID),
 		strings.TrimSpace(task.StagingTarget.AccountFingerprint),
 	}, "|")
+}
+
+func mediaTransferShareSaveTempRoot(task protocol.TaskContext, requestedTempRoot string) string {
+	requestedTempRoot = path.Clean(strings.TrimSpace(requestedTempRoot))
+	collisionID, ok := shareSaveBatchCollisionID(task.ShareSaveKey)
+	if !ok {
+		return requestedTempRoot
+	}
+	return path.Join(requestedTempRoot, ".share-save-collision-"+collisionID)
+}
+
+func shareSaveBatchCollisionID(key string) (string, bool) {
+	key = strings.TrimSpace(key)
+	if !strings.HasPrefix(key, shareSaveBatchCollisionKeyPrefix) {
+		return "", false
+	}
+	collisionID := strings.TrimSpace(strings.TrimPrefix(key, shareSaveBatchCollisionKeyPrefix))
+	if collisionID == "" {
+		return "", false
+	}
+	return collisionID, true
 }
 
 func matchMediaTransferStagedPath(tempRoot string, primary protocol.SourceObject, stagedPaths []string) (string, bool) {

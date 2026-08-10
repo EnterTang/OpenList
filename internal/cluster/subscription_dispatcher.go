@@ -653,7 +653,7 @@ func shareSaveBatchCollisionKeys(requests []DispatchMediaJobRequest, baseKey str
 }
 
 func shareSaveBatchCollisionKey(baseKey, identity string) string {
-	return fmt.Sprintf("share-save-batch:%x", sha256Bytes(strings.Join([]string{
+	return fmt.Sprintf("share-save-batch-collision:%x", sha256Bytes(strings.Join([]string{
 		baseKey,
 		"collision",
 		identity,

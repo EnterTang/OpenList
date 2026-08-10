@@ -335,6 +335,9 @@ func TestAttachShareSaveBatchContext_MergesAcrossDeliveryBinding(t *testing.T) {
 	if requests[0].TaskContext.ShareSaveKey != requests[1].TaskContext.ShareSaveKey {
 		t.Fatalf("different delivery bindings should still share one batch key: %q != %q", requests[0].TaskContext.ShareSaveKey, requests[1].TaskContext.ShareSaveKey)
 	}
+	if !strings.HasPrefix(requests[0].TaskContext.ShareSaveKey, "share-save-batch:") || strings.HasPrefix(requests[0].TaskContext.ShareSaveKey, "share-save-batch-collision:") {
+		t.Fatalf("non-collision batch key = %q, want ordinary share-save-batch prefix", requests[0].TaskContext.ShareSaveKey)
+	}
 	assertShareSaveObjects(t, requests[0].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
 	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
 }
@@ -379,6 +382,9 @@ func TestAttachShareSaveBatchContext_SeparatesCollidingBasenamesAcrossDeliveryBi
 	}
 	if requests[0].TaskContext.ShareSaveKey == requests[1].TaskContext.ShareSaveKey {
 		t.Fatalf("colliding basenames across delivery bindings should not share one batch key: %q", requests[0].TaskContext.ShareSaveKey)
+	}
+	if !strings.HasPrefix(requests[0].TaskContext.ShareSaveKey, "share-save-batch-collision:") || !strings.HasPrefix(requests[1].TaskContext.ShareSaveKey, "share-save-batch-collision:") {
+		t.Fatalf("collision batch keys = %q and %q, want collision-prefixed keys", requests[0].TaskContext.ShareSaveKey, requests[1].TaskContext.ShareSaveKey)
 	}
 	assertShareSaveObjects(t, requests[0].TaskContext.ShareSaveObjects, []string{"file-1"})
 	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-2"})
