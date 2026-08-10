@@ -180,6 +180,24 @@ func TestTaskContextValidate_RejectsShareSaveBatchMissingPrimarySource(t *testin
 	}
 }
 
+func TestTaskContextValidate_RejectsDuplicateShareSaveObjectIdentity(t *testing.T) {
+	context := testTaskContext()
+	context.ShareSaveKey = "share-save-batch:abc123"
+	context.ShareSaveObjects = []SourceObject{
+		context.SourceObjects[0],
+		{
+			Provider:           context.SourceObjects[0].Provider,
+			SourceFileID:       context.SourceObjects[0].SourceFileID,
+			SourceRelativePath: "Season 01/Example.S01E13.alt.mkv",
+			Size:               context.SourceObjects[0].Size - 1,
+		},
+	}
+
+	if err := context.Validate(); err == nil || !strings.Contains(err.Error(), "duplicates source object id") {
+		t.Fatalf("validate task context error = %v, want duplicate-identity rejection", err)
+	}
+}
+
 func TestUploadETFManifestCarriesAndValidatesCoordinatorContext(t *testing.T) {
 	context := testTaskContext()
 	context.ShareSaveKey = "share-save-batch:abc123"

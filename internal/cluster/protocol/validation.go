@@ -241,20 +241,20 @@ func validateShareSaveBatch(c TaskContext) error {
 		if strings.TrimSpace(object.Provider) == "" || strings.TrimSpace(object.SourceFileID) == "" {
 			return fmt.Errorf("share save object %d requires provider and source file id", i)
 		}
-		key := shareSaveObjectKey(object)
+		key := ShareSaveObjectIdentityKey(object)
 		if _, exists := seen[key]; exists {
 			return fmt.Errorf("share save object %d duplicates source object id", i)
 		}
 		seen[key] = struct{}{}
 	}
 	for _, object := range c.SourceObjects {
-		if _, ok := seen[shareSaveObjectKey(object)]; !ok {
+		if _, ok := seen[ShareSaveObjectIdentityKey(object)]; !ok {
 			return errors.New("share save objects must include current source object")
 		}
 	}
 	return nil
 }
 
-func shareSaveObjectKey(object SourceObject) string {
+func ShareSaveObjectIdentityKey(object SourceObject) string {
 	return strings.TrimSpace(object.Provider) + "\x00" + strings.TrimSpace(object.SourceFileID)
 }

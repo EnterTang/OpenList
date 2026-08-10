@@ -583,7 +583,6 @@ func shareSaveBatchKey(request DispatchMediaJobRequest) string {
 		strings.TrimSpace(context.Subscription.ShareRefFingerprint),
 		passcodeHash,
 		strings.TrimSpace(request.NodeID),
-		strings.TrimSpace(context.TargetProfile),
 		strings.TrimSpace(context.StagingTarget.Provider),
 		fmt.Sprint(context.StagingTarget.StorageID),
 		strings.TrimSpace(context.StagingTarget.NodeMountID),
@@ -597,29 +596,34 @@ func shareSaveBatchKey(request DispatchMediaJobRequest) string {
 }
 
 func shareSaveBatchObjects(requests []DispatchMediaJobRequest, indexes []int) []protocol.SourceObject {
-	byID := make(map[string]protocol.SourceObject, len(indexes))
+	byIdentity := make(map[string]protocol.SourceObject, len(indexes))
 	for _, index := range indexes {
 		for _, object := range requests[index].TaskContext.SourceObjects {
-			byID[shareSaveBatchObjectStableKey(object)] = object
+			identity := protocol.ShareSaveObjectIdentityKey(object)
+			canonical, exists := byIdentity[identity]
+			if !exists || shareSaveBatchObjectCanonicalKey(object) < shareSaveBatchObjectCanonicalKey(canonical) {
+				byIdentity[identity] = object
+			}
 		}
 	}
-	objects := make([]protocol.SourceObject, 0, len(byID))
-	for _, object := range byID {
+	objects := make([]protocol.SourceObject, 0, len(byIdentity))
+	for _, object := range byIdentity {
 		objects = append(objects, object)
 	}
 	sort.SliceStable(objects, func(i, j int) bool {
-		return shareSaveBatchObjectStableKey(objects[i]) < shareSaveBatchObjectStableKey(objects[j])
+		return protocol.ShareSaveObjectIdentityKey(objects[i]) < protocol.ShareSaveObjectIdentityKey(objects[j])
 	})
 	return objects
 }
 
-func shareSaveBatchObjectStableKey(object protocol.SourceObject) string {
+func shareSaveBatchObjectCanonicalKey(object protocol.SourceObject) string {
 	return strings.Join([]string{
 		strings.TrimSpace(object.Provider),
 		strings.TrimSpace(object.SourceFileID),
 		strings.TrimSpace(object.SourceRelativePath),
 		fmt.Sprint(object.Size),
 		strings.TrimSpace(object.Hash),
+		strings.TrimSpace(object.ContentSHA256),
 		object.ModifiedAt.UTC().Format(time.RFC3339Nano),
 	}, "\x00")
 }

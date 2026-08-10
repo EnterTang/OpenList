@@ -263,6 +263,99 @@ func TestAttachShareSaveBatchContext_SeparatesByDeliveryBinding(t *testing.T) {
 	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-2"})
 }
 
+func TestAttachShareSaveBatchContext_MergesAcrossTargetProfileAliases(t *testing.T) {
+	task := validProviderPipelineTask(20 << 30)
+	task.SharePasscode = "2468"
+	task.ShareRefFingerprint = "share-ref-1"
+
+	firstContext := subscriptionMediaTaskContext(task, "mobile-primary")
+	firstContext.StagingTarget.StorageID = 11
+	firstContext.StagingTarget.NodeMountID = "staging-a"
+	firstContext.StagingTarget.AccountFingerprint = "staging-fp"
+	firstContext.DeliveryTarget.StorageID = 21
+	firstContext.DeliveryTarget.NodeMountID = "delivery-a"
+	firstContext.DeliveryTarget.AccountFingerprint = "delivery-fp-a"
+
+	secondTask := task
+	secondTask.SourceFileID = "file-2"
+	secondTask.SourceKey = "source-2"
+	secondTask.SubscriptionItemID = task.SubscriptionItemID + 1
+	secondTask.IdempotencyKey = "target-profile-alias-task-2"
+	secondTask.LogicalTargetPath = "/legacy/episode-2.mkv"
+	secondContext := subscriptionMediaTaskContext(secondTask, "mobile-secondary-alias")
+	secondContext.StagingTarget.StorageID = 11
+	secondContext.StagingTarget.NodeMountID = "staging-a"
+	secondContext.StagingTarget.AccountFingerprint = "staging-fp"
+	secondContext.DeliveryTarget.StorageID = 21
+	secondContext.DeliveryTarget.NodeMountID = "delivery-a"
+	secondContext.DeliveryTarget.AccountFingerprint = "delivery-fp-a"
+
+	requests := []DispatchMediaJobRequest{
+		{NodeID: "worker-a", TaskContext: firstContext},
+		{NodeID: "worker-a", TaskContext: secondContext},
+	}
+	attachShareSaveBatchContext(requests)
+
+	if requests[0].TaskContext.ShareSaveKey == "" || requests[1].TaskContext.ShareSaveKey == "" {
+		t.Fatalf("share-save keys must be set: %#v", requests)
+	}
+	if requests[0].TaskContext.ShareSaveKey != requests[1].TaskContext.ShareSaveKey {
+		t.Fatalf("different target profile aliases should share one batch: %q != %q", requests[0].TaskContext.ShareSaveKey, requests[1].TaskContext.ShareSaveKey)
+	}
+	assertShareSaveObjects(t, requests[0].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
+	assertShareSaveObjects(t, requests[1].TaskContext.ShareSaveObjects, []string{"file-1", "file-2"})
+}
+
+func TestAttachShareSaveBatchContext_CanonicalizesDuplicateIdentityMetadata(t *testing.T) {
+	task := validProviderPipelineTask(20 << 30)
+	task.SharePasscode = "2468"
+	task.ShareRefFingerprint = "share-ref-1"
+	task.SourceFileID = "file-1"
+	firstContext := subscriptionMediaTaskContext(task, "mobile-primary")
+	firstContext.StagingTarget.StorageID = 11
+	firstContext.StagingTarget.NodeMountID = "staging-a"
+	firstContext.StagingTarget.AccountFingerprint = "staging-fp"
+	firstContext.DeliveryTarget.StorageID = 21
+	firstContext.DeliveryTarget.NodeMountID = "delivery-a"
+	firstContext.DeliveryTarget.AccountFingerprint = "delivery-fp-a"
+	firstContext.ParentBatchID = "batch-1"
+	firstContext.SourceObjects = []protocol.SourceObject{{Provider: "pan123", SourceFileID: "file-1", SourceRelativePath: "z-path.mkv", Size: 200, Hash: "z"}}
+
+	secondTask := task
+	secondTask.SourceKey = "source-2"
+	secondTask.SubscriptionItemID = task.SubscriptionItemID + 1
+	secondTask.IdempotencyKey = "canonical-identity-task-2"
+	secondTask.LogicalTargetPath = "/legacy/episode-2.mkv"
+	secondTask.SourceFileID = "file-1"
+	secondContext := subscriptionMediaTaskContext(secondTask, "mobile-alias")
+	secondContext.StagingTarget.StorageID = 11
+	secondContext.StagingTarget.NodeMountID = "staging-a"
+	secondContext.StagingTarget.AccountFingerprint = "staging-fp"
+	secondContext.DeliveryTarget.StorageID = 21
+	secondContext.DeliveryTarget.NodeMountID = "delivery-a"
+	secondContext.DeliveryTarget.AccountFingerprint = "delivery-fp-a"
+	secondContext.ParentBatchID = "batch-1"
+	secondContext.SourceObjects = []protocol.SourceObject{{Provider: "pan123", SourceFileID: "file-1", SourceRelativePath: "a-path.mkv", Size: 100, Hash: "a"}}
+
+	requests := []DispatchMediaJobRequest{
+		{NodeID: "worker-a", TaskContext: firstContext},
+		{NodeID: "worker-a", TaskContext: secondContext},
+	}
+	attachShareSaveBatchContext(requests)
+
+	for i, request := range requests {
+		if len(request.TaskContext.ShareSaveObjects) != 1 {
+			t.Fatalf("request %d share-save objects = %#v, want one canonical object", i, request.TaskContext.ShareSaveObjects)
+		}
+		if request.TaskContext.ShareSaveObjects[0].SourceRelativePath != "a-path.mkv" {
+			t.Fatalf("request %d canonical object = %#v, want lexicographically stable metadata choice", i, request.TaskContext.ShareSaveObjects[0])
+		}
+		if err := request.TaskContext.Validate(); err != nil {
+			t.Fatalf("request %d validate error = %v", i, err)
+		}
+	}
+}
+
 func TestConsumeSubscriptionShareInspectWaitsForObservationAndSelectsLargest(t *testing.T) {
 	database := openClusterRuntimeTestDB(t)
 	originalConfig := conf.Conf
