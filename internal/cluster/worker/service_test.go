@@ -732,6 +732,14 @@ func TestMediaTransfer_BatchShareSaveFailureFansOutAndAllowsRetry(t *testing.T) 
 	firstRelease := make(chan struct{})
 	initialReady := make(chan struct{})
 	saverEntered := make(chan struct{})
+	waiterJoined := make(chan struct{})
+	service.shareSaveFlightJoined = func(_ string) {
+		select {
+		case <-waiterJoined:
+		default:
+			close(waiterJoined)
+		}
+	}
 	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
 		mu.Lock()
 		stagedPath, ok := staged[primary.SourceFileID]
@@ -788,7 +796,11 @@ func TestMediaTransfer_BatchShareSaveFailureFansOutAndAllowsRetry(t *testing.T) 
 	case <-time.After(2 * time.Second):
 		t.Fatal("batch saver was not entered")
 	}
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-waiterJoined:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second caller did not join the in-flight singleflight wait")
+	}
 	close(firstRelease)
 	for range shareSaveObjects {
 		err := <-errs
@@ -844,6 +856,124 @@ func TestMediaTransfer_BatchShareSaveSkipsWhenAllFilesAlreadyStaged(t *testing.T
 	require.True(t, reused)
 	require.Equal(t, testStagedSourcePath(tempRoot, shareSaveObjects[0]), stagedPath)
 	require.False(t, called)
+}
+
+func TestMediaTransfer_BatchShareSaveUsesReturnedPrimaryPath(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Show.S01E01.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Show.S01E02.mkv", Size: 102},
+	}
+	service := New(&fakeResultQueue{}, nil)
+	service.stagedSourceFinder = func(context.Context, string, protocol.SourceObject) (string, bool) {
+		return "", false
+	}
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, _ string, _ []string) ([]string, error) {
+		return []string{
+			testStagedSourcePath(tempRoot, shareSaveObjects[0]),
+			testStagedSourcePath(tempRoot, shareSaveObjects[1]),
+		}, nil
+	}
+
+	stagedPath, reused, err := service.prepareMediaTransferShareSave(
+		context.Background(),
+		testMediaTransferOffer(shareSaveObjects[0], shareSaveObjects, "share-save-batch:returned-path"),
+		tempRoot,
+	)
+
+	require.NoError(t, err)
+	require.False(t, reused)
+	require.Equal(t, testStagedSourcePath(tempRoot, shareSaveObjects[0]), stagedPath)
+}
+
+func TestMediaTransfer_BatchShareSaveCallerCancelDoesNotAbortFollower(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Show.S01E01.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Show.S01E02.mkv", Size: 102},
+	}
+	service := New(&fakeResultQueue{}, nil)
+
+	saverEntered := make(chan struct{})
+	releaseSaver := make(chan struct{})
+	waiterJoined := make(chan struct{})
+	service.shareSaveFlightJoined = func(_ string) {
+		select {
+		case <-waiterJoined:
+		default:
+			close(waiterJoined)
+		}
+	}
+	service.stagedSourceFinder = func(context.Context, string, protocol.SourceObject) (string, bool) {
+		return "", false
+	}
+	service.shareSaveBatchSaver = func(ctx context.Context, _, _, _ string, _ []string) ([]string, error) {
+		select {
+		case <-saverEntered:
+		default:
+			close(saverEntered)
+		}
+		<-releaseSaver
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		return []string{
+			testStagedSourcePath(tempRoot, shareSaveObjects[0]),
+			testStagedSourcePath(tempRoot, shareSaveObjects[1]),
+		}, nil
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	type shareSaveResult struct {
+		stagedPath string
+		reused     bool
+		err        error
+	}
+	leaderResult := make(chan shareSaveResult, 1)
+	followerResult := make(chan shareSaveResult, 1)
+
+	go func() {
+		stagedPath, reused, err := service.prepareMediaTransferShareSave(
+			leaderCtx,
+			testMediaTransferOffer(shareSaveObjects[0], shareSaveObjects, "share-save-batch:caller-cancel"),
+			tempRoot,
+		)
+		leaderResult <- shareSaveResult{stagedPath: stagedPath, reused: reused, err: err}
+	}()
+
+	select {
+	case <-saverEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch saver was not entered")
+	}
+
+	go func() {
+		stagedPath, reused, err := service.prepareMediaTransferShareSave(
+			context.Background(),
+			testMediaTransferOffer(shareSaveObjects[1], shareSaveObjects, "share-save-batch:caller-cancel"),
+			tempRoot,
+		)
+		followerResult <- shareSaveResult{stagedPath: stagedPath, reused: reused, err: err}
+	}()
+
+	select {
+	case <-waiterJoined:
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower did not join the in-flight singleflight wait")
+	}
+
+	cancelLeader()
+	close(releaseSaver)
+
+	leader := <-leaderResult
+	require.ErrorIs(t, leader.err, context.Canceled)
+
+	follower := <-followerResult
+	require.NoError(t, follower.err)
+	require.False(t, follower.reused)
+	require.Equal(t, testStagedSourcePath(tempRoot, shareSaveObjects[1]), follower.stagedPath)
 }
 
 func TestMediaTransfer_SingleShareSaveWithoutBatchUsesPrimaryOnly(t *testing.T) {

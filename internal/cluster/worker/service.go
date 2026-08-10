@@ -118,6 +118,9 @@ type Service struct {
 	shareSaveBatchSaver   func(context.Context, string, string, string, []string) ([]string, error)
 	stagedSourceFinder    func(context.Context, string, protocol.SourceObject) (string, bool)
 	shareSaveFlights      singleflight.Group[[]string]
+	shareSaveFlightMu     sync.Mutex
+	shareSaveFlightCalls  map[string]int
+	shareSaveFlightJoined func(string)
 }
 
 type resolvedMediaTransferTargets struct {
@@ -1166,9 +1169,11 @@ func (s *Service) prepareMediaTransferShareSave(ctx context.Context, offer proto
 	if strings.TrimSpace(offer.TaskContext.ShareSaveKey) != "" && len(shareSaveObjects) > 0 {
 		if !s.allShareSaveObjectsStaged(ctx, requestedTempRoot, shareSaveObjects) {
 			key := mediaTransferShareSaveSingleflightKey(offer.TaskContext, requestedTempRoot)
-			if _, saveErr, _ := s.shareSaveFlights.Do(key, func() ([]string, error) {
-				return s.saveClusterShareSelectionBatch(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, mediaTransferShareSaveFileIDs(shareSaveObjects))
-			}); saveErr != nil {
+			saved, saveErr := s.waitMediaTransferShareSaveBatch(ctx, key, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, mediaTransferShareSaveFileIDs(shareSaveObjects))
+			if saveErr != nil {
+				if err := ctx.Err(); err != nil {
+					return "", false, err
+				}
 				// A previous cancelled attempt may have left the object in staging.
 				if fallback, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
 					log.Warnf("cluster job %s share-save batch reported %v; reusing existing staged object %s", offer.JobID, saveErr, fallback)
@@ -1176,9 +1181,21 @@ func (s *Service) prepareMediaTransferShareSave(ctx context.Context, offer proto
 				}
 				return "", false, fmt.Errorf("save cluster share selection batch: %w", saveErr)
 			}
+			if err := ctx.Err(); err != nil {
+				return "", false, err
+			}
+			if stagedSource, ok := matchMediaTransferStagedPath(requestedTempRoot, primary, saved); ok {
+				return stagedSource, false, nil
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return "", false, err
 		}
 		if stagedSource, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
 			return stagedSource, false, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return "", false, err
 		}
 		return "", false, fmt.Errorf("cluster staged source for %s was not found after share-save batch preparation", primary.SourceFileID)
 	}
@@ -1196,6 +1213,49 @@ func (s *Service) prepareMediaTransferShareSave(ctx context.Context, offer proto
 		return "", false, fmt.Errorf("cluster media task saved %d files, want 1", len(saved))
 	}
 	return saved[0], false, nil
+}
+
+func (s *Service) waitMediaTransferShareSaveBatch(ctx context.Context, key, rawURL, passcode, tempRoot string, selectedFileIDs []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	joined, done := s.beginShareSaveFlightCall(key)
+	defer done()
+	sharedCtx := context.WithoutCancel(ctx)
+	resultCh := s.shareSaveFlights.DoChan(key, func() ([]string, error) {
+		return s.saveClusterShareSelectionBatch(sharedCtx, rawURL, passcode, tempRoot, selectedFileIDs)
+	})
+	if joined && s.shareSaveFlightJoined != nil {
+		s.shareSaveFlightJoined(key)
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result.Val, result.Err
+	}
+}
+
+func (s *Service) beginShareSaveFlightCall(key string) (bool, func()) {
+	s.shareSaveFlightMu.Lock()
+	defer s.shareSaveFlightMu.Unlock()
+	if s.shareSaveFlightCalls == nil {
+		s.shareSaveFlightCalls = make(map[string]int)
+	}
+	joined := s.shareSaveFlightCalls[key] > 0
+	s.shareSaveFlightCalls[key]++
+	return joined, func() {
+		s.shareSaveFlightMu.Lock()
+		defer s.shareSaveFlightMu.Unlock()
+		if s.shareSaveFlightCalls[key] <= 1 {
+			delete(s.shareSaveFlightCalls, key)
+			return
+		}
+		s.shareSaveFlightCalls[key]--
+	}
 }
 
 func (s *Service) saveClusterShareSelection(ctx context.Context, rawURL, passcode, tempRoot string, selectedFileIDs []string) ([]string, error) {
@@ -1274,6 +1334,20 @@ func mediaTransferShareSaveSingleflightKey(task protocol.TaskContext, requestedT
 		strings.TrimSpace(task.StagingTarget.NodeMountID),
 		strings.TrimSpace(task.StagingTarget.AccountFingerprint),
 	}, "|")
+}
+
+func matchMediaTransferStagedPath(tempRoot string, primary protocol.SourceObject, stagedPaths []string) (string, bool) {
+	name := path.Base(strings.TrimSpace(primary.SourceRelativePath))
+	if name == "" || name == "." || name == "/" {
+		return "", false
+	}
+	candidate := path.Join(tempRoot, name)
+	for _, stagedPath := range stagedPaths {
+		if path.Clean(strings.TrimSpace(stagedPath)) == candidate {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
 func findExistingStagedSource(ctx context.Context, tempRoot string, primary protocol.SourceObject) (string, bool) {
