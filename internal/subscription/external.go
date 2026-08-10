@@ -418,14 +418,17 @@ func existingExternalSubscription(ctx context.Context, idempotencyKey, lookupKey
 }
 
 func projectExternalSubscriptionStatus(request *model.ExternalSubscriptionRequest, subscription *model.Subscription, items []model.SubscriptionItem) (string, string) {
+	hasFailedItem := false
 	for _, item := range items {
 		if item.Status == model.SubscriptionItemStatusFailed {
-			message := strings.TrimSpace(item.LastError)
-			if message == "" {
-				message = externalSubscriptionDeliveryFailedMessage
+			hasFailedItem = true
+			if message := strings.TrimSpace(item.LastError); message != "" {
+				return "failed", message
 			}
-			return "failed", message
 		}
+	}
+	if hasFailedItem {
+		return "failed", externalSubscriptionDeliveryFailedMessage
 	}
 	for _, item := range items {
 		switch item.Status {

@@ -77,6 +77,16 @@ func TestProjectExternalSubscriptionStatus(t *testing.T) {
 			wantMessage:   externalSubscriptionDeliveryFailedMessage,
 			wantCompleted: false,
 		},
+		{
+			name: "failed items prefer any specific error over fallback",
+			items: []model.SubscriptionItem{
+				{SourceKey: "failed-empty", Status: model.SubscriptionItemStatusFailed},
+				{SourceKey: "failed-specific", Status: model.SubscriptionItemStatusFailed, LastError: "saving share failed"},
+			},
+			wantStatus:    "failed",
+			wantMessage:   "saving share failed",
+			wantCompleted: false,
+		},
 	}
 
 	for _, tc := range tests {
