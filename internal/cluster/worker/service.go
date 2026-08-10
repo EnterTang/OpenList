@@ -27,6 +27,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
+	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/tache"
 	log "github.com/sirupsen/logrus"
@@ -113,6 +114,10 @@ type Service struct {
 	uploadGate            *limitGate
 	targetGates           map[string]*limitGate
 	mediaTransferBoundary func(context.Context, protocol.JobOffer, resolvedMediaTransferTargets) error
+	shareSaveSaver        func(context.Context, string, string, string, []string) ([]string, error)
+	shareSaveBatchSaver   func(context.Context, string, string, string, []string) ([]string, error)
+	stagedSourceFinder    func(context.Context, string, protocol.SourceObject) (string, bool)
+	shareSaveFlights      singleflight.Group[[]string]
 }
 
 type resolvedMediaTransferTargets struct {
@@ -128,6 +133,7 @@ func New(queue resultQueue, sender Sender) *Service {
 		pending: make(map[string]resultqueue.Result), active: make(map[string]*activeTask), control: make(map[string]chan error), permits: make(map[string]chan protocol.StagePermit),
 		storageOperator: openListStorageOperator{}, storageObserved: make(map[string]observedState),
 		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), targetGates: make(map[string]*limitGate),
+		shareSaveSaver: subscription.SaveClusterShareSelection, shareSaveBatchSaver: subscription.SaveClusterShareSelectionBatch, stagedSourceFinder: findExistingStagedSource,
 	}
 }
 
@@ -990,27 +996,10 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return fmt.Errorf("resolve cluster staging account: %w", err)
 	}
 	s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
-	stagedSource, reused := findExistingStagedSource(ctx, requestedTempRoot, primary)
-	if !reused {
-		saved, saveErr := subscription.SaveClusterShareSelection(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, []string{primary.SourceFileID})
-		if saveErr != nil {
-			// A previous cancelled attempt may have left the object in staging.
-			if fallback, ok := findExistingStagedSource(ctx, requestedTempRoot, primary); ok {
-				stagedSource = fallback
-				reused = true
-				log.Warnf("cluster job %s share-save reported %v; reusing existing staged object %s", offer.JobID, saveErr, stagedSource)
-			} else {
-				s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, saveErr.Error())
-				return fmt.Errorf("save cluster share selection: %w", saveErr)
-			}
-		} else {
-			if len(saved) != 1 {
-				err := fmt.Errorf("cluster media task saved %d files, want 1", len(saved))
-				s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
-				return err
-			}
-			stagedSource = saved[0]
-		}
+	stagedSource, reused, err := s.prepareMediaTransferShareSave(ctx, offer, requestedTempRoot)
+	if err != nil {
+		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
+		return err
 	}
 	s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, "")
 	if reused {
@@ -1162,6 +1151,129 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	}
 	finishUploadStage(model.ClusterStageStatusSucceeded, "")
 	return nil
+}
+
+func (s *Service) prepareMediaTransferShareSave(ctx context.Context, offer protocol.JobOffer, requestedTempRoot string) (string, bool, error) {
+	primary := primarySourceObject(offer.TaskContext.SourceObjects)
+	if primary.SourceFileID == "" {
+		return "", false, errors.New("cluster media task has no source object")
+	}
+	if stagedSource, reused := s.findStagedSource(ctx, requestedTempRoot, primary); reused {
+		return stagedSource, true, nil
+	}
+
+	shareSaveObjects := mediaTransferShareSaveObjects(offer.TaskContext, primary)
+	if strings.TrimSpace(offer.TaskContext.ShareSaveKey) != "" && len(shareSaveObjects) > 0 {
+		if !s.allShareSaveObjectsStaged(ctx, requestedTempRoot, shareSaveObjects) {
+			key := mediaTransferShareSaveSingleflightKey(offer.TaskContext, requestedTempRoot)
+			if _, saveErr, _ := s.shareSaveFlights.Do(key, func() ([]string, error) {
+				return s.saveClusterShareSelectionBatch(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, mediaTransferShareSaveFileIDs(shareSaveObjects))
+			}); saveErr != nil {
+				// A previous cancelled attempt may have left the object in staging.
+				if fallback, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
+					log.Warnf("cluster job %s share-save batch reported %v; reusing existing staged object %s", offer.JobID, saveErr, fallback)
+					return fallback, true, nil
+				}
+				return "", false, fmt.Errorf("save cluster share selection batch: %w", saveErr)
+			}
+		}
+		if stagedSource, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
+			return stagedSource, false, nil
+		}
+		return "", false, fmt.Errorf("cluster staged source for %s was not found after share-save batch preparation", primary.SourceFileID)
+	}
+
+	saved, saveErr := s.saveClusterShareSelection(ctx, offer.TaskContext.Share.URL, offer.TaskContext.Share.Passcode, requestedTempRoot, []string{primary.SourceFileID})
+	if saveErr != nil {
+		// A previous cancelled attempt may have left the object in staging.
+		if fallback, ok := s.findStagedSource(ctx, requestedTempRoot, primary); ok {
+			log.Warnf("cluster job %s share-save reported %v; reusing existing staged object %s", offer.JobID, saveErr, fallback)
+			return fallback, true, nil
+		}
+		return "", false, fmt.Errorf("save cluster share selection: %w", saveErr)
+	}
+	if len(saved) != 1 {
+		return "", false, fmt.Errorf("cluster media task saved %d files, want 1", len(saved))
+	}
+	return saved[0], false, nil
+}
+
+func (s *Service) saveClusterShareSelection(ctx context.Context, rawURL, passcode, tempRoot string, selectedFileIDs []string) ([]string, error) {
+	if s.shareSaveSaver != nil {
+		return s.shareSaveSaver(ctx, rawURL, passcode, tempRoot, selectedFileIDs)
+	}
+	return subscription.SaveClusterShareSelection(ctx, rawURL, passcode, tempRoot, selectedFileIDs)
+}
+
+func (s *Service) saveClusterShareSelectionBatch(ctx context.Context, rawURL, passcode, tempRoot string, selectedFileIDs []string) ([]string, error) {
+	if s.shareSaveBatchSaver != nil {
+		return s.shareSaveBatchSaver(ctx, rawURL, passcode, tempRoot, selectedFileIDs)
+	}
+	return subscription.SaveClusterShareSelectionBatch(ctx, rawURL, passcode, tempRoot, selectedFileIDs)
+}
+
+func (s *Service) findStagedSource(ctx context.Context, tempRoot string, primary protocol.SourceObject) (string, bool) {
+	if s.stagedSourceFinder != nil {
+		return s.stagedSourceFinder(ctx, tempRoot, primary)
+	}
+	return findExistingStagedSource(ctx, tempRoot, primary)
+}
+
+func (s *Service) allShareSaveObjectsStaged(ctx context.Context, tempRoot string, objects []protocol.SourceObject) bool {
+	if len(objects) == 0 {
+		return false
+	}
+	for _, object := range objects {
+		if _, ok := s.findStagedSource(ctx, tempRoot, object); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func mediaTransferShareSaveObjects(task protocol.TaskContext, primary protocol.SourceObject) []protocol.SourceObject {
+	objects := make([]protocol.SourceObject, 0, len(task.ShareSaveObjects)+1)
+	seen := make(map[string]struct{}, len(task.ShareSaveObjects)+1)
+	appendObject := func(object protocol.SourceObject) {
+		id := strings.TrimSpace(object.SourceFileID)
+		if id == "" {
+			return
+		}
+		object.SourceFileID = id
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		objects = append(objects, object)
+	}
+	for _, object := range task.ShareSaveObjects {
+		appendObject(object)
+	}
+	appendObject(primary)
+	return objects
+}
+
+func mediaTransferShareSaveFileIDs(objects []protocol.SourceObject) []string {
+	selectedFileIDs := make([]string, 0, len(objects))
+	for _, object := range objects {
+		if id := strings.TrimSpace(object.SourceFileID); id != "" {
+			selectedFileIDs = append(selectedFileIDs, id)
+		}
+	}
+	return selectedFileIDs
+}
+
+func mediaTransferShareSaveSingleflightKey(task protocol.TaskContext, requestedTempRoot string) string {
+	return strings.Join([]string{
+		"share-save-batch",
+		strings.TrimSpace(task.ShareSaveKey),
+		path.Clean(strings.TrimSpace(requestedTempRoot)),
+		strings.TrimSpace(task.StagingTarget.Provider),
+		task.StagingTarget.Folder,
+		fmt.Sprintf("%d", task.StagingTarget.StorageID),
+		strings.TrimSpace(task.StagingTarget.NodeMountID),
+		strings.TrimSpace(task.StagingTarget.AccountFingerprint),
+	}, "|")
 }
 
 func findExistingStagedSource(ctx context.Context, tempRoot string, primary protocol.SourceObject) (string, bool) {

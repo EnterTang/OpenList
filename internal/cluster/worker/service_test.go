@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"errors"
+	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -626,6 +628,264 @@ func TestValidUploadManifestReconstructsShareSaveTaskContextHash(t *testing.T) {
 	require.Equal(t, manifest.TaskContextHash, got)
 }
 
+func TestMediaTransfer_BatchShareSaveUsesSingleflight(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Show.S01E01.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Show.S01E02.mkv", Size: 102},
+		{Provider: "pan115", SourceFileID: "file-3", SourceRelativePath: "Show.S01E03.mkv", Size: 103},
+	}
+	service := New(&fakeResultQueue{}, nil)
+
+	var (
+		mu        sync.Mutex
+		callCount int
+		gotIDs    []string
+		staged    = make(map[string]string, len(shareSaveObjects))
+	)
+	saverEntered := make(chan struct{})
+	releaseSaver := make(chan struct{})
+	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		stagedPath, ok := staged[primary.SourceFileID]
+		return stagedPath, ok
+	}
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, _ string, selectedFileIDs []string) ([]string, error) {
+		mu.Lock()
+		callCount++
+		gotIDs = append([]string(nil), selectedFileIDs...)
+		if callCount == 1 {
+			close(saverEntered)
+		}
+		mu.Unlock()
+
+		<-releaseSaver
+
+		mu.Lock()
+		defer mu.Unlock()
+		paths := make([]string, 0, len(shareSaveObjects))
+		for _, object := range shareSaveObjects {
+			stagedPath := testStagedSourcePath(tempRoot, object)
+			staged[object.SourceFileID] = stagedPath
+			paths = append(paths, stagedPath)
+		}
+		return paths, nil
+	}
+
+	type result struct {
+		sourceFileID string
+		stagedPath   string
+		reused       bool
+		err          error
+	}
+	results := make(chan result, len(shareSaveObjects))
+	for _, primary := range shareSaveObjects {
+		primary := primary
+		go func() {
+			stagedPath, reused, err := service.prepareMediaTransferShareSave(
+				context.Background(),
+				testMediaTransferOffer(primary, shareSaveObjects, "share-save-batch:alpha"),
+				tempRoot,
+			)
+			results <- result{sourceFileID: primary.SourceFileID, stagedPath: stagedPath, reused: reused, err: err}
+		}()
+	}
+
+	select {
+	case <-saverEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch saver was not called")
+	}
+	close(releaseSaver)
+
+	gotPaths := make(map[string]string, len(shareSaveObjects))
+	for range shareSaveObjects {
+		result := <-results
+		require.NoError(t, result.err)
+		gotPaths[result.sourceFileID] = result.stagedPath
+	}
+
+	mu.Lock()
+	require.Equal(t, 1, callCount)
+	require.Equal(t, []string{"file-1", "file-2", "file-3"}, gotIDs)
+	mu.Unlock()
+	for _, object := range shareSaveObjects {
+		require.Equal(t, testStagedSourcePath(tempRoot, object), gotPaths[object.SourceFileID])
+	}
+}
+
+func TestMediaTransfer_BatchShareSaveFailureFansOutAndAllowsRetry(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Show.S01E01.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Show.S01E02.mkv", Size: 102},
+	}
+	service := New(&fakeResultQueue{}, nil)
+
+	var (
+		mu             sync.Mutex
+		callCount      int
+		staged         = make(map[string]string, len(shareSaveObjects))
+		initialLookups = make(map[string]struct{}, len(shareSaveObjects))
+	)
+	firstRelease := make(chan struct{})
+	initialReady := make(chan struct{})
+	saverEntered := make(chan struct{})
+	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
+		mu.Lock()
+		stagedPath, ok := staged[primary.SourceFileID]
+		if !ok && len(staged) == 0 {
+			if _, seen := initialLookups[primary.SourceFileID]; !seen {
+				initialLookups[primary.SourceFileID] = struct{}{}
+				if len(initialLookups) == len(shareSaveObjects) {
+					close(initialReady)
+				}
+			}
+			mu.Unlock()
+			<-initialReady
+			return "", false
+		}
+		mu.Unlock()
+		return stagedPath, ok
+	}
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, _ string, _ []string) ([]string, error) {
+		mu.Lock()
+		callCount++
+		currentCall := callCount
+		mu.Unlock()
+		if currentCall == 1 {
+			close(saverEntered)
+			<-firstRelease
+			return nil, errors.New("save batch failed")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		paths := make([]string, 0, len(shareSaveObjects))
+		for _, object := range shareSaveObjects {
+			stagedPath := testStagedSourcePath(tempRoot, object)
+			staged[object.SourceFileID] = stagedPath
+			paths = append(paths, stagedPath)
+		}
+		return paths, nil
+	}
+
+	errs := make(chan error, len(shareSaveObjects))
+	for _, primary := range shareSaveObjects {
+		primary := primary
+		go func() {
+			_, _, err := service.prepareMediaTransferShareSave(
+				context.Background(),
+				testMediaTransferOffer(primary, shareSaveObjects, "share-save-batch:beta"),
+				tempRoot,
+			)
+			errs <- err
+		}()
+	}
+
+	select {
+	case <-saverEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch saver was not entered")
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(firstRelease)
+	for range shareSaveObjects {
+		err := <-errs
+		require.ErrorContains(t, err, "save batch failed")
+	}
+
+	mu.Lock()
+	require.Equal(t, 1, callCount)
+	mu.Unlock()
+
+	stagedPath, reused, err := service.prepareMediaTransferShareSave(
+		context.Background(),
+		testMediaTransferOffer(shareSaveObjects[0], shareSaveObjects, "share-save-batch:beta"),
+		tempRoot,
+	)
+	require.NoError(t, err)
+	require.False(t, reused)
+	require.Equal(t, testStagedSourcePath(tempRoot, shareSaveObjects[0]), stagedPath)
+	mu.Lock()
+	require.Equal(t, 2, callCount)
+	mu.Unlock()
+}
+
+func TestMediaTransfer_BatchShareSaveSkipsWhenAllFilesAlreadyStaged(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	shareSaveObjects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "file-1", SourceRelativePath: "Show.S01E01.mkv", Size: 101},
+		{Provider: "pan115", SourceFileID: "file-2", SourceRelativePath: "Show.S01E02.mkv", Size: 102},
+	}
+	service := New(&fakeResultQueue{}, nil)
+
+	staged := make(map[string]string, len(shareSaveObjects))
+	for _, object := range shareSaveObjects {
+		staged[object.SourceFileID] = testStagedSourcePath(tempRoot, object)
+	}
+	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
+		stagedPath, ok := staged[primary.SourceFileID]
+		return stagedPath, ok
+	}
+
+	called := false
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, _ string, _ []string) ([]string, error) {
+		called = true
+		return nil, nil
+	}
+
+	stagedPath, reused, err := service.prepareMediaTransferShareSave(
+		context.Background(),
+		testMediaTransferOffer(shareSaveObjects[0], shareSaveObjects, "share-save-batch:gamma"),
+		tempRoot,
+	)
+	require.NoError(t, err)
+	require.True(t, reused)
+	require.Equal(t, testStagedSourcePath(tempRoot, shareSaveObjects[0]), stagedPath)
+	require.False(t, called)
+}
+
+func TestMediaTransfer_SingleShareSaveWithoutBatchUsesPrimaryOnly(t *testing.T) {
+	tempRoot := "/worker-staging/share-save"
+	service := New(&fakeResultQueue{}, nil)
+	objects := []protocol.SourceObject{
+		{Provider: "pan115", SourceFileID: "cover", SourceRelativePath: "Show.S01E01.jpg", Size: 20},
+		{Provider: "pan115", SourceFileID: "episode", SourceRelativePath: "Show.S01E01.mkv", Size: 200},
+		{Provider: "pan115", SourceFileID: "subtitle", SourceRelativePath: "Show.S01E01.ass", Size: 10},
+	}
+
+	var (
+		gotIDs []string
+		staged string
+	)
+	service.stagedSourceFinder = func(_ context.Context, _ string, primary protocol.SourceObject) (string, bool) {
+		if staged == "" {
+			return "", false
+		}
+		return staged, primary.SourceFileID == "episode"
+	}
+	service.shareSaveBatchSaver = func(_ context.Context, _, _, _ string, _ []string) ([]string, error) {
+		t.Fatal("batch saver should not be called when share-save batch context is absent")
+		return nil, nil
+	}
+	service.shareSaveSaver = func(_ context.Context, _, _, _ string, selectedFileIDs []string) ([]string, error) {
+		gotIDs = append([]string(nil), selectedFileIDs...)
+		staged = testStagedSourcePath(tempRoot, objects[1])
+		return []string{staged}, nil
+	}
+
+	stagedPath, reused, err := service.prepareMediaTransferShareSave(
+		context.Background(),
+		testMediaTransferOfferWithoutBatch(objects),
+		tempRoot,
+	)
+	require.NoError(t, err)
+	require.False(t, reused)
+	require.Equal(t, []string{"episode"}, gotIDs)
+	require.Equal(t, staged, stagedPath)
+}
+
 func TestDefaultMediaConcurrencyUsesConfiguredMoveWorkers(t *testing.T) {
 	original := conf.Conf
 	conf.Conf = conf.DefaultConfig(t.TempDir())
@@ -704,4 +964,56 @@ func TestCleanupBacklogBlocksOfferRejectsMediaTransfer(t *testing.T) {
 	if err := service.cleanupBacklogBlocksOffer(context.Background(), offer); err == nil {
 		t.Fatal("expected media transfer to reject cleanup backlog")
 	}
+}
+
+func testMediaTransferOffer(primary protocol.SourceObject, shareSaveObjects []protocol.SourceObject, shareSaveKey string) protocol.JobOffer {
+	return protocol.JobOffer{
+		AttemptRef:     protocol.AttemptRef{JobID: "job-" + primary.SourceFileID, AttemptID: "attempt-1", Generation: 1, LeaseToken: "lease"},
+		IdempotencyKey: "operation-" + primary.SourceFileID,
+		JobType:        model.ClusterJobTypeMediaTransfer,
+		TaskContext: protocol.TaskContext{
+			Share: protocol.ShareTaskContext{
+				Provider: "pan115",
+				URL:      "https://example.com/share",
+				Passcode: "passcode",
+			},
+			SourceObjects:    []protocol.SourceObject{primary},
+			ShareSaveKey:     shareSaveKey,
+			ShareSaveObjects: shareSaveObjects,
+			StagingTarget: protocol.ProviderTargetRequirement{
+				Provider:           "pan115",
+				StorageID:          42,
+				NodeMountID:        "node-mount-42",
+				AccountFingerprint: "account-42",
+				NeedShareSave:      true,
+			},
+		},
+	}
+}
+
+func testMediaTransferOfferWithoutBatch(sourceObjects []protocol.SourceObject) protocol.JobOffer {
+	return protocol.JobOffer{
+		AttemptRef:     protocol.AttemptRef{JobID: "job-no-batch", AttemptID: "attempt-1", Generation: 1, LeaseToken: "lease"},
+		IdempotencyKey: "operation-no-batch",
+		JobType:        model.ClusterJobTypeMediaTransfer,
+		TaskContext: protocol.TaskContext{
+			Share: protocol.ShareTaskContext{
+				Provider: "pan115",
+				URL:      "https://example.com/share",
+				Passcode: "passcode",
+			},
+			SourceObjects: sourceObjects,
+			StagingTarget: protocol.ProviderTargetRequirement{
+				Provider:           "pan115",
+				StorageID:          42,
+				NodeMountID:        "node-mount-42",
+				AccountFingerprint: "account-42",
+				NeedShareSave:      true,
+			},
+		},
+	}
+}
+
+func testStagedSourcePath(tempRoot string, object protocol.SourceObject) string {
+	return path.Join(tempRoot, path.Base(strings.TrimSpace(object.SourceRelativePath)))
 }
