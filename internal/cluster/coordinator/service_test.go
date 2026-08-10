@@ -436,6 +436,61 @@ func TestRetryableMediaResultStopsAfterAttemptLimit(t *testing.T) {
 	}
 }
 
+func TestPermanentShareCredentialFailureDoesNotQueueAnotherAttempt(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, contextHash, model.ClusterAttemptStatusRunning)
+	job.SubscriptionItemID = 0
+	job.NotificationStatus = model.ClusterNotificationStatusPending
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	stage := &model.ClusterJobStage{
+		ID: "upload-invalid-credential", JobID: job.ID, AttemptID: attempt.ID,
+		Name: model.ClusterStageUploadingMobile, Status: model.ClusterStageStatusRunning,
+	}
+	if err := database.Create(stage).Error; err != nil {
+		t.Fatal(err)
+	}
+	finishedAt := time.Now().UTC()
+	result, _ := protocol.NewEnvelope(protocol.MessageJobResult, protocol.JobResult{
+		AttemptRef: protocol.AttemptRef{JobID: job.ID, AttemptID: attempt.ID, Generation: 1, LeaseToken: "lease"},
+		Status:     "failed", ErrorCode: "share_save_credentials_invalid", Error: "refresh_token无效", FinishedAt: finishedAt,
+	})
+	result.Seq = 1
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *result); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusFailed || job.FinishedAt == nil || job.CurrentAttemptID != attempt.ID {
+		t.Fatalf("permanent failure job = %#v", job)
+	}
+	if !job.FinishedAt.Equal(finishedAt) {
+		t.Fatalf("finished at = %v, want %v", job.FinishedAt, finishedAt)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != model.ClusterAttemptStatusFailed || attempt.ErrorCode != "share_save_credentials_invalid" {
+		t.Fatalf("attempt = %#v", attempt)
+	}
+	if err := database.First(stage, "id = ?", stage.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusFailed || stage.ErrorCode != "share_save_credentials_invalid" || stage.Error != "refresh_token无效" {
+		t.Fatalf("stage = %#v", stage)
+	}
+}
+
 func TestDuplicateMediaResultDoesNotRegressMaterializedJob(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	task := testTaskContext()

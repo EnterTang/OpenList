@@ -18,6 +18,8 @@ import (
 
 const pan115WebURL = "https://115cdn.com"
 
+const pan115ClusterErrorCodeShareSaveCredentialsInvalid = "share_save_credentials_invalid"
+
 type pan115ShareProvider struct {
 	cfg    model.SubscriptionTelegramPanConfig
 	webURL string
@@ -168,10 +170,46 @@ func decodePan115JSON(resp *resty.Response, out any) error {
 }
 
 func pan115Error(message string) error {
-	if strings.TrimSpace(message) == "" {
+	message = strings.TrimSpace(message)
+	if message == "" {
 		return errors.New("115 request failed")
 	}
+	if code := classifyPan115ClusterErrorCode(message); code != "" {
+		return &pan115ClusterError{message: message, code: code}
+	}
 	return errors.New(message)
+}
+
+func classifyPan115ClusterErrorCode(message string) string {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	switch {
+	case strings.Contains(normalized, "密钥错误"),
+		strings.Contains(normalized, "签名无效"),
+		strings.Contains(normalized, "refresh_token无效"),
+		strings.Contains(normalized, "refresh token无效"):
+		return pan115ClusterErrorCodeShareSaveCredentialsInvalid
+	default:
+		return ""
+	}
+}
+
+type pan115ClusterError struct {
+	message string
+	code    string
+}
+
+func (e *pan115ClusterError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func (e *pan115ClusterError) ClusterErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.code
 }
 
 type pan115SnapResp struct {

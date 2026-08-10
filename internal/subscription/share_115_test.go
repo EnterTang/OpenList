@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -160,5 +161,43 @@ func TestPan115ShareProviderSavesItems(t *testing.T) {
 	}
 	if !receiveCalled {
 		t.Fatal("receive endpoint was not called")
+	}
+}
+
+func TestPan115ErrorClassifiesPermanentCredentialFailures(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		message   string
+		wantCode  string
+		wantCoded bool
+	}{
+		{name: "secret key error", message: "密钥错误", wantCode: "share_save_credentials_invalid", wantCoded: true},
+		{name: "invalid signature", message: "签名无效，请重新登录", wantCode: "share_save_credentials_invalid", wantCoded: true},
+		{name: "invalid refresh token", message: "refresh_token无效", wantCode: "share_save_credentials_invalid", wantCoded: true},
+		{name: "ordinary business error", message: "文件不存在", wantCoded: false},
+		{name: "blank message", message: "   ", wantCoded: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := pan115Error(tc.message)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+
+			var coded interface{ ClusterErrorCode() string }
+			gotCoded := errors.As(err, &coded)
+			if gotCoded != tc.wantCoded {
+				t.Fatalf("coded=%v, want %v, err=%v", gotCoded, tc.wantCoded, err)
+			}
+			if tc.wantCoded && coded.ClusterErrorCode() != tc.wantCode {
+				t.Fatalf("cluster error code = %q, want %q", coded.ClusterErrorCode(), tc.wantCode)
+			}
+		})
 	}
 }
