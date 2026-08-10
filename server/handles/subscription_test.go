@@ -62,6 +62,8 @@ type subscriptionEpisodeSourcesData struct {
 
 type recordingSubscriptionDispatcher struct {
 	inspectTasks []subscription.ClusterInspectTask
+	retryResult  *subscription.ClusterRetryResult
+	retryCalls   int
 }
 
 func TestUpdateSubscriptionRejectsBlankName(t *testing.T) {
@@ -372,6 +374,14 @@ func (d *recordingSubscriptionDispatcher) DispatchSubscriptionMedia(context.Cont
 	return nil, nil
 }
 
+func (d *recordingSubscriptionDispatcher) RetryFailedSubscriptionItems(context.Context, uint) (subscription.ClusterRetryResult, error) {
+	d.retryCalls++
+	if d.retryResult == nil {
+		return subscription.ClusterRetryResult{}, errors.New("retry result not configured")
+	}
+	return *d.retryResult, nil
+}
+
 func TestCheckSubscriptionUsesClusterDispatchForHybridRole(t *testing.T) {
 	oldConf := conf.Conf
 	t.Cleanup(func() { conf.Conf = oldConf })
@@ -408,6 +418,42 @@ func TestCheckSubscriptionUsesClusterDispatchForHybridRole(t *testing.T) {
 	}
 	if len(dispatcher.inspectTasks) != 1 {
 		t.Fatalf("inspect tasks = %#v, want one cluster inspection", dispatcher.inspectTasks)
+	}
+}
+
+func TestRetryFailedSubscriptionUsesClusterReplayForHybridRole(t *testing.T) {
+	oldConf := conf.Conf
+	t.Cleanup(func() { conf.Conf = oldConf })
+	setupSubscriptionHandleDB(t)
+	conf.Conf.Cluster.Role = model.ClusterRoleHybrid
+	dispatcher := &recordingSubscriptionDispatcher{retryResult: &subscription.ClusterRetryResult{Requeued: 2}}
+	subscription.RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { subscription.RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{Name: "Hybrid retry", TMDBName: "Hybrid retry", TransferEnabled: true}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/admin/subscription/retry_failed",
+		strings.NewReader(`{"id":`+strconv.Itoa(int(sub.ID))+`}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	RetryFailedSubscription(c)
+
+	resp := decodeHandleResp[model.SubscriptionRunResult](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200: %s", resp.Code, recorder.Body.String())
+	}
+	if dispatcher.retryCalls != 1 {
+		t.Fatalf("retry calls = %d, want 1", dispatcher.retryCalls)
+	}
+	if resp.Data.Run == nil || resp.Data.Run.TransferredCount != 2 {
+		t.Fatalf("response run = %#v, want two requeued tasks", resp.Data.Run)
 	}
 }
 

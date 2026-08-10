@@ -424,11 +424,7 @@ func RetryFailedSubscription(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	if _, err := db.ResetFailedSubscriptionItems(c.Request.Context(), req.ID); err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-	result, err := subscription.RunForRole(c.Request.Context(), req.ID, true, conf.Conf.Cluster.Role)
+	result, err := subscription.RetryFailedForRole(c.Request.Context(), req.ID, conf.Conf.Cluster.Role)
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return

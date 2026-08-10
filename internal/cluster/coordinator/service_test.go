@@ -946,6 +946,96 @@ func TestArchiveAndRetryFailedJobs(t *testing.T) {
 	}
 }
 
+func TestRetryFailedSubscriptionItemsRequeuesJobsAndRestoresLinks(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	if err := database.AutoMigrate(&model.Subscription{}, &model.SubscriptionItem{}, &model.SubscriptionEpisodeSource{}); err != nil {
+		t.Fatal(err)
+	}
+	subscription := model.Subscription{ID: 71, Name: "Retry subscription"}
+	if err := database.Create(&subscription).Error; err != nil {
+		t.Fatal(err)
+	}
+	items := []model.SubscriptionItem{
+		{ID: 701, SubscriptionID: subscription.ID, SourceKey: "historical-failure", Status: model.SubscriptionItemStatusFailed, Season: 1, Episode: 1, LastError: "worker failed"},
+		{ID: 702, SubscriptionID: subscription.ID, SourceKey: "stale-pending", Status: model.SubscriptionItemStatusPending, Season: 1, Episode: 2},
+		{ID: 703, SubscriptionID: subscription.ID, SourceKey: "live-failure", Status: model.SubscriptionItemStatusFailed, ClusterJobID: "live-job", LastError: "late callback"},
+		{ID: 704, SubscriptionID: subscription.ID, SourceKey: "unmatched-failure", Status: model.SubscriptionItemStatusFailed, LastError: "no durable job"},
+		{ID: 705, SubscriptionID: subscription.ID, SourceKey: "transferred", Status: model.SubscriptionItemStatusTransferred, ClusterJobID: "done-job"},
+	}
+	for i := range items {
+		if err := database.Create(&items[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, source := range []model.SubscriptionEpisodeSource{
+		{SubscriptionID: subscription.ID, Season: 1, Episode: 1, SourceItemID: 701, Status: model.SubscriptionItemStatusFailed, ClusterJobID: "historical-job"},
+		{SubscriptionID: subscription.ID, Season: 1, Episode: 2, SourceItemID: 702, Status: model.SubscriptionItemStatusPending},
+	} {
+		if err := database.Create(&source).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobs := []model.ClusterJob{
+		{ID: "historical-job", IdempotencyKey: "historical-job", Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusFailed, SubscriptionID: subscription.ID, SubscriptionItemID: 701},
+		{ID: "pending-job", IdempotencyKey: "pending-job", Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusDeadLetter, SubscriptionID: subscription.ID, SubscriptionItemID: 702},
+		{ID: "live-job", IdempotencyKey: "live-job", Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusRunning, SubscriptionID: subscription.ID, SubscriptionItemID: 703},
+		{ID: "done-job", IdempotencyKey: "done-job", Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusSucceeded, SubscriptionID: subscription.ID, SubscriptionItemID: 705},
+	}
+	for i := range jobs {
+		if err := database.Create(&jobs[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := New(database, "token").RetryFailedSubscriptionItems(context.Background(), subscription.ID)
+	if err != nil {
+		t.Fatalf("retry failed subscription items: %v", err)
+	}
+	if result.Requeued != 2 || result.Unmatched != 1 {
+		t.Fatalf("retry result = %#v, want requeued=2 unmatched=1", result)
+	}
+
+	for _, itemID := range []uint{701, 702} {
+		var item model.SubscriptionItem
+		if err := database.First(&item, "id = ?", itemID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if item.Status != model.SubscriptionItemStatusPending || item.ClusterJobID == "" || item.LastError != "" {
+			t.Fatalf("requeued item %d = %#v", itemID, item)
+		}
+		var source model.SubscriptionEpisodeSource
+		if err := database.Where("subscription_id = ? AND source_item_id = ?", subscription.ID, itemID).First(&source).Error; err != nil {
+			t.Fatal(err)
+		}
+		if source.Status != model.SubscriptionItemStatusPending || source.ClusterJobID != item.ClusterJobID {
+			t.Fatalf("requeued source %d = %#v", itemID, source)
+		}
+	}
+	var unmatched model.SubscriptionItem
+	if err := database.First(&unmatched, "id = ?", 704).Error; err != nil {
+		t.Fatal(err)
+	}
+	if unmatched.Status != model.SubscriptionItemStatusFailed || unmatched.LastError != "no durable job" {
+		t.Fatalf("unmatched item = %#v", unmatched)
+	}
+	var live model.SubscriptionItem
+	if err := database.First(&live, "id = ?", 703).Error; err != nil {
+		t.Fatal(err)
+	}
+	if live.Status != model.SubscriptionItemStatusFailed || live.ClusterJobID != "live-job" {
+		t.Fatalf("live item changed = %#v", live)
+	}
+	for _, jobID := range []string{"historical-job", "pending-job"} {
+		var job model.ClusterJob
+		if err := database.First(&job, "id = ?", jobID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if job.Status != model.ClusterJobStatusQueued || job.AssignedNodeID != "" || job.CurrentAttemptID != "" || job.FinishedAt != nil {
+			t.Fatalf("requeued job %s = %#v", jobID, job)
+		}
+	}
+}
+
 func TestListJobsIncludesStageProgress(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	job := model.ClusterJob{

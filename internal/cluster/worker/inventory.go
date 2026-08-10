@@ -52,7 +52,9 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 				snapshot.Account.SupportsUpload = false
 			}
 		}
-		providers[snapshot.Mount.Provider] = struct{}{}
+		if inventoryProviderAvailable(snapshot.Account) {
+			providers[snapshot.Mount.Provider] = struct{}{}
+		}
 		mounts = append(mounts, snapshot.Mount)
 		providerAccounts = append(providerAccounts, snapshot.Account)
 	}
@@ -83,6 +85,10 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 	sum := sha256.Sum256(raw)
 	report.InventoryHash = hex.EncodeToString(sum[:])
 	return report, nil
+}
+
+func inventoryProviderAvailable(account protocol.ProviderAccountInventory) bool {
+	return strings.EqualFold(strings.TrimSpace(account.Status), "work")
 }
 
 func requiresWorkerStagingRouting(provider string) bool {

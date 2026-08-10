@@ -66,6 +66,21 @@ func (d subscriptionDispatcher) DispatchSubscriptionInspect(ctx context.Context,
 	return job.ID, nil
 }
 
+func (d subscriptionDispatcher) RetryFailedSubscriptionItems(ctx context.Context, subscriptionID uint) (subscription.ClusterRetryResult, error) {
+	if d.runtime == nil {
+		return subscription.ClusterRetryResult{}, errors.New("cluster subscription dispatcher is unavailable")
+	}
+	service := d.runtime.CoordinatorService()
+	if service == nil {
+		return subscription.ClusterRetryResult{}, errors.New("cluster coordinator is unavailable")
+	}
+	result, err := service.RetryFailedSubscriptionItems(ctx, subscriptionID)
+	if err != nil {
+		return subscription.ClusterRetryResult{}, err
+	}
+	return subscription.ClusterRetryResult{Requeued: result.Requeued, Unmatched: result.Unmatched}, nil
+}
+
 func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterShareInspectManifest, manifest protocol.ShareInspectManifest) error {
 	progress, err := loadShareInspectObservationProgress(ctx, record)
 	if err != nil {

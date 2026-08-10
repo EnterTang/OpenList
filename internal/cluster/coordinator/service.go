@@ -49,6 +49,15 @@ type NodeSummary struct {
 	LatestInventory *NodeInventorySummary `json:"latest_inventory,omitempty"`
 }
 
+// RetrySubscriptionResult describes the durable recovery performed for a
+// subscription's failed media children. Unmatched counts are intentionally
+// reported instead of being reset: a failed item without a durable cluster
+// job cannot be safely replayed by the coordinator.
+type RetrySubscriptionResult struct {
+	Requeued  int
+	Unmatched int
+}
+
 // ShareInspectConsumer is the subscription-facing durable handoff. The
 // manifest remains pending until the consumer returns nil, so a Coordinator
 // restart cannot lose an inspected share tree.
@@ -1735,24 +1744,159 @@ func (s *Service) RetryJob(ctx context.Context, jobID string) error {
 	}
 	now := time.Now().UTC()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var job model.ClusterJob
-		if err := tx.Select("id", "parent_job_id").First(&job, "id = ?", jobID).Error; err != nil {
+		return retryJobTx(tx, jobID, now)
+	})
+}
+
+var retryableSubscriptionJobStatuses = []string{
+	model.ClusterJobStatusFailed,
+	model.ClusterJobStatusPartialFailed,
+	model.ClusterJobStatusDeadLetter,
+	model.ClusterJobStatusCancelled,
+}
+
+func isRetryableSubscriptionJobStatus(status string) bool {
+	for _, retryable := range retryableSubscriptionJobStatuses {
+		if status == retryable {
+			return true
+		}
+	}
+	return false
+}
+
+// RetryFailedSubscriptionItems reopens the existing media-transfer children
+// for a subscription. It deliberately searches by SubscriptionItemID as a
+// fallback because older retry handlers cleared subscription_item.cluster_job_id
+// after a job had already been persisted.
+func (s *Service) RetryFailedSubscriptionItems(ctx context.Context, subscriptionID uint) (RetrySubscriptionResult, error) {
+	if subscriptionID == 0 {
+		return RetrySubscriptionResult{}, errors.New("subscription id is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var recovered RetrySubscriptionResult
+	now := time.Now().UTC()
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var items []model.SubscriptionItem
+		if err := tx.Where("subscription_id = ? AND status IN ?", subscriptionID, []string{
+			model.SubscriptionItemStatusFailed,
+			model.SubscriptionItemStatusPending,
+		}).Order("id ASC").Find(&items).Error; err != nil {
 			return err
 		}
-		result := tx.Model(&model.ClusterJob{}).
-			Where("id = ? AND status IN ?", jobID, []string{model.ClusterJobStatusFailed, model.ClusterJobStatusPartialFailed, model.ClusterJobStatusDeadLetter, model.ClusterJobStatusCancelled}).
-			Updates(map[string]any{
-				"status": model.ClusterJobStatusQueued, "available_at": now, "archived_at": nil,
-				"assigned_node_id": "", "current_attempt_id": "", "last_error_code": "", "last_error": "", "finished_at": nil,
-			})
-		if result.Error != nil {
-			return result.Error
+		if len(items) == 0 {
+			return nil
 		}
-		if result.RowsAffected == 0 {
-			return errors.New("cluster job is not in a retryable terminal state")
+
+		var jobs []model.ClusterJob
+		if err := tx.Where("subscription_id = ? AND type = ?", subscriptionID, model.ClusterJobTypeMediaTransfer).
+			Order("created_at DESC, id DESC").Find(&jobs).Error; err != nil {
+			return err
 		}
-		return reconcileParentJobTx(tx, job.ParentJobID, now)
+		jobsByID := make(map[string]*model.ClusterJob, len(jobs))
+		latestByItemID := make(map[uint]*model.ClusterJob)
+		for i := range jobs {
+			job := &jobs[i]
+			jobsByID[job.ID] = job
+			if job.SubscriptionItemID == 0 {
+				continue
+			}
+			if _, exists := latestByItemID[job.SubscriptionItemID]; !exists {
+				latestByItemID[job.SubscriptionItemID] = job
+			}
+		}
+
+		retriedJobs := make(map[string]struct{}, len(items))
+		for i := range items {
+			item := &items[i]
+			job := jobsByID[strings.TrimSpace(item.ClusterJobID)]
+			if job == nil {
+				job = latestByItemID[item.ID]
+			}
+			if job == nil {
+				if item.Status == model.SubscriptionItemStatusFailed {
+					recovered.Unmatched++
+				}
+				continue
+			}
+			if !isRetryableSubscriptionJobStatus(job.Status) {
+				// A live job is already in flight. A succeeded or otherwise
+				// terminal job cannot be replayed safely, so report a failed item
+				// that has no retryable durable task instead of hiding it.
+				if item.Status == model.SubscriptionItemStatusFailed && !isActiveSubscriptionJobStatus(job.Status) {
+					recovered.Unmatched++
+				}
+				continue
+			}
+			if _, alreadyRetried := retriedJobs[job.ID]; alreadyRetried {
+				continue
+			}
+			if err := retryJobTx(tx, job.ID, now); err != nil {
+				return err
+			}
+			retriedJobs[job.ID] = struct{}{}
+			if err := tx.Model(&model.SubscriptionItem{}).Where("id = ?", item.ID).Updates(map[string]any{
+				"status":         model.SubscriptionItemStatusPending,
+				"cluster_job_id": job.ID,
+				"last_error":     "",
+			}).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&model.SubscriptionEpisodeSource{}).
+				Where("subscription_id = ? AND source_item_id = ?", subscriptionID, item.ID).
+				Updates(map[string]any{
+					"status":         model.SubscriptionItemStatusPending,
+					"cluster_job_id": job.ID,
+				}).Error; err != nil {
+				return err
+			}
+			recovered.Requeued++
+		}
+		return nil
 	})
+	return recovered, err
+}
+
+func isActiveSubscriptionJobStatus(status string) bool {
+	switch status {
+	case model.ClusterJobStatusQueued,
+		model.ClusterJobStatusPlanning,
+		model.ClusterJobStatusLeased,
+		model.ClusterJobStatusRunning,
+		model.ClusterJobStatusRetryWait,
+		model.ClusterJobStatusCancelRequested:
+		return true
+	default:
+		return false
+	}
+}
+
+func retryJobTx(tx *gorm.DB, jobID string, now time.Time) error {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("cluster job id is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var job model.ClusterJob
+	if err := tx.Select("id", "parent_job_id").First(&job, "id = ?", jobID).Error; err != nil {
+		return err
+	}
+	result := tx.Model(&model.ClusterJob{}).
+		Where("id = ? AND status IN ?", jobID, retryableSubscriptionJobStatuses).
+		Updates(map[string]any{
+			"status": model.ClusterJobStatusQueued, "available_at": now, "archived_at": nil,
+			"assigned_node_id": "", "current_attempt_id": "", "last_error_code": "", "last_error": "", "finished_at": nil,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("cluster job is not in a retryable terminal state")
+	}
+	return reconcileParentJobTx(tx, job.ParentJobID, now)
 }
 
 func (s *Service) ArchiveFailedJobs(ctx context.Context) (int64, error) {

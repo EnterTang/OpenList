@@ -14,8 +14,8 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	log "github.com/sirupsen/logrus"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -64,6 +64,20 @@ type ClusterDispatchResult struct {
 	SourceKey string
 	JobID     string
 	Error     error
+}
+
+// ClusterRetryResult reports replayed durable media jobs. Unmatched is kept
+// separate so a retry endpoint can fail loudly instead of turning an item
+// without a replayable job into a misleading pending state.
+type ClusterRetryResult struct {
+	Requeued  int
+	Unmatched int
+}
+
+// ClusterFailedSubscriptionRetrier is optional on ClusterDispatcher so old
+// test adapters and non-coordinator integrations remain source-compatible.
+type ClusterFailedSubscriptionRetrier interface {
+	RetryFailedSubscriptionItems(context.Context, uint) (ClusterRetryResult, error)
 }
 
 type ClusterInspectTask struct {

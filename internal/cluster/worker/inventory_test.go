@@ -400,6 +400,11 @@ func TestBuildInventoryMarks115CD2ReauthorizationFailuresUnavailable(t *testing.
 	if account.SupportsShareSave || account.SupportsDownload || account.SupportsUpload || account.SupportsETF {
 		t.Fatalf("unhealthy CD2 account should not advertise capabilities: %#v", account)
 	}
+	for _, provider := range report.Capabilities.SupportedProviders {
+		if provider == "pan115" {
+			t.Fatalf("unhealthy CD2 provider should not be advertised as supported: %#v", report.Capabilities)
+		}
+	}
 	mount := report.Mounts[0]
 	if mount.Status != "reauthorization_required" || !mount.ReadOnly || mount.CanShare || mount.CanUpload || mount.SupportsETF {
 		t.Fatalf("unhealthy CD2 mount = %#v", mount)

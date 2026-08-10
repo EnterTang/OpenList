@@ -41,6 +41,68 @@ func RunForRole(ctx context.Context, subscriptionID uint, transfer bool, role st
 	return RunCluster(ctx, subscriptionID)
 }
 
+// RetryFailedForRole replays durable cluster media children in coordinator
+// roles. A normal cluster run performs source discovery and is not a retry:
+// using it here would create a new inspect observation while leaving the
+// existing failed media children untouched.
+func RetryFailedForRole(ctx context.Context, subscriptionID uint, role string) (*model.SubscriptionRunResult, error) {
+	if subscriptionTransfersLocally(role) {
+		if _, err := db.ResetFailedSubscriptionItems(ctx, subscriptionID); err != nil {
+			return nil, err
+		}
+		return Run(ctx, subscriptionID, true)
+	}
+	dispatcher := currentClusterDispatcher()
+	retrier, ok := dispatcher.(ClusterFailedSubscriptionRetrier)
+	if !ok {
+		return nil, errors.New("cluster subscription retry is unavailable")
+	}
+	unlock := lockSubscriptionRun(subscriptionID)
+	defer unlock()
+	retry, err := retrier.RetryFailedSubscriptionItems(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	if retry.Unmatched > 0 {
+		return nil, fmt.Errorf("%d failed subscription items have no retryable cluster job", retry.Unmatched)
+	}
+	return finishClusterRetry(subscriptionID, retry.Requeued)
+}
+
+func finishClusterRetry(subscriptionID uint, requeued int) (*model.SubscriptionRunResult, error) {
+	sub, err := db.GetSubscriptionByID(subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	items, err := db.ListSubscriptionItems(subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	if requeued == 0 {
+		return &model.SubscriptionRunResult{Subscription: sub, Items: items}, nil
+	}
+	now := time.Now()
+	run := &model.SubscriptionRun{
+		SubscriptionID:   subscriptionID,
+		StartedAt:        now,
+		FinishedAt:       &now,
+		Status:           model.SubscriptionStatusSuccess,
+		PreviousTreeHash: sub.LastTreeHash,
+		CurrentTreeHash:  sub.LastTreeHash,
+		TransferredCount: requeued,
+	}
+	if err := db.CreateSubscriptionRun(run); err != nil {
+		return nil, err
+	}
+	sub.LastStatus = model.SubscriptionStatusSuccess
+	sub.LastError = ""
+	sub.LastCheckedAt = &now
+	if err := db.UpdateSubscription(sub); err != nil {
+		return nil, err
+	}
+	return &model.SubscriptionRunResult{Subscription: sub, Run: run, Items: items}, nil
+}
+
 func subscriptionTransfersLocally(role string) bool {
 	role = strings.ToLower(strings.TrimSpace(role))
 	return role == "" || role == model.ClusterRoleStandalone

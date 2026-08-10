@@ -21,6 +21,16 @@ type recordingClusterDispatcher struct {
 	err          error
 }
 
+type retryClusterDispatcher struct {
+	recordingClusterDispatcher
+	result ClusterRetryResult
+	err    error
+}
+
+func (d *retryClusterDispatcher) RetryFailedSubscriptionItems(context.Context, uint) (ClusterRetryResult, error) {
+	return d.result, d.err
+}
+
 func (d *recordingClusterDispatcher) DispatchSubscriptionInspect(_ context.Context, task ClusterInspectTask) (string, error) {
 	if d.err != nil {
 		return "", d.err
@@ -42,6 +52,28 @@ func (d *recordingClusterDispatcher) DispatchSubscriptionMedia(_ context.Context
 		results = append(results, ClusterDispatchResult{SourceKey: task.SourceKey, JobID: "job-" + task.SourceKey})
 	}
 	return results, nil
+}
+
+func TestRetryFailedForRoleUsesClusterJobReplayWithoutDiscovery(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "Cluster retry", TMDBName: "Cluster retry", TransferEnabled: true}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	dispatcher := &retryClusterDispatcher{result: ClusterRetryResult{Requeued: 3}}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	result, err := RetryFailedForRole(context.Background(), sub.ID, model.ClusterRoleHybrid)
+	if err != nil {
+		t.Fatalf("retry failed for role: %v", err)
+	}
+	if result == nil || result.Run == nil || result.Run.TransferredCount != 3 {
+		t.Fatalf("retry result = %#v, want a run with three requeued tasks", result)
+	}
+	if result.Subscription == nil || result.Subscription.ID != sub.ID {
+		t.Fatalf("retry subscription = %#v", result.Subscription)
+	}
 }
 
 func TestRunTelegramClusterSkipsMessagesWithoutSubscriptionTitle(t *testing.T) {
@@ -482,11 +514,11 @@ func TestApplyClusterInspectObservationIncrementalKeepsOneWinnerPerMovieSlot(t *
 	}
 
 	weaker := ClusterInspectManifestInput{
-		Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderAliyunDrive), ShareURL: "https://www.alipan.com/s/example"},
+		Task:    ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderAliyunDrive), ShareURL: "https://www.alipan.com/s/example"},
 		Objects: []ClusterInspectObject{{FileID: "movie-aliyun", RelativePath: "Movie.aliyun.mkv", Size: 900}},
 	}
 	stronger := ClusterInspectManifestInput{
-		Task: ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan123), ShareURL: "https://www.123pan.com/s/example"},
+		Task:    ClusterInspectTask{SubscriptionID: sub.ID, ShareProvider: string(ShareProviderPan123), ShareURL: "https://www.123pan.com/s/example"},
 		Objects: []ClusterInspectObject{{FileID: "movie-pan123", RelativePath: "Movie.pan123.mkv", Size: 600}},
 	}
 
