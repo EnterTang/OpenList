@@ -65,7 +65,14 @@ func (l *pan115RateLimiter) wait(ctx context.Context) error {
 	return nil
 }
 
-const pan115ClusterErrorCodeShareSaveCredentialsInvalid = "share_save_credentials_invalid"
+const (
+	pan115ClusterErrorCodeShareSaveCredentialsInvalid = "share_save_credentials_invalid"
+	pan115ClusterErrorCodeShareSaveRateLimited        = "share_save_rate_limited"
+	pan115ClusterErrorCodeShareSaveMethodNotAllowed   = "share_save_method_not_allowed"
+	pan115ClusterErrorCodeShareSaveSourceInvalid      = "share_save_source_invalid"
+	pan115ClusterErrorCodeShareSaveGatewayResponse    = "share_save_gateway_response"
+	pan115ClusterErrorCodeShareSaveTransient          = "share_save_transient"
+)
 
 type pan115ShareProvider struct {
 	cfg            model.SubscriptionTelegramPanConfig
@@ -214,8 +221,14 @@ func (p *pan115ShareProvider) doRequest(ctx context.Context, request func() (*re
 			lastErr = errors.Errorf("115 request temporarily unavailable: status=%d", response.StatusCode())
 		}
 		if attempt+1 == pan115MaxRequestAttempts {
-			if response != nil && pan115ResponseKind(response.Header().Get("Content-Type"), response.Body()) == "html" {
+			if response != nil {
 				return response, nil
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if lastErr != nil {
+				return nil, &pan115ClusterError{message: lastErr.Error(), code: pan115ClusterErrorCodeShareSaveTransient}
 			}
 			return nil, lastErr
 		}
@@ -237,8 +250,7 @@ func pan115ShouldRetryResponse(ctx context.Context, response *resty.Response, er
 		return true
 	}
 	status := response.StatusCode()
-	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError ||
-		pan115ResponseKind(response.Header().Get("Content-Type"), response.Body()) == "html"
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 }
 
 func (p *pan115ShareProvider) retryDelay(attempt int, response *resty.Response) time.Duration {
@@ -304,6 +316,18 @@ func decodePan115JSON(resp *resty.Response, out any) error {
 	}
 	if err := json.Unmarshal(resp.Body(), out); err != nil {
 		contentType := strings.TrimSpace(resp.Header().Get("Content-Type"))
+		message := fmt.Sprintf(
+			"decode 115 response: status=%d content-type=%s body_len=%d first_non_space=%q kind=%s",
+			resp.StatusCode(),
+			firstNonEmpty(contentType, "unknown"),
+			len(resp.Body()),
+			pan115FirstNonSpace(resp.Body()),
+			pan115ResponseKind(contentType, resp.Body()),
+		)
+		code := classifyPan115HTTPResponse(resp)
+		if code != "" {
+			return &pan115ClusterError{message: fmt.Sprintf("%s: %v", message, err), code: code}
+		}
 		return errors.Wrapf(err,
 			"decode 115 response: status=%d content-type=%s body_len=%d first_non_space=%q kind=%s",
 			resp.StatusCode(),
@@ -312,6 +336,12 @@ func decodePan115JSON(resp *resty.Response, out any) error {
 			pan115FirstNonSpace(resp.Body()),
 			pan115ResponseKind(contentType, resp.Body()),
 		)
+	}
+	if code := classifyPan115HTTPResponse(resp); code != "" {
+		return &pan115ClusterError{
+			message: fmt.Sprintf("115 response rejected: status=%d content-type=%s kind=%s", resp.StatusCode(), firstNonEmpty(strings.TrimSpace(resp.Header().Get("Content-Type")), "unknown"), pan115ResponseKind(resp.Header().Get("Content-Type"), resp.Body())),
+			code:    code,
+		}
 	}
 	return nil
 }
@@ -329,12 +359,50 @@ func pan115Error(message string) error {
 
 func classifyPan115ClusterErrorCode(message string) string {
 	normalized := strings.ToLower(strings.TrimSpace(message))
+	compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(normalized)
 	switch {
 	case strings.Contains(normalized, "密钥错误"),
 		strings.Contains(normalized, "签名无效"),
-		strings.Contains(normalized, "refresh_token无效"),
-		strings.Contains(normalized, "refresh token无效"):
+		strings.Contains(normalized, "invalid signature"),
+		strings.Contains(normalized, "key error"),
+		strings.Contains(compact, "refresh_token无效"),
+		strings.Contains(compact, "refresh token无效"):
 		return pan115ClusterErrorCodeShareSaveCredentialsInvalid
+	case strings.Contains(normalized, "rate limit"),
+		strings.Contains(normalized, "too many requests"),
+		strings.Contains(normalized, "限流"),
+		strings.Contains(normalized, "429"):
+		return pan115ClusterErrorCodeShareSaveRateLimited
+	case strings.Contains(normalized, "分享已失效"),
+		strings.Contains(normalized, "分享已取消"),
+		strings.Contains(normalized, "分享不存在"),
+		strings.Contains(normalized, "share expired"),
+		strings.Contains(normalized, "share invalid"),
+		strings.Contains(normalized, "share canceled"),
+		strings.Contains(normalized, "share cancelled"):
+		return pan115ClusterErrorCodeShareSaveSourceInvalid
+	default:
+		return ""
+	}
+}
+
+func classifyPan115HTTPResponse(resp *resty.Response) string {
+	if resp == nil {
+		return ""
+	}
+	contentType := strings.TrimSpace(resp.Header().Get("Content-Type"))
+	kind := pan115ResponseKind(contentType, resp.Body())
+	switch {
+	case resp.StatusCode() == http.StatusMethodNotAllowed:
+		return pan115ClusterErrorCodeShareSaveMethodNotAllowed
+	case resp.StatusCode() == http.StatusUnauthorized || resp.StatusCode() == http.StatusForbidden:
+		return pan115ClusterErrorCodeShareSaveCredentialsInvalid
+	case resp.StatusCode() == http.StatusTooManyRequests:
+		return pan115ClusterErrorCodeShareSaveRateLimited
+	case resp.StatusCode() >= http.StatusInternalServerError:
+		return pan115ClusterErrorCodeShareSaveGatewayResponse
+	case kind == "html":
+		return pan115ClusterErrorCodeShareSaveGatewayResponse
 	default:
 		return ""
 	}

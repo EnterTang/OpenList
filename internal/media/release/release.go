@@ -12,6 +12,7 @@ import (
 
 var (
 	seasonEpisodeRangePattern     = regexp.MustCompile(`(?i)\bS0*(\d{1,2})E0*(\d{1,4})\s*-\s*E?0*(\d{1,4})\b`)
+	seasonEpisodeMultiPattern     = regexp.MustCompile(`(?i)\bS0*(\d{1,2})E0*(\d{1,4})(?:E0*(\d{1,4}))+\b`)
 	seasonEpisodePattern          = regexp.MustCompile(`(?i)\bS0*(\d{1,2})E0*(\d{1,4})\b`)
 	seasonSeparatedEpisodePattern = regexp.MustCompile(`(?i)\bS0*(\d{1,2})\s+0*(\d{1,3})\b`)
 	seasonPattern                 = regexp.MustCompile(`(?i)\bSeason\s*0*(\d{1,2})\b|\bS0*(\d{1,2})\b`)
@@ -22,7 +23,7 @@ var (
 	qualityPattern                = regexp.MustCompile(`(?i)(4320p|2160p|1440p|1080p|720p|576p|540p|480p|8k|4k|uhd)`)
 	sourcePattern                 = regexp.MustCompile(`(?i)(web[- .]?dl|web[- .]?rip|blu[- .]?ray|bdrip|remux|hdtv|dvdrip|原盘|蓝光)`)
 	completePattern               = regexp.MustCompile(`(?i)(全集|集全|完结|complete|complete series|完结篇)`)
-	removeSeasonEpisodePattern    = regexp.MustCompile(`(?i)\bS0*\d{1,2}E0*\d{1,4}(?:\s*-\s*E?0*\d{1,4})?\b|\bS0*\d{1,2}\s+0*\d{1,3}\b|\bSeason\s*0*\d{1,2}\b|\bS0*\d{1,2}\b|第\s*[一二三四五六七八九十百零〇两\d]{1,4}\s*[季集]|(?:更新至|更新到|更至)?\s*[一二三四五六七八九十百零〇两\d]{1,4}\s*集|\bE0*\d{1,4}(?:\s*-\s*E?0*\d{1,4})?\b`)
+	removeSeasonEpisodePattern    = regexp.MustCompile(`(?i)\bS0*\d{1,2}E0*\d{1,4}(?:E0*\d{1,4})+(?:\s*-\s*E?0*\d{1,4})?\b|\bS0*\d{1,2}E0*\d{1,4}(?:\s*-\s*E?0*\d{1,4})?\b|\bS0*\d{1,2}\s+0*\d{1,3}\b|\bSeason\s*0*\d{1,2}\b|\bS0*\d{1,2}\b|第\s*[一二三四五六七八九十百零〇两\d]{1,4}\s*[季集]|(?:更新至|更新到|更至)?\s*[一二三四五六七八九十百零〇两\d]{1,4}\s*集|\bE0*\d{1,4}(?:\s*-\s*E?0*\d{1,4})?\b`)
 	removeCompletePattern         = regexp.MustCompile(`(?i)(全集|集全|完结|complete(?:\s+series)?|完结篇)`)
 	removeLanguagePattern         = regexp.MustCompile(`(?i)(国英双语|中英字幕|中文字幕|内封字幕|特效字幕|简中|繁中|中字|国配|国语|粤语|英语|日语|韩语|双语|字幕)`)
 	removeYearPattern             = regexp.MustCompile(`(?:^|[\s._\-\[(（])(?:19|20)\d{2}(?:$|[\s._\-\])）])`)
@@ -102,6 +103,12 @@ func extractYear(value string) int {
 
 func extractEpisodeEvidence(value string) (season, episodeStart, episodeEnd int) {
 	if match := seasonEpisodeRangePattern.FindStringSubmatch(value); len(match) == 4 {
+		season = atoi(match[1])
+		episodeStart = atoi(match[2])
+		episodeEnd = atoi(match[3])
+		return season, episodeStart, episodeEnd
+	}
+	if match := seasonEpisodeMultiPattern.FindStringSubmatch(value); len(match) == 4 {
 		season = atoi(match[1])
 		episodeStart = atoi(match[2])
 		episodeEnd = atoi(match[3])

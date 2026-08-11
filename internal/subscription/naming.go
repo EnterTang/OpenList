@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/recognize"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/release"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
@@ -32,6 +33,7 @@ type PlanInput struct {
 type PlannedName struct {
 	Season     int    `json:"season"`
 	Episode    int    `json:"episode"`
+	EpisodeEnd int    `json:"episode_end,omitempty"`
 	TargetDir  string `json:"target_dir"`
 	TargetName string `json:"target_name"`
 	TargetPath string `json:"target_path"`
@@ -40,6 +42,7 @@ type PlannedName struct {
 func PlanTarget(input PlanInput, fileName, parentPath string) PlannedName {
 	mediaType := normalizeMediaType(input.MediaType)
 	recognized := recognize.Recognize(fileName, parentPath)
+	parsed := release.Parse(fileName)
 	season := recognized.Season
 	if season <= 0 {
 		season = inferSeason(parentPath)
@@ -54,6 +57,14 @@ func PlanTarget(input PlanInput, fileName, parentPath string) PlannedName {
 		season = 1
 	}
 	episode := recognized.Episode
+	episodeEnd := 0
+	if parsed.EpisodeStart > 0 {
+		if parsed.Season > 0 {
+			season = parsed.Season
+		}
+		episode = parsed.EpisodeStart
+		episodeEnd = parsed.EpisodeEnd
+	}
 	if episode <= 0 && mediaType == "tv" {
 		episode = inferLeadingEpisode(fileName)
 	}
@@ -72,7 +83,7 @@ func PlanTarget(input PlanInput, fileName, parentPath string) PlannedName {
 	var targetDir, targetName string
 	if mediaType == "tv" {
 		targetDir = stdpath.Join(targetRoot, "tv", category, titleFolder, fmt.Sprintf("Season %d", season))
-		targetName = buildEpisodeName(input.TMDBName, input.TMDBYear, season, episode, ext)
+		targetName = buildEpisodeNameRange(input.TMDBName, input.TMDBYear, season, episode, episodeEnd, ext)
 	} else {
 		targetDir = stdpath.Join(targetRoot, "movie", category, titleFolder)
 		targetName = buildMovieName(input.TMDBName, input.TMDBYear, ext)
@@ -80,6 +91,7 @@ func PlanTarget(input PlanInput, fileName, parentPath string) PlannedName {
 	return PlannedName{
 		Season:     season,
 		Episode:    episode,
+		EpisodeEnd: episodeEnd,
 		TargetDir:  utils.FixAndCleanPath(targetDir),
 		TargetName: targetName,
 		TargetPath: utils.FixAndCleanPath(stdpath.Join(targetDir, targetName)),
@@ -179,6 +191,20 @@ func buildEpisodeName(name string, year, season, episode int, ext string) string
 		return fmt.Sprintf("%s.%d.S%02dE%02d.第%d集%s", name, year, season, episode, episode, ext)
 	}
 	return fmt.Sprintf("%s.S%02dE%02d.第%d集%s", name, season, episode, episode, ext)
+}
+
+func buildEpisodeNameRange(name string, year, season, episode, episodeEnd int, ext string) string {
+	if episodeEnd <= episode {
+		return buildEpisodeName(name, year, season, episode, ext)
+	}
+	name = sanitizeComponent(name)
+	if name == "" {
+		name = "未命名"
+	}
+	if year > 0 {
+		return fmt.Sprintf("%s.%d.S%02dE%02d-E%02d.第%d-%d集%s", name, year, season, episode, episodeEnd, episode, episodeEnd, ext)
+	}
+	return fmt.Sprintf("%s.S%02dE%02d-E%02d.第%d-%d集%s", name, season, episode, episodeEnd, episode, episodeEnd, ext)
 }
 
 func buildMovieName(name string, year int, ext string) string {

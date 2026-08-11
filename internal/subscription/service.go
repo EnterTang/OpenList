@@ -59,14 +59,27 @@ func RetryFailedForRole(ctx context.Context, subscriptionID uint, role string) (
 	}
 	unlock := lockSubscriptionRun(subscriptionID)
 	defer unlock()
+	if _, err := ReconcileSubscriptionExecution(ctx, subscriptionID); err != nil {
+		return nil, err
+	}
 	retry, err := retrier.RetryFailedSubscriptionItems(ctx, subscriptionID)
 	if err != nil {
 		return nil, err
 	}
-	if retry.Unmatched > 0 {
-		return nil, fmt.Errorf("%d failed subscription items have no retryable cluster job", retry.Unmatched)
+	orphanRetry, orphanErr := RetryOrphanedClusterSubscriptionItems(ctx, subscriptionID)
+	if orphanErr != nil {
+		return nil, orphanErr
 	}
-	return finishClusterRetry(subscriptionID, retry.Requeued)
+	requeued := retry.Requeued + orphanRetry.Requeued
+	unmatched := orphanRetry.Unmatched
+	result, finishErr := finishClusterRetry(subscriptionID, requeued)
+	if finishErr != nil {
+		return nil, finishErr
+	}
+	if unmatched > 0 {
+		return result, fmt.Errorf("%d failed subscription items have no replayable source or cluster job", unmatched)
+	}
+	return result, nil
 }
 
 func finishClusterRetry(subscriptionID uint, requeued int) (*model.SubscriptionRunResult, error) {
@@ -82,19 +95,23 @@ func finishClusterRetry(subscriptionID uint, requeued int) (*model.SubscriptionR
 		return &model.SubscriptionRunResult{Subscription: sub, Items: items}, nil
 	}
 	now := time.Now()
+	status := aggregateSubscriptionStatus(items)
+	if requeued > 0 {
+		status = model.SubscriptionStatusRunning
+	}
 	run := &model.SubscriptionRun{
 		SubscriptionID:   subscriptionID,
 		StartedAt:        now,
 		FinishedAt:       &now,
-		Status:           model.SubscriptionStatusSuccess,
+		Status:           status,
 		PreviousTreeHash: sub.LastTreeHash,
 		CurrentTreeHash:  sub.LastTreeHash,
-		TransferredCount: requeued,
+		QueuedCount:      requeued,
 	}
 	if err := db.CreateSubscriptionRun(run); err != nil {
 		return nil, err
 	}
-	sub.LastStatus = model.SubscriptionStatusSuccess
+	sub.LastStatus = run.Status
 	sub.LastError = ""
 	sub.LastCheckedAt = &now
 	if err := db.UpdateSubscription(sub); err != nil {
@@ -158,16 +175,39 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 	run.AddedCount = added
 	run.ChangedCount = changed
 	run.TransferredCount = transferred
-	if runErr != nil {
+	durableItems, durableItemsErr := db.ListSubscriptionItems(sub.ID)
+	if durableItemsErr != nil && runErr == nil {
+		runErr = durableItemsErr
+	}
+	durableStatus := aggregateSubscriptionStatus(durableItems)
+	activeClusterJobs := false
+	if clusterDispatch && runErr == nil {
+		activeClusterJobs, durableItemsErr = subscriptionHasActiveClusterJobs(ctx, sub.ID)
+		if durableItemsErr != nil {
+			runErr = durableItemsErr
+		}
+	}
+	if runErr != nil && clusterDispatch && durableStatus == model.SubscriptionStatusRunning && errors.Is(runErr, ErrClusterWorkerUnavailable) {
+		// No compatible worker is a recoverable scheduling condition. Keep the
+		// item pending and let the scheduler retry when worker capability returns.
+		run.Status = model.SubscriptionStatusRunning
+		sub.LastStatus = model.SubscriptionStatusRunning
+		sub.LastError = runErr.Error()
+	} else if runErr != nil {
 		run.Status = model.SubscriptionStatusFailed
 		run.Error = runErr.Error()
 		sub.LastStatus = model.SubscriptionStatusFailed
 		sub.LastError = runErr.Error()
 	} else {
-		run.Status = model.SubscriptionStatusSuccess
-		sub.LastStatus = model.SubscriptionStatusSuccess
+		run.Status = durableStatus
+		if clusterDispatch && activeClusterJobs && run.Status == model.SubscriptionStatusSuccess {
+			run.Status = model.SubscriptionStatusRunning
+		}
+		sub.LastStatus = run.Status
 		sub.LastError = ""
-		sub.LastTreeHash = currentHash
+		if run.Status == model.SubscriptionStatusSuccess {
+			sub.LastTreeHash = currentHash
+		}
 	}
 	sub.LastCheckedAt = &finished
 	if shouldPersistSubscriptionRun(run) {
@@ -179,6 +219,16 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 		Run:          run,
 		Items:        items,
 	}, runErr
+}
+
+func subscriptionHasActiveClusterJobs(ctx context.Context, subscriptionID uint) (bool, error) {
+	if subscriptionID == 0 {
+		return false, nil
+	}
+	var count int64
+	err := db.GetDb().WithContext(ctx).Model(&model.ClusterJob{}).
+		Where("subscription_id = ? AND status IN ?", subscriptionID, subscriptionActiveJobStatuses()).Count(&count).Error
+	return count > 0, err
 }
 
 func resolveSubscriptionDeliveryTarget(ctx context.Context, sub *model.Subscription, ensure bool) (*model.Subscription, error) {

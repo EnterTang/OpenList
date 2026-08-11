@@ -23,6 +23,26 @@ const (
 	ClusterSealedManifestVersion = "etf-sha256-v1"
 )
 
+// ErrClusterWorkerUnavailable means dispatch is blocked by worker capability
+// or account health, not that the media item itself is invalid. Callers must
+// leave the item retryable instead of converting this condition to failure.
+var ErrClusterWorkerUnavailable = errors.New("no compatible cluster worker is available")
+
+type ClusterWorkerUnavailableError struct {
+	Message string
+}
+
+func (e *ClusterWorkerUnavailableError) Error() string {
+	if e == nil {
+		return ErrClusterWorkerUnavailable.Error()
+	}
+	return e.Message
+}
+
+func (e *ClusterWorkerUnavailableError) Unwrap() error {
+	return ErrClusterWorkerUnavailable
+}
+
 // ClusterMediaTask is deliberately owned by the subscription package. The
 // cluster runtime adapts it to its wire protocol, avoiding a subscription ->
 // cluster -> subscription import cycle.
@@ -142,6 +162,121 @@ func currentClusterDispatcher() ClusterDispatcher {
 	clusterDispatcherRegistry.RLock()
 	defer clusterDispatcherRegistry.RUnlock()
 	return clusterDispatcherRegistry.dispatcher
+}
+
+// RetryOrphanedClusterSubscriptionItems rebuilds media children from the
+// source metadata stored on the item when the original durable job row is
+// missing. This is the compensation path for the historical "failed item with
+// no task" population; successful items are never included.
+func RetryOrphanedClusterSubscriptionItems(ctx context.Context, subscriptionID uint) (ClusterRetryResult, error) {
+	var recovered ClusterRetryResult
+	if subscriptionID == 0 {
+		return recovered, errors.New("subscription id is required")
+	}
+	if currentClusterDispatcher() == nil {
+		return recovered, errors.New("cluster subscription dispatcher is not registered")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sub, err := db.GetSubscriptionByID(subscriptionID)
+	if err != nil {
+		return recovered, err
+	}
+	items, err := db.ListSubscriptionItems(subscriptionID)
+	if err != nil {
+		return recovered, err
+	}
+	var jobs []model.ClusterJob
+	if err := db.GetDb().WithContext(ctx).Where("subscription_id = ? AND type = ?", subscriptionID, model.ClusterJobTypeMediaTransfer).
+		Order("created_at DESC, id DESC").Find(&jobs).Error; err != nil {
+		return recovered, err
+	}
+	activeByItemID := make(map[uint]struct{}, len(jobs))
+	for i := range jobs {
+		if jobs[i].SubscriptionItemID != 0 && subscriptionJobActive(jobs[i].Status) {
+			activeByItemID[jobs[i].SubscriptionItemID] = struct{}{}
+		}
+	}
+	type retryGroup struct {
+		ref     ShareRef
+		message clusterSourceMessage
+		items   []*model.SubscriptionItem
+	}
+	groups := make(map[string]*retryGroup)
+	for i := range items {
+		item := &items[i]
+		if item.Status != model.SubscriptionItemStatusFailed && item.Status != model.SubscriptionItemStatusPending {
+			continue
+		}
+		if _, active := activeByItemID[item.ID]; active {
+			continue
+		}
+		ref, parseErr := retryShareRef(item)
+		if parseErr != nil {
+			recovered.Unmatched++
+			continue
+		}
+		item.Status = model.SubscriptionItemStatusPending
+		item.ClusterJobID = ""
+		item.LastError = ""
+		if _, _, err := db.UpsertSubscriptionItemForceStatus(item); err != nil {
+			return recovered, err
+		}
+		if item.Season > 0 && item.Episode > 0 {
+			if err := db.GetDb().WithContext(ctx).Model(&model.SubscriptionEpisodeSource{}).
+				Where("subscription_id = ? AND source_item_id = ? AND file_hash = ?", subscriptionID, item.ID, item.FileHash).
+				Updates(map[string]any{"status": model.SubscriptionItemStatusPending, "cluster_job_id": "", "updated_at": time.Now().UTC()}).Error; err != nil {
+				return recovered, err
+			}
+		}
+		message := clusterSourceMessage{ID: item.SourceMessageID, Channel: item.SourceMessageChannel, URL: item.SourceMessageURL, Text: item.SourceMessageText}
+		key := ref.RawURL + "\x00" + message.ID + "\x00" + message.Channel
+		group := groups[key]
+		if group == nil {
+			group = &retryGroup{ref: ref, message: message}
+			groups[key] = group
+		}
+		group.items = append(group.items, item)
+	}
+	for _, group := range groups {
+		dispatched, dispatchErr := dispatchClusterItems(ctx, sub, group.items, group.ref, group.message)
+		recovered.Requeued += dispatched
+		if dispatchErr != nil {
+			return recovered, dispatchErr
+		}
+	}
+	return recovered, nil
+}
+
+func retryShareRef(item *model.SubscriptionItem) (ShareRef, error) {
+	if item == nil {
+		return ShareRef{}, errors.New("subscription item is nil")
+	}
+	candidates := make([]string, 0, 2)
+	if sourceURL := strings.TrimSpace(item.SourceURL); sourceURL != "" {
+		candidates = append(candidates, sourceURL)
+	}
+	// Older rows may have lost SourceURL while retaining the original source
+	// message. Recovering a link from that message keeps those rows replayable
+	// without re-scanning the remote source.
+	for _, link := range resourceLinksFromText(item.SourceMessageText, "") {
+		candidates = append(candidates, link.URL)
+	}
+	var firstErr error
+	for _, candidate := range candidates {
+		ref, err := ParseShareURL(candidate)
+		if err == nil {
+			return ref, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr == nil {
+		firstErr = errors.New("subscription item has no persisted replayable share URL")
+	}
+	return ShareRef{}, firstErr
 }
 
 func dispatchClusterInspect(ctx context.Context, sub *model.Subscription, ref ShareRef, message clusterSourceMessage) (string, error) {
@@ -694,9 +829,24 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 	}
 	dispatched := 0
 	var firstErr error
+	waitingForWorker := errors.Is(dispatchErr, ErrClusterWorkerUnavailable)
 	for _, item := range dispatchItems {
 		result, ok := resultByKey[item.SourceKey]
 		if !ok {
+			if waitingForWorker {
+				item.Status = model.SubscriptionItemStatusPending
+				item.ClusterJobID = ""
+				item.LastError = dispatchErr.Error()
+				if _, _, err := db.UpsertSubscriptionItem(item); err != nil && firstErr == nil {
+					firstErr = err
+				}
+				if claimedItems[item] {
+					if releaseErr := db.ReleaseSubscriptionEpisodeSourceClaim(item); releaseErr != nil && firstErr == nil {
+						firstErr = releaseErr
+					}
+				}
+				continue
+			}
 			item.Status = model.SubscriptionItemStatusFailed
 			missingErr := dispatchErr
 			if missingErr == nil {
@@ -707,6 +857,23 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 				firstErr = missingErr
 			}
 		} else if result.Error != nil {
+			if errors.Is(result.Error, ErrClusterWorkerUnavailable) {
+				item.Status = model.SubscriptionItemStatusPending
+				item.ClusterJobID = ""
+				item.LastError = result.Error.Error()
+				if _, _, err := db.UpsertSubscriptionItem(item); err != nil && firstErr == nil {
+					firstErr = err
+				}
+				if claimedItems[item] {
+					if releaseErr := db.ReleaseSubscriptionEpisodeSourceClaim(item); releaseErr != nil && firstErr == nil {
+						firstErr = releaseErr
+					}
+				}
+				if firstErr == nil {
+					firstErr = result.Error
+				}
+				continue
+			}
 			item.Status = model.SubscriptionItemStatusFailed
 			item.LastError = result.Error.Error()
 			if firstErr == nil {
