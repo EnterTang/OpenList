@@ -323,14 +323,12 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 		taskContext := subscriptionMediaTaskContext(task, plan.targetProfile)
 		bindTaskContextProviderAccounts(&taskContext, plan.match)
 		requests = append(requests, DispatchMediaJobRequest{
-			NodeID:         plan.nodeID,
-			IdempotencyKey: task.IdempotencyKey,
-			ExpectedBytes:  task.SourceSize,
-			LeaseDuration:  mediaJobLeaseDuration,
-			RequiredCapabilities: []string{
-				"share.save", "mobile.upload", "result.report",
-			},
-			TaskContext: taskContext,
+			NodeID:               plan.nodeID,
+			IdempotencyKey:       task.IdempotencyKey,
+			ExpectedBytes:        task.SourceSize,
+			LeaseDuration:        mediaJobLeaseDuration,
+			RequiredCapabilities: subscriptionMediaRequiredCapabilities(task),
+			TaskContext:          taskContext,
 		})
 		requestTaskIndexes = append(requestTaskIndexes, plan.taskIndex)
 	}
@@ -417,6 +415,14 @@ func (d subscriptionDispatcher) planSubscriptionMediaDispatch(ctx context.Contex
 	return planned, nil
 }
 
+func subscriptionMediaRequiredCapabilities(task subscription.ClusterMediaTask) []string {
+	capabilities := []string{"share.save", "mobile.upload", "result.report"}
+	if strings.EqualFold(strings.TrimSpace(task.DeliveryMode), model.SubscriptionDeliveryModeDirectDownload) {
+		capabilities[0] = "share.download"
+	}
+	return capabilities
+}
+
 func subscriptionDispatchTaskKey(task subscription.ClusterMediaTask, index int) string {
 	if key := strings.TrimSpace(task.SourceKey); key != "" {
 		return key
@@ -428,10 +434,12 @@ func subscriptionDispatchTaskKey(task subscription.ClusterMediaTask, index int) 
 }
 
 func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProfile string) protocol.TaskContext {
+	directDownload := strings.EqualFold(strings.TrimSpace(task.DeliveryMode), model.SubscriptionDeliveryModeDirectDownload)
 	staging := protocol.ProviderTargetRequirement{
-		Provider:      strings.TrimSpace(task.ShareProvider),
-		NeedShareSave: true,
-		RequiredBytes: max64(task.SourceSize, 0),
+		Provider:          strings.TrimSpace(task.ShareProvider),
+		NeedShareSave:     !directDownload,
+		NeedShareDownload: directDownload,
+		RequiredBytes:     max64(task.SourceSize, 0),
 	}
 	delivery := protocol.ProviderTargetRequirement{
 		Provider:      "yidong139",
@@ -441,6 +449,7 @@ func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProf
 	return protocol.TaskContext{
 		MediaItemID: task.MediaItemID, WorkflowVersion: task.WorkflowVersion,
 		SealedManifestVersion: task.SealedManifestVersion, TargetProfile: targetProfile,
+		DeliveryMode: task.DeliveryMode,
 		Subscription: protocol.SubscriptionTaskContext{
 			SubscriptionID: task.SubscriptionID, SubscriptionItemID: task.SubscriptionItemID,
 			SubscriptionName: task.SubscriptionName, PreferredWorkerNodeID: task.PreferredWorkerNodeID, SourceKey: task.SourceKey,
@@ -455,6 +464,7 @@ func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProf
 		SourceObjects: []protocol.SourceObject{{
 			Provider: task.ShareProvider, SourceFileID: task.SourceFileID,
 			SourceRelativePath: task.SourceRelativePath, Size: task.SourceSize, Hash: task.SourceHash,
+			ProviderData: task.SourceProviderData,
 		}},
 		StagingTarget:  staging,
 		DeliveryTarget: delivery,
@@ -552,7 +562,7 @@ func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchT
 	eligible := make([]*dispatchTarget, 0, len(targets))
 	for _, target := range targets {
 		taskContext := subscriptionMediaTaskContext(task, target.targetProfile)
-		match, ok, err := nodeInventoryProviderMatch(ctx, target.nodeID, taskContext, []string{"share.save", "mobile.upload", "result.report"}, task.SourceSize)
+		match, ok, err := nodeInventoryProviderMatch(ctx, target.nodeID, taskContext, subscriptionMediaRequiredCapabilities(task), task.SourceSize)
 		if err != nil || !ok {
 			utils.Log.Warnf("[cluster-dispatch] target node=%s rejected: ok=%v err=%v", target.nodeID, ok, err)
 			continue

@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"mime"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	_115sy "github.com/OpenListTeam/OpenList/v4/internal/115sy"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -26,6 +29,8 @@ const (
 	pan115RequestInterval    = time.Second
 	pan115MaxRequestAttempts = 3
 	pan115RetryBaseDelay     = time.Second
+	pan115ConfirmationTries  = 3
+	pan115ConfirmationDelay  = 500 * time.Millisecond
 )
 
 var pan115RequestLimiter = newPan115RateLimiter(pan115RequestInterval)
@@ -72,6 +77,7 @@ const (
 	pan115ClusterErrorCodeShareSaveSourceInvalid      = "share_save_source_invalid"
 	pan115ClusterErrorCodeShareSaveGatewayResponse    = "share_save_gateway_response"
 	pan115ClusterErrorCodeShareSaveTransient          = "share_save_transient"
+	pan115ClusterErrorCodeShareSaveResultUnknown      = "share_save_result_unknown"
 )
 
 type pan115ShareProvider struct {
@@ -80,16 +86,38 @@ type pan115ShareProvider struct {
 	client         *resty.Client
 	limiter        *pan115RateLimiter
 	retryBaseDelay time.Duration
+	confirmClient  *_115sy.Client
+	confirmEnabled bool
 }
 
 func NewPan115ShareProvider(cfg model.SubscriptionTelegramPanConfig) ShareSaver {
+	cfg = normalizeTelegramPanConfig(cfg)
+	confirmEnabled := pan115ConfirmationEnabled()
+	var confirmClient *_115sy.Client
+	if cfg.Cookie != "" {
+		confirmClient, _ = _115sy.NewClient(_115sy.ClientOptions{
+			Cookie:       cfg.Cookie,
+			LimitRate:    1,
+			PageCooldown: pan115RequestInterval,
+		})
+	}
 	return &pan115ShareProvider{
-		cfg:            normalizeTelegramPanConfig(cfg),
+		cfg:            cfg,
 		webURL:         pan115WebURL,
 		client:         newShareHTTPClient(),
 		limiter:        pan115RequestLimiter,
 		retryBaseDelay: pan115RetryBaseDelay,
+		confirmClient:  confirmClient,
+		confirmEnabled: confirmEnabled,
 	}
+}
+
+func pan115ConfirmationEnabled() bool {
+	if db.GetDb() == nil {
+		return false
+	}
+	cfg, err := GetConfig()
+	return err == nil && cfg.ResultConfirmationEnabled
 }
 
 func (p *pan115ShareProvider) Name() ShareProviderName {
@@ -199,7 +227,21 @@ func (p *pan115ShareProvider) SaveShareItems(ctx context.Context, ref ShareRef, 
 	if !resp.State {
 		return nil, pan115Error(resp.Error)
 	}
-	return []string{"pan115_sync_" + ref.ShareID}, nil
+	operation := pan115SaveOperation{
+		ShareID:       ref.ShareID,
+		DestinationID: firstNonEmpty(dstDirID, "0"),
+		Items:         make([]pan115SaveItem, 0, len(items)),
+	}
+	for _, item := range items {
+		operation.Items = append(operation.Items, pan115SaveItem{Name: item.Name, Size: item.Size})
+	}
+	if !p.confirmEnabled {
+		// Keep the legacy task marker for deployments that have not opted into
+		// remote confirmation yet. It is still only an internal completion
+		// token; the confirmation-enabled path carries the probe checkpoint.
+		return []string{"pan115_sync_" + ref.ShareID}, nil
+	}
+	return []string{encodePan115SaveOperation(operation)}, nil
 }
 
 func (p *pan115ShareProvider) doRequest(ctx context.Context, request func() (*resty.Response, error)) (*resty.Response, error) {
@@ -303,7 +345,95 @@ func (p *pan115ShareProvider) WaitSaveComplete(ctx context.Context, taskIDs []st
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !p.confirmEnabled {
+		return nil
+	}
+	for _, taskID := range taskIDs {
+		operation, ok := decodePan115SaveOperation(taskID)
+		if !ok {
+			return &pan115ClusterError{message: "115 save result is not confirmable", code: pan115ClusterErrorCodeShareSaveResultUnknown}
+		}
+		if err := p.confirmSavedOperation(ctx, operation); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (p *pan115ShareProvider) confirmSavedOperation(ctx context.Context, operation pan115SaveOperation) error {
+	if p == nil || p.confirmClient == nil {
+		return &pan115ClusterError{message: "115 save confirmation client is unavailable", code: pan115ClusterErrorCodeShareSaveResultUnknown}
+	}
+	for attempt := 0; attempt < pan115ConfirmationTries; attempt++ {
+		items, err := p.confirmClient.ListFiles(ctx, operation.DestinationID, _115sy.ListOptions{PageSize: 1150})
+		if err != nil {
+			return &pan115ClusterError{message: fmt.Sprintf("115 save confirmation request failed: %v", err), code: pan115ClusterErrorCodeShareSaveResultUnknown}
+		}
+		remaining := make([]pan115SaveItem, 0, len(operation.Items))
+		for _, expected := range operation.Items {
+			found := false
+			for _, item := range items {
+				if item.IsDir || strings.TrimSpace(item.Name) != strings.TrimSpace(expected.Name) || item.Size != expected.Size {
+					continue
+				}
+				found = true
+				break
+			}
+			if !found {
+				remaining = append(remaining, expected)
+			}
+		}
+		if len(remaining) == 0 {
+			return nil
+		}
+		if attempt+1 < pan115ConfirmationTries {
+			timer := time.NewTimer(pan115ConfirmationDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return &pan115ClusterError{message: fmt.Sprintf("115 save confirmation did not find all %d requested files", len(operation.Items)), code: pan115ClusterErrorCodeShareSaveResultUnknown}
+}
+
+type pan115SaveOperation struct {
+	ShareID       string           `json:"share_id"`
+	DestinationID string           `json:"destination_id"`
+	Items         []pan115SaveItem `json:"items"`
+}
+
+type pan115SaveItem struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+const pan115SaveOperationPrefix = "pan115_result:"
+
+func encodePan115SaveOperation(operation pan115SaveOperation) string {
+	body, err := json.Marshal(operation)
+	if err != nil {
+		return pan115SaveOperationPrefix + "invalid"
+	}
+	return pan115SaveOperationPrefix + base64.RawURLEncoding.EncodeToString(body)
+}
+
+func decodePan115SaveOperation(value string) (pan115SaveOperation, bool) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, pan115SaveOperationPrefix) {
+		return pan115SaveOperation{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, pan115SaveOperationPrefix))
+	if err != nil {
+		return pan115SaveOperation{}, false
+	}
+	var operation pan115SaveOperation
+	if err := json.Unmarshal(payload, &operation); err != nil || strings.TrimSpace(operation.DestinationID) == "" || len(operation.Items) == 0 {
+		return pan115SaveOperation{}, false
+	}
+	return operation, true
 }
 
 func pan115ShareReferer(baseURL string, ref ShareRef) string {

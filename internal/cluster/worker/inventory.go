@@ -63,12 +63,19 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 		providerList = append(providerList, provider)
 	}
 	sort.Strings(providerList)
+	supportedOperations := []string{"share.inspect", "share.save", "download", "range_download", "result_probe", "mobile.upload", "result.report", "config.apply", "storage.apply"}
+	for _, account := range providerAccounts {
+		if containsInventoryOperation(account.SupportedOperations, "share.download") {
+			supportedOperations = append(supportedOperations, "share.download")
+			break
+		}
+	}
 	report := protocol.InventoryReport{
 		Revision:    uint64(time.Now().UTC().UnixNano()),
 		CollectedAt: time.Now().UTC(),
 		Capabilities: protocol.NodeCapabilities{
 			SupportedProviders:   providerList,
-			SupportedOperations:  []string{"share.inspect", "share.save", "download", "mobile.upload", "result.report", "config.apply", "storage.apply"},
+			SupportedOperations:  supportedOperations,
 			RedisDurabilityReady: redisReady,
 		},
 		Mounts:           mounts,
@@ -85,6 +92,15 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 	sum := sha256.Sum256(raw)
 	report.InventoryHash = hex.EncodeToString(sum[:])
 	return report, nil
+}
+
+func containsInventoryOperation(values []string, expected string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), expected) {
+			return true
+		}
+	}
+	return false
 }
 
 func inventoryProviderAvailable(account protocol.ProviderAccountInventory) bool {

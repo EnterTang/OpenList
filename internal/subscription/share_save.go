@@ -81,6 +81,7 @@ func saveSharePairsToTemp(ctx context.Context, provider ShareSaver, ref ShareRef
 	selected := make([]TreeEntry, 0, len(pairs))
 	dirIDs := map[string]string{"": dstDirID}
 	grouped := map[shareSaveGroup][]ShareItem{}
+	groupEntries := map[shareSaveGroup][]TreeEntry{}
 	groupOrder := make([]shareSaveGroup, 0)
 	for _, pair := range pairs {
 		dirPath := importedParentPath(pair.entry.Path)
@@ -100,6 +101,22 @@ func saveSharePairsToTemp(ctx context.Context, provider ShareSaver, ref ShareRef
 			groupOrder = append(groupOrder, key)
 		}
 		grouped[key] = append(grouped[key], pair.item)
+		groupEntries[key] = append(groupEntries[key], pair.entry)
+	}
+	if provider.Name() == ShareProviderPan123 {
+		confirmed := make([]TreeEntry, 0, len(selected))
+		var firstErr error
+		for _, key := range groupOrder {
+			groupConfirmed, saveErr := saveShareItemsIndividually(ctx, provider, ref, key.parentID, grouped[key], key.dstDirID, groupEntries[key])
+			confirmed = append(confirmed, groupConfirmed...)
+			if saveErr != nil && firstErr == nil {
+				firstErr = saveErr
+			}
+		}
+		if firstErr != nil {
+			return mergeConfirmedShareEntries(selected, confirmed), firstErr
+		}
+		return mergeConfirmedShareEntries(selected, confirmed), nil
 	}
 	for _, key := range groupOrder {
 		items := grouped[key]
@@ -127,6 +144,9 @@ func savePan115SharePairsToTemp(ctx context.Context, provider ShareSaver, ref Sh
 	for _, pair := range pairs {
 		selected = append(selected, pair.entry)
 		items = append(items, pair.item)
+	}
+	if provider.Name() == ShareProviderPan123 {
+		return saveShareItemsIndividually(ctx, provider, ref, "", items, dstDirID, selected)
 	}
 	taskIDs, err := provider.SaveShareItems(ctx, ref, "", items, dstDirID)
 	if err != nil {
@@ -177,6 +197,7 @@ func SaveImportedFilesToTemp(ctx context.Context, provider ShareSaver, rootPath 
 	}
 	selected := make([]TreeEntry, 0, len(matched))
 	grouped := map[string][]ShareItem{}
+	groupEntries := map[string][]TreeEntry{}
 	for _, file := range matched {
 		entry := TreeEntry{
 			RootPath: rootPath,
@@ -201,12 +222,29 @@ func SaveImportedFilesToTemp(ctx context.Context, provider ShareSaver, rootPath 
 				"type":      0,
 			},
 		})
+		groupEntries[dstDirID] = append(groupEntries[dstDirID], entry)
 	}
 	groupKeys := make([]string, 0, len(grouped))
 	for dstDirID := range grouped {
 		groupKeys = append(groupKeys, dstDirID)
 	}
 	sort.Strings(groupKeys)
+	if provider.Name() == ShareProviderPan123 {
+		confirmed := make([]TreeEntry, 0, len(selected))
+		var firstErr error
+		ref := ShareRef{Provider: ShareProviderPan123, RawURL: rootPath}
+		for _, dstDirID := range groupKeys {
+			groupConfirmed, saveErr := saveShareItemsIndividually(ctx, provider, ref, "", grouped[dstDirID], dstDirID, groupEntries[dstDirID])
+			confirmed = append(confirmed, groupConfirmed...)
+			if saveErr != nil && firstErr == nil {
+				firstErr = saveErr
+			}
+		}
+		if firstErr != nil {
+			return mergeConfirmedShareEntries(selected, confirmed), firstErr
+		}
+		return mergeConfirmedShareEntries(selected, confirmed), nil
+	}
 	for _, dstDirID := range groupKeys {
 		taskIDs, err := provider.SaveShareItems(ctx, ShareRef{Provider: ShareProviderPan123, RawURL: rootPath}, "", grouped[dstDirID], dstDirID)
 		if err != nil {
@@ -219,6 +257,58 @@ func SaveImportedFilesToTemp(ctx context.Context, provider ShareSaver, rootPath 
 		}
 	}
 	return selected, nil
+}
+
+// saveShareItemsIndividually prevents one ambiguous result from aborting an
+// entire 123Pan batch. The provider still controls its own request-level
+// probe and idempotency semantics; this layer makes sure every item gets one
+// classification before the batch is returned for compensation.
+func saveShareItemsIndividually(ctx context.Context, provider ShareSaver, ref ShareRef, parentID string, items []ShareItem, dstDirID string, entries []TreeEntry) ([]TreeEntry, error) {
+	confirmed := make([]TreeEntry, 0, len(entries))
+	var firstErr error
+	for index, item := range items {
+		taskIDs, err := provider.SaveShareItems(ctx, ref, parentID, []ShareItem{item}, dstDirID)
+		if err == nil && len(taskIDs) > 0 {
+			err = provider.WaitSaveComplete(ctx, taskIDs)
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if index < len(entries) {
+			confirmed = append(confirmed, entries[index])
+		}
+	}
+	if firstErr != nil {
+		return confirmed, firstErr
+	}
+	return confirmed, nil
+}
+
+func mergeConfirmedShareEntries(selected, confirmed []TreeEntry) []TreeEntry {
+	if len(confirmed) == 0 {
+		return nil
+	}
+	confirmedKeys := make(map[string]int, len(confirmed))
+	for _, entry := range confirmed {
+		confirmedKeys[shareEntryMatchKey(entry)]++
+	}
+	ordered := make([]TreeEntry, 0, len(confirmed))
+	for _, entry := range selected {
+		key := shareEntryMatchKey(entry)
+		if confirmedKeys[key] <= 0 {
+			continue
+		}
+		confirmedKeys[key]--
+		ordered = append(ordered, entry)
+	}
+	return ordered
+}
+
+func shareEntryMatchKey(entry TreeEntry) string {
+	return fmt.Sprintf("%s\x00%s\x00%d", entry.Path, entry.Name, entry.Size)
 }
 
 func collectShareTreePairs(ctx context.Context, provider ShareTreeLister, ref ShareRef) ([]shareTreePair, error) {

@@ -43,13 +43,14 @@ func listShareTreeChildren(ctx context.Context, provider ShareTreeLister, ref Sh
 		}
 		entryPath := utils.FixAndCleanPath(stdpath.Join("/", parentPath, name))
 		*entries = append(*entries, TreeEntry{
-			RootPath: ref.RawURL,
-			Path:     entryPath,
-			Name:     name,
-			ID:       child.ID,
-			Size:     child.Size,
-			Modified: child.Modified,
-			IsDir:    child.IsDir,
+			RootPath:     ref.RawURL,
+			Path:         entryPath,
+			Name:         name,
+			ID:           child.ID,
+			Size:         child.Size,
+			Modified:     child.Modified,
+			IsDir:        child.IsDir,
+			ProviderData: SanitizeShareItemProviderData(child.Raw),
 		})
 		if child.IsDir {
 			if err := listShareTreeChildren(ctx, provider, ref, child.ID, strings.TrimPrefix(entryPath, "/"), depth+1, entries); err != nil {

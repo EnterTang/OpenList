@@ -103,25 +103,31 @@ type MountInventory struct {
 }
 
 type ProviderAccountInventory struct {
-	StorageID            uint   `json:"storage_id"`
-	NodeMountID          string `json:"node_mount_id"`
-	Provider             string `json:"provider"`
-	MountPath            string `json:"mount_path"`
-	AccountAlias         string `json:"account_alias,omitempty"`
-	AccountFingerprint   string `json:"account_fingerprint,omitempty"`
-	Status               string `json:"status"`
-	MembershipTier       string `json:"membership_tier,omitempty"`
-	MembershipWeight     int    `json:"membership_weight,omitempty"`
-	MembershipStatus     string `json:"membership_status,omitempty"`
-	MembershipExpireDate string `json:"membership_expire_date,omitempty"`
-	MaxSingleUploadBytes int64  `json:"max_single_upload_bytes,omitempty"`
-	SupportsUpload       bool   `json:"supports_upload"`
-	SupportsDownload     bool   `json:"supports_download"`
-	SupportsShareSave    bool   `json:"supports_share_save"`
-	SupportsETF          bool   `json:"supports_etf"`
-	TotalBytes           int64  `json:"total_bytes,omitempty"`
-	FreeBytes            int64  `json:"free_bytes,omitempty"`
-	ActiveJobs           int    `json:"active_jobs,omitempty"`
+	StorageID            uint      `json:"storage_id"`
+	NodeMountID          string    `json:"node_mount_id"`
+	Provider             string    `json:"provider"`
+	MountPath            string    `json:"mount_path"`
+	AccountAlias         string    `json:"account_alias,omitempty"`
+	AccountFingerprint   string    `json:"account_fingerprint,omitempty"`
+	Status               string    `json:"status"`
+	MembershipTier       string    `json:"membership_tier,omitempty"`
+	MembershipWeight     int       `json:"membership_weight,omitempty"`
+	MembershipStatus     string    `json:"membership_status,omitempty"`
+	MembershipExpireDate string    `json:"membership_expire_date,omitempty"`
+	MaxSingleUploadBytes int64     `json:"max_single_upload_bytes,omitempty"`
+	SupportsUpload       bool      `json:"supports_upload"`
+	SupportsDownload     bool      `json:"supports_download"`
+	SupportsShareSave    bool      `json:"supports_share_save"`
+	CredentialState      string    `json:"credential_state,omitempty"`
+	HealthState          string    `json:"health_state,omitempty"`
+	CheckedAt            time.Time `json:"checked_at,omitempty"`
+	NextProbeAt          time.Time `json:"next_probe_at,omitempty"`
+	LastErrorCode        string    `json:"last_error_code,omitempty"`
+	SupportedOperations  []string  `json:"supported_operations,omitempty"`
+	SupportsETF          bool      `json:"supports_etf"`
+	TotalBytes           int64     `json:"total_bytes,omitempty"`
+	FreeBytes            int64     `json:"free_bytes,omitempty"`
+	ActiveJobs           int       `json:"active_jobs,omitempty"`
 }
 
 type ConfigApply struct {
@@ -260,6 +266,7 @@ type ProviderTargetRequirement struct {
 	AccountFingerprint string `json:"account_fingerprint,omitempty"`
 	NeedShareSave      bool   `json:"need_share_save,omitempty"`
 	NeedUpload         bool   `json:"need_upload,omitempty"`
+	NeedShareDownload  bool   `json:"need_share_download,omitempty"`
 	RequiredBytes      int64  `json:"required_bytes,omitempty"`
 }
 
@@ -271,6 +278,7 @@ type TaskContext struct {
 	Subscription          SubscriptionTaskContext   `json:"subscription"`
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
+	DeliveryMode          string                    `json:"delivery_mode,omitempty"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
 	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
 	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`
@@ -311,13 +319,14 @@ type MediaTaskContext struct {
 }
 
 type SourceObject struct {
-	Provider           string    `json:"provider"`
-	SourceFileID       string    `json:"source_file_id"`
-	SourceRelativePath string    `json:"source_relative_path"`
-	Size               int64     `json:"size,omitempty"`
-	Hash               string    `json:"hash,omitempty"`
-	ContentSHA256      string    `json:"content_sha256,omitempty"`
-	ModifiedAt         time.Time `json:"modified_at,omitempty"`
+	Provider           string            `json:"provider"`
+	SourceFileID       string            `json:"source_file_id"`
+	SourceRelativePath string            `json:"source_relative_path"`
+	Size               int64             `json:"size,omitempty"`
+	Hash               string            `json:"hash,omitempty"`
+	ContentSHA256      string            `json:"content_sha256,omitempty"`
+	ModifiedAt         time.Time         `json:"modified_at,omitempty"`
+	ProviderData       map[string]string `json:"provider_data,omitempty"`
 }
 
 type UploadETFManifest struct {
@@ -336,6 +345,7 @@ type UploadETFManifest struct {
 	Subscription          SubscriptionTaskContext   `json:"subscription"`
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
+	DeliveryMode          string                    `json:"delivery_mode,omitempty"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
 	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
 	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`

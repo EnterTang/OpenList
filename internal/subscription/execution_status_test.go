@@ -16,6 +16,10 @@ func TestAggregateSubscriptionStatusRequiresDurableTransferOutcome(t *testing.T)
 		want  string
 	}{
 		{name: "dispatch only remains running", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusPending}}, want: model.SubscriptionStatusRunning},
+		{name: "retry wait remains running", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusRetryWait}}, want: model.SubscriptionStatusRunning},
+		{name: "blocked remains running", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusBlocked}}, want: model.SubscriptionStatusRunning},
+		{name: "unknown remains running", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusUnknown}}, want: model.SubscriptionStatusRunning},
+		{name: "notifying remains running", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusNotifying}}, want: model.SubscriptionStatusRunning},
 		{name: "transferring remains running", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusTransferring}}, want: model.SubscriptionStatusRunning},
 		{name: "terminal failure is failed", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusFailed}}, want: model.SubscriptionStatusFailed},
 		{name: "transferred and skipped is success", items: []model.SubscriptionItem{{Status: model.SubscriptionItemStatusTransferred}, {Status: model.SubscriptionItemStatusSkipped}}, want: model.SubscriptionStatusSuccess},
@@ -126,5 +130,54 @@ func TestSubscriptionNeedsExecutionFollowupDoesNotSpinOnBlockedWorker(t *testing
 	}
 	if followup {
 		t.Fatal("blocked worker item should wait for the normal scheduler interval")
+	}
+}
+
+func TestReconcileSubscriptionExecutionClassifiesRecoverableFailures(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "classify", TMDBName: "classify", LastStatus: model.SubscriptionStatusRunning}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	cases := []struct {
+		key      string
+		code     string
+		want     string
+		wantCode string
+	}{
+		{key: "retry", code: "share_save_retryable", want: model.SubscriptionItemStatusRetryWait, wantCode: "share_save_retryable"},
+		{key: "unknown", code: "share_save_result_unknown", want: model.SubscriptionItemStatusUnknown, wantCode: "share_save_result_unknown"},
+		{key: "blocked", code: "no_compatible_worker", want: model.SubscriptionItemStatusBlocked, wantCode: "no_compatible_worker"},
+		{key: "direct-reauthorize", code: "direct_share_reauthorize", want: model.SubscriptionItemStatusBlocked, wantCode: "direct_share_reauthorize"},
+	}
+	for i, tc := range cases {
+		item := &model.SubscriptionItem{
+			SubscriptionID: sub.ID, SourceKey: tc.key, FileHash: tc.key, Status: model.SubscriptionItemStatusFailed,
+			ClusterJobID: "job-" + tc.key, LastSeenAt: now,
+		}
+		if err := db.GetDb().Create(item).Error; err != nil {
+			t.Fatal(err)
+		}
+		job := &model.ClusterJob{
+			ID: "job-" + tc.key, Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusFailed,
+			IdempotencyKey: "idem-" + tc.key, SubscriptionID: sub.ID, SubscriptionItemID: item.ID,
+			LastErrorCode: tc.code, LastError: "safe test error", AvailableAt: now.Add(time.Duration(i) * time.Second), FinishedAt: &now,
+		}
+		if err := db.GetDb().Create(job).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ReconcileSubscriptionExecution(context.Background(), sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		var item model.SubscriptionItem
+		if err := db.GetDb().Where("subscription_id = ? AND source_key = ?", sub.ID, tc.key).First(&item).Error; err != nil {
+			t.Fatal(err)
+		}
+		if item.Status != tc.want || item.LastErrorCode != tc.wantCode {
+			t.Fatalf("%s item = %#v, want status=%q code=%q", tc.key, item, tc.want, tc.wantCode)
+		}
 	}
 }

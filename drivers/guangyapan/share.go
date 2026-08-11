@@ -15,11 +15,64 @@ import (
 // Real API rejects "0" with code 143 (file not found); empty string works.
 const shareRootParentID = ""
 
+// shareRestoreSynchronousTaskID is an in-memory marker used when the restore
+// endpoint explicitly reports synchronous success and does not return a task.
+// It is never sent back to the provider.
+const shareRestoreSynchronousTaskID = "__guangyapan_restore_synchronous_success__"
+
 var (
+	// ErrShareRestoreResultUnknown means the provider accepted neither a
+	// durable task identifier nor a provable synchronous result. Callers must
+	// probe the target before retrying the restore operation.
+	ErrShareRestoreResultUnknown = errors.New("guangyapan share restore result unknown")
+
 	shareURLPattern = regexp.MustCompile(`(?i)(?:https?://)?(?:www\.)?guangyapan\.com/s/([A-Za-z0-9_-]+)`)
 	shareCodeQuery  = regexp.MustCompile(`(?i)[?&](?:code|pwd)=([A-Za-z0-9]{1,16})`)
 	shareCodeText   = regexp.MustCompile(`(?i)(?:提取码|访问码|密码|code|pwd)\s*[:：=]\s*([A-Za-z0-9]{1,16})`)
 )
+
+type guangYaShareError struct {
+	message string
+	code    string
+}
+
+func (e *guangYaShareError) Error() string {
+	if e == nil {
+		return "guangyapan share operation failed"
+	}
+	return e.message
+}
+
+func (e *guangYaShareError) ClusterErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.code
+}
+
+func newGuangYaShareError(message string, resultUnknown bool) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "guangyapan share operation failed"
+	}
+	code := classifyGuangYaShareBusinessError(message)
+	if resultUnknown {
+		code = "share_save_result_unknown"
+	}
+	return &guangYaShareError{message: message, code: code}
+}
+
+func classifyGuangYaShareBusinessError(message string) string {
+	value := strings.ToLower(strings.TrimSpace(message))
+	switch {
+	case strings.Contains(value, "token"), strings.Contains(value, "unauthorized"), strings.Contains(value, "登录"), strings.Contains(value, "认证"):
+		return "reauthorization_required"
+	case strings.Contains(value, "rate"), strings.Contains(value, "频繁"), strings.Contains(value, "too many"), strings.Contains(value, "限流"):
+		return "share_save_retryable"
+	default:
+		return "share_save_terminal"
+	}
+}
 
 type ShareSummary struct {
 	ShareID   string
@@ -68,7 +121,7 @@ func (d *GuangYaPan) GetShareSummary(ctx context.Context, shareID, code string) 
 		return nil, err
 	}
 	if !isBizOK(resp.Code) {
-		return nil, fmt.Errorf("get share summary failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code)))
+		return nil, newGuangYaShareError(fmt.Sprintf("get share summary failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code))), false)
 	}
 	return &ShareSummary{
 		ShareID:   firstNonEmpty(resp.Data.ShareID, shareID),
@@ -90,7 +143,7 @@ func (d *GuangYaPan) GetShareAccessToken(ctx context.Context, shareID, code stri
 		return "", err
 	}
 	if !isBizOK(resp.Code) {
-		return "", fmt.Errorf("get share access token failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code)))
+		return "", newGuangYaShareError(fmt.Sprintf("get share access token failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code))), false)
 	}
 	token := strings.TrimSpace(resp.Data.AccessToken)
 	if token == "" {
@@ -111,7 +164,11 @@ func (d *GuangYaPan) ListShareFiles(ctx context.Context, shareAccessToken, paren
 	}
 
 	out := make([]ShareFileItem, 0, pageSize)
+	seen := make(map[string]struct{})
 	for page := 0; ; page++ {
+		if page >= 10000 {
+			return nil, errors.New("share pagination exceeded safety limit")
+		}
 		var resp shareListResp
 		body := map[string]any{
 			"accessToken": shareAccessToken,
@@ -125,30 +182,46 @@ func (d *GuangYaPan) ListShareFiles(ctx context.Context, shareAccessToken, paren
 			return nil, err
 		}
 		if !isBizOK(resp.Code) {
-			return nil, fmt.Errorf("list share files failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code)))
+			return nil, newGuangYaShareError(fmt.Sprintf("list share files failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code))), false)
 		}
 		items := resp.Data.List
 		if len(items) == 0 {
 			items = resp.Data.Items
 		}
-		for _, item := range items {
-			id := firstNonEmpty(item.FileID, item.ID)
-			if id == "" {
-				continue
-			}
-			out = append(out, ShareFileItem{
-				FileID:   id,
-				FileName: firstNonEmpty(item.FileName, item.Name),
-				FileSize: item.FileSize,
-				IsFolder: item.IsFolder || item.ResType == 2,
-				ParentID: parentID,
-			})
+		before := len(out)
+		out = appendGuangYaShareItems(out, items, parentID, seen)
+		if len(items) > 0 && len(out) == before {
+			return nil, errors.New("share pagination made no progress")
+		}
+		if resp.Data.Total > 0 && len(out) >= resp.Data.Total {
+			break
 		}
 		if len(items) < pageSize {
 			break
 		}
 	}
 	return out, nil
+}
+
+func appendGuangYaShareItems(out []ShareFileItem, items []shareListItem, parentID string, seen map[string]struct{}) []ShareFileItem {
+	for _, item := range items {
+		id := firstNonEmpty(item.FileID, item.ID)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, ShareFileItem{
+			FileID:   id,
+			FileName: firstNonEmpty(item.FileName, item.Name),
+			FileSize: item.FileSize,
+			IsFolder: item.IsFolder || item.ResType == 2,
+			ParentID: parentID,
+		})
+	}
+	return out
 }
 
 func (d *GuangYaPan) RestoreShare(ctx context.Context, shareAccessToken string, fileIDs []string, parentID string) (string, error) {
@@ -180,20 +253,27 @@ func (d *GuangYaPan) RestoreShare(ctx context.Context, shareAccessToken string, 
 		return "", err
 	}
 	if !isBizOK(resp.Code) {
-		return "", fmt.Errorf("restore share failed: %s", firstNonEmpty(resp.Msg, resp.Message, resp.Data.Message, fmt.Sprintf("code=%v", resp.Code)))
+		return "", newGuangYaShareError(fmt.Sprintf("restore share failed: %s", firstNonEmpty(resp.Msg, resp.Message, resp.Data.Message, fmt.Sprintf("code=%v", resp.Code))), false)
 	}
 	taskID := strings.TrimSpace(resp.Data.TaskID)
 	if taskID == "" {
-		// Some responses may complete synchronously.
-		return "", nil
+		if resp.Data.Success || strings.EqualFold(strings.TrimSpace(resp.Data.Message), "success") || strings.EqualFold(strings.TrimSpace(resp.Msg), "success") {
+			return shareRestoreSynchronousTaskID, nil
+		}
+		// An empty task ID is not proof of synchronous completion. The caller
+		// must probe the destination before deciding whether to retry.
+		return "", ErrShareRestoreResultUnknown
 	}
 	return taskID, nil
 }
 
 func (d *GuangYaPan) WaitShareRestoreTask(ctx context.Context, taskID string) error {
 	taskID = strings.TrimSpace(taskID)
-	if taskID == "" {
+	if taskID == shareRestoreSynchronousTaskID {
 		return nil
+	}
+	if taskID == "" {
+		return ErrShareRestoreResultUnknown
 	}
 	const (
 		maxTry   = 120
@@ -211,13 +291,13 @@ func (d *GuangYaPan) WaitShareRestoreTask(ctx context.Context, taskID string) er
 			return err
 		}
 		if !isBizOK(resp.Code) && strings.TrimSpace(resp.Msg) != "" && !strings.EqualFold(strings.TrimSpace(resp.Msg), "success") {
-			return fmt.Errorf("get restore task status failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code)))
+			return newGuangYaShareError(fmt.Sprintf("get restore task status failed: %s", firstNonEmpty(resp.Msg, resp.Message, fmt.Sprintf("code=%v", resp.Code))), false)
 		}
 		if shareTaskSucceeded(resp.Data.Status, resp.Data.Progress) {
 			return nil
 		}
 		if shareTaskFailed(resp.Data.Status) {
-			return fmt.Errorf("restore task %s failed with status=%v", taskID, resp.Data.Status)
+			return newGuangYaShareError(fmt.Sprintf("restore task failed with status=%v", resp.Data.Status), false)
 		}
 		if i == maxTry-1 {
 			break
@@ -228,7 +308,7 @@ func (d *GuangYaPan) WaitShareRestoreTask(ctx context.Context, taskID string) er
 		case <-time.After(interval):
 		}
 	}
-	return fmt.Errorf("restore task %s timeout", taskID)
+	return newGuangYaShareError("restore task timeout", true)
 }
 
 // TransferShareLink restores all root items from a share URL into parentID.
@@ -268,42 +348,51 @@ func (d *GuangYaPan) postShareAPI(ctx context.Context, path string, body any, wi
 	if d.apiClient == nil {
 		return errors.New("api client is not initialized")
 	}
-	if err := d.apiRateLimitWait(ctx, path); err != nil {
-		return err
-	}
-	req := d.apiClient.R().
-		SetContext(ctx).
-		SetHeaders(d.shareHeaders(withUserAuth)).
-		SetBody(body)
-	if out != nil {
-		req.SetResult(out)
-	}
-	resp, err := req.Post(path)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode() == http.StatusUnauthorized || resp.StatusCode() == http.StatusForbidden {
-		if withUserAuth && strings.TrimSpace(d.RefreshToken) != "" {
-			if err := d.refreshToken(ctx); err != nil {
-				return err
-			}
-			req = d.apiClient.R().
-				SetContext(ctx).
-				SetHeaders(d.shareHeaders(withUserAuth)).
-				SetBody(body)
-			if out != nil {
-				req.SetResult(out)
-			}
-			resp, err = req.Post(path)
-			if err != nil {
+	idempotent := guangYaPathIdempotent(path)
+	authRefreshed := false
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			if err := waitGuangYaRetry(ctx, attempt); err != nil {
 				return err
 			}
 		}
+		if err := d.apiRateLimitWait(ctx, path); err != nil {
+			return err
+		}
+		req := d.apiClient.R().
+			SetContext(ctx).
+			SetHeaders(d.shareHeaders(withUserAuth)).
+			SetBody(body)
+		if out != nil {
+			req.SetResult(out)
+		}
+		resp, err := req.Post(path)
+		if err != nil {
+			if idempotent && attempt+1 < maxAttempts {
+				continue
+			}
+			return &guangYaRequestError{Disposition: guangYaResultUnknown, Message: err.Error(), ResultUnknown: !idempotent}
+		}
+
+		disposition := classifyGuangYaHTTPStatus(resp.StatusCode(), idempotent)
+		if (resp.StatusCode() == http.StatusUnauthorized || resp.StatusCode() == http.StatusForbidden) && withUserAuth && !authRefreshed && strings.TrimSpace(d.RefreshToken) != "" {
+			authRefreshed = true
+			if err := d.refreshToken(ctx); err != nil {
+				return &guangYaRequestError{Status: resp.StatusCode(), Disposition: guangYaReauthorize, Message: err.Error()}
+			}
+			attempt--
+			continue
+		}
+		if disposition == guangYaRetry && attempt+1 < maxAttempts {
+			continue
+		}
+		if resp.IsError() {
+			return &guangYaRequestError{Status: resp.StatusCode(), Disposition: disposition, ResultUnknown: disposition == guangYaResultUnknown}
+		}
+		return nil
 	}
-	if resp.IsError() {
-		return fmt.Errorf("share request failed: status=%d body=%s", resp.StatusCode(), resp.String())
-	}
-	return nil
+	return &guangYaRequestError{Disposition: guangYaRetry, Message: "retry limit exceeded"}
 }
 
 func (d *GuangYaPan) shareHeaders(withUserAuth bool) map[string]string {
@@ -392,4 +481,3 @@ func shareTaskFailed(status any) bool {
 	}
 	return false
 }
-

@@ -150,6 +150,7 @@ func ResetFailedSubscriptionItems(ctx context.Context, subscriptionID uint) (int
 				"status":         model.SubscriptionItemStatusPending,
 				"cluster_job_id": "",
 				"last_error":     "",
+				"state_version":  gorm.Expr("state_version + 1"),
 			})
 		if result.Error != nil {
 			return result.Error
@@ -180,6 +181,7 @@ func ResetStandaloneSubscriptionTransfer(item *model.SubscriptionItem, reason st
 			"status":         model.SubscriptionItemStatusPending,
 			"cluster_job_id": "",
 			"last_error":     reason,
+			"state_version":  gorm.Expr("state_version + 1"),
 			"updated_at":     time.Now(),
 		})
 		if result.Error != nil {
@@ -274,6 +276,9 @@ func UpsertSubscriptionItemForceStatus(item *model.SubscriptionItem) (*model.Sub
 	} else if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
+	if !isNew && item.StateVersion <= existing.StateVersion {
+		item.StateVersion = existing.StateVersion + 1
+	}
 	if isNew && item.Status == "" {
 		item.Status = model.SubscriptionItemStatusPending
 	}
@@ -292,6 +297,7 @@ func UpsertSubscriptionItemForceStatus(item *model.SubscriptionItem) (*model.Sub
 			"file_name",
 			"file_size",
 			"file_hash",
+			"provider_data",
 			"season",
 			"episode",
 			"target_dir",
@@ -301,6 +307,14 @@ func UpsertSubscriptionItemForceStatus(item *model.SubscriptionItem) (*model.Sub
 			"cluster_job_id",
 			"last_seen_at",
 			"last_error",
+			"last_error_code",
+			"retry_count",
+			"retry_at",
+			"blocked_reason",
+			"operation_key",
+			"state_version",
+			"delivery_mode",
+			"fallback_reason",
 			"updated_at",
 		}),
 	}).Create(item).Error
@@ -323,12 +337,18 @@ func upsertSubscriptionItem(tx *gorm.DB, item *model.SubscriptionItem) (*model.S
 	} else if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
+	if !isNew && item.StateVersion < existing.StateVersion {
+		item.StateVersion = existing.StateVersion
+	}
 	if isNew {
 		if item.Status == "" {
 			item.Status = model.SubscriptionItemStatusPending
 		}
 	} else if existing.FileHash != "" && existing.FileHash != item.FileHash {
 		item.Status = model.SubscriptionItemStatusPending
+		if item.StateVersion <= existing.StateVersion {
+			item.StateVersion = existing.StateVersion + 1
+		}
 	} else if item.Status == model.SubscriptionItemStatusPending &&
 		existing.TargetPath != "" &&
 		item.TargetPath != "" &&
@@ -355,6 +375,7 @@ func upsertSubscriptionItem(tx *gorm.DB, item *model.SubscriptionItem) (*model.S
 			"file_name",
 			"file_size",
 			"file_hash",
+			"provider_data",
 			"season",
 			"episode",
 			"target_dir",
@@ -364,6 +385,14 @@ func upsertSubscriptionItem(tx *gorm.DB, item *model.SubscriptionItem) (*model.S
 			"cluster_job_id",
 			"last_seen_at",
 			"last_error",
+			"last_error_code",
+			"retry_count",
+			"retry_at",
+			"blocked_reason",
+			"operation_key",
+			"state_version",
+			"delivery_mode",
+			"fallback_reason",
 			"updated_at",
 		}),
 	}).Create(item).Error
@@ -641,9 +670,10 @@ func PersistSubscriptionTerminalItem(request SubscriptionTerminalItemRequest) (*
 			}
 			updatedAt := time.Now()
 			updates := map[string]any{
-				"status":     request.TerminalStatus,
-				"last_error": request.TerminalLastError,
-				"updated_at": updatedAt,
+				"status":        request.TerminalStatus,
+				"last_error":    request.TerminalLastError,
+				"state_version": gorm.Expr("state_version + 1"),
+				"updated_at":    updatedAt,
 			}
 			if request.TerminalClusterJobID != nil {
 				updates["cluster_job_id"] = *request.TerminalClusterJobID

@@ -205,6 +205,16 @@ func TestBuildInventoryRequiresWorkerLocalStagingRoutingForPanShareSave(t *testi
 	}
 }
 
+func TestProviderSupportedOperationsKeepsPan123DirectDownloadWithoutShareSave(t *testing.T) {
+	operations := providerSupportedOperations("pan123", true, false)
+	if !containsInventoryOperation(operations, "share.download") {
+		t.Fatalf("operations = %#v, want share.download", operations)
+	}
+	if containsInventoryOperation(operations, "share.save") {
+		t.Fatalf("operations = %#v, did not expect share.save", operations)
+	}
+}
+
 func TestProviderAccountInventoryKeepsUnknown139MembershipWithoutUploadLimit(t *testing.T) {
 	storage := model.Storage{ID: 9, MountPath: "/139-b", Driver: "139Yun", Status: "work"}
 	account := providerAccountInventory("node-1", storage, 10<<30, 20<<30)
@@ -244,6 +254,15 @@ func TestProviderAccountInventoryMapsConfigured123And115Membership(t *testing.T)
 		if storage.ID == 2 && (account.MembershipTier != "vip" || account.MembershipWeight != 200) {
 			t.Fatalf("115 account membership = %#v", account)
 		}
+	}
+}
+
+func TestInventoryProbeErrorCodeClassifiesCredentialFailures(t *testing.T) {
+	if got := inventoryProbeErrorCode(errors.New("refresh_token 无效")); got != inventoryStatusReauthorizationRequired {
+		t.Fatalf("credential probe code = %q, want %q", got, inventoryStatusReauthorizationRequired)
+	}
+	if got := inventoryProbeErrorCode(errors.New("connection reset by peer")); got != "provider_health_probe_failed" {
+		t.Fatalf("transient probe code = %q, want provider_health_probe_failed", got)
 	}
 }
 

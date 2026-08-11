@@ -61,6 +61,9 @@ func (c TaskContext) Validate() error {
 	if c.Media.LogicalTargetPath == "" {
 		return errors.New("logical target path is required")
 	}
+	if mode := strings.TrimSpace(c.DeliveryMode); mode != "" && mode != "transfer" && mode != "direct_download" {
+		return fmt.Errorf("unsupported delivery mode %q", mode)
+	}
 	if len(c.SourceObjects) == 0 {
 		return errors.New("at least one source object is required")
 	}
@@ -180,6 +183,7 @@ func (m UploadETFManifest) TaskContext() TaskContext {
 		Subscription:          m.Subscription,
 		Share:                 m.Share,
 		Media:                 m.Media,
+		DeliveryMode:          m.DeliveryMode,
 		SourceObjects:         m.SourceObjects,
 		ShareSaveKey:          m.ShareSaveKey,
 		ShareSaveObjects:      m.ShareSaveObjects,

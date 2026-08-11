@@ -35,6 +35,12 @@ func ReconcileSubscriptionExecution(ctx context.Context, subscriptionID uint) (E
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	maxAttempts := defaultMaxReconcileAttempts
+	if cfg, cfgErr := GetConfig(); cfgErr != nil {
+		return result, cfgErr
+	} else if cfg.MaxReconcileAttempts > 0 {
+		maxAttempts = cfg.MaxReconcileAttempts
+	}
 	now := time.Now().UTC()
 	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var sub model.Subscription
@@ -74,7 +80,7 @@ func ReconcileSubscriptionExecution(ctx context.Context, subscriptionID uint) (E
 			if job == nil {
 				job = latestByItemID[item.ID]
 			}
-			if err := reconcileSubscriptionItemTx(tx, item, job, now, &result); err != nil {
+			if err := reconcileSubscriptionItemTx(tx, item, job, now, maxAttempts, &result); err != nil {
 				return err
 			}
 		}
@@ -138,7 +144,11 @@ func SubscriptionNeedsExecutionFollowup(ctx context.Context, subscriptionID uint
 		return false, nil
 	}
 	var items []model.SubscriptionItem
-	if err := db.GetDb().WithContext(ctx).Where("subscription_id = ? AND status = ?", subscriptionID, model.SubscriptionItemStatusPending).Find(&items).Error; err != nil {
+	if err := db.GetDb().WithContext(ctx).Where("subscription_id = ? AND status IN ?", subscriptionID, []string{
+		model.SubscriptionItemStatusPending,
+		model.SubscriptionItemStatusRetryWait,
+		model.SubscriptionItemStatusUnknown,
+	}).Where("retry_at IS NULL OR retry_at <= ?", time.Now().UTC()).Find(&items).Error; err != nil {
 		return false, err
 	}
 	if len(items) == 0 {
@@ -164,7 +174,7 @@ func SubscriptionNeedsExecutionFollowup(ctx context.Context, subscriptionID uint
 		if strings.Contains(strings.ToLower(items[i].LastError), "no compatible cluster worker") {
 			continue
 		}
-		if strings.TrimSpace(items[i].LastError) == "" || strings.Contains(items[i].LastError, "no durable cluster job") {
+		if items[i].Status == model.SubscriptionItemStatusRetryWait || items[i].Status == model.SubscriptionItemStatusUnknown || strings.TrimSpace(items[i].LastError) == "" || strings.Contains(items[i].LastError, "no durable cluster job") {
 			return true, nil
 		}
 	}
@@ -198,7 +208,7 @@ func ReconcileActiveSubscriptionExecutions(ctx context.Context, limit int) (int,
 	return reconciled, firstErr
 }
 
-func reconcileSubscriptionItemTx(tx *gorm.DB, item *model.SubscriptionItem, job *model.ClusterJob, now time.Time, result *ExecutionReconcileResult) error {
+func reconcileSubscriptionItemTx(tx *gorm.DB, item *model.SubscriptionItem, job *model.ClusterJob, now time.Time, maxAttempts int, result *ExecutionReconcileResult) error {
 	if item == nil || result == nil {
 		return nil
 	}
@@ -231,7 +241,7 @@ func reconcileSubscriptionItemTx(tx *gorm.DB, item *model.SubscriptionItem, job 
 		if item.Status != model.SubscriptionItemStatusTransferred {
 			return updateSubscriptionItemReconcileTx(tx, item, map[string]any{
 				"status": model.SubscriptionItemStatusTransferred, "cluster_job_id": job.ID,
-				"last_error": "", "updated_at": now,
+				"last_error": "", "last_error_code": "", "retry_at": nil, "blocked_reason": "", "updated_at": now,
 			}, model.SubscriptionItemStatusTransferred, job.ID, result)
 		}
 		return nil
@@ -257,17 +267,93 @@ func reconcileSubscriptionItemTx(tx *gorm.DB, item *model.SubscriptionItem, job 
 		if lastError == "" {
 			lastError = "cluster media transfer reached a terminal failure"
 		}
-		return updateSubscriptionItemReconcileTx(tx, item, map[string]any{
-			"status": model.SubscriptionItemStatusFailed, "cluster_job_id": job.ID,
-			"last_error": lastError, "updated_at": now,
-		}, model.SubscriptionItemStatusFailed, job.ID, result)
+		lastErrorCode := strings.TrimSpace(job.LastErrorCode)
+		status := model.SubscriptionItemStatusFailed
+		updates := map[string]any{
+			"status":          status,
+			"cluster_job_id":  job.ID,
+			"last_error":      lastError,
+			"last_error_code": lastErrorCode,
+			"updated_at":      now,
+		}
+		if job.Status != model.ClusterJobStatusDeadLetter {
+			switch classifySubscriptionFailure(lastErrorCode) {
+			case model.SubscriptionItemStatusRetryWait:
+				nextRetryCount := item.RetryCount + 1
+				if nextRetryCount >= maxAttempts {
+					status = model.SubscriptionItemStatusFailed
+					updates["status"] = status
+					updates["last_error_code"] = "retry_limit_exceeded"
+					updates["retry_at"] = nil
+					updates["blocked_reason"] = ""
+				} else {
+					status = model.SubscriptionItemStatusRetryWait
+					retryAt := now.Add(subscriptionRetryDelay)
+					updates["status"] = status
+					updates["retry_count"] = nextRetryCount
+					updates["retry_at"] = retryAt
+					updates["blocked_reason"] = ""
+				}
+			case model.SubscriptionItemStatusUnknown:
+				nextRetryCount := item.RetryCount + 1
+				if nextRetryCount >= maxAttempts {
+					status = model.SubscriptionItemStatusFailed
+					updates["status"] = status
+					updates["last_error_code"] = "retry_limit_exceeded"
+					updates["retry_at"] = nil
+					updates["blocked_reason"] = ""
+				} else {
+					status = model.SubscriptionItemStatusUnknown
+					retryAt := now.Add(subscriptionUnknownProbeDelay)
+					updates["status"] = status
+					updates["retry_count"] = nextRetryCount
+					updates["retry_at"] = retryAt
+					updates["blocked_reason"] = ""
+				}
+			case model.SubscriptionItemStatusBlocked:
+				status = model.SubscriptionItemStatusBlocked
+				updates["status"] = status
+				updates["blocked_reason"] = lastErrorCode
+				updates["retry_at"] = nil
+			}
+		}
+		return updateSubscriptionItemReconcileTx(tx, item, updates, status, job.ID, result)
 	}
 	return nil
 }
 
+const (
+	subscriptionRetryDelay        = 1 * time.Minute
+	subscriptionUnknownProbeDelay = 5 * time.Minute
+)
+
+func classifySubscriptionFailure(errorCode string) string {
+	switch strings.ToLower(strings.TrimSpace(errorCode)) {
+	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_range_failed", "network_timeout", "timeout", "rate_limited":
+		return model.SubscriptionItemStatusRetryWait
+	case "share_save_result_unknown", "result_unknown", "request_result_unknown", "operation_result_unknown":
+		return model.SubscriptionItemStatusUnknown
+	case "no_compatible_worker", "worker_unavailable", "provider_health_stale", "reauthorization_required", "direct_share_reauthorize":
+		return model.SubscriptionItemStatusBlocked
+	default:
+		return model.SubscriptionItemStatusFailed
+	}
+}
+
 func updateSubscriptionItemReconcileTx(tx *gorm.DB, item *model.SubscriptionItem, updates map[string]any, status, jobID string, result *ExecutionReconcileResult) error {
-	if err := tx.Model(&model.SubscriptionItem{}).Where("id = ?", item.ID).Updates(updates).Error; err != nil {
-		return err
+	if item == nil {
+		return errors.New("subscription item is required for reconciliation")
+	}
+	currentVersion := item.StateVersion
+	updates["state_version"] = currentVersion + 1
+	updated := tx.Model(&model.SubscriptionItem{}).
+		Where("id = ? AND state_version = ?", item.ID, currentVersion).
+		Updates(updates)
+	if updated.Error != nil {
+		return updated.Error
+	}
+	if updated.RowsAffected != 1 {
+		return errors.New("subscription item changed during reconciliation")
 	}
 	if err := tx.Model(&model.SubscriptionEpisodeSource{}).
 		Where("subscription_id = ? AND source_item_id = ? AND file_hash = ?", item.SubscriptionID, item.ID, item.FileHash).
@@ -276,8 +362,21 @@ func updateSubscriptionItemReconcileTx(tx *gorm.DB, item *model.SubscriptionItem
 	}
 	item.Status = status
 	item.ClusterJobID = jobID
+	item.StateVersion = currentVersion + 1
 	if value, ok := updates["last_error"].(string); ok {
 		item.LastError = value
+	}
+	if value, ok := updates["last_error_code"].(string); ok {
+		item.LastErrorCode = value
+	}
+	if value, ok := updates["blocked_reason"].(string); ok {
+		item.BlockedReason = value
+	}
+	if value, ok := updates["retry_count"].(int); ok {
+		item.RetryCount = value
+	}
+	if value, ok := updates["retry_at"].(*time.Time); ok {
+		item.RetryAt = value
 	}
 	result.Repaired++
 	switch status {

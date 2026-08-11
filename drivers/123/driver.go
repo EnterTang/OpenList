@@ -119,21 +119,13 @@ func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	if err != nil {
 		return nil, err
 	}
-	rangeReader := stream.RangeReaderFunc(func(readCtx context.Context, requested http_range.Range) (io.ReadCloser, error) {
-		return newPan123DownloadReader(
-			readCtx,
-			f.Size,
-			requested,
-			initial,
-			func(refreshCtx context.Context) (pan123ResolvedDownload, error) {
-				return d.resolveDownload(refreshCtx, f)
-			},
-			pan123FallbackConfig{},
-		)
-	})
-	return &model.Link{
-		URL: initial.URL, Header: initial.Header, RangeReader: rangeReader, ContentLength: f.Size,
-	}, nil
+	return NewRefreshableLink(f.Size, initial.URL, initial.Header, func(refreshCtx context.Context) (string, http.Header, error) {
+		refreshed, err := d.resolveDownload(refreshCtx, f)
+		if err != nil {
+			return "", nil, err
+		}
+		return refreshed.URL, refreshed.Header, nil
+	}), nil
 }
 
 func (d *Pan123) resolveDownload(ctx context.Context, file File) (pan123ResolvedDownload, error) {
@@ -153,19 +145,30 @@ func (d *Pan123) resolveDownload(ctx context.Context, file File) (pan123Resolved
 		return pan123ResolvedDownload{}, err
 	}
 	downloadURL := utils.Json.Get(resp, "data", "DownloadUrl").ToString()
-	originalURL, err := url.Parse(downloadURL)
+	directURL, header, err := ResolveRedirectedDownload(ctx, downloadURL)
 	if err != nil {
 		return pan123ResolvedDownload{}, err
+	}
+	return pan123ResolvedDownload{
+		URL:    directURL,
+		Header: header,
+	}, nil
+}
+
+func ResolveRedirectedDownload(ctx context.Context, downloadURL string) (string, http.Header, error) {
+	originalURL, err := url.Parse(downloadURL)
+	if err != nil {
+		return "", nil, err
 	}
 	requestURL := originalURL.String()
 	if params := originalURL.Query().Get("params"); params != "" {
 		decoded, decodeErr := base64.StdEncoding.DecodeString(params)
 		if decodeErr != nil {
-			return pan123ResolvedDownload{}, fmt.Errorf("decode 123pan download parameters: %w", decodeErr)
+			return "", nil, fmt.Errorf("decode 123pan download parameters: %w", decodeErr)
 		}
 		parsed, parseErr := url.Parse(string(decoded))
 		if parseErr != nil {
-			return pan123ResolvedDownload{}, parseErr
+			return "", nil, parseErr
 		}
 		requestURL = parsed.String()
 	}
@@ -174,7 +177,7 @@ func (d *Pan123) resolveDownload(ctx context.Context, file File) (pan123Resolved
 		SetHeader("Referer", "https://yun.123pan.com/").
 		Get(requestURL)
 	if err != nil {
-		return pan123ResolvedDownload{}, err
+		return "", nil, err
 	}
 	directURL := requestURL
 	if res.StatusCode() == http.StatusFound {
@@ -183,14 +186,39 @@ func (d *Pan123) resolveDownload(ctx context.Context, file File) (pan123Resolved
 		directURL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
 	}
 	if directURL == "" {
-		return pan123ResolvedDownload{}, errors.New("123pan download URL resolution returned an empty redirect")
+		return "", nil, errors.New("123pan download URL resolution returned an empty redirect")
 	}
-	return pan123ResolvedDownload{
-		URL: directURL,
-		Header: http.Header{
-			"Referer": []string{fmt.Sprintf("%s://%s/", originalURL.Scheme, originalURL.Host)},
-		},
+	return directURL, http.Header{
+		"Referer": []string{fmt.Sprintf("%s://%s/", originalURL.Scheme, originalURL.Host)},
 	}, nil
+}
+
+func NewRefreshableLink(totalSize int64, initialURL string, header http.Header, refresh func(context.Context) (string, http.Header, error)) *model.Link {
+	rangeReader := stream.RangeReaderFunc(func(readCtx context.Context, requested http_range.Range) (io.ReadCloser, error) {
+		return newPan123DownloadReader(
+			readCtx,
+			totalSize,
+			requested,
+			pan123ResolvedDownload{URL: initialURL, Header: header},
+			func(refreshCtx context.Context) (pan123ResolvedDownload, error) {
+				if refresh == nil {
+					return pan123ResolvedDownload{}, errors.New("123pan direct link refresher is unavailable")
+				}
+				url, refreshedHeader, err := refresh(refreshCtx)
+				if err != nil {
+					return pan123ResolvedDownload{}, err
+				}
+				return pan123ResolvedDownload{URL: url, Header: refreshedHeader}, nil
+			},
+			pan123FallbackConfig{},
+		)
+	})
+	return &model.Link{
+		URL:           initialURL,
+		Header:        header,
+		RangeReader:   rangeReader,
+		ContentLength: totalSize,
+	}
 }
 
 func (d *Pan123) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
@@ -277,8 +305,38 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 		return err
 	}
 	log.Debugln("upload request res: ", string(res))
-	if resp.Data.Reuse || resp.Data.Key == "" {
-		return nil
+	if resp.Data.Reuse {
+		if resp.Data.FileId > 0 {
+			return nil
+		}
+		confirmed, err := d.probeUploadedFile(ctx, dstDir, file.GetName(), file.GetSize(), etag)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			return nil
+		}
+		return fmt.Errorf("123pan upload request reported reuse without a valid file id")
+	}
+	if resp.Data.Key == "" {
+		confirmed, err := d.probeUploadedFile(ctx, dstDir, file.GetName(), file.GetSize(), etag)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			return nil
+		}
+		return fmt.Errorf("123pan upload request returned an empty storage key without a confirmed destination file")
+	}
+	if resp.Data.FileId == 0 {
+		confirmed, err := d.probeUploadedFile(ctx, dstDir, file.GetName(), file.GetSize(), etag)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			return nil
+		}
+		return fmt.Errorf("123pan upload request returned an empty file id without a confirmed destination file")
 	}
 	if resp.Data.AccessKeyId == "" || resp.Data.SecretAccessKey == "" || resp.Data.SessionToken == "" {
 		err = d.newUpload(ctx, &resp, file, up)
@@ -317,6 +375,25 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 		}).SetContext(ctx)
 	}, nil)
 	return err
+}
+
+func (d *Pan123) probeUploadedFile(ctx context.Context, dstDir model.Obj, name string, size int64, etag string) (bool, error) {
+	files, err := d.getFiles(ctx, dstDir.GetID(), dstDir.GetName())
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range files {
+		if candidate.IsDir() || strings.TrimSpace(candidate.FileName) != name || candidate.Size != size {
+			continue
+		}
+		if etag != "" && !strings.EqualFold(strings.TrimSpace(candidate.Etag), etag) {
+			continue
+		}
+		if candidate.FileId > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (d *Pan123) APIRateLimit(ctx context.Context, api string) error {

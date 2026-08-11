@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
@@ -90,6 +92,14 @@ func defaultHydrateInventoryStorage(ctx context.Context, nodeID string, storage 
 		mount.FreeBytes = details.FreeSpace()
 		account.TotalBytes = details.TotalSpace
 		account.FreeBytes = details.FreeSpace()
+	} else if detailsErr != nil && !errs.IsNotImplementError(detailsErr) {
+		account.HealthState = "degraded"
+		account.LastErrorCode = inventoryProbeErrorCode(detailsErr)
+		if account.LastErrorCode == inventoryStatusReauthorizationRequired {
+			account.CredentialState = inventoryStatusReauthorizationRequired
+		}
+		account.SupportsShareSave = false
+		account.SupportedOperations = nil
 	}
 	if reporter, ok := driver.(clusterMembershipDetailsReporter); ok {
 		applyRuntimeMembership(&account, reporter.ClusterMembershipDetails())
@@ -97,6 +107,16 @@ func defaultHydrateInventoryStorage(ctx context.Context, nodeID string, storage 
 		applyRuntimeMembership(&account, model.MembershipDetails{Tier: reporter.ClusterMembershipTier()})
 	}
 	return inventoryStorageSnapshot{Mount: mount, Account: account}, nil
+}
+
+func inventoryProbeErrorCode(err error) string {
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	for _, marker := range []string{"refresh token", "refresh_token", "invalid token", "unauthorized", "forbidden", "credential", "sign invalid", "signature"} {
+		if strings.Contains(message, marker) {
+			return inventoryStatusReauthorizationRequired
+		}
+	}
+	return "provider_health_probe_failed"
 }
 
 func applyRuntimeMembership(account *protocol.ProviderAccountInventory, membership model.MembershipDetails) {
@@ -139,6 +159,15 @@ func providerAccountInventory(nodeID string, storage model.Storage, freeBytes, t
 	tier := providerMembershipTier(storage, provider)
 	status := inventoryReportedStorageStatus(storage.Status)
 	healthy := !storage.Disabled && strings.EqualFold(strings.TrimSpace(status), op.WORK)
+	healthState := "unknown"
+	credentialState := "unknown"
+	if healthy {
+		healthState = "ready"
+		credentialState = "ready"
+	} else if storage.Disabled || strings.EqualFold(strings.TrimSpace(status), op.DISABLED) {
+		healthState = "offline"
+	}
+	checkedAt := time.Now().UTC()
 	return protocol.ProviderAccountInventory{
 		StorageID:            storage.ID,
 		NodeMountID:          stableMountID(nodeID, storage.ID, storage.MountPath),
@@ -153,10 +182,36 @@ func providerAccountInventory(nodeID string, storage model.Storage, freeBytes, t
 		SupportsUpload:       !storage.Disabled && healthy,
 		SupportsDownload:     !storage.Disabled && healthy,
 		SupportsShareSave:    !storage.Disabled && healthy && supportsShare(storage.Driver),
+		CredentialState:      credentialState,
+		HealthState:          healthState,
+		CheckedAt:            checkedAt,
+		NextProbeAt:          checkedAt.Add(5 * time.Minute),
+		SupportedOperations:  providerSupportedOperations(provider, healthy && !storage.Disabled, healthy && !storage.Disabled && supportsShare(storage.Driver)),
 		SupportsETF:          !storage.Disabled && healthy && supportsETFAccount(storage),
 		TotalBytes:           totalBytes,
 		FreeBytes:            freeBytes,
 	}
+}
+
+func providerSupportedOperations(provider string, downloadReady, shareSaveReady bool) []string {
+	if !downloadReady {
+		return nil
+	}
+	operations := []string{"share.inspect", "result_probe"}
+	if shareSaveReady {
+		operations = append(operations, "share.save")
+	}
+	switch provider {
+	case "pan123":
+		// 123Pan's share-download contract is covered by the provider HTTP
+		// tests. The subscription feature gate remains off by default, so this
+		// capability is only consumed when direct-download-first is enabled.
+		operations = append(operations, "share.download", "instant_upload", "range_download")
+	case "guangyapan":
+		operations = append(operations, "instant_upload", "range_download")
+	}
+	operations = append(operations, "download")
+	return operations
 }
 
 func mobileProviderUploadLimit(provider, tier string) int64 {
@@ -289,6 +344,9 @@ func applyInventoryStatus(mount *protocol.MountInventory, account *protocol.Prov
 	account.SupportsUpload = false
 	account.SupportsDownload = false
 	account.SupportsShareSave = false
+	account.CredentialState = "unknown"
+	account.HealthState = "offline"
+	account.SupportedOperations = nil
 	account.SupportsETF = false
 }
 

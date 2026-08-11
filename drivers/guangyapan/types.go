@@ -234,6 +234,7 @@ type shareListResp struct {
 	Data    struct {
 		Items []shareListItem `json:"items"`
 		List  []shareListItem `json:"list"`
+		Total int             `json:"total"`
 	} `json:"data"`
 }
 

@@ -66,6 +66,7 @@ type ClusterMediaTask struct {
 	SourceRelativePath    string
 	SourceSize            int64
 	SourceHash            string
+	SourceProviderData    map[string]string
 	MediaItemID           string
 	MediaType             string
 	TMDBID                int64
@@ -78,6 +79,7 @@ type ClusterMediaTask struct {
 	TargetProfile         string
 	WorkflowVersion       string
 	SealedManifestVersion string
+	DeliveryMode          string
 }
 
 type ClusterDispatchResult struct {
@@ -206,7 +208,9 @@ func RetryOrphanedClusterSubscriptionItems(ctx context.Context, subscriptionID u
 	groups := make(map[string]*retryGroup)
 	for i := range items {
 		item := &items[i]
-		if item.Status != model.SubscriptionItemStatusFailed && item.Status != model.SubscriptionItemStatusPending {
+		if item.Status != model.SubscriptionItemStatusFailed && item.Status != model.SubscriptionItemStatusPending &&
+			item.Status != model.SubscriptionItemStatusRetryWait && item.Status != model.SubscriptionItemStatusUnknown &&
+			item.Status != model.SubscriptionItemStatusBlocked {
 			continue
 		}
 		if _, active := activeByItemID[item.ID]; active {
@@ -220,6 +224,10 @@ func RetryOrphanedClusterSubscriptionItems(ctx context.Context, subscriptionID u
 		item.Status = model.SubscriptionItemStatusPending
 		item.ClusterJobID = ""
 		item.LastError = ""
+		item.LastErrorCode = ""
+		item.RetryAt = nil
+		item.BlockedReason = ""
+		item.StateVersion++
 		if _, _, err := db.UpsertSubscriptionItemForceStatus(item); err != nil {
 			return recovered, err
 		}
@@ -754,6 +762,7 @@ func skipClusterDuplicateEpisodeItem(item *model.SubscriptionItem) error {
 	}
 	item.Status = model.SubscriptionItemStatusSkipped
 	item.LastError = clusterSkippedDuplicateEpisodeReason
+	item.StateVersion++
 	// Keep ClusterJobID so a late worker callback can still match and no-op.
 	_, _, err := db.UpsertSubscriptionItem(item)
 	return err
@@ -816,7 +825,10 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 			}
 			claimedItems[item] = true
 		}
-		tasks = append(tasks, clusterMediaTask(sub, item, ref, message))
+		task := clusterMediaTask(sub, item, ref, message)
+		item.DeliveryMode = task.DeliveryMode
+		item.OperationKey = task.IdempotencyKey
+		tasks = append(tasks, task)
 		dispatchItems = append(dispatchItems, item)
 	}
 	if len(tasks) == 0 {
@@ -832,6 +844,7 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 	waitingForWorker := errors.Is(dispatchErr, ErrClusterWorkerUnavailable)
 	for _, item := range dispatchItems {
 		result, ok := resultByKey[item.SourceKey]
+		item.StateVersion++
 		if !ok {
 			if waitingForWorker {
 				item.Status = model.SubscriptionItemStatusPending
@@ -901,6 +914,9 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 			item.Status = model.SubscriptionItemStatusTransferring
 			item.ClusterJobID = jobID
 			item.LastError = ""
+			item.LastErrorCode = ""
+			item.RetryAt = nil
+			item.BlockedReason = ""
 			if err := persistAcceptedSubscriptionItemAndEpisodeSourceSnapshot(sub, item); err != nil {
 				if firstErr == nil {
 					firstErr = err
@@ -931,6 +947,10 @@ func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref
 	shareFingerprint := shortHash(string(ref.Provider) + "\x00" + strings.TrimSpace(ref.RawURL) + "\x00" + ref.Passcode)
 	mediaItemID := clusterMediaItemID(sub.ID, item.SourceKey, item.FileHash)
 	idempotency := hashClusterSource(fmt.Sprint(sub.ID), string(ref.Provider), ref.ShareID, item.FileID, item.FileHash, item.TargetPath)
+	deliveryMode := model.SubscriptionDeliveryModeTransfer
+	if cfg, err := GetConfig(); err == nil && cfg.DirectShareLinkEnabled && cfg.DirectDownloadFirstEnabled && ref.Provider == ShareProviderPan123 {
+		deliveryMode = model.SubscriptionDeliveryModeDirectDownload
+	}
 	return ClusterMediaTask{
 		IdempotencyKey: idempotency, SubscriptionID: sub.ID, SubscriptionItemID: item.ID,
 		SubscriptionName: sub.Name, PreferredWorkerNodeID: sub.PreferredWorkerNodeID, SourceKey: item.SourceKey,
@@ -939,12 +959,13 @@ func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref
 		ShareProvider: string(ref.Provider), ShareURL: ref.RawURL, SharePasscode: ref.Passcode,
 		ShareRefFingerprint: shareFingerprint, SourceFileID: item.FileID,
 		SourceRelativePath: strings.TrimPrefix(item.FilePath, "/"), SourceSize: item.FileSize,
-		SourceHash: item.FileHash, MediaItemID: mediaItemID, MediaType: sub.MediaType,
+		SourceHash: item.FileHash, SourceProviderData: cloneShareItemProviderData(item.ProviderData), MediaItemID: mediaItemID, MediaType: sub.MediaType,
 		TMDBID: sub.TMDBID, TMDBName: sub.TMDBName, TMDBYear: sub.TMDBYear,
 		Season: item.Season, Episode: item.Episode,
 		LogicalMediaRoot:  sub.TargetRoot,
 		LogicalTargetPath: item.TargetPath,
 		WorkflowVersion:   ClusterWorkflowVersion, SealedManifestVersion: ClusterSealedManifestVersion,
+		DeliveryMode: deliveryMode,
 	}
 }
 

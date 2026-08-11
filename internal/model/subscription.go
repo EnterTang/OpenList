@@ -14,6 +14,13 @@ const (
 	SubscriptionStatusSuccess = "success"
 	SubscriptionStatusFailed  = "failed"
 
+	SubscriptionItemStatusRetryWait = "retry_wait"
+	SubscriptionItemStatusBlocked   = "blocked"
+	SubscriptionItemStatusUnknown   = "unknown"
+
+	SubscriptionDeliveryModeTransfer       = "transfer"
+	SubscriptionDeliveryModeDirectDownload = "direct_download"
+
 	SubscriptionRunViewChanges  = "changes"
 	SubscriptionRunViewFailures = "failures"
 
@@ -112,32 +119,41 @@ type SubscriptionProgress struct {
 }
 
 type SubscriptionItem struct {
-	ID                   uint      `json:"id" gorm:"primarykey"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
-	SubscriptionID       uint      `json:"subscription_id" gorm:"uniqueIndex:idx_subscription_item_source;index"`
-	SourceKey            string    `json:"source_key" gorm:"uniqueIndex:idx_subscription_item_source"`
-	SourceProvider       string    `json:"source_provider" gorm:"index"`
-	SourceURL            string    `json:"source_url" gorm:"type:text"`
-	SourceMessageID      string    `json:"source_message_id" gorm:"index"`
-	SourceMessageChannel string    `json:"source_message_channel" gorm:"index"`
-	SourceMessageURL     string    `json:"source_message_url" gorm:"type:text"`
-	SourceMessageText    string    `json:"source_message_text" gorm:"type:text"`
-	SourcePath           string    `json:"source_path" gorm:"index"`
-	FileID               string    `json:"file_id" gorm:"index"`
-	FilePath             string    `json:"file_path" gorm:"index"`
-	FileName             string    `json:"file_name"`
-	FileSize             int64     `json:"file_size"`
-	FileHash             string    `json:"file_hash" gorm:"index"`
-	Season               int       `json:"season" gorm:"index"`
-	Episode              int       `json:"episode" gorm:"index"`
-	TargetDir            string    `json:"target_dir"`
-	TargetName           string    `json:"target_name"`
-	TargetPath           string    `json:"target_path"`
-	Status               string    `json:"status" gorm:"index"`
-	ClusterJobID         string    `json:"cluster_job_id" gorm:"size:64;index"`
-	LastSeenAt           time.Time `json:"last_seen_at" gorm:"index"`
-	LastError            string    `json:"last_error" gorm:"type:text"`
+	ID                   uint              `json:"id" gorm:"primarykey"`
+	CreatedAt            time.Time         `json:"created_at"`
+	UpdatedAt            time.Time         `json:"updated_at"`
+	SubscriptionID       uint              `json:"subscription_id" gorm:"uniqueIndex:idx_subscription_item_source;index"`
+	SourceKey            string            `json:"source_key" gorm:"uniqueIndex:idx_subscription_item_source"`
+	SourceProvider       string            `json:"source_provider" gorm:"index"`
+	SourceURL            string            `json:"source_url" gorm:"type:text"`
+	SourceMessageID      string            `json:"source_message_id" gorm:"index"`
+	SourceMessageChannel string            `json:"source_message_channel" gorm:"index"`
+	SourceMessageURL     string            `json:"source_message_url" gorm:"type:text"`
+	SourceMessageText    string            `json:"source_message_text" gorm:"type:text"`
+	SourcePath           string            `json:"source_path" gorm:"index"`
+	FileID               string            `json:"file_id" gorm:"index"`
+	FilePath             string            `json:"file_path" gorm:"index"`
+	FileName             string            `json:"file_name"`
+	FileSize             int64             `json:"file_size"`
+	FileHash             string            `json:"file_hash" gorm:"index"`
+	ProviderData         map[string]string `json:"provider_data,omitempty" gorm:"serializer:json"`
+	Season               int               `json:"season" gorm:"index"`
+	Episode              int               `json:"episode" gorm:"index"`
+	TargetDir            string            `json:"target_dir"`
+	TargetName           string            `json:"target_name"`
+	TargetPath           string            `json:"target_path"`
+	Status               string            `json:"status" gorm:"index"`
+	ClusterJobID         string            `json:"cluster_job_id" gorm:"size:64;index"`
+	LastSeenAt           time.Time         `json:"last_seen_at" gorm:"index"`
+	LastError            string            `json:"last_error" gorm:"type:text"`
+	LastErrorCode        string            `json:"last_error_code" gorm:"size:64;index"`
+	RetryCount           int               `json:"retry_count"`
+	RetryAt              *time.Time        `json:"retry_at,omitempty" gorm:"index"`
+	BlockedReason        string            `json:"blocked_reason,omitempty" gorm:"size:128"`
+	OperationKey         string            `json:"operation_key,omitempty" gorm:"size:191;index"`
+	StateVersion         uint64            `json:"state_version"`
+	DeliveryMode         string            `json:"delivery_mode,omitempty" gorm:"size:32;index"`
+	FallbackReason       string            `json:"fallback_reason,omitempty" gorm:"size:128"`
 }
 
 type SubscriptionEpisodeSource struct {
@@ -172,6 +188,18 @@ type SubscriptionRun struct {
 	ChangedCount           int        `json:"changed_count"`
 	TransferredCount       int        `json:"transferred_count"`
 	QueuedCount            int        `json:"queued_count,omitempty"`
+	DiscoveredCount        int        `json:"discovered_count,omitempty"`
+	DispatchedCount        int        `json:"dispatched_count,omitempty"`
+	SucceededCount         int        `json:"succeeded_count,omitempty"`
+	SkippedCount           int        `json:"skipped_count,omitempty"`
+	RetryableCount         int        `json:"retryable_count,omitempty"`
+	BlockedCount           int        `json:"blocked_count,omitempty"`
+	UnknownCount           int        `json:"unknown_count,omitempty"`
+	FailedCount            int        `json:"failed_count,omitempty"`
+	DiscoverStatus         string     `json:"discover_status,omitempty" gorm:"size:32"`
+	DispatchStatus         string     `json:"dispatch_status,omitempty" gorm:"size:32"`
+	TransferStatus         string     `json:"transfer_status,omitempty" gorm:"size:32"`
+	CompletionState        string     `json:"completion_state,omitempty" gorm:"size:32;index"`
 	Error                  string     `json:"error" gorm:"type:text"`
 	SubscriptionName       string     `json:"subscription_name" gorm:"->;-:migration;column:subscription_name"`
 	SubscriptionSourceType string     `json:"subscription_source_type" gorm:"->;-:migration;column:subscription_source_type"`
@@ -317,6 +345,11 @@ type SubscriptionConfig struct {
 	DefaultTarget               SubscriptionStorageTarget        `json:"default_target,omitempty"`
 	DefaultCheckIntervalMinutes int                              `json:"default_check_interval_minutes,omitempty"`
 	DefaultTransferEnabled      bool                             `json:"default_transfer_enabled,omitempty"`
+	ResultConfirmationEnabled   bool                             `json:"result_confirmation_enabled,omitempty"`
+	ProviderHealthRequired      bool                             `json:"provider_health_required,omitempty"`
+	DirectShareLinkEnabled      bool                             `json:"direct_share_link_enabled,omitempty"`
+	DirectDownloadFirstEnabled  bool                             `json:"direct_download_first_enabled,omitempty"`
+	MaxReconcileAttempts        int                              `json:"max_reconcile_attempts,omitempty"`
 	DefaultMediaType            string                           `json:"default_media_type,omitempty"`
 	DefaultCategory             string                           `json:"default_category,omitempty"`
 	EpisodeEarlyCloseMinBytes   *int64                           `json:"episode_early_close_min_bytes,omitempty"`

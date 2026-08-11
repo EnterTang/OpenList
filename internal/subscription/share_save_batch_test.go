@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -32,6 +33,61 @@ type groupingBoundaryTestProvider struct {
 	ensureDirCalls []string
 	saveCalls      []recordedSaveCall
 	waitedTaskIDs  []string
+}
+
+type pan123PartialResultProvider struct {
+	fakeShareTreeProvider
+	attempted []string
+	failID    string
+}
+
+func (p *pan123PartialResultProvider) EnsureDir(context.Context, string) (string, error) {
+	return "dst-dir", nil
+}
+
+func (p *pan123PartialResultProvider) SaveShareItems(_ context.Context, _ ShareRef, _ string, items []ShareItem, _ string) ([]string, error) {
+	if len(items) != 1 {
+		return nil, errors.New("expected one item per compensated save")
+	}
+	p.attempted = append(p.attempted, items[0].ID)
+	return []string{"task-" + items[0].ID}, nil
+}
+
+func (p *pan123PartialResultProvider) WaitSaveComplete(_ context.Context, taskIDs []string) error {
+	if len(taskIDs) == 1 && taskIDs[0] == "task-"+p.failID {
+		return errors.New("save result unknown")
+	}
+	return nil
+}
+
+func TestSaveShareToTempPan123AttemptsAllItemsAfterMixedResult(t *testing.T) {
+	provider := &pan123PartialResultProvider{
+		fakeShareTreeProvider: fakeShareTreeProvider{
+			name: ShareProviderPan123,
+			children: map[string][]ShareItem{
+				"": {
+					{ID: "file-1", Name: "one.mkv"},
+					{ID: "file-2", Name: "two.mkv"},
+					{ID: "file-3", Name: "three.mkv"},
+				},
+			},
+		},
+		failID: "file-2",
+	}
+
+	entries, err := SaveShareToTemp(context.Background(), provider, ShareRef{
+		Provider: ShareProviderPan123,
+		RawURL:   "https://www.123pan.com/s/example",
+	}, SaveShareOptions{TempRoot: "/tmp/pan123"})
+	if err == nil {
+		t.Fatal("expected mixed save error")
+	}
+	if got, want := strings.Join(provider.attempted, ","), "file-1,file-2,file-3"; got != want {
+		t.Fatalf("attempted = %q, want %q", got, want)
+	}
+	if got, want := len(entries), 2; got != want {
+		t.Fatalf("confirmed entries = %d, want %d", got, want)
+	}
 }
 
 func (p *pan115BatchTestProvider) EnsureDir(ctx context.Context, path string) (string, error) {

@@ -452,7 +452,7 @@ func TestRetryFailedSubscriptionUsesClusterReplayForHybridRole(t *testing.T) {
 	if dispatcher.retryCalls != 1 {
 		t.Fatalf("retry calls = %d, want 1", dispatcher.retryCalls)
 	}
-	if resp.Data.Run == nil || resp.Data.Run.TransferredCount != 2 {
+	if resp.Data.Run == nil || resp.Data.Run.QueuedCount != 2 || resp.Data.Run.TransferredCount != 0 {
 		t.Fatalf("response run = %#v, want two requeued tasks", resp.Data.Run)
 	}
 }

@@ -864,7 +864,7 @@ func shouldRetryMediaTransfer(errorCode string, generation uint64) bool {
 	}
 	switch strings.TrimSpace(errorCode) {
 	case "source_unexpected_eof", "source_range_failed", "source_link_expired",
-		"share_save_rate_limited", "share_save_gateway_response", "share_save_transient":
+		"share_save_retryable", "share_save_rate_limited", "share_save_gateway_response", "share_save_transient":
 		return true
 	default:
 		return false
@@ -918,6 +918,12 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		attemptStatus := model.ClusterAttemptStatusFailed
 		jobUpdates := map[string]any{"last_error_code": result.ErrorCode, "last_error": result.Error}
 		if result.Status == "succeeded" {
+			directDelivery := false
+			if result.Result != nil {
+				if mode, ok := result.Result["delivery_mode"].(string); ok && strings.EqualFold(strings.TrimSpace(mode), model.SubscriptionDeliveryModeDirectDownload) {
+					directDelivery = true
+				}
+			}
 			if job.Type == model.ClusterJobTypeShareInspect {
 				payloadHash, err := persistShareInspectResultTx(tx, peer.NodeID(), &job, attempt, result)
 				if err != nil {
@@ -930,6 +936,9 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 			}
 			attemptStatus = model.ClusterAttemptStatusSucceeded
 			if job.Type == model.ClusterJobTypeShareInspect {
+				jobUpdates["status"] = model.ClusterJobStatusSucceeded
+				jobUpdates["finished_at"] = now
+			} else if directDelivery {
 				jobUpdates["status"] = model.ClusterJobStatusSucceeded
 				jobUpdates["finished_at"] = now
 			} else if job.Status == model.ClusterJobStatusSucceeded {
@@ -984,10 +993,31 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		if err := tx.Model(&model.ClusterJob{}).Where("id = ?", result.JobID).Updates(jobUpdates).Error; err != nil {
 			return err
 		}
+		if result.Status == "succeeded" && job.Type == model.ClusterJobTypeMediaTransfer {
+			if mode, ok := result.Result["delivery_mode"].(string); ok && strings.EqualFold(strings.TrimSpace(mode), model.SubscriptionDeliveryModeDirectDownload) && job.SubscriptionItemID != 0 {
+				updates := map[string]any{
+					"status":          model.SubscriptionItemStatusTransferred,
+					"last_error":      "",
+					"last_error_code": "",
+					"retry_at":        nil,
+					"blocked_reason":  "",
+					"delivery_mode":   model.SubscriptionDeliveryModeDirectDownload,
+					"state_version":   gorm.Expr("state_version + 1"),
+				}
+				if fallbackReason, ok := result.Result["fallback_reason"].(string); ok {
+					updates["fallback_reason"] = strings.TrimSpace(fallbackReason)
+				}
+				if err := tx.Model(&model.SubscriptionItem{}).
+					Where("id = ? AND cluster_job_id = ?", job.SubscriptionItemID, job.ID).
+					Updates(updates).Error; err != nil {
+					return err
+				}
+			}
+		}
 		if result.Status != "succeeded" && job.Type == model.ClusterJobTypeMediaTransfer && job.SubscriptionItemID != 0 && jobUpdates["status"] == model.ClusterJobStatusFailed {
 			if err := tx.Model(&model.SubscriptionItem{}).
 				Where("id = ? AND cluster_job_id = ?", job.SubscriptionItemID, job.ID).
-				Updates(map[string]any{"status": model.SubscriptionItemStatusFailed, "last_error": result.Error}).Error; err != nil {
+				Updates(map[string]any{"status": model.SubscriptionItemStatusFailed, "last_error": result.Error, "last_error_code": result.ErrorCode, "state_version": gorm.Expr("state_version + 1")}).Error; err != nil {
 				return err
 			}
 		}
@@ -1285,8 +1315,10 @@ func (s *Service) SweepExpiredLeases(ctx context.Context, now time.Time) (int64,
 					if err := tx.Model(&model.SubscriptionItem{}).
 						Where("id = ? AND cluster_job_id = ?", job.SubscriptionItemID, attempt.JobID).
 						Updates(map[string]any{
-							"status":     model.SubscriptionItemStatusFailed,
-							"last_error": "worker lease expired and automatic retry limit was reached",
+							"status":          model.SubscriptionItemStatusFailed,
+							"last_error":      "worker lease expired and automatic retry limit was reached",
+							"last_error_code": "lease_expired_attempt_limit",
+							"state_version":   gorm.Expr("state_version + 1"),
 						}).Error; err != nil {
 						return err
 					}
@@ -1811,6 +1843,9 @@ func (s *Service) RetryFailedSubscriptionItems(ctx context.Context, subscription
 		if err := tx.Where("subscription_id = ? AND status IN ?", subscriptionID, []string{
 			model.SubscriptionItemStatusFailed,
 			model.SubscriptionItemStatusPending,
+			model.SubscriptionItemStatusRetryWait,
+			model.SubscriptionItemStatusUnknown,
+			model.SubscriptionItemStatusBlocked,
 		}).Order("id ASC").Find(&items).Error; err != nil {
 			return err
 		}
@@ -1844,7 +1879,7 @@ func (s *Service) RetryFailedSubscriptionItems(ctx context.Context, subscription
 				job = latestByItemID[item.ID]
 			}
 			if job == nil {
-				if item.Status == model.SubscriptionItemStatusFailed {
+				if item.Status != model.SubscriptionItemStatusTransferred && item.Status != model.SubscriptionItemStatusSkipped {
 					recovered.Unmatched++
 				}
 				continue
@@ -1853,7 +1888,7 @@ func (s *Service) RetryFailedSubscriptionItems(ctx context.Context, subscription
 				// A live job is already in flight. A succeeded or otherwise
 				// terminal job cannot be replayed safely, so report a failed item
 				// that has no retryable durable task instead of hiding it.
-				if item.Status == model.SubscriptionItemStatusFailed && !isActiveSubscriptionJobStatus(job.Status) {
+				if item.Status != model.SubscriptionItemStatusTransferred && item.Status != model.SubscriptionItemStatusSkipped && !isActiveSubscriptionJobStatus(job.Status) {
 					recovered.Unmatched++
 				}
 				continue
@@ -1866,9 +1901,13 @@ func (s *Service) RetryFailedSubscriptionItems(ctx context.Context, subscription
 			}
 			retriedJobs[job.ID] = struct{}{}
 			if err := tx.Model(&model.SubscriptionItem{}).Where("id = ?", item.ID).Updates(map[string]any{
-				"status":         model.SubscriptionItemStatusPending,
-				"cluster_job_id": job.ID,
-				"last_error":     "",
+				"status":          model.SubscriptionItemStatusPending,
+				"cluster_job_id":  job.ID,
+				"last_error":      "",
+				"last_error_code": "",
+				"retry_at":        nil,
+				"blocked_reason":  "",
+				"state_version":   gorm.Expr("state_version + 1"),
 			}).Error; err != nil {
 				return err
 			}

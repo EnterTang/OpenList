@@ -81,7 +81,7 @@ func inspectConfiguredShareTree(ctx context.Context, share protocol.ShareTaskCon
 		if entry.IsDir {
 			continue
 		}
-		objects = append(objects, protocol.SourceObject{Provider: string(ref.Provider), SourceFileID: entry.ID, SourceRelativePath: strings.TrimPrefix(entry.Path, "/"), Size: entry.Size})
+		objects = append(objects, protocol.SourceObject{Provider: string(ref.Provider), SourceFileID: entry.ID, SourceRelativePath: strings.TrimPrefix(entry.Path, "/"), Size: entry.Size, ProviderData: entry.ProviderData})
 		objects[len(objects)-1].ModifiedAt = entry.Modified.UTC()
 	}
 	sort.Slice(objects, func(i, j int) bool {

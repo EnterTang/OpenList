@@ -24,13 +24,14 @@ var mediaExts = map[string]struct{}{
 }
 
 type TreeEntry struct {
-	RootPath string    `json:"root_path"`
-	Path     string    `json:"path"`
-	Name     string    `json:"name"`
-	ID       string    `json:"id"`
-	Size     int64     `json:"size"`
-	Modified time.Time `json:"modified"`
-	IsDir    bool      `json:"is_dir"`
+	RootPath     string                `json:"root_path"`
+	Path         string                `json:"path"`
+	Name         string                `json:"name"`
+	ID           string                `json:"id"`
+	Size         int64                 `json:"size"`
+	Modified     time.Time             `json:"modified"`
+	IsDir        bool                  `json:"is_dir"`
+	ProviderData ShareItemProviderData `json:"provider_data,omitempty"`
 }
 
 type TreeSnapshot struct {

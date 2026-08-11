@@ -62,6 +62,22 @@ func TestApplyConfigDefaultsMergesTelegramConfig(t *testing.T) {
 	}
 }
 
+func TestSubscriptionReliabilityConfigDefaultsAndValidation(t *testing.T) {
+	defaults := normalizeConfig(model.SubscriptionConfig{})
+	if defaults.MaxReconcileAttempts != defaultMaxReconcileAttempts {
+		t.Fatalf("max reconcile attempts = %d, want %d", defaults.MaxReconcileAttempts, defaultMaxReconcileAttempts)
+	}
+	if defaults.ResultConfirmationEnabled || defaults.ProviderHealthRequired || defaults.DirectShareLinkEnabled || defaults.DirectDownloadFirstEnabled {
+		t.Fatalf("reliability feature flags should be disabled by default: %#v", defaults)
+	}
+	if err := validateSubscriptionConfigTargets(model.SubscriptionConfig{MaxReconcileAttempts: maxMaxReconcileAttempts + 1}); err == nil {
+		t.Fatal("out-of-range max reconcile attempts unexpectedly accepted")
+	}
+	if err := validateSubscriptionConfigTargets(model.SubscriptionConfig{MaxReconcileAttempts: 1}); err != nil {
+		t.Fatalf("minimum max reconcile attempts rejected: %v", err)
+	}
+}
+
 func TestApplyConfigDefaultsMergesHDHiveSourceConfig(t *testing.T) {
 	sub := &model.Subscription{
 		SourceType: model.SubscriptionSourceHDHive,

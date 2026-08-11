@@ -15,6 +15,11 @@ import (
 
 const ConfigSettingKey = "subscription_config"
 
+const (
+	defaultMaxReconcileAttempts = 3
+	maxMaxReconcileAttempts     = 10
+)
+
 func DefaultConfig() model.SubscriptionConfig {
 	return model.SubscriptionConfig{
 		Telegram: model.SubscriptionTelegramSourceConfig{
@@ -142,6 +147,9 @@ func ApplyConfigDefaults(sub *model.Subscription, cfg model.SubscriptionConfig) 
 }
 
 func validateSubscriptionConfigTargets(cfg model.SubscriptionConfig) error {
+	if cfg.MaxReconcileAttempts < 1 || cfg.MaxReconcileAttempts > maxMaxReconcileAttempts {
+		return errors.Errorf("max_reconcile_attempts must be between 1 and %d", maxMaxReconcileAttempts)
+	}
 	if err := ValidateSubscriptionStorageTarget(cfg.DefaultTarget); err != nil {
 		return errors.WithMessage(err, "invalid default target")
 	}
@@ -203,6 +211,9 @@ func normalizeConfig(cfg model.SubscriptionConfig) model.SubscriptionConfig {
 	cfg.DefaultMediaType = ""
 	cfg.DefaultCategory = ""
 	cfg.DefaultTransferEnabled = false
+	if cfg.MaxReconcileAttempts <= 0 {
+		cfg.MaxReconcileAttempts = defaultMaxReconcileAttempts
+	}
 	cfg.Telegram = normalizeTelegramSourceConfig(cfg.Telegram)
 	if len(cfg.Telegram.TransferPriority) == 0 {
 		cfg.Telegram.TransferPriority = append([]string(nil), defaultTransferPriority...)

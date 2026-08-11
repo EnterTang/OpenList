@@ -235,7 +235,7 @@ func TestRequestReturnsBusinessErrorFromErrno(t *testing.T) {
 		t.Fatalf("business error = %#v, want errno 90001 / business kind", businessErr)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("request count = %d, want one request without fallback", got)
+		t.Fatalf("request count = %d, want one request for business response", got)
 	}
 }
 
@@ -305,6 +305,70 @@ func TestRequestFallsBackOnHTTP405(t *testing.T) {
 	}
 }
 
+func TestRequestRetriesIdempotent429WithResponseMetadata(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	client := newTestClient(t, ClientOptions{
+		WebBaseURL: "https://web.invalid",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if calls.Add(1) < 3 {
+				resp := jsonResponse(req, http.StatusTooManyRequests, "<html>rate limited</html>")
+				resp.Header.Set("Content-Type", "text/html")
+				resp.Header.Set("Retry-After", "0")
+				return resp, nil
+			}
+			return jsonResponse(req, http.StatusOK, `{"state":true,"errno":0,"data":{"id":"ok"}}`), nil
+		})},
+	})
+	var out UserInfo
+	if err := client.doJSON(context.Background(), OperationUserInfo, ProfileWeb, http.MethodGet, EndpointUserInfo, nil, nil, &out); err != nil {
+		t.Fatalf("idempotent retry: %v", err)
+	}
+	if calls.Load() != 3 || out.ID != "ok" {
+		t.Fatalf("calls=%d out=%#v, want 3 attempts and decoded result", calls.Load(), out)
+	}
+}
+
+func TestRequestDoesNotRetryNonIdempotentShareReceive(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	client := newTestClient(t, ClientOptions{
+		WebBaseURL: "https://web.invalid",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return jsonResponse(req, http.StatusBadGateway, `{"error":"gateway"}`), nil
+		})},
+	})
+	err := client.doJSON(context.Background(), OperationShareReceive, ProfileWeb, http.MethodPost, EndpointShareReceive, nil, map[string]string{"file_id": "safe"}, nil)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || calls.Load() != 1 {
+		t.Fatalf("error=%v calls=%d, want one non-idempotent attempt", err, calls.Load())
+	}
+	if httpErr.Disposition != RetryDispositionResultUnknown {
+		t.Fatalf("disposition=%q, want result_unknown for non-idempotent request", httpErr.Disposition)
+	}
+}
+
+func TestRequestCapturesHTMLResponseMetadataAfterProfileFallback(t *testing.T) {
+	t.Parallel()
+	client := newTestClient(t, ClientOptions{
+		WebBaseURL: "https://web.invalid", AndroidBaseURL: "https://android.invalid",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp := jsonResponse(req, http.StatusMethodNotAllowed, "<html>method not allowed</html>")
+			resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+			return resp, nil
+		})},
+	})
+	err := client.doJSON(context.Background(), OperationUserInfo, ProfileWeb, http.MethodGet, EndpointUserInfo, nil, nil, &UserInfo{})
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error=%v, want HTTPError", err)
+	}
+	if httpErr.Meta.BodyKind != "html" || httpErr.Meta.ContentType == "" || httpErr.Meta.BodyLength == 0 || httpErr.Profile != ProfileAndroid {
+		t.Fatalf("metadata=%#v profile=%q, want HTML metadata on fallback profile", httpErr.Meta, httpErr.Profile)
+	}
+}
+
 func TestRequestDoesNotFallbackOnNetworkError(t *testing.T) {
 	t.Parallel()
 
@@ -328,8 +392,8 @@ func TestRequestDoesNotFallbackOnNetworkError(t *testing.T) {
 	if networkErr.Profile != ProfileWeb {
 		t.Fatalf("network error profile = %q, want web", networkErr.Profile)
 	}
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("request count = %d, want one request without fallback", got)
+	if got := calls.Load(); got != maxRequestAttempts {
+		t.Fatalf("request count = %d, want %d bounded retries without fallback", got, maxRequestAttempts)
 	}
 }
 

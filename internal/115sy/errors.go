@@ -6,9 +6,32 @@ import (
 	"fmt"
 	neturl "net/url"
 	"strings"
+	"time"
 )
 
 type ErrorKind string
+
+type RetryDisposition string
+
+const (
+	RetryDispositionNone            RetryDisposition = "none"
+	RetryDispositionRetryAfter      RetryDisposition = "retry_after"
+	RetryDispositionFallbackProfile RetryDisposition = "fallback_profile"
+	RetryDispositionReauthorize     RetryDisposition = "reauthorize"
+	RetryDispositionBlocked         RetryDisposition = "blocked"
+	RetryDispositionTerminal        RetryDisposition = "terminal"
+	RetryDispositionResultUnknown   RetryDisposition = "result_unknown"
+)
+
+type ResponseMeta struct {
+	StatusCode  int
+	ContentType string
+	BodyKind    string
+	BodyLength  int
+	RetryAfter  time.Duration
+	Endpoint    string
+	Profile     Profile
+}
 
 const (
 	KindNetwork  ErrorKind = "network"
@@ -37,10 +60,12 @@ func (e *NetworkError) Unwrap() error {
 }
 
 type HTTPError struct {
-	Kind       ErrorKind
-	StatusCode int
-	Endpoint   string
-	Profile    Profile
+	Kind        ErrorKind
+	StatusCode  int
+	Endpoint    string
+	Profile     Profile
+	Meta        ResponseMeta
+	Disposition RetryDisposition
 }
 
 func (e *HTTPError) Error() string {

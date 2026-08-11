@@ -572,6 +572,8 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		var err error
 		if offer.JobType == "share.inspect" {
 			result, err = s.executeShareInspect(jobCtx, offer)
+		} else if offer.JobType == "media.transfer" && offer.TaskContext.DeliveryMode == model.SubscriptionDeliveryModeDirectDownload {
+			result, err = s.executeMediaDirectFirst(jobCtx, offer)
 		} else {
 			err = s.executeMediaTransfer(jobCtx, offer)
 		}
@@ -1064,6 +1066,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		Subscription:          offer.TaskContext.Subscription,
 		Share:                 offer.TaskContext.Share,
 		Media:                 offer.TaskContext.Media,
+		DeliveryMode:          offer.TaskContext.DeliveryMode,
 		SourceObjects:         offer.TaskContext.SourceObjects,
 		ShareSaveKey:          offer.TaskContext.ShareSaveKey,
 		ShareSaveObjects:      offer.TaskContext.ShareSaveObjects,

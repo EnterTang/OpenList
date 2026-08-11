@@ -108,6 +108,27 @@ func finishClusterRetry(subscriptionID uint, requeued int) (*model.SubscriptionR
 		CurrentTreeHash:  sub.LastTreeHash,
 		QueuedCount:      requeued,
 	}
+	projection := projectSubscriptionRun(subscriptionRunProjectionInput{
+		Items:             items,
+		DiscoveredHint:    len(items),
+		DispatchedHint:    requeued,
+		HasDispatchStage:  true,
+		DispatchSucceeded: true,
+		TransferRequested: true,
+		ClusterDispatch:   true,
+	})
+	run.DiscoveredCount = projection.DiscoveredCount
+	run.DispatchedCount = projection.DispatchedCount
+	run.SucceededCount = projection.SucceededCount
+	run.SkippedCount = projection.SkippedCount
+	run.RetryableCount = projection.RetryableCount
+	run.BlockedCount = projection.BlockedCount
+	run.UnknownCount = projection.UnknownCount
+	run.FailedCount = projection.FailedCount
+	run.DiscoverStatus = projection.DiscoverStatus
+	run.DispatchStatus = projection.DispatchStatus
+	run.TransferStatus = projection.TransferStatus
+	run.CompletionState = projection.CompletionState
 	if err := db.CreateSubscriptionRun(run); err != nil {
 		return nil, err
 	}
@@ -174,10 +195,17 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 	run.CurrentTreeHash = currentHash
 	run.AddedCount = added
 	run.ChangedCount = changed
-	run.TransferredCount = transferred
 	durableItems, durableItemsErr := db.ListSubscriptionItems(sub.ID)
 	if durableItemsErr != nil && runErr == nil {
 		runErr = durableItemsErr
+	}
+	if clusterDispatch {
+		// Cluster dispatch counts are recorded separately. The legacy field
+		// must only describe items whose durable state is actually transferred,
+		// never items that were merely submitted to a worker.
+		run.TransferredCount = summarizeSubscriptionItems(durableItems).SucceededCount
+	} else {
+		run.TransferredCount = transferred
 	}
 	durableStatus := aggregateSubscriptionStatus(durableItems)
 	activeClusterJobs := false
@@ -209,6 +237,39 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 			sub.LastTreeHash = currentHash
 		}
 	}
+	discoveredHint := len(durableItems)
+	if clusterDispatch && transferred > discoveredHint {
+		discoveredHint = transferred
+	}
+	discoverySucceeded := runErr == nil ||
+		discoveredHint > 0 ||
+		added > 0 ||
+		changed > 0 ||
+		transferred > 0 ||
+		(strings.TrimSpace(currentHash) != "" && currentHash != run.PreviousTreeHash)
+	projection := projectSubscriptionRun(subscriptionRunProjectionInput{
+		Items:              durableItems,
+		DiscoveredHint:     discoveredHint,
+		DispatchedHint:     map[bool]int{true: transferred, false: 0}[clusterDispatch],
+		HasDiscoveryStage:  true,
+		HasDispatchStage:   clusterDispatch,
+		DiscoverySucceeded: discoverySucceeded,
+		DispatchSucceeded:  clusterDispatch && runErr == nil,
+		TransferRequested:  transfer,
+		ClusterDispatch:    clusterDispatch,
+	})
+	run.DiscoveredCount = projection.DiscoveredCount
+	run.DispatchedCount = projection.DispatchedCount
+	run.SucceededCount = projection.SucceededCount
+	run.SkippedCount = projection.SkippedCount
+	run.RetryableCount = projection.RetryableCount
+	run.BlockedCount = projection.BlockedCount
+	run.UnknownCount = projection.UnknownCount
+	run.FailedCount = projection.FailedCount
+	run.DiscoverStatus = projection.DiscoverStatus
+	run.DispatchStatus = projection.DispatchStatus
+	run.TransferStatus = projection.TransferStatus
+	run.CompletionState = projection.CompletionState
 	sub.LastCheckedAt = &finished
 	if shouldPersistSubscriptionRun(run) {
 		_ = db.CreateSubscriptionRun(run)
@@ -620,10 +681,22 @@ func itemFromEntry(sub *model.Subscription, entry TreeEntry, seenAt time.Time) *
 		FileName:       entry.Name,
 		FileSize:       entry.Size,
 		FileHash:       FileHash(entry),
+		ProviderData:   cloneShareItemProviderData(entry.ProviderData),
 		Status:         model.SubscriptionItemStatusPending,
 		LastSeenAt:     seenAt,
 	}
 	return syncSubscriptionItemPaths(item, sub, entry, seenAt)
+}
+
+func cloneShareItemProviderData(value ShareItemProviderData) map[string]string {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(value))
+	for key, item := range value {
+		result[key] = item
+	}
+	return result
 }
 
 func syncSubscriptionItemPaths(item *model.SubscriptionItem, sub *model.Subscription, entry TreeEntry, seenAt time.Time) *model.SubscriptionItem {

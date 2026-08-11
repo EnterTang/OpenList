@@ -52,45 +52,77 @@ func GetApi(rawUrl string) string {
 	return u.String()
 }
 
-func (d *Pan123Share) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	if d.ref != nil {
-		return d.ref.Request(url, method, callback, resp)
+func (d *Pan123Share) request(ctx context.Context, url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	req := base.RestyClient.R()
-	req.SetHeaders(map[string]string{
-		"origin":        "https://yun.123pan.com",
-		"referer":       "https://yun.123pan.com/",
-		"authorization": "Bearer " + d.AccessToken,
-		"user-agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) openlist-client",
-		"platform":      "web",
-		"app-version":   "3",
-		//"user-agent":    base.UserAgent,
-	})
-	if callback != nil {
-		callback(req)
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := d.APIRateLimit(ctx, url); err != nil {
+			return nil, err
+		}
+		var (
+			body   []byte
+			status = http.StatusOK
+			err    error
+		)
+		if d.ref != nil {
+			body, err = d.ref.Request(url, method, callback, resp)
+		} else {
+			req := base.RestyClient.R()
+			req.SetContext(ctx)
+			req.SetHeaders(map[string]string{
+				"origin":        "https://yun.123pan.com",
+				"referer":       "https://yun.123pan.com/",
+				"authorization": "Bearer " + d.AccessToken,
+				"user-agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) openlist-client",
+				"platform":      "web",
+				"app-version":   "3",
+			})
+			if callback != nil {
+				callback(req)
+			}
+			if resp != nil {
+				req.SetResult(resp)
+			}
+			res, requestErr := req.Execute(method, GetApi(url))
+			err = requestErr
+			if res != nil {
+				body = res.Body()
+				status = res.StatusCode()
+			}
+		}
+		if err != nil {
+			if attempt+1 < maxAttempts {
+				if err := wait123ShareRetry(ctx, attempt); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, err
+		}
+		code := utils.Json.Get(body, "code").ToInt()
+		message := jsoniter.Get(body, "message").ToString()
+		if !retryable123ShareResponse(status, code, message) || attempt+1 == maxAttempts {
+			if status < http.StatusOK || status >= http.StatusMultipleChoices {
+				return nil, fmt.Errorf("123pan share request failed with HTTP %d", status)
+			}
+			if code != 0 {
+				return nil, errors.New(message)
+			}
+			return body, nil
+		}
+		if err := wait123ShareRetry(ctx, attempt); err != nil {
+			return nil, err
+		}
 	}
-	if resp != nil {
-		req.SetResult(resp)
-	}
-	res, err := req.Execute(method, GetApi(url))
-	if err != nil {
-		return nil, err
-	}
-	body := res.Body()
-	code := utils.Json.Get(body, "code").ToInt()
-	if code != 0 {
-		return nil, errors.New(jsoniter.Get(body, "message").ToString())
-	}
-	return body, nil
+	return nil, errors.New("123pan share retry limit exceeded")
 }
 
 func (d *Pan123Share) getFiles(ctx context.Context, parentId string) ([]File, error) {
 	page := 1
 	res := make([]File, 0)
 	for {
-		if err := d.APIRateLimit(ctx, FileList); err != nil {
-			return nil, err
-		}
 		var resp Files
 		query := map[string]string{
 			"limit":          "100",
@@ -102,7 +134,7 @@ func (d *Pan123Share) getFiles(ctx context.Context, parentId string) ([]File, er
 			"shareKey":       d.ShareKey,
 			"SharePwd":       d.SharePwd,
 		}
-		_, err := d.request(FileList, http.MethodGet, func(req *resty.Request) {
+		_, err := d.request(ctx, FileList, http.MethodGet, func(req *resty.Request) {
 			req.SetQueryParams(query)
 		}, &resp)
 		if err != nil {
@@ -115,6 +147,26 @@ func (d *Pan123Share) getFiles(ctx context.Context, parentId string) ([]File, er
 		}
 	}
 	return res, nil
+}
+
+func retryable123ShareResponse(status, code int, message string) bool {
+	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
+		return true
+	}
+	message = strings.ToLower(strings.TrimSpace(message))
+	return code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || strings.Contains(message, "rate") || strings.Contains(message, "频繁") || strings.Contains(message, "限流")
+}
+
+func wait123ShareRetry(ctx context.Context, attempt int) error {
+	delay := 500 * time.Millisecond * time.Duration(1<<attempt)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // do others that not defined in Driver interface

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	_115sy "github.com/OpenListTeam/OpenList/v4/internal/115sy"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/go-resty/resty/v2"
 )
@@ -275,5 +276,37 @@ func TestPan115ErrorClassifiesRetryAndPermanentProviderFailures(t *testing.T) {
 				t.Fatalf("error code = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestPan115ShareProviderConfirmsSavedItemsWhenEnabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != _115sy.EndpointFileList {
+			t.Fatalf("confirmation endpoint = %s, want %s", r.URL.Path, _115sy.EndpointFileList)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":true,"errno":0,"data":{"items":[{"id":"saved-1","name":"Movie.mkv","size":1024,"is_dir":false}]}}`))
+	}))
+	defer server.Close()
+
+	client, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1;CID=2;SEID=3",
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new confirmation client: %v", err)
+	}
+	provider := &pan115ShareProvider{confirmEnabled: true, confirmClient: client}
+	taskID := encodePan115SaveOperation(pan115SaveOperation{
+		ShareID:       "share-id",
+		DestinationID: "dst-dir",
+		Items:         []pan115SaveItem{{Name: "Movie.mkv", Size: 1024}},
+	})
+	if strings.Contains(taskID, "passcode") {
+		t.Fatalf("confirmation token leaked passcode: %q", taskID)
+	}
+	if err := provider.WaitSaveComplete(context.Background(), []string{taskID}); err != nil {
+		t.Fatalf("wait save confirmation: %v", err)
 	}
 }

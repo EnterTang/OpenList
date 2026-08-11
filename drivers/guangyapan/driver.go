@@ -3,10 +3,12 @@ package guangyapan
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -43,6 +45,72 @@ type GuangYaPan struct {
 	// (e.g. copying many files cross-storage) don't flood the upstream API.
 	apiRateLimit sync.Map
 }
+
+type guangYaRetryDisposition string
+
+const (
+	guangYaRetry         guangYaRetryDisposition = "retry"
+	guangYaReauthorize   guangYaRetryDisposition = "reauthorize"
+	guangYaResultUnknown guangYaRetryDisposition = "result_unknown"
+	guangYaTerminal      guangYaRetryDisposition = "terminal"
+)
+
+// classifyGuangYaHTTPStatus classifies transport-level responses before the
+// provider-specific JSON envelope is interpreted. Mutating requests never
+// receive an automatic replay for transient upstream failures because the
+// server may already have accepted them.
+func classifyGuangYaHTTPStatus(status int, idempotent bool) guangYaRetryDisposition {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return guangYaReauthorize
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		if idempotent {
+			return guangYaRetry
+		}
+		return guangYaResultUnknown
+	}
+	if status >= http.StatusInternalServerError && status <= 599 {
+		if idempotent {
+			return guangYaRetry
+		}
+		return guangYaResultUnknown
+	}
+	return guangYaTerminal
+}
+
+type guangYaRequestError struct {
+	Status        int
+	Disposition   guangYaRetryDisposition
+	Message       string
+	ResultUnknown bool
+}
+
+func (e *guangYaRequestError) ClusterErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	switch e.Disposition {
+	case guangYaRetry:
+		return "share_save_retryable"
+	case guangYaResultUnknown:
+		return "share_save_result_unknown"
+	case guangYaReauthorize:
+		return "reauthorization_required"
+	case guangYaTerminal:
+		return "share_save_terminal"
+	default:
+		return "share_save_gateway_response"
+	}
+}
+
+func (e *guangYaRequestError) Error() string {
+	if e.Status > 0 {
+		return fmt.Sprintf("guangyapan request failed: status=%d disposition=%s", e.Status, e.Disposition)
+	}
+	return fmt.Sprintf("guangyapan request failed: disposition=%s: %s", e.Disposition, e.Message)
+}
+
+var guangYaAccountLimiters sync.Map
 
 // apiRateInterval is the minimum gap between two requests to the same endpoint.
 const apiRateInterval = 500 * time.Millisecond
@@ -838,10 +906,12 @@ func (d *GuangYaPan) accountErr(desc, short string, resp *resty.Response) string
 		msg = strings.TrimSpace(short)
 	}
 	if msg == "" && resp != nil {
-		msg = strings.TrimSpace(resp.String())
-	}
-	if msg == "" && resp != nil {
-		msg = fmt.Sprintf("status=%d", resp.StatusCode())
+		contentType := strings.TrimSpace(resp.Header().Get("Content-Type"))
+		if contentType != "" {
+			msg = fmt.Sprintf("status=%d content_type=%s", resp.StatusCode(), contentType)
+		} else {
+			msg = fmt.Sprintf("status=%d", resp.StatusCode())
+		}
 	}
 	if msg == "" {
 		msg = "unknown error"
@@ -850,47 +920,95 @@ func (d *GuangYaPan) accountErr(desc, short string, resp *resty.Response) string
 }
 
 func (d *GuangYaPan) apiRateLimitWait(ctx context.Context, path string) error {
-	value, _ := d.apiRateLimit.LoadOrStore(path, rate.NewLimiter(rate.Every(apiRateInterval), 1))
+	// The provider limit is account-wide. Keeping the limiter outside the
+	// driver instance prevents multiple workers in one process from each
+	// creating a full-rate endpoint bucket. The fingerprint is one-way and is
+	// never logged.
+	keyMaterial := strings.TrimSpace(d.RefreshToken)
+	if keyMaterial == "" {
+		keyMaterial = strings.TrimSpace(d.AccessToken)
+	}
+	if keyMaterial == "" {
+		keyMaterial = strings.TrimSpace(d.DeviceID)
+	}
+	digest := sha256.Sum256([]byte(keyMaterial))
+	key := hex.EncodeToString(digest[:])
+	value, _ := guangYaAccountLimiters.LoadOrStore(key, rate.NewLimiter(rate.Every(apiRateInterval), 1))
 	return value.(*rate.Limiter).Wait(ctx)
 }
 
 func (d *GuangYaPan) postAPI(ctx context.Context, path string, body any, out any) error {
+	return d.postAPIPolicy(ctx, path, body, out, guangYaPathIdempotent(path))
+}
+
+func guangYaPathIdempotent(path string) bool {
+	path = strings.ToLower(strings.TrimSpace(path))
+	for _, marker := range []string{"list", "status", "get_info", "download_url", "resolve_res", "share_summary", "access_token", "page_files"} {
+		if strings.Contains(path, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *GuangYaPan) postAPIPolicy(ctx context.Context, path string, body any, out any, idempotent bool) error {
 	if strings.TrimSpace(d.AccessToken) == "" {
 		return errors.New("access token is empty")
 	}
-	if err := d.apiRateLimitWait(ctx, path); err != nil {
-		return err
-	}
-	resp, err := d.apiClient.R().
-		SetContext(ctx).
-		SetHeader("Authorization", "Bearer "+d.AccessToken).
-		SetBody(body).
-		SetResult(out).
-		Post(path)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode() == 401 || resp.StatusCode() == 403 {
-		if strings.TrimSpace(d.RefreshToken) == "" {
-			return fmt.Errorf("request failed: status=%d body=%s", resp.StatusCode(), resp.String())
+	const maxAttempts = 3
+	authRefreshed := false
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			if err := waitGuangYaRetry(ctx, attempt); err != nil {
+				return err
+			}
 		}
-		if err := d.refreshToken(ctx); err != nil {
+		if err := d.apiRateLimitWait(ctx, path); err != nil {
 			return err
 		}
-		resp, err = d.apiClient.R().
+		resp, err := d.apiClient.R().
 			SetContext(ctx).
 			SetHeader("Authorization", "Bearer "+d.AccessToken).
 			SetBody(body).
 			SetResult(out).
 			Post(path)
 		if err != nil {
-			return err
+			if idempotent && attempt+1 < maxAttempts {
+				continue
+			}
+			return &guangYaRequestError{Disposition: guangYaResultUnknown, Message: err.Error(), ResultUnknown: !idempotent}
 		}
+
+		disposition := classifyGuangYaHTTPStatus(resp.StatusCode(), idempotent)
+		if (resp.StatusCode() == http.StatusUnauthorized || resp.StatusCode() == http.StatusForbidden) && !authRefreshed && strings.TrimSpace(d.RefreshToken) != "" {
+			authRefreshed = true
+			if err := d.refreshToken(ctx); err != nil {
+				return &guangYaRequestError{Status: resp.StatusCode(), Disposition: guangYaReauthorize, Message: err.Error()}
+			}
+			attempt--
+			continue
+		}
+		if disposition == guangYaRetry && attempt+1 < maxAttempts {
+			continue
+		}
+		if resp.IsError() {
+			return &guangYaRequestError{Status: resp.StatusCode(), Disposition: disposition, ResultUnknown: disposition == guangYaResultUnknown}
+		}
+		return nil
 	}
-	if resp.IsError() {
-		return fmt.Errorf("request failed: status=%d body=%s", resp.StatusCode(), resp.String())
+	return &guangYaRequestError{Disposition: guangYaRetry, Message: "retry limit exceeded"}
+}
+
+func waitGuangYaRetry(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt) * 250 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	return nil
 }
 
 func (d *GuangYaPan) waitTaskDone(ctx context.Context, taskID string) error {

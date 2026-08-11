@@ -8,8 +8,10 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type responseEnvelope struct {
@@ -76,7 +78,9 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 	}
 
 	fallbackTried := false
+	attempt := 0
 	for {
+		attempt++
 		if err := waitAccountLimiter(ctx, c.accountLimiter); err != nil {
 			return wrapContextError(err, endpoint, currentProfile)
 		}
@@ -106,6 +110,12 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 			if contextErr := normalizedContextError(ctx, err); contextErr != nil {
 				return wrapContextError(contextErr, endpoint, currentProfile)
 			}
+			if operationIsIdempotent(operation) && attempt < maxRequestAttempts {
+				if retryErr := waitRequestRetry(ctx, attempt, 0); retryErr != nil {
+					return retryErr
+				}
+				continue
+			}
 			return &NetworkError{
 				Kind:     KindNetwork,
 				Method:   method,
@@ -127,6 +137,12 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 		releasePageGate()
 
 		if readErr != nil {
+			if operationIsIdempotent(operation) && attempt < maxRequestAttempts {
+				if retryErr := waitRequestRetry(ctx, attempt, 0); retryErr != nil {
+					return retryErr
+				}
+				continue
+			}
 			return &NetworkError{
 				Kind:     KindNetwork,
 				Method:   method,
@@ -136,6 +152,12 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 			}
 		}
 		if closeErr != nil {
+			if operationIsIdempotent(operation) && attempt < maxRequestAttempts {
+				if retryErr := waitRequestRetry(ctx, attempt, 0); retryErr != nil {
+					return retryErr
+				}
+				continue
+			}
 			return &NetworkError{
 				Kind:     KindNetwork,
 				Method:   method,
@@ -146,17 +168,53 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 		}
 
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			meta := ResponseMeta{
+				StatusCode: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"),
+				BodyKind: bodyKind(respBody, resp.Header.Get("Content-Type")), BodyLength: len(respBody),
+				RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")), Endpoint: endpoint, Profile: currentProfile,
+			}
 			if !fallbackTried && shouldFallbackHTTP(policy, currentProfile, resp.StatusCode) {
 				currentProfile = policy.Fallback
 				fallbackTried = true
+				attempt = 0
 				continue
 			}
-			return &HTTPError{
+			httpErr := &HTTPError{
 				Kind:       KindHTTP,
 				StatusCode: resp.StatusCode,
 				Endpoint:   endpoint,
 				Profile:    currentProfile,
+				Meta:       meta,
 			}
+			switch resp.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				httpErr.Disposition = RetryDispositionReauthorize
+			case http.StatusMethodNotAllowed:
+				// A 405 is only a profile fallback when a fallback was
+				// actually available. Once both profiles have been tried it
+				// is terminal and must not enter a retry loop.
+				if fallbackTried {
+					httpErr.Disposition = RetryDispositionFallbackProfile
+				} else {
+					httpErr.Disposition = RetryDispositionTerminal
+				}
+			case http.StatusBadRequest, http.StatusNotFound:
+				httpErr.Disposition = RetryDispositionTerminal
+			}
+			if shouldRetryHTTP(resp.StatusCode) {
+				if operationIsIdempotent(operation) {
+					httpErr.Disposition = RetryDispositionRetryAfter
+				} else {
+					httpErr.Disposition = RetryDispositionResultUnknown
+				}
+			}
+			if operationIsIdempotent(operation) && shouldRetryHTTP(resp.StatusCode) && attempt < maxRequestAttempts {
+				if retryErr := waitRequestRetry(ctx, attempt, meta.RetryAfter); retryErr != nil {
+					return retryErr
+				}
+				continue
+			}
+			return httpErr
 		}
 
 		var envelope responseEnvelope
@@ -167,13 +225,7 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 				*envelope.State = true
 				envelope.Data = append(json.RawMessage(nil), trimmedBody...)
 			} else if err := json.Unmarshal(respBody, &envelope); err != nil {
-				return &NetworkError{
-					Kind:     KindNetwork,
-					Method:   method,
-					Endpoint: endpoint,
-					Profile:  currentProfile,
-					Err:      sanitizeRequestError(err),
-				}
+				return &ProtocolError{Endpoint: endpoint, Message: fmt.Sprintf("invalid %s response body (%d bytes)", bodyKind(respBody, resp.Header.Get("Content-Type")), len(respBody))}
 			}
 		}
 
@@ -276,6 +328,74 @@ func shouldFallbackHTTP(policy operationPolicy, profile Profile, statusCode int)
 		return false
 	}
 	return policy.FallbackHTTP405 && statusCode == http.StatusMethodNotAllowed
+}
+
+const (
+	maxRequestAttempts = 3
+	requestRetryBase   = 250 * time.Millisecond
+)
+
+func operationIsIdempotent(operation Operation) bool {
+	switch operation {
+	case OperationUserInfo, OperationFileList, OperationShareSnapshot, OperationDownloadURL,
+		OperationQRCodeToken, OperationQRCodeStatus:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetryHTTP(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func waitRequestRetry(ctx context.Context, attempt int, retryAfter time.Duration) error {
+	delay := retryAfter
+	if delay <= 0 {
+		delay = time.Duration(attempt) * requestRetryBase
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(when); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func bodyKind(body []byte, contentType string) string {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return "empty"
+	}
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	if strings.Contains(contentType, "html") || strings.HasPrefix(trimmed, "<") {
+		return "html"
+	}
+	if strings.Contains(contentType, "json") || strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return "json"
+	}
+	if strings.HasPrefix(contentType, "text/") {
+		return "text"
+	}
+	return "binary"
 }
 
 func (c *Client) acquirePageGate(ctx context.Context, policy operationPolicy) (func(), error) {

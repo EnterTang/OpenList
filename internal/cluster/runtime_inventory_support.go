@@ -7,6 +7,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -77,7 +78,9 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	if stagingRequirement.RequiredBytes <= 0 {
 		stagingRequirement.RequiredBytes = expectedBytes
 	}
-	stagingRequirement.NeedShareSave = true
+	directDownload := strings.EqualFold(strings.TrimSpace(taskContext.DeliveryMode), model.SubscriptionDeliveryModeDirectDownload)
+	stagingRequirement.NeedShareSave = !directDownload
+	stagingRequirement.NeedShareDownload = directDownload
 	// share.save is a cloud-side copy that does not consume worker-local
 	// storage, so skip the free_bytes check for staging (mirrors share.inspect
 	// handling above). Providers such as guangyapan routinely report
@@ -126,7 +129,7 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 		}
 		return nodeProviderAccountMatch{}, mountsSupportTarget(mounts, targetPath, expectedBytes), nil
 	}
-	staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", true)
+	staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", !directDownload)
 	if !ok {
 		utils.Log.Warnf("[cluster-dispatch] node=%s staging failed: provider=%s needShareSave=%v requiredBytes=%d accounts=%d", nodeID, stagingRequirement.Provider, stagingRequirement.NeedShareSave, stagingRequirement.RequiredBytes, len(providerAccounts))
 		return nodeProviderAccountMatch{}, false, nil
@@ -160,7 +163,28 @@ func providerAccountsSupportTarget(accounts []protocol.ProviderAccountInventory,
 }
 
 func providerAccountHealthy(account protocol.ProviderAccountInventory) bool {
-	return strings.EqualFold(strings.TrimSpace(account.Status), "work")
+	if !strings.EqualFold(strings.TrimSpace(account.Status), "work") {
+		return false
+	}
+	if state := strings.TrimSpace(account.HealthState); state != "" && !strings.EqualFold(state, "ready") {
+		return false
+	}
+	if state := strings.TrimSpace(account.CredentialState); state != "" && !strings.EqualFold(state, "ready") {
+		return false
+	}
+	// Older inventories did not report probe timestamps; keep them usable
+	// during the rolling upgrade. New reports must remain inside their probe
+	// lease so a stale ready bit cannot route new work forever.
+	if !account.CheckedAt.IsZero() {
+		now := time.Now().UTC()
+		if !account.NextProbeAt.IsZero() && now.After(account.NextProbeAt) {
+			return false
+		}
+		if account.NextProbeAt.IsZero() && now.Sub(account.CheckedAt) > 10*time.Minute {
+			return false
+		}
+	}
+	return true
 }
 
 func selectProviderAccount(accounts []protocol.ProviderAccountInventory, requirement protocol.ProviderTargetRequirement, targetPath string, staging bool) (protocol.ProviderAccountInventory, bool) {
@@ -216,6 +240,9 @@ func providerAccountMatches(account protocol.ProviderAccountInventory, requireme
 		if !account.SupportsShareSave || !account.SupportsDownload {
 			return false
 		}
+	}
+	if requirement.NeedShareDownload && !account.SupportsDownload {
+		return false
 	}
 	if requirement.NeedUpload {
 		if !account.SupportsUpload || !account.SupportsETF {

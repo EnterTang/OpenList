@@ -90,9 +90,6 @@ func (d *Pan115Share) login() error {
 		driver115.UA(base.UserAgentNT),
 	}
 	d.client = driver115.New(opts...)
-	if _, err := d.client.GetShareSnap(d.ShareCode, d.ReceiveCode, ""); err != nil {
-		return errors.Wrap(err, "failed to get share snap")
-	}
 	cr := &driver115.Credential{}
 	if d.QRCodeToken != "" {
 		s := &driver115.QRCodeSession{
@@ -112,5 +109,11 @@ func (d *Pan115Share) login() error {
 		return errors.New("missing cookie or qrcode account")
 	}
 
-	return d.client.LoginCheck()
+	if err := d.client.LoginCheck(); err != nil {
+		return err
+	}
+	if _, err := d.client.GetShareSnap(d.ShareCode, d.ReceiveCode, ""); err != nil {
+		return errors.Wrap(err, "failed to validate 115 share")
+	}
+	return nil
 }
