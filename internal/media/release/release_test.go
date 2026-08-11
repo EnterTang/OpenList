@@ -22,6 +22,13 @@ func TestParseExtractsSeasonAndEpisodeRange(t *testing.T) {
 	}
 }
 
+func TestParseExtractsRepeatedEpisodeRange(t *testing.T) {
+	got := Parse("超感警探.2008.S03E23E24.1080p.WEB-DL.mkv")
+	if got.Season != 3 || got.EpisodeStart != 23 || got.EpisodeEnd != 24 {
+		t.Fatalf("parsed repeated episode range = %#v", got)
+	}
+}
+
 func TestParseSupportsChineseSeasonAndCompleteMarkers(t *testing.T) {
 	got := Parse("国产剧 斗破苍穹 第五季 104集全 4K HDR")
 	if got.Season != 5 || got.EpisodeEnd != 104 || !got.Complete {

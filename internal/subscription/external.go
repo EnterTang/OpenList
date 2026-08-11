@@ -240,10 +240,12 @@ func runExternalSubscription(request *model.ExternalSubscriptionRequest) {
 	if conf.Conf != nil {
 		role = conf.Conf.Cluster.Role
 	}
-	_, runErr := RunForRole(ctx, request.SubscriptionID, true, role)
-	if runErr != nil {
+	result, runErr := RunForRole(ctx, request.SubscriptionID, true, role)
+	if runErr != nil && !(result != nil && (result.Run != nil && result.Run.Status == model.SubscriptionStatusRunning || result.Subscription != nil && result.Subscription.LastStatus == model.SubscriptionStatusRunning)) {
 		_ = db.UpdateExternalSubscriptionRequestState(ctx, request.ID, "failed", runErr.Error(), "", "", runErr.Error(), &startedAt)
 		log.Errorf("external subscription %d run failed: %+v", request.ID, runErr)
+	} else if result != nil && (result.Run != nil && result.Run.Status == model.SubscriptionStatusRunning || result.Subscription != nil && result.Subscription.LastStatus == model.SubscriptionStatusRunning) {
+		_ = db.UpdateExternalSubscriptionRequestState(ctx, request.ID, "running", "processing", "", "", "", &startedAt)
 	} else {
 		_ = db.UpdateExternalSubscriptionRequestState(ctx, request.ID, "completed", "completed", "", "", "", &startedAt)
 	}

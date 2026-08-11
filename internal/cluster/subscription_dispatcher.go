@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -339,7 +340,7 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 	}
 	var dispatchErr error
 	jobsByItemID := make(map[uint]*model.ClusterJob)
-	batchErrors := make([]string, 0, len(requests))
+	batchErrors := make(map[int]string, len(requests))
 	const maxBatchSize = 100
 	for start := 0; start < len(requests); start += maxBatchSize {
 		end := start + maxBatchSize
@@ -347,17 +348,26 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			end = len(requests)
 		}
 		chunk := requests[start:end]
-		b, err := d.runtime.DispatchMediaBatch(ctx, DispatchMediaBatchRequest{BatchID: subscriptionBatchID(tasks), Items: chunk})
+		b, err := d.runtime.DispatchMediaBatch(ctx, DispatchMediaBatchRequest{
+			BatchID: subscriptionBatchIDForChunk(tasks, start, end), Items: chunk,
+		})
 		if b != nil {
 			for _, job := range b.Jobs {
 				if job != nil {
 					jobsByItemID[job.SubscriptionItemID] = job
 				}
 			}
-			batchErrors = append(batchErrors, b.Errors...)
-		} else {
-			for range chunk {
-				batchErrors = append(batchErrors, "")
+			for _, batchError := range b.Errors {
+				localIndex, message, ok := parseSubscriptionBatchError(batchError)
+				if ok && localIndex >= 0 && localIndex < len(chunk) {
+					batchErrors[start+localIndex] = message
+					continue
+				}
+				for index := start; index < end; index++ {
+					if _, exists := batchErrors[index]; !exists {
+						batchErrors[index] = batchError
+					}
+				}
 			}
 		}
 		if err != nil {
@@ -371,8 +381,8 @@ func (d subscriptionDispatcher) DispatchSubscriptionMedia(ctx context.Context, t
 			results[taskIndex].JobID = job.ID
 			continue
 		}
-		if requestIndex < len(batchErrors) && batchErrors[requestIndex] != "" {
-			results[taskIndex].Error = errors.New(batchErrors[requestIndex])
+		if batchError := batchErrors[requestIndex]; batchError != "" {
+			results[taskIndex].Error = errors.New(batchError)
 		} else if dispatchErr != nil {
 			results[taskIndex].Error = dispatchErr
 		} else {
@@ -392,7 +402,9 @@ func (d subscriptionDispatcher) planSubscriptionMediaDispatch(ctx context.Contex
 	for i, task := range tasks {
 		target := d.runtime.chooseDispatchTarget(ctx, targets, task)
 		if target == nil {
-			return nil, fmt.Errorf("subscription media task %q has no connected compatible cluster worker", subscriptionDispatchTaskKey(task, i))
+			return nil, &subscription.ClusterWorkerUnavailableError{
+				Message: fmt.Sprintf("subscription media task %q has no connected compatible cluster worker", subscriptionDispatchTaskKey(task, i)),
+			}
 		}
 		planned = append(planned, plannedSubscriptionDispatch{
 			taskIndex:     i,
@@ -603,6 +615,36 @@ func subscriptionBatchID(tasks []subscription.ClusterMediaTask) string {
 	}
 	sort.Strings(keys)
 	return fmt.Sprintf("subscription-batch-%x", sha256Bytes(strings.Join(keys, "\x00")))[:63]
+}
+
+func subscriptionBatchIDForChunk(tasks []subscription.ClusterMediaTask, start, end int) string {
+	base := subscriptionBatchID(tasks)
+	if start < 0 {
+		start = 0
+	}
+	if end > len(tasks) {
+		end = len(tasks)
+	}
+	if end < start {
+		end = start
+	}
+	return fmt.Sprintf("subscription-batch-%x", sha256Bytes(fmt.Sprintf("%s:%d:%d", base, start, end)))[:63]
+}
+
+func parseSubscriptionBatchError(value string) (int, string, bool) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "item ") {
+		return 0, value, false
+	}
+	separator := strings.Index(value, ":")
+	if separator < 0 {
+		return 0, value, false
+	}
+	index, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(value[:separator], "item ")))
+	if err != nil {
+		return 0, value, false
+	}
+	return index, strings.TrimSpace(value[separator+1:]), true
 }
 
 func sha256Bytes(value string) []byte {

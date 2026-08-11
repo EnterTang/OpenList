@@ -13,9 +13,9 @@ import (
 const defaultMaxConcurrentSubscriptionRuns = 2
 
 var defaultScheduler = &scheduler{
-	stop:                   make(chan struct{}),
-	running:                map[uint]struct{}{},
-	maxConcurrentRuns:      defaultMaxConcurrentSubscriptionRuns,
+	stop:              make(chan struct{}),
+	running:           map[uint]struct{}{},
+	maxConcurrentRuns: defaultMaxConcurrentSubscriptionRuns,
 }
 
 type scheduler struct {
@@ -90,23 +90,37 @@ func (s *scheduler) tick() {
 	}
 	now := time.Now()
 	for _, item := range items {
+		if _, err := ReconcileSubscriptionExecution(context.Background(), item.ID); err != nil {
+			log.Errorf("subscription %d execution reconciliation failed: %+v", item.ID, err)
+			continue
+		}
+		followup, err := SubscriptionNeedsExecutionFollowup(context.Background(), item.ID)
+		if err != nil {
+			log.Errorf("subscription %d follow-up check failed: %+v", item.ID, err)
+			continue
+		}
 		interval := item.CheckIntervalMinutes
 		if interval <= 0 {
 			interval = 60
 		}
-		if item.LastCheckedAt != nil && now.Sub(*item.LastCheckedAt) < time.Duration(interval)*time.Minute {
+		if !followup && item.LastCheckedAt != nil && now.Sub(*item.LastCheckedAt) < time.Duration(interval)*time.Minute {
 			continue
 		}
 		if !s.markRunning(item.ID) {
 			continue
 		}
-		go func(id uint) {
+		go func(id uint, compensate bool) {
 			defer s.markDone(id)
-			_, err := RunForRole(context.Background(), id, true, conf.Conf.Cluster.Role)
+			var err error
+			if compensate {
+				_, err = RetryFailedForRole(context.Background(), id, conf.Conf.Cluster.Role)
+			} else {
+				_, err = RunForRole(context.Background(), id, true, conf.Conf.Cluster.Role)
+			}
 			if err != nil {
 				log.Errorf("subscription %d run failed: %+v", id, err)
 			}
-		}(item.ID)
+		}(item.ID, followup)
 	}
 }
 

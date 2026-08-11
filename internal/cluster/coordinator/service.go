@@ -863,7 +863,8 @@ func shouldRetryMediaTransfer(errorCode string, generation uint64) bool {
 		return false
 	}
 	switch strings.TrimSpace(errorCode) {
-	case "source_unexpected_eof", "source_range_failed", "source_link_expired":
+	case "source_unexpected_eof", "source_range_failed", "source_link_expired",
+		"share_save_rate_limited", "share_save_gateway_response", "share_save_transient":
 		return true
 	default:
 		return false
@@ -1245,14 +1246,32 @@ func (s *Service) SweepExpiredLeases(ctx context.Context, now time.Time) (int64,
 			if err := tx.Model(attempt).Updates(map[string]any{"status": model.ClusterAttemptStatusLost, "finished_at": now, "error_code": "lease_expired"}).Error; err != nil {
 				return err
 			}
-			result := tx.Model(&model.ClusterJob{}).Where("id = ? AND current_attempt_id = ? AND current_generation = ?", attempt.JobID, attempt.ID, attempt.Generation).Updates(map[string]any{
-				"status":             model.ClusterJobStatusQueued,
+			var job model.ClusterJob
+			if err := tx.Select("id", "type", "subscription_item_id").First(&job, "id = ?", attempt.JobID).Error; err != nil {
+				// The attempt can outlive its job after manual cleanup or a
+				// partial restore. It is still safe to retire the attempt; the
+				// subscription reconciler will recover any item that referenced it.
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				return err
+			}
+			jobUpdates := map[string]any{
 				"assigned_node_id":   "",
 				"current_attempt_id": "",
 				"last_error_code":    "lease_expired",
 				"last_error":         "worker lease expired before completion",
 				"available_at":       now,
-			})
+			}
+			if job.Type == model.ClusterJobTypeMediaTransfer && attempt.Generation >= automaticMediaTransferAttemptLimit {
+				jobUpdates["status"] = model.ClusterJobStatusDeadLetter
+				jobUpdates["finished_at"] = now
+				jobUpdates["last_error_code"] = "lease_expired_attempt_limit"
+				jobUpdates["last_error"] = "worker lease expired and automatic retry limit was reached"
+			} else {
+				jobUpdates["status"] = model.ClusterJobStatusQueued
+			}
+			result := tx.Model(&model.ClusterJob{}).Where("id = ? AND current_attempt_id = ? AND current_generation = ?", attempt.JobID, attempt.ID, attempt.Generation).Updates(jobUpdates)
 			if result.Error != nil {
 				return result.Error
 			}
@@ -1261,6 +1280,16 @@ func (s *Service) SweepExpiredLeases(ctx context.Context, now time.Time) (int64,
 					Where("correlation_id = ? AND message_type = ? AND status IN ?", attempt.JobID, protocol.MessageJobOffer, []string{model.ClusterMessageStatusPending, model.ClusterMessageStatusSending}).
 					Updates(map[string]any{"status": model.ClusterMessageStatusFailed, "last_error": "lease expired; superseded by retry"}).Error; err != nil {
 					return err
+				}
+				if job.Type == model.ClusterJobTypeMediaTransfer && job.SubscriptionItemID != 0 && jobUpdates["status"] == model.ClusterJobStatusDeadLetter {
+					if err := tx.Model(&model.SubscriptionItem{}).
+						Where("id = ? AND cluster_job_id = ?", job.SubscriptionItemID, attempt.JobID).
+						Updates(map[string]any{
+							"status":     model.SubscriptionItemStatusFailed,
+							"last_error": "worker lease expired and automatic retry limit was reached",
+						}).Error; err != nil {
+						return err
+					}
 				}
 			}
 			affected += result.RowsAffected

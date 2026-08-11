@@ -171,6 +171,7 @@ type SubscriptionRun struct {
 	AddedCount             int        `json:"added_count"`
 	ChangedCount           int        `json:"changed_count"`
 	TransferredCount       int        `json:"transferred_count"`
+	QueuedCount            int        `json:"queued_count,omitempty"`
 	Error                  string     `json:"error" gorm:"type:text"`
 	SubscriptionName       string     `json:"subscription_name" gorm:"->;-:migration;column:subscription_name"`
 	SubscriptionSourceType string     `json:"subscription_source_type" gorm:"->;-:migration;column:subscription_source_type"`

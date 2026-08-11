@@ -24,6 +24,22 @@ func TestPlanTargetWeakEpisodeUsesSubscriptionTMDBName(t *testing.T) {
 	}
 }
 
+func TestPlanTargetPreservesRepeatedEpisodeRange(t *testing.T) {
+	got := PlanTarget(PlanInput{
+		TargetRoot: "/media",
+		TMDBName:   "超感警探",
+		TMDBYear:   2008,
+		MediaType:  "tv",
+		Category:   "欧美剧",
+	}, "超感警探.2008.S03E23E24.mkv", "/shares/超感警探")
+	if got.Season != 3 || got.Episode != 23 || got.EpisodeEnd != 24 {
+		t.Fatalf("planned repeated episode range = %#v", got)
+	}
+	if got.TargetName != "超感警探.2008.S03E23-E24.第23-24集.mkv" {
+		t.Fatalf("TargetName = %q", got.TargetName)
+	}
+}
+
 func TestPlanTargetInfersSeasonFromParentPath(t *testing.T) {
 	got := PlanTarget(PlanInput{
 		TargetRoot: "/media",

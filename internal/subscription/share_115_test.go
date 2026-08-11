@@ -229,3 +229,51 @@ func TestPan115ErrorClassifiesPermanentCredentialFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestPan115HTML405IsNotRetriedAndIsClassified(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte("<html>method not allowed</html>"))
+	}))
+	defer server.Close()
+
+	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1"}).(*pan115ShareProvider)
+	provider.webURL = server.URL
+	provider.limiter = newPan115RateLimiter(0)
+	provider.retryBaseDelay = 0
+	_, err := provider.ListShareChildren(context.Background(), ShareRef{
+		Provider: ShareProviderPan115, ShareID: "share", Passcode: "pass",
+	}, "0")
+	if err == nil {
+		t.Fatal("expected 405 HTML error")
+	}
+	if requests != 1 {
+		t.Fatalf("405 request count = %d, want 1", requests)
+	}
+	var coded interface{ ClusterErrorCode() string }
+	if !errors.As(err, &coded) || coded.ClusterErrorCode() != pan115ClusterErrorCodeShareSaveMethodNotAllowed {
+		t.Fatalf("405 error code = %v, want %q", err, pan115ClusterErrorCodeShareSaveMethodNotAllowed)
+	}
+}
+
+func TestPan115ErrorClassifiesRetryAndPermanentProviderFailures(t *testing.T) {
+	tests := []struct {
+		message string
+		want    string
+	}{
+		{message: "rate limit exceeded", want: pan115ClusterErrorCodeShareSaveRateLimited},
+		{message: "分享已失效或取消", want: pan115ClusterErrorCodeShareSaveSourceInvalid},
+	}
+	for _, tc := range tests {
+		t.Run(tc.message, func(t *testing.T) {
+			err := pan115Error(tc.message)
+			var coded interface{ ClusterErrorCode() string }
+			if !errors.As(err, &coded) || coded.ClusterErrorCode() != tc.want {
+				t.Fatalf("error code = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}

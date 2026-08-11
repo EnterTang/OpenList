@@ -68,11 +68,58 @@ func TestRetryFailedForRoleUsesClusterJobReplayWithoutDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry failed for role: %v", err)
 	}
-	if result == nil || result.Run == nil || result.Run.TransferredCount != 3 {
+	if result == nil || result.Run == nil || result.Run.Status != model.SubscriptionStatusRunning || result.Run.QueuedCount != 3 || result.Run.TransferredCount != 0 {
 		t.Fatalf("retry result = %#v, want a run with three requeued tasks", result)
 	}
 	if result.Subscription == nil || result.Subscription.ID != sub.ID {
 		t.Fatalf("retry subscription = %#v", result.Subscription)
+	}
+}
+
+func TestRetryOrphanedClusterSubscriptionItemsRebuildsMissingJob(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "orphan retry", TMDBName: "orphan retry", TransferEnabled: true}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	item := &model.SubscriptionItem{
+		SubscriptionID: sub.ID, SourceKey: "orphan-source", SourceProvider: "quark",
+		SourceURL: "https://pan.quark.cn/s/orphan-share", FileID: "file-1", FileName: "episode.mkv",
+		FileHash: "hash-1", Status: model.SubscriptionItemStatusFailed, LastSeenAt: time.Now().UTC(),
+	}
+	if err := db.GetDb().Create(item).Error; err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := &recordingClusterDispatcher{}
+	RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { RegisterClusterDispatcher(nil) })
+
+	result, err := RetryOrphanedClusterSubscriptionItems(context.Background(), sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Requeued != 1 || len(dispatcher.tasks) != 1 {
+		t.Fatalf("retry result = %#v tasks=%#v", result, dispatcher.tasks)
+	}
+	var got model.SubscriptionItem
+	if err := db.GetDb().First(&got, "id = ?", item.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.SubscriptionItemStatusTransferring || got.ClusterJobID == "" {
+		t.Fatalf("replayed item = %#v", got)
+	}
+}
+
+func TestRetryShareRefFallsBackToPersistedSourceMessage(t *testing.T) {
+	item := &model.SubscriptionItem{
+		SourceMessageText: "Example S01E01 https://pan.quark.cn/s/replay-share 提取码: pass",
+	}
+	ref, err := retryShareRef(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Provider != ShareProviderQuark || ref.ShareID != "replay-share" || ref.Passcode != "pass" {
+		t.Fatalf("recovered ref = %#v", ref)
 	}
 }
 

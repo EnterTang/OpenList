@@ -526,6 +526,9 @@ func (r *Runtime) runManifestProcessor(ctx context.Context) {
 }
 
 func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coordinator.Service) {
+	if _, err := subscription.ReconcileActiveSubscriptionExecutions(ctx, 100); err != nil {
+		log.Errorf("reconcile active subscription executions: %v", err)
+	}
 	if _, err := service.ProcessPendingManifests(ctx, 20); err != nil {
 		log.Errorf("process cluster ETF manifests: %v", err)
 	}
