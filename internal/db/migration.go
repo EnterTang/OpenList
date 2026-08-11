@@ -283,8 +283,8 @@ func migrationSampleHash(ctx context.Context, database *gorm.DB, spec MigrationT
 		if err := rows.Scan(pointers...); err != nil {
 			return "", err
 		}
-		for _, value := range values {
-			_, _ = fmt.Fprintf(hash, "%s\x00", canonicalMigrationValue(value))
+		for i, value := range values {
+			_, _ = fmt.Fprintf(hash, "%s\x00", canonicalMigrationValue(normalizeMigrationColumnValue(spec.Table, columns[i], value)))
 		}
 		_, _ = hash.Write([]byte{'\n'})
 	}
@@ -331,8 +331,8 @@ func copyMigrationTable(ctx context.Context, source, target *gorm.DB, spec Migra
 		if err := rows.Scan(pointers...); err != nil {
 			return copied, err
 		}
-		for _, value := range rowValues {
-			values = append(values, normalizeMigrationValue(value))
+		for i, value := range rowValues {
+			values = append(values, normalizeMigrationColumnValue(spec.Table, columns[i], value))
 		}
 		rowsInBatch++
 		if rowsInBatch >= batchSize {
@@ -447,6 +447,13 @@ func normalizeMigrationValue(value any) any {
 		return string(bytes)
 	}
 	return value
+}
+
+func normalizeMigrationColumnValue(table, column string, value any) any {
+	if value == nil && strings.EqualFold(strings.TrimSpace(column), "state_version") && strings.HasSuffix(strings.ToLower(strings.TrimSpace(table)), "subscription_items") {
+		return int64(0)
+	}
+	return normalizeMigrationValue(value)
 }
 
 func quoteMigrationIdentifier(identifier string) string {

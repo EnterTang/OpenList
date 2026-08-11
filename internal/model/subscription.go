@@ -151,7 +151,7 @@ type SubscriptionItem struct {
 	RetryAt              *time.Time        `json:"retry_at,omitempty" gorm:"index"`
 	BlockedReason        string            `json:"blocked_reason,omitempty" gorm:"size:128"`
 	OperationKey         string            `json:"operation_key,omitempty" gorm:"size:191;index"`
-	StateVersion         uint64            `json:"state_version"`
+	StateVersion         uint64            `json:"state_version" gorm:"not null;default:0"`
 	DeliveryMode         string            `json:"delivery_mode,omitempty" gorm:"size:32;index"`
 	FallbackReason       string            `json:"fallback_reason,omitempty" gorm:"size:128"`
 }

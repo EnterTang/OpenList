@@ -81,6 +81,11 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 	attempt := 0
 	for {
 		attempt++
+		if c.requestGate != nil {
+			if err := c.requestGate(ctx); err != nil {
+				return wrapContextError(err, endpoint, currentProfile)
+			}
+		}
 		if err := waitAccountLimiter(ctx, c.accountLimiter); err != nil {
 			return wrapContextError(err, endpoint, currentProfile)
 		}
@@ -337,7 +342,7 @@ const (
 
 func operationIsIdempotent(operation Operation) bool {
 	switch operation {
-	case OperationUserInfo, OperationFileList, OperationShareSnapshot, OperationDownloadURL,
+	case OperationUserInfo, OperationFileList, OperationShareSnapshot, OperationShareDownloadURL, OperationDownloadURL,
 		OperationQRCodeToken, OperationQRCodeStatus:
 		return true
 	default:

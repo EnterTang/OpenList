@@ -76,6 +76,8 @@ const (
 	coordinatorLeaseRenewalInterval = 15 * time.Second
 )
 
+var workerInventoryRefreshInterval = 5 * time.Minute
+
 type runtimeDispatchTransport interface {
 	ConnectedNodes() []string
 	Session(string) (transport.Peer, bool)
@@ -364,7 +366,7 @@ func (r *Runtime) startWorkerLocked() error {
 	}()
 	go func() {
 		defer r.workerBackground.Done()
-		refreshInventoryAfterStoragesLoaded(workerCtx, func(ctx context.Context) error {
+		runWorkerInventoryRefreshLoop(workerCtx, func(ctx context.Context) error {
 			return reportWorkerInventory(ctx, nodeID, workerService, queue)
 		})
 	}()
@@ -402,6 +404,29 @@ func refreshInventoryAfterStoragesLoaded(ctx context.Context, refresh func(conte
 	}
 	if err := refresh(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, transport.ErrNotConnected) {
 		log.Errorf("refresh cluster worker inventory after storages loaded: %v", err)
+	}
+}
+
+func runWorkerInventoryRefreshLoop(ctx context.Context, refresh func(context.Context) error) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-conf.StoragesLoadSignal():
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if err := refresh(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, transport.ErrNotConnected) {
+			log.Errorf("refresh cluster worker inventory: %v", err)
+		}
+		timer := time.NewTimer(workerInventoryRefreshInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 

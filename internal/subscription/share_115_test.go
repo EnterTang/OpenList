@@ -125,6 +125,59 @@ func TestPan115ShareProviderRetriesRateLimitedResponse(t *testing.T) {
 	}
 }
 
+func TestPan115ShareProviderGetsDirectURLAndFallsBackFromModernEndpoint(t *testing.T) {
+	var endpoints []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		endpoints = append(endpoints, r.URL.Path)
+		if r.URL.Path == "/modern/share/downurl" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte("<html>method not allowed</html>"))
+			return
+		}
+		if r.URL.Path != "/legacy/share/downurl" {
+			t.Fatalf("unexpected direct endpoint: %s", r.URL.Path)
+		}
+		query := r.URL.Query()
+		if query.Get("share_code") != "share-1" || query.Get("receive_code") != "pwd-1" || query.Get("file_id") != "file-1" || query.Get("dl") != "1" {
+			t.Fatalf("direct query = %s", r.URL.RawQuery)
+		}
+		if got := r.Header.Get("Cookie"); got != "UID=1;CID=2" {
+			t.Fatalf("cookie = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"state":true,"data":{"fid":"file-1","fn":"Movie.mkv","fs":1024,"url":{"url":"https://download.example/movie.mkv"}}}`))
+	}))
+	defer server.Close()
+
+	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1;CID=2"}).(*pan115ShareProvider)
+	provider.limiter = newPan115RateLimiter(0)
+	provider.retryBaseDelay = 0
+	provider.directAppURL = server.URL + "/modern/share/downurl"
+	provider.directWebURL = server.URL + "/legacy/share/downurl"
+	ref := ShareRef{Provider: ShareProviderPan115, ShareID: "share-1", Passcode: "pwd-1"}
+
+	link, err := provider.GetShareDownloadURL(context.Background(), ref, ShareItem{ID: "file-1", Name: "Movie.mkv", Size: 1024})
+	if err != nil {
+		t.Fatalf("get direct URL: %v", err)
+	}
+	if link.URL != "https://download.example/movie.mkv" || link.FileID != "file-1" || link.Size != 1024 {
+		t.Fatalf("direct link = %#v", link)
+	}
+	if got := strings.Join(endpoints, ","); got != "/modern/share/downurl,/legacy/share/downurl" {
+		t.Fatalf("endpoint sequence = %q", got)
+	}
+}
+
+func TestPan115ShareProviderRejectsDirectoryWithoutDirectFallbackLoop(t *testing.T) {
+	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1;CID=2"}).(*pan115ShareProvider)
+	provider.limiter = newPan115RateLimiter(0)
+	ref := ShareRef{Provider: ShareProviderPan115, ShareID: "share-1", Passcode: "pwd-1"}
+	_, err := provider.GetShareDownloadURL(context.Background(), ref, ShareItem{ID: "dir-1", Name: "Season", IsDir: true})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "directory") {
+		t.Fatalf("error = %v, want directory validation error", err)
+	}
+}
+
 func TestPan115FileShareItemAcceptsNumberAndStringIDs(t *testing.T) {
 	t.Run("string ids", func(t *testing.T) {
 		var file pan115File

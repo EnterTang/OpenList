@@ -3,6 +3,7 @@ package _115sy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -125,6 +126,108 @@ func (c *Client) ShareSnapshot(ctx context.Context, share ShareURL) (ShareSnapsh
 		TotalSize:   totalSize(items),
 		Items:       items,
 	}, nil
+}
+
+// ShareDownloadURL obtains the short-lived URL for one file in a share. The
+// app endpoint follows the RSA envelope used by the official 115 client; a
+// 405 is the only automatic profile fallback and then uses the web endpoint.
+// The returned URL is intentionally not cached by this package.
+func (c *Client) ShareDownloadURL(ctx context.Context, share ShareURL, fileID, userAgent string) (DownloadLink, error) {
+	if c == nil || !validShareToken(share.ShareCode) || !validShareToken(share.ReceiveCode) || strings.TrimSpace(fileID) == "" {
+		return DownloadLink{}, fmt.Errorf("invalid 115 share download request")
+	}
+	requestClient := c
+	if strings.TrimSpace(userAgent) != "" && userAgent != c.userAgent {
+		requestClient = c.cloneForUserAgent(userAgent)
+	}
+	payloadJSON, err := json.Marshal(map[string]any{
+		"share_code":   share.ShareCode,
+		"receive_code": share.ReceiveCode,
+		"file_id":      strings.TrimSpace(fileID),
+		"dl":           1,
+	})
+	if err != nil {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointShareDownloadURLApp, Message: err.Error()}
+	}
+	encrypted, err := p115RSAEncrypt(payloadJSON)
+	if err != nil {
+		return DownloadLink{}, &ProtocolError{Endpoint: EndpointShareDownloadURLApp, Message: err.Error()}
+	}
+	var envelope responseEnvelope
+	form := url.Values{"data": {encrypted}}
+	err = requestClient.do(ctx, OperationShareDownloadURL, ProfileAndroid, http.MethodPost, EndpointShareDownloadURLApp, nil, []byte(form.Encode()), "application/x-www-form-urlencoded", &envelope)
+	if err != nil {
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusMethodNotAllowed {
+			return DownloadLink{}, err
+		}
+		query := url.Values{
+			"share_code":   {share.ShareCode},
+			"receive_code": {share.ReceiveCode},
+			"file_id":      {strings.TrimSpace(fileID)},
+		}
+		if err := requestClient.do(ctx, OperationShareDownloadURL, ProfileWeb, http.MethodGet, EndpointShareDownloadURLWeb, query, nil, "", &envelope); err != nil {
+			return DownloadLink{}, err
+		}
+		link, err := decodeShareDownloadLink(envelope.Data)
+		if err != nil {
+			return DownloadLink{}, err
+		}
+		setShareDownloadUserAgent(&link, userAgent)
+		return link, nil
+	}
+
+	var encryptedResponse string
+	if err := json.Unmarshal(envelope.Data, &encryptedResponse); err == nil && strings.TrimSpace(encryptedResponse) != "" {
+		decrypted, decryptErr := p115RSADecrypt(encryptedResponse)
+		if decryptErr != nil {
+			return DownloadLink{}, &ProtocolError{Endpoint: EndpointShareDownloadURLApp, Message: decryptErr.Error()}
+		}
+		link, decodeErr := decodeShareDownloadLink(decrypted)
+		if decodeErr != nil {
+			return DownloadLink{}, decodeErr
+		}
+		setShareDownloadUserAgent(&link, userAgent)
+		return link, nil
+	}
+	// Some compatible gateways expose the same endpoint without the RSA
+	// envelope. Accept that response shape while keeping the encrypted path as
+	// the default official-client protocol.
+	link, err := decodeShareDownloadLink(envelope.Data)
+	if err != nil {
+		return DownloadLink{}, err
+	}
+	setShareDownloadUserAgent(&link, userAgent)
+	return link, nil
+}
+
+func setShareDownloadUserAgent(link *DownloadLink, userAgent string) {
+	if link == nil || strings.TrimSpace(userAgent) == "" {
+		return
+	}
+	if link.Header == nil {
+		link.Header = make(http.Header)
+	}
+	link.Header.Set("User-Agent", userAgent)
+}
+
+func decodeShareDownloadLink(raw []byte) (DownloadLink, error) {
+	payload, err := decodeDownloadPayload(raw)
+	if err != nil {
+		return DownloadLink{}, err
+	}
+	link, err := payload.downloadURL()
+	if err != nil {
+		return DownloadLink{}, err
+	}
+	header := payload.Header
+	if header == nil {
+		header = make(http.Header)
+	}
+	if header.Get("User-Agent") == "" {
+		header.Set("User-Agent", DefaultAndroidUA)
+	}
+	return DownloadLink{URL: link, Header: header}, nil
 }
 
 type sharePage struct {

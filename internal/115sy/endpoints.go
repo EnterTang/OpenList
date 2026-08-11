@@ -18,6 +18,7 @@ const (
 	OperationFileList
 	OperationShareSnapshot
 	OperationShareReceive
+	OperationShareDownloadURL
 	OperationDownloadURL
 	OperationOffline
 	OperationQRCodeToken
@@ -40,35 +41,37 @@ const (
 )
 
 const (
-	EndpointUserInfo         = "/user/info"
-	EndpointFileList         = "/android/2.0/ufile/files"
-	EndpointFileListWeb      = "/files"
-	EndpointShareSnapshot    = "/share/snap"
-	EndpointShareSnapshotApp = "/android/2.0/share/snap"
-	EndpointShareReceive     = "/share/receive"
-	EndpointShareReceiveApp  = "/android/2.0/share/receive"
-	EndpointShareSend        = "/share/send"
-	EndpointShareSendApp     = "/android/2.0/share/send"
-	EndpointDownloadURL      = "/app/chrome/downurl"
-	EndpointOfflineAdd       = "/open/offline/add_task_urls"
-	EndpointOfflineList      = "/open/offline/get_task_list"
-	EndpointOfflineDelete    = "/open/offline/del_task"
-	EndpointQRCodeToken      = "/api/1.0/web/1.0/token"
-	EndpointQRCodeStatus     = "/get/status/"
-	EndpointQRCodeLogin      = "/app/1.0/%s/1.0/login/qrcode"
-	EndpointUploadInfo       = "/app/uploadinfo"
-	EndpointUploadInit       = "/4.0/initupload.php"
-	EndpointUploadOSSToken   = "/3.0/gettoken.php"
-	EndpointFileInfo         = "/files/get_info"
-	EndpointDirID            = "/files/getid"
-	EndpointDirAdd           = "/files/add"
-	EndpointFileMove         = "/files/move"
-	EndpointFileRename       = "/files/batch_rename"
-	EndpointFileCopy         = "/files/copy"
-	EndpointFileDelete       = "/rb/delete"
-	EndpointRecycleClean     = "/rb/clean"
-	EndpointCategory         = "/android/2.0/category/get"
-	EndpointCategoryWeb      = "/category/get"
+	EndpointUserInfo            = "/user/info"
+	EndpointFileList            = "/android/2.0/ufile/files"
+	EndpointFileListWeb         = "/files"
+	EndpointShareSnapshot       = "/share/snap"
+	EndpointShareSnapshotApp    = "/android/2.0/share/snap"
+	EndpointShareReceive        = "/share/receive"
+	EndpointShareReceiveApp     = "/android/2.0/share/receive"
+	EndpointShareSend           = "/share/send"
+	EndpointShareSendApp        = "/android/2.0/share/send"
+	EndpointShareDownloadURLApp = "/app/share/downurl"
+	EndpointShareDownloadURLWeb = "/share/downurl"
+	EndpointDownloadURL         = "/app/chrome/downurl"
+	EndpointOfflineAdd          = "/open/offline/add_task_urls"
+	EndpointOfflineList         = "/open/offline/get_task_list"
+	EndpointOfflineDelete       = "/open/offline/del_task"
+	EndpointQRCodeToken         = "/api/1.0/web/1.0/token"
+	EndpointQRCodeStatus        = "/get/status/"
+	EndpointQRCodeLogin         = "/app/1.0/%s/1.0/login/qrcode"
+	EndpointUploadInfo          = "/app/uploadinfo"
+	EndpointUploadInit          = "/4.0/initupload.php"
+	EndpointUploadOSSToken      = "/3.0/gettoken.php"
+	EndpointFileInfo            = "/files/get_info"
+	EndpointDirID               = "/files/getid"
+	EndpointDirAdd              = "/files/add"
+	EndpointFileMove            = "/files/move"
+	EndpointFileRename          = "/files/batch_rename"
+	EndpointFileCopy            = "/files/copy"
+	EndpointFileDelete          = "/rb/delete"
+	EndpointRecycleClean        = "/rb/clean"
+	EndpointCategory            = "/android/2.0/category/get"
+	EndpointCategoryWeb         = "/category/get"
 )
 
 type operationPolicy struct {
@@ -100,6 +103,9 @@ var operationPolicies = map[Operation]operationPolicy{
 		Primary:         ProfileWeb,
 		Fallback:        ProfileAndroid,
 		FallbackHTTP405: true,
+	},
+	OperationShareDownloadURL: {
+		Primary: ProfileAndroid,
 	},
 	OperationDownloadURL: {
 		Primary: ProfileChrome,

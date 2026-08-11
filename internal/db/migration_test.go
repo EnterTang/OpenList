@@ -158,6 +158,42 @@ func TestMigrationTableSpecsIncludeOrdering(t *testing.T) {
 	}
 }
 
+func TestNormalizeSubscriptionStateVersionBackfillsNullRows(t *testing.T) {
+	database, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "state-version.db")), &gorm.Config{
+		NamingStrategy: schema.NamingStrategy{TablePrefix: "x_"},
+	})
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := database.Exec(`CREATE TABLE x_subscription_items (id INTEGER PRIMARY KEY, subscription_id INTEGER, source_key TEXT, state_version INTEGER NULL)`).Error; err != nil {
+		t.Fatalf("create legacy subscription items: %v", err)
+	}
+	if err := database.Exec(`INSERT INTO x_subscription_items (subscription_id, source_key, state_version) VALUES (?, ?, NULL)`, 1, "nullable-version").Error; err != nil {
+		t.Fatalf("insert nullable state version: %v", err)
+	}
+	if err := NormalizeSubscriptionStateVersion(database); err != nil {
+		t.Fatalf("normalize state version: %v", err)
+	}
+	var row struct {
+		StateVersion *uint64 `gorm:"column:state_version"`
+	}
+	if err := database.Table("x_subscription_items").Where("source_key = ?", "nullable-version").First(&row).Error; err != nil {
+		t.Fatalf("read state version: %v", err)
+	}
+	if row.StateVersion == nil || *row.StateVersion != 0 {
+		t.Fatalf("state version = %v, want non-null zero", row.StateVersion)
+	}
+}
+
+func TestNormalizeMigrationColumnValueRepairsLegacyStateVersion(t *testing.T) {
+	if got := normalizeMigrationColumnValue("x_subscription_items", "state_version", nil); got != int64(0) {
+		t.Fatalf("normalized legacy state version = %#v, want zero", got)
+	}
+	if got := normalizeMigrationColumnValue("x_subscription_items", "last_error", nil); got != nil {
+		t.Fatalf("normalized nullable error = %#v, want nil", got)
+	}
+}
+
 func openMigrationTestDatabases(t *testing.T) (*gorm.DB, *gorm.DB) {
 	t.Helper()
 	source, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "source.db")), &gorm.Config{

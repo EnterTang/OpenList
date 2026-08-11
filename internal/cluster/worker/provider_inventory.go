@@ -202,11 +202,13 @@ func providerSupportedOperations(provider string, downloadReady, shareSaveReady 
 		operations = append(operations, "share.save")
 	}
 	switch provider {
-	case "pan123":
-		// 123Pan's share-download contract is covered by the provider HTTP
-		// tests. The subscription feature gate remains off by default, so this
-		// capability is only consumed when direct-download-first is enabled.
-		operations = append(operations, "share.download", "instant_upload", "range_download")
+	case "pan115", "pan123":
+		// Share-download is consumed only when direct-download-first is enabled;
+		// the feature gate remains off by default for existing deployments.
+		operations = append(operations, "share.download")
+		if provider == "pan123" {
+			operations = append(operations, "instant_upload", "range_download")
+		}
 	case "guangyapan":
 		operations = append(operations, "instant_upload", "range_download")
 	}

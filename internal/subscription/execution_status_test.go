@@ -111,6 +111,55 @@ func TestReconcileSubscriptionExecutionRepairsOrphansAndTerminalMismatch(t *test
 	}
 }
 
+func TestReconcileSubscriptionExecutionFinalizesLatestRunAfterTerminalJobs(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "run-finalize", TMDBName: "run-finalize", LastStatus: model.SubscriptionStatusRunning}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	item := &model.SubscriptionItem{
+		SubscriptionID: sub.ID, SourceKey: "terminal-item", FileHash: "terminal-hash",
+		Status: model.SubscriptionItemStatusTransferring, ClusterJobID: "terminal-job", LastSeenAt: now,
+	}
+	if err := db.GetDb().Create(item).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := &model.ClusterJob{
+		ID: "terminal-job", Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusSucceeded,
+		IdempotencyKey: "terminal-idempotency", SubscriptionID: sub.ID, SubscriptionItemID: item.ID,
+		AvailableAt: now, FinishedAt: &now,
+	}
+	if err := db.GetDb().Create(job).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := &model.SubscriptionRun{
+		SubscriptionID: sub.ID, StartedAt: now.Add(-time.Minute), FinishedAt: &now,
+		Status: model.SubscriptionStatusRunning, CompletionState: "dispatching", TransferStatus: "running",
+		DispatchStatus: model.SubscriptionStatusSuccess, DiscoverStatus: model.SubscriptionStatusSuccess,
+	}
+	if err := db.GetDb().Create(run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReconcileSubscriptionExecution(context.Background(), sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	var gotItem model.SubscriptionItem
+	if err := db.GetDb().First(&gotItem, item.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gotItem.Status != model.SubscriptionItemStatusTransferred || gotItem.StateVersion == 0 {
+		t.Fatalf("item = %#v, want transferred with advanced state version", gotItem)
+	}
+	var gotRun model.SubscriptionRun
+	if err := db.GetDb().First(&gotRun, run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gotRun.Status != model.SubscriptionStatusSuccess || gotRun.CompletionState == "dispatching" || gotRun.CompletionState == "transferring" || gotRun.FinishedAt == nil {
+		t.Fatalf("run = %#v, want terminal success", gotRun)
+	}
+}
+
 func TestSubscriptionNeedsExecutionFollowupDoesNotSpinOnBlockedWorker(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	sub := &model.Subscription{Name: "blocked", TMDBName: "blocked", Active: true, TransferEnabled: true}

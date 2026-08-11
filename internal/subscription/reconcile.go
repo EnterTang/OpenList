@@ -118,11 +118,87 @@ func ReconcileSubscriptionExecution(ctx context.Context, subscriptionID uint) (E
 				lastError = "one or more subscription items failed; retry is available"
 			}
 		}
+		if err := reconcileLatestSubscriptionRunTx(tx, subscriptionID, items, jobs, now); err != nil {
+			return err
+		}
 		return tx.Model(&model.Subscription{}).Where("id = ?", subscriptionID).Updates(map[string]any{
 			"last_status": status, "last_error": lastError, "updated_at": now,
 		}).Error
 	})
 	return result, err
+}
+
+func reconcileLatestSubscriptionRunTx(tx *gorm.DB, subscriptionID uint, items []model.SubscriptionItem, jobs []model.ClusterJob, now time.Time) error {
+	var run model.SubscriptionRun
+	err := tx.Where("subscription_id = ? AND status = ?", subscriptionID, model.SubscriptionStatusRunning).
+		Order("started_at DESC, id DESC").First(&run).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	dispatchedItems := make(map[uint]struct{}, len(jobs))
+	active := false
+	for i := range jobs {
+		job := &jobs[i]
+		if job.SubscriptionItemID != 0 {
+			dispatchedItems[job.SubscriptionItemID] = struct{}{}
+		}
+		if subscriptionJobActive(job.Status) {
+			active = true
+		}
+	}
+	projection := projectSubscriptionRun(subscriptionRunProjectionInput{
+		Items:              items,
+		DiscoveredHint:     len(items),
+		DispatchedHint:     len(dispatchedItems),
+		HasDiscoveryStage:  true,
+		HasDispatchStage:   true,
+		DiscoverySucceeded: true,
+		DispatchSucceeded:  true,
+		TransferRequested:  true,
+		ClusterDispatch:    len(dispatchedItems) > 0,
+	})
+	status := aggregateSubscriptionStatus(items)
+	finishedAt := any(now)
+	if active {
+		status = model.SubscriptionStatusRunning
+		finishedAt = nil
+	}
+	lastError := ""
+	if status == model.SubscriptionStatusFailed {
+		for i := range items {
+			if items[i].Status == model.SubscriptionItemStatusFailed && strings.TrimSpace(items[i].LastError) != "" {
+				lastError = items[i].LastError
+				break
+			}
+		}
+		if lastError == "" {
+			lastError = "one or more subscription items failed; retry is available"
+		}
+	}
+	return tx.Model(&model.SubscriptionRun{}).Where("id = ?", run.ID).Updates(map[string]any{
+		"status":            status,
+		"finished_at":       finishedAt,
+		"discovered_count":  projection.DiscoveredCount,
+		"dispatched_count":  projection.DispatchedCount,
+		"queued_count":      projection.DispatchedCount,
+		"transferred_count": projection.SucceededCount,
+		"succeeded_count":   projection.SucceededCount,
+		"skipped_count":     projection.SkippedCount,
+		"retryable_count":   projection.RetryableCount,
+		"blocked_count":     projection.BlockedCount,
+		"unknown_count":     projection.UnknownCount,
+		"failed_count":      projection.FailedCount,
+		"discover_status":   projection.DiscoverStatus,
+		"dispatch_status":   projection.DispatchStatus,
+		"transfer_status":   projection.TransferStatus,
+		"completion_state":  projection.CompletionState,
+		"error":             lastError,
+		"updated_at":        now,
+	}).Error
 }
 
 // SubscriptionNeedsExecutionFollowup reports whether a scheduled run should
@@ -329,7 +405,7 @@ const (
 
 func classifySubscriptionFailure(errorCode string) string {
 	switch strings.ToLower(strings.TrimSpace(errorCode)) {
-	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_range_failed", "network_timeout", "timeout", "rate_limited":
+	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_unexpected_eof", "source_range_failed", "source_link_expired", "network_timeout", "timeout", "rate_limited":
 		return model.SubscriptionItemStatusRetryWait
 	case "share_save_result_unknown", "result_unknown", "request_result_unknown", "operation_result_unknown":
 		return model.SubscriptionItemStatusUnknown
@@ -347,7 +423,7 @@ func updateSubscriptionItemReconcileTx(tx *gorm.DB, item *model.SubscriptionItem
 	currentVersion := item.StateVersion
 	updates["state_version"] = currentVersion + 1
 	updated := tx.Model(&model.SubscriptionItem{}).
-		Where("id = ? AND state_version = ?", item.ID, currentVersion).
+		Where("id = ? AND COALESCE(state_version, 0) = ?", item.ID, currentVersion).
 		Updates(updates)
 	if updated.Error != nil {
 		return updated.Error

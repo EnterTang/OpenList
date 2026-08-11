@@ -215,6 +215,13 @@ func TestProviderSupportedOperationsKeepsPan123DirectDownloadWithoutShareSave(t 
 	}
 }
 
+func TestProviderSupportedOperationsAdvertisesPan115DirectDownload(t *testing.T) {
+	operations := providerSupportedOperations("pan115", true, true)
+	if !containsInventoryOperation(operations, "share.download") {
+		t.Fatalf("operations = %#v, want share.download", operations)
+	}
+}
+
 func TestProviderAccountInventoryKeepsUnknown139MembershipWithoutUploadLimit(t *testing.T) {
 	storage := model.Storage{ID: 9, MountPath: "/139-b", Driver: "139Yun", Status: "work"}
 	account := providerAccountInventory("node-1", storage, 10<<30, 20<<30)

@@ -463,6 +463,7 @@ func (c *Client) cloneForUserAgent(userAgent string) *Client {
 		passportBaseURL: c.passportBaseURL,
 		accountLimiter:  c.accountLimiter,
 		pageLimiter:     c.pageLimiter,
+		requestGate:     c.requestGate,
 		pathCache:       c.pathCache,
 		pathItemCache:   c.pathItemCache,
 	}

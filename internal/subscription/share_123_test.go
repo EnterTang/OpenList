@@ -60,7 +60,7 @@ func TestPan123ShareProviderListsChildren(t *testing.T) {
 			_, _ = w.Write([]byte(`{
 				"code":0,
 				"data":{"InfoList":[
-					{"FileId":101,"FileName":"Movie.mkv","Type":0,"Size":1024,"Etag":"etag-file","UpdateAt":"2023-11-14T22:13:20Z"},
+					{"FileId":101,"FileName":"Movie.mkv","Type":0,"Size":1024,"Etag":"etag-file","S3KeyFlag":"flag-file","UpdateAt":"2023-11-14T22:13:20Z"},
 					{"FileId":102,"FileName":"Season 1","Type":1,"Size":0,"Etag":"","UpdateAt":"2023-11-14T22:13:21Z"}
 				],"Next":"-1"}
 			}`))
@@ -89,6 +89,9 @@ func TestPan123ShareProviderListsChildren(t *testing.T) {
 	}
 	if items[0].Size != 1024 || !items[0].Modified.Equal(time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)) {
 		t.Fatalf("file metadata = %#v", items[0])
+	}
+	if got := rawString(shareItemRawMap(items[0]), "s3key_flag"); got != "flag-file" {
+		t.Fatalf("s3key_flag = %q, want flag-file", got)
 	}
 	if items[1].ID != "102" || !items[1].IsDir {
 		t.Fatalf("dir item = %#v", items[1])

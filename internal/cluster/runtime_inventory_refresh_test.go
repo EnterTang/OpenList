@@ -69,6 +69,39 @@ func TestRefreshInventoryAfterStoragesLoadedStopsWhenWorkerStops(t *testing.T) {
 	}
 }
 
+func TestRunWorkerInventoryRefreshLoopRefreshesPeriodically(t *testing.T) {
+	resetPendingStoragesLoadSignal(t)
+	oldInterval := workerInventoryRefreshInterval
+	workerInventoryRefreshInterval = 10 * time.Millisecond
+	t.Cleanup(func() { workerInventoryRefreshInterval = oldInterval })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	refreshed := make(chan struct{}, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runWorkerInventoryRefreshLoop(ctx, func(context.Context) error {
+			refreshed <- struct{}{}
+			return nil
+		})
+	}()
+	conf.SendStoragesLoadedSignal()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-refreshed:
+		case <-time.After(time.Second):
+			t.Fatalf("inventory refresh %d did not occur", i+1)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("inventory refresh loop did not stop")
+	}
+}
+
 func resetPendingStoragesLoadSignal(t *testing.T) {
 	t.Helper()
 	conf.SendStoragesLoadedSignal()

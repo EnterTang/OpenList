@@ -84,6 +84,14 @@ func executeDirectShareDownload(ctx context.Context, offer protocol.JobOffer, ta
 		if !ok {
 			return nil, &directDownloadError{code: directDownloadErrorCodeUnavailable, message: "123pan direct share download is unavailable", fallback: true}
 		}
+	case subscription.ShareProviderPan115:
+		providerConfig := subscription.ResolveShareInspectConfig(ref.Provider, cfg.Telegram.Pan115)
+		provider := subscription.NewPan115ShareProvider(providerConfig)
+		var ok bool
+		downloader, ok = provider.(subscription.ShareDirectDownloader)
+		if !ok {
+			return nil, &directDownloadError{code: directDownloadErrorCodeUnavailable, message: "115 direct share download is unavailable", fallback: true}
+		}
 	default:
 		return nil, &directDownloadError{code: directDownloadErrorCodeUnavailable, message: "provider direct share download is not supported", fallback: true}
 	}

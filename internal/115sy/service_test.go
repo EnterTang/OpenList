@@ -49,6 +49,44 @@ func TestShareSnapshotUsesAndroidThenWeb405Fallback(t *testing.T) {
 	}
 }
 
+func TestShareDownloadURLUsesEncryptedAppThenWeb405Fallback(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case EndpointShareDownloadURLApp:
+			if r.Method != http.MethodPost {
+				t.Fatalf("app method = %s, want POST", r.Method)
+			}
+			if err := r.ParseForm(); err != nil || r.Form.Get("data") == "" {
+				t.Fatalf("app form = %s", r.Form.Encode())
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, `{"state":false,"errno":0,"error":"unsupported"}`)
+		case EndpointShareDownloadURLWeb:
+			if r.Method != http.MethodGet || r.URL.Query().Get("share_code") != "code" || r.URL.Query().Get("receive_code") != "pass" || r.URL.Query().Get("file_id") != "file" {
+				t.Fatalf("web request = %s %s", r.Method, r.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, `{"state":true,"errno":0,"data":{"fid":"file","fn":"Movie.mkv","fs":12,"url":{"url":"https://download.example/movie.mkv"}}}`)
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(t, ClientOptions{Cookie: "UID=1;CID=2", LimitRate: 1e6, AndroidBaseURL: server.URL, WebBaseURL: server.URL})
+	link, err := client.ShareDownloadURL(context.Background(), ShareURL{ShareCode: "code", ReceiveCode: "pass"}, "file", "test-android-ua")
+	if err != nil {
+		t.Fatalf("share download URL: %v", err)
+	}
+	if link.URL != "https://download.example/movie.mkv" || link.Header.Get("User-Agent") != "test-android-ua" {
+		t.Fatalf("link = %#v", link)
+	}
+	if strings.Join(paths, ",") != EndpointShareDownloadURLApp+","+EndpointShareDownloadURLWeb {
+		t.Fatalf("paths = %q", paths)
+	}
+}
+
 func TestReceiveShareAndOfflineTasksUseExpectedForms(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

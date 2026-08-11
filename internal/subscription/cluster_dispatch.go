@@ -948,7 +948,7 @@ func clusterMediaTask(sub *model.Subscription, item *model.SubscriptionItem, ref
 	mediaItemID := clusterMediaItemID(sub.ID, item.SourceKey, item.FileHash)
 	idempotency := hashClusterSource(fmt.Sprint(sub.ID), string(ref.Provider), ref.ShareID, item.FileID, item.FileHash, item.TargetPath)
 	deliveryMode := model.SubscriptionDeliveryModeTransfer
-	if cfg, err := GetConfig(); err == nil && cfg.DirectShareLinkEnabled && cfg.DirectDownloadFirstEnabled && ref.Provider == ShareProviderPan123 {
+	if cfg, err := GetConfig(); err == nil && cfg.DirectShareLinkEnabled && cfg.DirectDownloadFirstEnabled && (ref.Provider == ShareProviderPan123 || ref.Provider == ShareProviderPan115) {
 		deliveryMode = model.SubscriptionDeliveryModeDirectDownload
 	}
 	return ClusterMediaTask{

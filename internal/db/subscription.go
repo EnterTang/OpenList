@@ -150,7 +150,7 @@ func ResetFailedSubscriptionItems(ctx context.Context, subscriptionID uint) (int
 				"status":         model.SubscriptionItemStatusPending,
 				"cluster_job_id": "",
 				"last_error":     "",
-				"state_version":  gorm.Expr("state_version + 1"),
+				"state_version":  gorm.Expr("COALESCE(state_version, 0) + 1"),
 			})
 		if result.Error != nil {
 			return result.Error
@@ -181,7 +181,7 @@ func ResetStandaloneSubscriptionTransfer(item *model.SubscriptionItem, reason st
 			"status":         model.SubscriptionItemStatusPending,
 			"cluster_job_id": "",
 			"last_error":     reason,
-			"state_version":  gorm.Expr("state_version + 1"),
+			"state_version":  gorm.Expr("COALESCE(state_version, 0) + 1"),
 			"updated_at":     time.Now(),
 		})
 		if result.Error != nil {
@@ -672,7 +672,7 @@ func PersistSubscriptionTerminalItem(request SubscriptionTerminalItemRequest) (*
 			updates := map[string]any{
 				"status":        request.TerminalStatus,
 				"last_error":    request.TerminalLastError,
-				"state_version": gorm.Expr("state_version + 1"),
+				"state_version": gorm.Expr("COALESCE(state_version, 0) + 1"),
 				"updated_at":    updatedAt,
 			}
 			if request.TerminalClusterJobID != nil {

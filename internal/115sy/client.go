@@ -1,6 +1,7 @@
 package _115sy
 
 import (
+	"context"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -21,6 +22,7 @@ type ClientOptions struct {
 	UploadBaseURL   string
 	QRCodeBaseURL   string
 	PassportBaseURL string
+	RequestGate     func(context.Context) error
 }
 
 type Client struct {
@@ -43,6 +45,7 @@ type Client struct {
 
 	accountLimiter *accountLimiter
 	pageLimiter    *pageLimiter
+	requestGate    func(context.Context) error
 	pathMu         sync.RWMutex
 	pathCache      map[string]string
 	pathItemCache  map[string]RemoteItem
@@ -96,6 +99,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		),
 		accountLimiter: newAccountLimiter(opts.LimitRate),
 		pageLimiter:    newPageLimiter(pageCooldown),
+		requestGate:    opts.RequestGate,
 		pathCache:      make(map[string]string),
 		pathItemCache:  make(map[string]RemoteItem),
 	}

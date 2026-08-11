@@ -541,12 +541,13 @@ type pan123ListResp struct {
 }
 
 type pan123File struct {
-	FileID   int64  `json:"FileId"`
-	FileName string `json:"FileName"`
-	Type     int    `json:"Type"`
-	Size     int64  `json:"Size"`
-	Etag     string `json:"Etag"`
-	UpdateAt string `json:"UpdateAt"`
+	FileID    int64  `json:"FileId"`
+	FileName  string `json:"FileName"`
+	Type      int    `json:"Type"`
+	Size      int64  `json:"Size"`
+	Etag      string `json:"Etag"`
+	S3KeyFlag string `json:"S3KeyFlag"`
+	UpdateAt  string `json:"UpdateAt"`
 }
 
 func (f pan123File) shareItem(parentID string) ShareItem {
@@ -560,11 +561,12 @@ func (f pan123File) shareItem(parentID string) ShareItem {
 		Modified: parsePan123Time(f.UpdateAt),
 		IsDir:    isDir,
 		Raw: map[string]any{
-			"file_id":   id,
-			"etag":      f.Etag,
-			"size":      f.Size,
-			"file_name": f.FileName,
-			"type":      f.Type,
+			"file_id":    id,
+			"etag":       f.Etag,
+			"s3key_flag": f.S3KeyFlag,
+			"size":       f.Size,
+			"file_name":  f.FileName,
+			"type":       f.Type,
 		},
 	}
 }

@@ -863,7 +863,7 @@ func shouldRetryMediaTransfer(errorCode string, generation uint64) bool {
 		return false
 	}
 	switch strings.TrimSpace(errorCode) {
-	case "source_unexpected_eof", "source_range_failed", "source_link_expired",
+	case "source_unexpected_eof", "source_range_failed", "source_link_expired", "network_timeout", "timeout",
 		"share_save_retryable", "share_save_rate_limited", "share_save_gateway_response", "share_save_transient":
 		return true
 	default:
@@ -1002,7 +1002,7 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 					"retry_at":        nil,
 					"blocked_reason":  "",
 					"delivery_mode":   model.SubscriptionDeliveryModeDirectDownload,
-					"state_version":   gorm.Expr("state_version + 1"),
+					"state_version":   gorm.Expr("COALESCE(state_version, 0) + 1"),
 				}
 				if fallbackReason, ok := result.Result["fallback_reason"].(string); ok {
 					updates["fallback_reason"] = strings.TrimSpace(fallbackReason)
@@ -1017,7 +1017,7 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		if result.Status != "succeeded" && job.Type == model.ClusterJobTypeMediaTransfer && job.SubscriptionItemID != 0 && jobUpdates["status"] == model.ClusterJobStatusFailed {
 			if err := tx.Model(&model.SubscriptionItem{}).
 				Where("id = ? AND cluster_job_id = ?", job.SubscriptionItemID, job.ID).
-				Updates(map[string]any{"status": model.SubscriptionItemStatusFailed, "last_error": result.Error, "last_error_code": result.ErrorCode, "state_version": gorm.Expr("state_version + 1")}).Error; err != nil {
+				Updates(map[string]any{"status": model.SubscriptionItemStatusFailed, "last_error": result.Error, "last_error_code": result.ErrorCode, "state_version": gorm.Expr("COALESCE(state_version, 0) + 1")}).Error; err != nil {
 				return err
 			}
 		}
@@ -1318,7 +1318,7 @@ func (s *Service) SweepExpiredLeases(ctx context.Context, now time.Time) (int64,
 							"status":          model.SubscriptionItemStatusFailed,
 							"last_error":      "worker lease expired and automatic retry limit was reached",
 							"last_error_code": "lease_expired_attempt_limit",
-							"state_version":   gorm.Expr("state_version + 1"),
+							"state_version":   gorm.Expr("COALESCE(state_version, 0) + 1"),
 						}).Error; err != nil {
 						return err
 					}
@@ -1907,7 +1907,7 @@ func (s *Service) RetryFailedSubscriptionItems(ctx context.Context, subscription
 				"last_error_code": "",
 				"retry_at":        nil,
 				"blocked_reason":  "",
-				"state_version":   gorm.Expr("state_version + 1"),
+				"state_version":   gorm.Expr("COALESCE(state_version, 0) + 1"),
 			}).Error; err != nil {
 				return err
 			}

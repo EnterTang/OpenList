@@ -24,6 +24,11 @@ import (
 const pan115WebURL = "https://115cdn.com"
 
 const (
+	pan115DirectAppURL = "https://proapi.115.com/2.0/share/downurl"
+	pan115DirectWebURL = "https://webapi.115.com/share/downurl"
+)
+
+const (
 	// 115 share APIs are sensitive to burst traffic. Keep one process-wide
 	// schedule for all share/list/receive requests and retries.
 	pan115RequestInterval    = time.Second
@@ -83,33 +88,40 @@ const (
 type pan115ShareProvider struct {
 	cfg            model.SubscriptionTelegramPanConfig
 	webURL         string
+	directAppURL   string
+	directWebURL   string
 	client         *resty.Client
 	limiter        *pan115RateLimiter
 	retryBaseDelay time.Duration
 	confirmClient  *_115sy.Client
+	directClient   *_115sy.Client
 	confirmEnabled bool
 }
 
 func NewPan115ShareProvider(cfg model.SubscriptionTelegramPanConfig) ShareSaver {
 	cfg = normalizeTelegramPanConfig(cfg)
 	confirmEnabled := pan115ConfirmationEnabled()
-	var confirmClient *_115sy.Client
-	if cfg.Cookie != "" {
-		confirmClient, _ = _115sy.NewClient(_115sy.ClientOptions{
-			Cookie:       cfg.Cookie,
-			LimitRate:    1,
-			PageCooldown: pan115RequestInterval,
-		})
-	}
-	return &pan115ShareProvider{
+	provider := &pan115ShareProvider{
 		cfg:            cfg,
 		webURL:         pan115WebURL,
+		directAppURL:   pan115DirectAppURL,
+		directWebURL:   pan115DirectWebURL,
 		client:         newShareHTTPClient(),
 		limiter:        pan115RequestLimiter,
 		retryBaseDelay: pan115RetryBaseDelay,
-		confirmClient:  confirmClient,
 		confirmEnabled: confirmEnabled,
 	}
+	if cfg.Cookie != "" {
+		client, _ := _115sy.NewClient(_115sy.ClientOptions{
+			Cookie:       cfg.Cookie,
+			LimitRate:    1,
+			PageCooldown: pan115RequestInterval,
+			RequestGate:  provider.limiter.wait,
+		})
+		provider.confirmClient = client
+		provider.directClient = client
+	}
+	return provider
 }
 
 func pan115ConfirmationEnabled() bool {
@@ -184,6 +196,137 @@ func (p *pan115ShareProvider) ListShareChildren(ctx context.Context, ref ShareRe
 		items = append(items, item.shareItem(parentID))
 	}
 	return items, nil
+}
+
+// GetShareDownloadURL uses the official-client-compatible app endpoint first,
+// then the web endpoint when the app route is rejected with 405. The URL is
+// short-lived and is returned only to the worker that performs the download.
+func (p *pan115ShareProvider) GetShareDownloadURL(ctx context.Context, ref ShareRef, item ShareItem) (ShareDownloadLink, error) {
+	if item.IsDir {
+		return ShareDownloadLink{}, errors.New("115 share item is a directory")
+	}
+	if p == nil || strings.TrimSpace(p.cfg.Cookie) == "" {
+		return ShareDownloadLink{}, &pan115ClusterError{message: "115 cookie is required", code: pan115ClusterErrorCodeShareSaveCredentialsInvalid}
+	}
+	fileID := firstNonEmpty(shareItemToken(item), item.ID)
+	if fileID == "" {
+		return ShareDownloadLink{}, errors.New("115 share item id is empty")
+	}
+	if p.directClient != nil && p.directAppURL == pan115DirectAppURL && p.directWebURL == pan115DirectWebURL {
+		link, err := p.directClient.ShareDownloadURL(ctx, _115sy.ShareURL{
+			ShareCode:   ref.ShareID,
+			ReceiveCode: ref.Passcode,
+			SourceURL:   ref.RawURL,
+		}, fileID, _115sy.DefaultAndroidUA)
+		if err != nil {
+			return ShareDownloadLink{}, pan115DirectError(err)
+		}
+		return ShareDownloadLink{
+			URL:     link.URL,
+			Headers: headerValues(link.Header),
+			FileID:  fileID,
+			Size:    item.Size,
+		}, nil
+	}
+
+	endpoints := []string{p.directAppURL, p.directWebURL}
+	for index, endpoint := range endpoints {
+		if strings.TrimSpace(endpoint) == "" {
+			continue
+		}
+		var resp pan115DirectDownloadResp
+		httpResp, err := p.doRequest(ctx, func() (*resty.Response, error) {
+			return p.client.R().
+				SetContext(ctx).
+				SetHeader("Cookie", p.cfg.Cookie).
+				SetHeader("Origin", p.webURL).
+				SetHeader("Referer", pan115ShareReferer(p.webURL, ref)).
+				SetHeader("User-Agent", _115sy.DefaultAndroidUA).
+				SetQueryParams(map[string]string{
+					"share_code":   ref.ShareID,
+					"receive_code": ref.Passcode,
+					"file_id":      fileID,
+					"dl":           "1",
+				}).
+				Get(endpoint)
+		})
+		if err != nil {
+			return ShareDownloadLink{}, err
+		}
+		if err := decodePan115JSON(httpResp, &resp); err != nil {
+			if index == 0 && pan115ErrorCode(err) == pan115ClusterErrorCodeShareSaveMethodNotAllowed {
+				continue
+			}
+			return ShareDownloadLink{}, err
+		}
+		if !resp.State {
+			return ShareDownloadLink{}, pan115Error(resp.Error)
+		}
+		info := resp.Data
+		if info.File != nil {
+			info = *info.File
+		}
+		urlValue := decodePan115DirectURL(info.URL)
+		if urlValue == "" {
+			return ShareDownloadLink{}, errors.New("115 share direct download URL is empty (directory or unavailable)")
+		}
+		return ShareDownloadLink{
+			URL:     urlValue,
+			Headers: map[string]string{"User-Agent": _115sy.DefaultAndroidUA},
+			FileID:  firstNonEmpty(info.FID.String(), fileID),
+			Size:    firstPositiveInt64(info.Size, item.Size),
+			Hash:    strings.TrimSpace(info.SHA1),
+		}, nil
+	}
+	return ShareDownloadLink{}, errors.New("115 share direct download endpoints are unavailable")
+}
+
+func pan115DirectError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var httpErr *_115sy.HTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveCredentialsInvalid}
+		case http.StatusMethodNotAllowed:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveMethodNotAllowed}
+		case http.StatusTooManyRequests:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveRateLimited}
+		case http.StatusRequestTimeout:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveTransient}
+		default:
+			if httpErr.StatusCode >= http.StatusInternalServerError {
+				return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveGatewayResponse}
+			}
+		}
+	}
+	if code := classifyPan115ClusterErrorCode(err.Error()); code != "" {
+		return &pan115ClusterError{message: err.Error(), code: code}
+	}
+	return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveTransient}
+}
+
+func pan115ErrorCode(err error) string {
+	var coded interface{ ClusterErrorCode() string }
+	if errors.As(err, &coded) {
+		return coded.ClusterErrorCode()
+	}
+	return ""
+}
+
+func headerValues(header http.Header) map[string]string {
+	if len(header) == 0 {
+		return nil
+	}
+	values := make(map[string]string, len(header))
+	for key, items := range header {
+		if len(items) > 0 && strings.TrimSpace(key) != "" && strings.TrimSpace(items[0]) != "" {
+			values[key] = items[0]
+		}
+	}
+	return values
 }
 
 func (p *pan115ShareProvider) SaveShareItems(ctx context.Context, ref ShareRef, parentID string, items []ShareItem, dstDirID string) ([]string, error) {
@@ -566,6 +709,21 @@ type pan115SnapResp struct {
 	} `json:"data"`
 }
 
+type pan115DirectDownloadInfo struct {
+	FID  pan115ID                  `json:"fid"`
+	Name string                    `json:"fn"`
+	Size int64                     `json:"fs"`
+	SHA1 string                    `json:"sha1"`
+	URL  json.RawMessage           `json:"url"`
+	File *pan115DirectDownloadInfo `json:"file"`
+}
+
+type pan115DirectDownloadResp struct {
+	State bool                     `json:"state"`
+	Error string                   `json:"error"`
+	Data  pan115DirectDownloadInfo `json:"data"`
+}
+
 type pan115ID string
 
 func (id *pan115ID) UnmarshalJSON(data []byte) error {
@@ -592,6 +750,32 @@ func (id *pan115ID) UnmarshalJSON(data []byte) error {
 
 func (id pan115ID) String() string {
 	return string(id)
+}
+
+func decodePan115DirectURL(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var direct string
+	if json.Unmarshal(raw, &direct) == nil {
+		return strings.TrimSpace(direct)
+	}
+	var nested struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(raw, &nested) == nil {
+		return strings.TrimSpace(nested.URL)
+	}
+	return ""
+}
+
+func firstPositiveInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 type pan115File struct {
@@ -681,3 +865,4 @@ func pan115ResponseKind(contentType string, body []byte) string {
 }
 
 var _ ShareSaver = (*pan115ShareProvider)(nil)
+var _ ShareDirectDownloader = (*pan115ShareProvider)(nil)
