@@ -168,36 +168,41 @@ func (p *pan115ShareProvider) EnsureDir(ctx context.Context, path string) (strin
 }
 
 func (p *pan115ShareProvider) ListShareChildren(ctx context.Context, ref ShareRef, parentID string) ([]ShareItem, error) {
-	var resp pan115SnapResp
-	httpResp, err := p.doRequest(ctx, func() (*resty.Response, error) {
-		return p.client.R().
-			SetContext(ctx).
-			SetHeader("Referer", pan115ShareReferer(p.webURL, ref)).
-			SetQueryParams(map[string]string{
-				"share_code":   ref.ShareID,
-				"receive_code": ref.Passcode,
-				"cid":          parentID,
-				"offset":       "0",
-				"limit":        "50",
-				"asc":          "0",
-				"format":       "json",
-			}).
-			Get(p.webURL + "/webapi/share/snap")
-	})
+	if p == nil || p.receiveClient == nil {
+		return nil, &pan115ClusterError{
+			message: "115 share snapshot client is unavailable",
+			code:    pan115ClusterErrorCodeShareSaveResultUnknown,
+		}
+	}
+
+	items, err := p.receiveClient.ShareChildren(ctx, _115sy.ShareURL{
+		ShareCode:   ref.ShareID,
+		ReceiveCode: ref.Passcode,
+	}, parentID)
 	if err != nil {
-		return nil, err
+		return nil, pan115ReceiveError(err)
 	}
-	if err := decodePan115JSON(httpResp, &resp); err != nil {
-		return nil, err
+
+	converted := make([]ShareItem, 0, len(items))
+	for _, item := range items {
+		itemParentID := firstNonEmpty(strings.TrimSpace(item.ParentID), "0")
+		modified := time.Time{}
+		if item.ModifyTime > 0 {
+			modified = time.Unix(item.ModifyTime, 0)
+		}
+		converted = append(converted, ShareItem{
+			ID:       item.ID,
+			ParentID: itemParentID,
+			Name:     item.Name,
+			Size:     item.Size,
+			Modified: modified,
+			IsDir:    item.IsDir,
+			Raw: map[string]any{
+				"share_fid_token": item.ID,
+			},
+		})
 	}
-	if !resp.State {
-		return nil, pan115Error(resp.Error)
-	}
-	items := make([]ShareItem, 0, len(resp.Data.List))
-	for _, item := range resp.Data.List {
-		items = append(items, item.shareItem(parentID))
-	}
-	return items, nil
+	return converted, nil
 }
 
 // GetShareDownloadURL uses the official-client-compatible app endpoint first,
@@ -742,15 +747,6 @@ func (e *pan115ClusterError) ClusterErrorCode() string {
 	return e.code
 }
 
-type pan115SnapResp struct {
-	State bool   `json:"state"`
-	Error string `json:"error"`
-	Data  struct {
-		Count int          `json:"count"`
-		List  []pan115File `json:"list"`
-	} `json:"data"`
-}
-
 type pan115DirectDownloadInfo struct {
 	FID  pan115ID                  `json:"fid"`
 	Name string                    `json:"fn"`
@@ -818,56 +814,6 @@ func firstPositiveInt64(values ...int64) int64 {
 		}
 	}
 	return 0
-}
-
-type pan115File struct {
-	FID      pan115ID `json:"fid"`
-	CID      pan115ID `json:"cid"`
-	Name     string   `json:"n"`
-	Size     int64    `json:"s"`
-	UpdateAt string   `json:"t"`
-	Icon     string   `json:"ico"`
-}
-
-func (f pan115File) shareItem(parentID string) ShareItem {
-	fid := f.FID.String()
-	cid := f.CID.String()
-	isDir := fid == ""
-	id := fid
-	if isDir {
-		id = cid
-	}
-	if parentID == "" {
-		parentID = cid
-		if isDir {
-			parentID = "0"
-		}
-	}
-	return ShareItem{
-		ID:       id,
-		ParentID: parentID,
-		Name:     f.Name,
-		Size:     f.Size,
-		Modified: parsePan115Time(f.UpdateAt),
-		IsDir:    isDir,
-		Raw: map[string]any{
-			"share_fid_token": id,
-		},
-	}
-}
-
-func parsePan115Time(value string) time.Time {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return time.Time{}
-	}
-	if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
-		return time.Unix(parsed, 0)
-	}
-	if parsed, err := time.Parse("2006-01-02 15:04:05", value); err == nil {
-		return parsed
-	}
-	return time.Time{}
 }
 
 func pan115FirstNonSpace(body []byte) string {

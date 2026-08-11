@@ -480,11 +480,12 @@ type ShareURL struct {
 }
 
 type ShareItem struct {
-	ID       string `json:"id"`
-	ParentID string `json:"parent_id"`
-	Name     string `json:"name"`
-	IsDir    bool   `json:"is_dir"`
-	Size     int64  `json:"size"`
+	ID         string `json:"id"`
+	ParentID   string `json:"parent_id"`
+	Name       string `json:"name"`
+	IsDir      bool   `json:"is_dir"`
+	Size       int64  `json:"size"`
+	ModifyTime int64  `json:"modify_time"`
 }
 
 type ShareTarget struct {

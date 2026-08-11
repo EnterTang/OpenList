@@ -128,6 +128,76 @@ func (c *Client) ShareSnapshot(ctx context.Context, share ShareURL) (ShareSnapsh
 	}, nil
 }
 
+// ShareChildren lists one directory from a share. It uses the same Android
+// first / HTTP 405 Web fallback policy as ShareSnapshot, while preserving the
+// requested cid so callers do not need to download the entire share tree for
+// every recursive directory visit.
+func (c *Client) ShareChildren(ctx context.Context, share ShareURL, parentID string) ([]ShareItem, error) {
+	if !validShareToken(share.ShareCode) || !validShareToken(share.ReceiveCode) {
+		return nil, fmt.Errorf("invalid 115 share credentials")
+	}
+	parentID = strings.TrimSpace(parentID)
+	if parentID == "" {
+		parentID = "0"
+	}
+	items := make([]ShareItem, 0)
+	seen := make(map[string]struct{})
+	seenOffsets := make(map[int64]struct{})
+	var total int64
+	for offset := int64(0); ; offset += sharePageSize {
+		if _, exists := seenOffsets[offset]; exists {
+			return nil, &ProtocolError{Endpoint: EndpointShareSnapshot, Message: "server repeated share pagination offset"}
+		}
+		seenOffsets[offset] = struct{}{}
+		query := url.Values{
+			"share_code":   {share.ShareCode},
+			"receive_code": {share.ReceiveCode},
+			"cid":          {parentID},
+			"limit":        {strconv.FormatInt(sharePageSize, 10)},
+			"offset":       {strconv.FormatInt(offset, 10)},
+			"asc":          {"0"},
+		}
+		var envelope responseEnvelope
+		if err := c.doJSON(ctx, OperationShareSnapshot, ProfileAndroid, http.MethodGet, EndpointShareSnapshot, query, nil, &envelope); err != nil {
+			return nil, err
+		}
+		page, err := decodeSharePage(envelope.Data)
+		if err != nil {
+			return nil, err
+		}
+		if page.Total == 0 {
+			if envelope.Count.set {
+				page.Total = envelope.Count.value
+			}
+			if envelope.Total.set {
+				page.Total = envelope.Total.value
+			}
+		}
+		if page.Total > total {
+			total = page.Total
+		}
+		for _, item := range page.Items {
+			if item.ID == "" {
+				return nil, &ProtocolError{Endpoint: EndpointShareSnapshot, Message: "share item is missing id"}
+			}
+			item.ParentID = firstNonEmpty(item.ParentID, parentID)
+			key := item.ID + "\x00" + item.ParentID
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			items = append(items, item)
+			if len(items) > shareItemLimit {
+				return nil, &ProtocolError{Endpoint: EndpointShareSnapshot, Message: "share item limit exceeded"}
+			}
+		}
+		if len(page.Items) == 0 || (total > 0 && int64(len(items)) >= total) || len(page.Items) < int(sharePageSize) {
+			break
+		}
+	}
+	return items, nil
+}
+
 // ShareDownloadURL obtains the short-lived URL for one file in a share. The
 // app endpoint follows the RSA envelope used by the official 115 client; a
 // 405 is the only automatic profile fallback and then uses the web endpoint.
@@ -266,7 +336,14 @@ func decodeSharePage(raw json.RawMessage) (sharePage, error) {
 	}
 	items := make([]ShareItem, 0, len(remoteItems))
 	for _, item := range remoteItems {
-		items = append(items, ShareItem{ID: item.ID, ParentID: item.ParentCID, Name: item.Name, IsDir: item.IsDir, Size: item.Size})
+		items = append(items, ShareItem{
+			ID:         item.ID,
+			ParentID:   item.ParentCID,
+			Name:       item.Name,
+			IsDir:      item.IsDir,
+			Size:       item.Size,
+			ModifyTime: item.ModifyTime,
+		})
 	}
 	total := int64(data.Total.value)
 	if total == 0 {

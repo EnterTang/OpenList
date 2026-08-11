@@ -2,7 +2,6 @@ package subscription
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -46,24 +45,60 @@ func TestDecodePan115JSON_ReportsHTTPMetadataForHTMLResponse(t *testing.T) {
 	}
 }
 
+func TestPan115ShareProviderClassifiesHTMLShareListResponse(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>gateway response</html>"))
+	}))
+	defer server.Close()
+
+	client, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1",
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new 115sy client: %v", err)
+	}
+	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1"}).(*pan115ShareProvider)
+	provider.receiveClient = client
+
+	_, err = provider.ListShareChildren(context.Background(), ShareRef{
+		Provider: ShareProviderPan115, ShareID: "share", Passcode: "pass",
+	}, "0")
+	if err == nil {
+		t.Fatal("expected HTML response error")
+	}
+	if requests != 1 {
+		t.Fatalf("request count = %d, want no retry for HTTP 200 HTML", requests)
+	}
+	if !strings.Contains(err.Error(), "content-type=text/html") || !strings.Contains(err.Error(), "kind=html") {
+		t.Fatalf("error = %q, want response metadata", err)
+	}
+}
+
 func TestPan115ShareProviderListsChildren(t *testing.T) {
-	var snapCalled bool
+	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/webapi/share/snap":
-			snapCalled = true
+		case _115sy.EndpointShareSnapshotApp:
+			paths = append(paths, r.URL.Path)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte(`{"state":false,"errno":0,"error":"unsupported"}`))
+		case _115sy.EndpointShareSnapshot:
+			paths = append(paths, r.URL.Path)
 			query := r.URL.Query()
-			if query.Get("share_code") != "swssal13zrk" || query.Get("receive_code") != "t58d" || query.Get("cid") != "" {
+			if query.Get("share_code") != "swssal13zrk" || query.Get("receive_code") != "t58d" || query.Get("cid") != "0" {
 				t.Fatalf("share snap query = %s", r.URL.RawQuery)
-			}
-			if got := r.Header.Get("Referer"); !strings.Contains(got, "swssal13zrk") || !strings.Contains(got, "t58d") {
-				t.Fatalf("referer = %q, want share code and password", got)
 			}
 			_, _ = w.Write([]byte(`{
 				"state":true,
 				"data":{"count":2,"list":[
 					{"fid":"file-1","cid":"0","n":"Movie.mkv","s":1024,"t":"1700000000","ico":"mkv"},
-					{"cid":1001,"n":"Season 1","t":"1700000001"}
+					{"cid":1001,"n":"Season 1","fc":"0","t":"1700000001"}
 				]}
 			}`))
 		default:
@@ -72,16 +107,26 @@ func TestPan115ShareProviderListsChildren(t *testing.T) {
 	}))
 	defer server.Close()
 
+	client, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1;CID=2",
+		LimitRate:      1e6,
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new 115sy client: %v", err)
+	}
 	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1;CID=2"})
 	provider.(*pan115ShareProvider).webURL = server.URL
+	provider.(*pan115ShareProvider).receiveClient = client
 	ref := ShareRef{Provider: ShareProviderPan115, RawURL: "https://115cdn.com/s/swssal13zrk?password=t58d", ShareID: "swssal13zrk", Passcode: "t58d"}
 
 	items, err := provider.ListShareChildren(context.Background(), ref, "")
 	if err != nil {
 		t.Fatalf("list children: %v", err)
 	}
-	if !snapCalled {
-		t.Fatal("share snap endpoint was not called")
+	if got := strings.Join(paths, ","); got != _115sy.EndpointShareSnapshotApp+","+_115sy.EndpointShareSnapshot {
+		t.Fatalf("endpoint sequence = %q", got)
 	}
 	if len(items) != 2 {
 		t.Fatalf("items = %#v, want 2", items)
@@ -94,6 +139,63 @@ func TestPan115ShareProviderListsChildren(t *testing.T) {
 	}
 	if items[1].ID != "1001" || items[1].ParentID != "0" || !items[1].IsDir {
 		t.Fatalf("dir item = %#v", items[1])
+	}
+}
+
+func TestPan115ShareProviderListsChildrenThrough115syClient(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case _115sy.EndpointShareSnapshotApp:
+			if r.Header.Get("app") != string(_115sy.ProfileAndroid) || r.Header.Get("appversion") == "" {
+				t.Fatalf("android headers = app=%q appversion=%q", r.Header.Get("app"), r.Header.Get("appversion"))
+			}
+			if !strings.Contains(r.Header.Get("Cookie"), "UID=1") {
+				t.Fatalf("cookie = %q, want UID=1", r.Header.Get("Cookie"))
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte(`{"state":false,"errno":0,"error":"unsupported"}`))
+		case _115sy.EndpointShareSnapshot:
+			if r.URL.Query().Get("share_code") != "share" || r.URL.Query().Get("receive_code") != "pass" || r.URL.Query().Get("cid") != "dir-1" {
+				t.Fatalf("share snapshot query = %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{
+				"state":true,
+				"data":{"count":1,"list":[
+					{"fid":"nested-file","pid":"dir-1","n":"episode.mkv","fc":"1","s":"20"}
+				]}
+			}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1;CID=2",
+		LimitRate:      1e6,
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new 115sy client: %v", err)
+	}
+	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1;CID=2"}).(*pan115ShareProvider)
+	provider.webURL = server.URL
+	provider.receiveClient = client
+	ref := ShareRef{Provider: ShareProviderPan115, ShareID: "share", Passcode: "pass"}
+
+	items, err := provider.ListShareChildren(context.Background(), ref, "dir-1")
+	if err != nil {
+		t.Fatalf("list children: %v", err)
+	}
+	if got := strings.Join(paths, ","); got != _115sy.EndpointShareSnapshotApp+","+_115sy.EndpointShareSnapshot {
+		t.Fatalf("endpoint sequence = %q", got)
+	}
+	if len(items) != 1 || items[0].ID != "nested-file" || items[0].ParentID != "dir-1" || items[0].Name != "episode.mkv" {
+		t.Fatalf("items = %#v, want the child under dir-1", items)
 	}
 }
 
@@ -110,10 +212,17 @@ func TestPan115ShareProviderRetriesRateLimitedResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
+	client, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1;CID=2",
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new 115sy client: %v", err)
+	}
 	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1;CID=2"}).(*pan115ShareProvider)
 	provider.webURL = server.URL
-	provider.limiter = newPan115RateLimiter(0)
-	provider.retryBaseDelay = 0
+	provider.receiveClient = client
 	ref := ShareRef{Provider: ShareProviderPan115, RawURL: server.URL + "/s/share?password=code", ShareID: "share", Passcode: "code"}
 
 	items, err := provider.ListShareChildren(context.Background(), ref, "")
@@ -176,32 +285,6 @@ func TestPan115ShareProviderRejectsDirectoryWithoutDirectFallbackLoop(t *testing
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "directory") {
 		t.Fatalf("error = %v, want directory validation error", err)
 	}
-}
-
-func TestPan115FileShareItemAcceptsNumberAndStringIDs(t *testing.T) {
-	t.Run("string ids", func(t *testing.T) {
-		var file pan115File
-		if err := json.Unmarshal([]byte(`{"fid":"file-1","cid":"0","n":"Movie.mkv","s":1024,"t":"1700000000"}`), &file); err != nil {
-			t.Fatalf("unmarshal string ids: %v", err)
-		}
-
-		item := file.shareItem("")
-		if item.ID != "file-1" || item.ParentID != "0" || item.IsDir {
-			t.Fatalf("string-id item = %#v", item)
-		}
-	})
-
-	t.Run("numeric ids", func(t *testing.T) {
-		var dir pan115File
-		if err := json.Unmarshal([]byte(`{"cid":123,"n":"Season 1","t":"1700000001"}`), &dir); err != nil {
-			t.Fatalf("unmarshal numeric ids: %v", err)
-		}
-
-		item := dir.shareItem("")
-		if item.ID != "123" || item.ParentID != "0" || !item.IsDir {
-			t.Fatalf("numeric-id item = %#v", item)
-		}
-	})
 }
 
 func TestPan115ShareProviderSavesItems(t *testing.T) {
@@ -340,18 +423,25 @@ func TestPan115HTML405IsNotRetriedAndIsClassified(t *testing.T) {
 	}))
 	defer server.Close()
 
+	client, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1",
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new 115sy client: %v", err)
+	}
 	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1"}).(*pan115ShareProvider)
 	provider.webURL = server.URL
-	provider.limiter = newPan115RateLimiter(0)
-	provider.retryBaseDelay = 0
-	_, err := provider.ListShareChildren(context.Background(), ShareRef{
+	provider.receiveClient = client
+	_, err = provider.ListShareChildren(context.Background(), ShareRef{
 		Provider: ShareProviderPan115, ShareID: "share", Passcode: "pass",
 	}, "0")
 	if err == nil {
 		t.Fatal("expected 405 HTML error")
 	}
-	if requests != 1 {
-		t.Fatalf("405 request count = %d, want 1", requests)
+	if requests != 2 {
+		t.Fatalf("405 request count = %d, want one profile fallback", requests)
 	}
 	var coded interface{ ClusterErrorCode() string }
 	if !errors.As(err, &coded) || coded.ClusterErrorCode() != pan115ClusterErrorCodeShareSaveMethodNotAllowed {

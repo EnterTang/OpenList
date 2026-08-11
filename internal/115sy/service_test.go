@@ -2,9 +2,11 @@ package _115sy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -46,6 +48,57 @@ func TestShareSnapshotUsesAndroidThenWeb405Fallback(t *testing.T) {
 	}
 	if strings.Join(paths, ",") != EndpointShareSnapshotApp+","+EndpointShareSnapshot {
 		t.Fatalf("paths = %q", paths)
+	}
+}
+
+func TestShareChildrenPaginatesRequestedDirectory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != EndpointShareSnapshotApp {
+			t.Fatalf("path = %q, want %q", r.URL.Path, EndpointShareSnapshotApp)
+		}
+		if r.URL.Query().Get("cid") != "dir-1" {
+			t.Fatalf("cid = %q, want dir-1", r.URL.Query().Get("cid"))
+		}
+		offset := r.URL.Query().Get("offset")
+		list := make([]map[string]any, 0)
+		if offset == "0" {
+			for i := 0; i < 1000; i++ {
+				list = append(list, map[string]any{
+					"fid": "file-" + strconv.Itoa(i),
+					"pid": "dir-1",
+					"n":   "episode-" + strconv.Itoa(i),
+					"fc":  "1",
+				})
+			}
+		} else if offset == "1000" {
+			list = append(list, map[string]any{
+				"fid": "file-1000",
+				"pid": "dir-1",
+				"n":   "episode-1000",
+				"fc":  "1",
+			})
+		} else {
+			t.Fatalf("unexpected offset = %q", offset)
+		}
+		body, err := json.Marshal(map[string]any{
+			"state": true,
+			"data":  map[string]any{"count": 1001, "list": list},
+		})
+		if err != nil {
+			t.Fatalf("marshal response: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	client := newTestClient(t, ClientOptions{LimitRate: 1e6, AndroidBaseURL: server.URL, WebBaseURL: server.URL})
+
+	items, err := client.ShareChildren(context.Background(), ShareURL{ShareCode: "code", ReceiveCode: "pass"}, "dir-1")
+	if err != nil {
+		t.Fatalf("share children: %v", err)
+	}
+	if len(items) != 1001 || items[0].ID != "file-0" || items[1000].ID != "file-1000" {
+		t.Fatalf("items = len:%d first:%#v last:%#v", len(items), items[0], items[len(items)-1])
 	}
 }
 
