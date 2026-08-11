@@ -20,9 +20,21 @@ type ListOptions struct {
 type ProtocolError struct {
 	Endpoint string
 	Message  string
+	Meta     *ResponseMeta
 }
 
 func (e *ProtocolError) Error() string {
+	if e != nil && e.Meta != nil {
+		contentType := strings.TrimSpace(e.Meta.ContentType)
+		if contentType == "" {
+			contentType = "unknown"
+		}
+		return fmt.Sprintf(
+			"invalid 115 response from %s: status=%d content-type=%s kind=%s: %s",
+			sanitizeEndpoint(e.Endpoint), e.Meta.StatusCode, contentType, e.Meta.BodyKind,
+			sanitizeMessage(e.Message),
+		)
+	}
 	return fmt.Sprintf("invalid 115 response from %s: %s", sanitizeEndpoint(e.Endpoint), sanitizeMessage(e.Message))
 }
 

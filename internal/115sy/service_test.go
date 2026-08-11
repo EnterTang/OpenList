@@ -87,11 +87,47 @@ func TestShareDownloadURLUsesEncryptedAppThenWeb405Fallback(t *testing.T) {
 	}
 }
 
+func TestReceiveShareUsesAndroidThenWeb405Fallback(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("share_code") != "code" || r.Form.Get("receive_code") != "pass" || r.Form.Get("cid") != "1001" || r.Form.Get("file_id") != "file" {
+			t.Fatalf("receive form = %#v", r.Form)
+		}
+		switch r.URL.Path {
+		case EndpointShareReceiveApp:
+			if r.Header.Get("app") != string(ProfileAndroid) || r.Header.Get("appversion") == "" {
+				t.Fatalf("android headers = app=%q appversion=%q", r.Header.Get("app"), r.Header.Get("appversion"))
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, `{"state":false,"errno":0,"error":"unsupported"}`)
+		case EndpointShareReceive:
+			_, _ = io.WriteString(w, `{"state":true,"errno":0,"data":{"task_id":"receive-1","cid":"1001"}}`)
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(t, ClientOptions{LimitRate: 1e6, AndroidBaseURL: server.URL, WebBaseURL: server.URL})
+
+	received, err := client.ReceiveShare(context.Background(), ReceiveShareRequest{ShareCode: "code", ReceiveCode: "pass", TargetCID: "1001", FileID: "file"})
+	if err != nil || received.TaskID != "receive-1" {
+		t.Fatalf("received = %#v, error = %v", received, err)
+	}
+	if strings.Join(paths, ",") != EndpointShareReceiveApp+","+EndpointShareReceive {
+		t.Fatalf("paths = %q", paths)
+	}
+}
+
 func TestReceiveShareAndOfflineTasksUseExpectedForms(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case EndpointShareReceive:
+		case EndpointShareReceiveApp:
 			if err := r.ParseForm(); err != nil {
 				t.Fatal(err)
 			}

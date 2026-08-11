@@ -305,7 +305,7 @@ func totalSize(items []ShareItem) int64 {
 }
 
 func (c *Client) ReceiveShare(ctx context.Context, req ReceiveShareRequest) (ReceiveResult, error) {
-	if !validShareToken(req.ShareCode) || !validShareToken(req.ReceiveCode) || strings.TrimSpace(req.TargetCID) == "" || strings.TrimSpace(req.TargetCID) == "0" {
+	if !validShareToken(req.ShareCode) || !validShareToken(req.ReceiveCode) || strings.TrimSpace(req.TargetCID) == "" {
 		return ReceiveResult{}, fmt.Errorf("invalid share receive request")
 	}
 	if strings.TrimSpace(req.FileID) == "" {
@@ -319,7 +319,10 @@ func (c *Client) ReceiveShare(ctx context.Context, req ReceiveShareRequest) (Rec
 		"is_check":     {"0"},
 	}
 	var envelope responseEnvelope
-	if err := c.doForm(ctx, OperationShareReceive, ProfileWeb, http.MethodPost, EndpointShareReceive, nil, form, &envelope); err != nil {
+	// Match p115client.share_receive_app: use the Android-compatible API
+	// first, and let the request policy fall back to the web endpoint only
+	// when the app route explicitly rejects the method with HTTP 405.
+	if err := c.doForm(ctx, OperationShareReceive, ProfileAndroid, http.MethodPost, EndpointShareReceive, nil, form, &envelope); err != nil {
 		return ReceiveResult{}, err
 	}
 	result := ReceiveResult{State: envelope.State == nil || bool(*envelope.State), Message: firstNonEmpty(envelope.Message, envelope.Error), Data: envelope.Data}

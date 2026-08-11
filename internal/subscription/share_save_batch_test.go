@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	_115sy "github.com/OpenListTeam/OpenList/v4/internal/115sy"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/stretchr/testify/require"
@@ -150,7 +151,7 @@ func TestSaveClusterShareSelectionBatchPan115UsesSingleTreeAndReceiveRequest(t *
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/webapi/share/receive":
+		case _115sy.EndpointShareReceiveApp:
 			receiveCalls++
 			require.NoError(t, r.ParseForm())
 			gotFileIDs = strings.Split(r.Form.Get("file_id"), ",")
@@ -172,6 +173,13 @@ func TestSaveClusterShareSelectionBatchPan115UsesSingleTreeAndReceiveRequest(t *
 		},
 	}
 	provider.webURL = server.URL
+	receiveClient, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "selected-cookie",
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	require.NoError(t, err)
+	provider.receiveClient = receiveClient
 
 	oldFactory := newShareSaverForProvider
 	t.Cleanup(func() { newShareSaverForProvider = oldFactory })
@@ -210,7 +218,7 @@ func TestSaveShareToTempPan115BatchesAcrossParentsIntoSingleReceiveRequest(t *te
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/webapi/share/receive":
+		case _115sy.EndpointShareReceiveApp:
 			receiveCalls++
 			require.NoError(t, r.ParseForm())
 			gotFileIDs = strings.Split(r.Form.Get("file_id"), ",")
@@ -238,6 +246,13 @@ func TestSaveShareToTempPan115BatchesAcrossParentsIntoSingleReceiveRequest(t *te
 		},
 	}
 	provider.webURL = server.URL
+	receiveClient, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1;CID=2",
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	require.NoError(t, err)
+	provider.receiveClient = receiveClient
 
 	entries, err := SaveShareToTemp(context.Background(), provider, ShareRef{
 		Provider: ShareProviderPan115,

@@ -13,4 +13,7 @@ func TestShouldRetryMediaTransferClassifiesProviderFailures(t *testing.T) {
 			t.Fatalf("error code %q should not be retryable", code)
 		}
 	}
+	if shouldRetryMediaTransfer("share_save_result_unknown", 0) {
+		t.Fatal("ambiguous share-save results must not be replayed automatically")
+	}
 }

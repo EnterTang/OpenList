@@ -100,8 +100,8 @@ var operationPolicies = map[Operation]operationPolicy{
 		FallbackHTTP405: true,
 	},
 	OperationShareReceive: {
-		Primary:         ProfileWeb,
-		Fallback:        ProfileAndroid,
+		Primary:         ProfileAndroid,
+		Fallback:        ProfileWeb,
 		FallbackHTTP405: true,
 	},
 	OperationShareDownloadURL: {

@@ -93,6 +93,7 @@ type pan115ShareProvider struct {
 	client         *resty.Client
 	limiter        *pan115RateLimiter
 	retryBaseDelay time.Duration
+	receiveClient  *_115sy.Client
 	confirmClient  *_115sy.Client
 	directClient   *_115sy.Client
 	confirmEnabled bool
@@ -120,6 +121,7 @@ func NewPan115ShareProvider(cfg model.SubscriptionTelegramPanConfig) ShareSaver 
 		})
 		provider.confirmClient = client
 		provider.directClient = client
+		provider.receiveClient = client
 	}
 	return provider
 }
@@ -308,6 +310,50 @@ func pan115DirectError(err error) error {
 	return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveTransient}
 }
 
+func pan115ReceiveError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var httpErr *_115sy.HTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveCredentialsInvalid}
+		case http.StatusMethodNotAllowed:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveMethodNotAllowed}
+		case http.StatusTooManyRequests:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveRateLimited}
+		case http.StatusRequestTimeout:
+			return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveTransient}
+		default:
+			if httpErr.StatusCode >= http.StatusInternalServerError {
+				return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveGatewayResponse}
+			}
+		}
+	}
+	var protocolErr *_115sy.ProtocolError
+	if errors.As(err, &protocolErr) {
+		// A successful HTTP response with an HTML or malformed body is
+		// ambiguous for a POST: the cloud may have accepted the save before
+		// the gateway rendered an error page. Do not blindly replay it.
+		return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveResultUnknown}
+	}
+	var businessErr *_115sy.BusinessError
+	if errors.As(err, &businessErr) {
+		if classified := pan115Error(businessErr.Message); classified != nil {
+			return classified
+		}
+	}
+	var networkErr *_115sy.NetworkError
+	if errors.As(err, &networkErr) {
+		return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveResultUnknown}
+	}
+	if code := classifyPan115ClusterErrorCode(err.Error()); code != "" {
+		return &pan115ClusterError{message: err.Error(), code: code}
+	}
+	return &pan115ClusterError{message: err.Error(), code: pan115ClusterErrorCodeShareSaveResultUnknown}
+}
+
 func pan115ErrorCode(err error) string {
 	var coded interface{ ClusterErrorCode() string }
 	if errors.As(err, &coded) {
@@ -346,29 +392,20 @@ func (p *pan115ShareProvider) SaveShareItems(ctx context.Context, ref ShareRef, 
 	if len(fileIDs) == 0 {
 		return nil, errors.New("115 share item ids are empty")
 	}
-	var resp pan115ReceiveResp
-	httpResp, err := p.doRequest(ctx, func() (*resty.Response, error) {
-		return p.client.R().
-			SetContext(ctx).
-			SetHeader("Cookie", p.cfg.Cookie).
-			SetHeader("Origin", p.webURL).
-			SetHeader("Referer", pan115ShareReferer(p.webURL, ref)).
-			SetFormData(map[string]string{
-				"cid":          firstNonEmpty(dstDirID, "0"),
-				"share_code":   ref.ShareID,
-				"receive_code": ref.Passcode,
-				"file_id":      strings.Join(fileIDs, ","),
-			}).
-			Post(p.webURL + "/webapi/share/receive")
+	if p.receiveClient == nil {
+		return nil, &pan115ClusterError{message: "115 share receive client is unavailable", code: pan115ClusterErrorCodeShareSaveResultUnknown}
+	}
+	received, err := p.receiveClient.ReceiveShare(ctx, _115sy.ReceiveShareRequest{
+		ShareCode:   ref.ShareID,
+		ReceiveCode: ref.Passcode,
+		TargetCID:   firstNonEmpty(dstDirID, "0"),
+		FileID:      strings.Join(fileIDs, ","),
 	})
 	if err != nil {
-		return nil, err
+		return nil, pan115ReceiveError(err)
 	}
-	if err := decodePan115JSON(httpResp, &resp); err != nil {
-		return nil, err
-	}
-	if !resp.State {
-		return nil, pan115Error(resp.Error)
+	if !received.State {
+		return nil, pan115Error(received.Message)
 	}
 	operation := pan115SaveOperation{
 		ShareID:       ref.ShareID,
@@ -644,8 +681,13 @@ func classifyPan115ClusterErrorCode(message string) string {
 	case strings.Contains(normalized, "rate limit"),
 		strings.Contains(normalized, "too many requests"),
 		strings.Contains(normalized, "限流"),
+		strings.Contains(normalized, "操作太频繁"),
 		strings.Contains(normalized, "429"):
 		return pan115ClusterErrorCodeShareSaveRateLimited
+	case strings.Contains(normalized, "请求异常需要重试"),
+		strings.Contains(normalized, "temporary unavailable"),
+		strings.Contains(normalized, "temporarily unavailable"):
+		return pan115ClusterErrorCodeShareSaveTransient
 	case strings.Contains(normalized, "分享已失效"),
 		strings.Contains(normalized, "分享已取消"),
 		strings.Contains(normalized, "分享不存在"),
@@ -812,11 +854,6 @@ func (f pan115File) shareItem(parentID string) ShareItem {
 			"share_fid_token": id,
 		},
 	}
-}
-
-type pan115ReceiveResp struct {
-	State bool   `json:"state"`
-	Error string `json:"error"`
 }
 
 func parsePan115Time(value string) time.Time {

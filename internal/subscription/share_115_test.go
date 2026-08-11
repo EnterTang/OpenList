@@ -208,10 +208,10 @@ func TestPan115ShareProviderSavesItems(t *testing.T) {
 	var receiveCalled bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/webapi/share/receive":
+		case _115sy.EndpointShareReceiveApp:
 			receiveCalled = true
-			if got := r.Header.Get("Cookie"); got != "UID=1;CID=2" {
-				t.Fatalf("cookie = %q, want UID=1;CID=2", got)
+			if r.Header.Get("app") != string(_115sy.ProfileAndroid) || r.Header.Get("appversion") == "" {
+				t.Fatalf("android headers = app=%q appversion=%q", r.Header.Get("app"), r.Header.Get("appversion"))
 			}
 			if err := r.ParseForm(); err != nil {
 				t.Fatalf("parse form: %v", err)
@@ -227,7 +227,16 @@ func TestPan115ShareProviderSavesItems(t *testing.T) {
 	defer server.Close()
 
 	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: " UID=1;CID=2 "})
-	provider.(*pan115ShareProvider).webURL = server.URL
+	receiveClient, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1;CID=2",
+		LimitRate:      1e6,
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new receive client: %v", err)
+	}
+	provider.(*pan115ShareProvider).receiveClient = receiveClient
 	ref := ShareRef{Provider: ShareProviderPan115, RawURL: "https://115cdn.com/s/swssal13zrk?password=t58d", ShareID: "swssal13zrk", Passcode: "t58d"}
 	items := []ShareItem{{ID: "file-1", Name: "Movie.mkv", Raw: map[string]any{"share_fid_token": "file-1"}}}
 
@@ -243,6 +252,43 @@ func TestPan115ShareProviderSavesItems(t *testing.T) {
 	}
 	if !receiveCalled {
 		t.Fatal("receive endpoint was not called")
+	}
+}
+
+func TestPan115ShareProviderDoesNotRetryAmbiguousHTMLReceive(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>gateway response</html>"))
+	}))
+	defer server.Close()
+
+	receiveClient, err := _115sy.NewClient(_115sy.ClientOptions{
+		Cookie:         "UID=1;CID=2",
+		AndroidBaseURL: server.URL,
+		WebBaseURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("new receive client: %v", err)
+	}
+	provider := NewPan115ShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "UID=1;CID=2"}).(*pan115ShareProvider)
+	provider.receiveClient = receiveClient
+
+	_, err = provider.SaveShareItems(context.Background(), ShareRef{Provider: ShareProviderPan115, ShareID: "share", Passcode: "pass"}, "", []ShareItem{{ID: "file-1", Name: "Movie.mkv"}}, "dst-dir")
+	if err == nil {
+		t.Fatal("expected ambiguous receive error")
+	}
+	if requests != 1 {
+		t.Fatalf("receive requests = %d, want one request", requests)
+	}
+	var coded interface{ ClusterErrorCode() string }
+	if !errors.As(err, &coded) || coded.ClusterErrorCode() != pan115ClusterErrorCodeShareSaveResultUnknown {
+		t.Fatalf("error code = %v, want %q", err, pan115ClusterErrorCodeShareSaveResultUnknown)
+	}
+	if !strings.Contains(err.Error(), "status=200") || !strings.Contains(err.Error(), "content-type=text/html") {
+		t.Fatalf("error = %q, want response metadata", err)
 	}
 }
 
@@ -319,6 +365,8 @@ func TestPan115ErrorClassifiesRetryAndPermanentProviderFailures(t *testing.T) {
 		want    string
 	}{
 		{message: "rate limit exceeded", want: pan115ClusterErrorCodeShareSaveRateLimited},
+		{message: "操作太频繁，请稍候再试", want: pan115ClusterErrorCodeShareSaveRateLimited},
+		{message: "请求异常需要重试", want: pan115ClusterErrorCodeShareSaveTransient},
 		{message: "分享已失效或取消", want: pan115ClusterErrorCodeShareSaveSourceInvalid},
 	}
 	for _, tc := range tests {

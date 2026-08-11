@@ -230,7 +230,19 @@ func (c *Client) do(ctx context.Context, operation Operation, profile Profile, m
 				*envelope.State = true
 				envelope.Data = append(json.RawMessage(nil), trimmedBody...)
 			} else if err := json.Unmarshal(respBody, &envelope); err != nil {
-				return &ProtocolError{Endpoint: endpoint, Message: fmt.Sprintf("invalid %s response body (%d bytes)", bodyKind(respBody, resp.Header.Get("Content-Type")), len(respBody))}
+				meta := ResponseMeta{
+					StatusCode:  resp.StatusCode,
+					ContentType: resp.Header.Get("Content-Type"),
+					BodyKind:    bodyKind(respBody, resp.Header.Get("Content-Type")),
+					BodyLength:  len(respBody),
+					Endpoint:    endpoint,
+					Profile:     currentProfile,
+				}
+				return &ProtocolError{
+					Endpoint: endpoint,
+					Message:  fmt.Sprintf("invalid %s response body (%d bytes)", meta.BodyKind, meta.BodyLength),
+					Meta:     &meta,
+				}
 			}
 		}
 
