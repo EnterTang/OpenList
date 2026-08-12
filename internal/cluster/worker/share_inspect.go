@@ -61,7 +61,7 @@ func inspectConfiguredShareTree(ctx context.Context, share protocol.ShareTaskCon
 	case subscription.ShareProviderPan123:
 		provider = subscription.NewPan123ShareProvider(withoutTempRoot(subscription.ResolveShareInspectConfig(subscription.ShareProviderPan123, cfg.Telegram.Pan123)))
 	case subscription.ShareProviderPan115:
-		provider = subscription.NewPan115ShareProvider(withoutTempRoot(cfg.Telegram.Pan115))
+		provider = subscription.NewPan115ShareProvider(withoutTempRoot(subscription.ResolveShareInspectConfig(subscription.ShareProviderPan115, cfg.Telegram.Pan115)))
 	case subscription.ShareProviderGuangYaPan:
 		resolvedCfg := subscription.ResolveShareInspectConfig(subscription.ShareProviderGuangYaPan, cfg.Telegram.GuangYaPan)
 		log.Infof("share inspect guangyapan: resolved access_token=%v, refresh_token=%v", resolvedCfg.AccessToken != "", resolvedCfg.RefreshToken != "")

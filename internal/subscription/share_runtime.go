@@ -299,6 +299,8 @@ func ResolveShareInspectConfig(provider ShareProviderName, cfg model.Subscriptio
 		if strings.TrimSpace(cfg.AccessToken) == "" {
 			cfg = pan123ConfigWithStorageFallback(cfg)
 		}
+	case ShareProviderPan115:
+		cfg = pan115ConfigWithStorageFallback(cfg)
 	case ShareProviderAliyunDrive:
 		if strings.TrimSpace(cfg.RefreshToken) == "" {
 			cfg = aliyunDriveConfigWithStorageFallback(cfg)

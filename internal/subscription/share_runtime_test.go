@@ -436,6 +436,24 @@ func TestPan123ConfigWithStorageFallbackPrefersStorageToken(t *testing.T) {
 	}
 }
 
+func TestResolveShareInspectConfigUsesPan115StorageCookie(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/115sy",
+		Driver:    "115 Cloud",
+		Addition:  `{"cookie":"storage-cookie"}`,
+	}); err != nil {
+		t.Fatalf("create 115 storage: %v", err)
+	}
+
+	cfg := ResolveShareInspectConfig(ShareProviderPan115, model.SubscriptionTelegramPanConfig{
+		Cookie: "stale-subscription-cookie",
+	})
+	if got, want := cfg.Cookie, "storage-cookie"; got != want {
+		t.Fatalf("cookie = %q, want live storage cookie %q", got, want)
+	}
+}
+
 func TestTrySaveShareLinkToTempHandlesPan123FastLink(t *testing.T) {
 	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "123Pan", Status: "work"})
 	oldFactory := newShareSaverForProvider
