@@ -3,8 +3,48 @@ package handles
 import (
 	"testing"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
+
+type fsReadProviderTestDriver struct {
+	name string
+}
+
+func (d fsReadProviderTestDriver) Config() driver.Config {
+	return driver.Config{Name: d.name}
+}
+
+func TestStorageProviderName(t *testing.T) {
+	tests := []struct {
+		name    string
+		storage storageProvider
+		want    string
+	}{
+		{
+			name: "nil storage",
+			want: "unknown",
+		},
+		{
+			name:    "driver config name",
+			storage: fsReadProviderTestDriver{name: "139Yun"},
+			want:    "139Yun",
+		},
+		{
+			name:    "empty config name",
+			storage: fsReadProviderTestDriver{},
+			want:    "unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := storageProviderName(tt.storage); got != tt.want {
+				t.Fatalf("storageProviderName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestGetReadme(t *testing.T) {
 	tests := []struct {

@@ -9,6 +9,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
 	"github.com/go-resty/resty/v2"
@@ -72,6 +74,9 @@ func getTime(t string) time.Time {
 func (d *Yun139) refreshToken() error {
 	if d.ref != nil {
 		return d.ref.refreshToken()
+	}
+	if d.useCookieAuthMode() {
+		return d.refreshCookieAuth(context.Background())
 	}
 	decode, err := base64.StdEncoding.DecodeString(d.Authorization)
 	if err != nil {
@@ -492,6 +497,10 @@ func unicode(str string) string {
 }
 
 func (d *Yun139) personalRequest(pathname string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	return d.personalRequestWithHeaders(pathname, method, callback, resp, nil)
+}
+
+func (d *Yun139) personalRequestWithHeaders(pathname string, method string, callback base.ReqCallback, resp interface{}, headers map[string]string) ([]byte, error) {
 	url := d.getPersonalCloudHost() + pathname
 	req := base.RestyClient.R()
 	randStr := random.String(16)
@@ -531,6 +540,9 @@ func (d *Yun139) personalRequest(pathname string, method string, callback base.R
 		"X-Yun-Module-Type":    "100",
 		"X-Yun-Svc-Type":       "1",
 	})
+	if len(headers) > 0 {
+		req.SetHeaders(headers)
+	}
 
 	var e BaseResp
 	req.SetResult(&e)
@@ -557,6 +569,12 @@ func (d *Yun139) personalPost(pathname string, data interface{}, resp interface{
 	return d.personalRequest(pathname, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, resp)
+}
+
+func (d *Yun139) personalUploadPost(pathname string, data interface{}, resp interface{}) ([]byte, error) {
+	return d.personalRequestWithHeaders(pathname, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data)
+	}, resp, d.personalUploadHeaders())
 }
 
 func (d *Yun139) isboPost(pathname string, data interface{}, resp interface{}) ([]byte, error) {
@@ -671,7 +689,14 @@ func (d *Yun139) getAccount() string {
 	if d.ref != nil {
 		return d.ref.getAccount()
 	}
-	return d.Account
+	if account := strings.TrimSpace(d.Account); account != "" {
+		return account
+	}
+	_, account, _, err := normalize139Authorization(d.Authorization)
+	if err == nil {
+		return account
+	}
+	return ""
 }
 
 func (d *Yun139) getPersonalCloudHost() string {
@@ -679,6 +704,81 @@ func (d *Yun139) getPersonalCloudHost() string {
 		return d.ref.getPersonalCloudHost()
 	}
 	return d.PersonalCloudHost
+}
+
+const (
+	personalUploadUserAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Electron/28.2.4 中国移动云盘/12.27.0"
+	personalUploadDefaultDeviceID = "b76e7ddc8f1a4601c4a594fa9f195a0c"
+)
+
+func (d *Yun139) personalUploadDeviceID() string {
+	if d.ref != nil {
+		return d.ref.personalUploadDeviceID()
+	}
+	if deviceID := strings.TrimSpace(d.UserDomainID); deviceID != "" {
+		return deviceID
+	}
+	return personalUploadDefaultDeviceID
+}
+
+func (d *Yun139) personalUploadClientInfo() string {
+	return "||13|12.27.0|PC|QkYtMjAyMDAzMTAxNjQ3|" + d.personalUploadDeviceID() + "||macOS 13.6|1978X1127|Q2hpbmVzZSAoU2ltcGxpZmllZCk=|||"
+}
+
+type personalUploadPartError struct {
+	PartNumber int
+	Expired    bool
+	Err        error
+}
+
+func (e *personalUploadPartError) Error() string {
+	if e == nil || e.Err == nil {
+		return "personal upload part failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *personalUploadPartError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+type personalUploadExpirationResponse struct {
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+func isPersonalUploadURLExpired(err error) bool {
+	var partErr *personalUploadPartError
+	if errors.As(err, &partErr) && partErr.Expired {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	const bodyMarker = "body:"
+	message := err.Error()
+	if index := strings.Index(message, bodyMarker); index >= 0 {
+		message = strings.TrimSpace(message[index+len(bodyMarker):])
+	}
+	var response personalUploadExpirationResponse
+	if xml.Unmarshal([]byte(message), &response) != nil {
+		return false
+	}
+	return response.Code == "AccessDenied" && response.Message == "Request has expired"
+}
+
+func (d *Yun139) personalUploadHeaders() map[string]string {
+	clientInfo := d.personalUploadClientInfo()
+	return map[string]string{
+		"User-Agent":        personalUploadUserAgent,
+		"X-Yun-App-Channel": "10301000",
+		"x-yun-device-id":   d.personalUploadDeviceID(),
+		"X-Yun-Client-Info": clientInfo,
+		"x-DeviceInfo":      clientInfo,
+	}
 }
 
 func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, uploadPartInfos []PersonalPartInfo, rateLimited *driver.RateLimitReader, p *driver.Progress) error {
@@ -693,10 +793,17 @@ func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, 
 			return fmt.Errorf("invalid PartNumber %d: index out of bounds (partInfos length: %d)", uploadPartInfo.PartNumber, len(partInfos))
 		}
 		partSize := partInfos[index].PartSize
+		uploadURL := uploadPartInfo.UploadUrl
+		if uploadURL == "" {
+			uploadURL = uploadPartInfo.CdnUploadUrl
+		}
+		if uploadURL == "" {
+			return fmt.Errorf("part %d upload url is empty", uploadPartInfo.PartNumber)
+		}
 		log.Debugf("[139] uploading part %+v/%+v", index, len(partInfos))
 		limitReader := io.LimitReader(rateLimited, partSize)
 		r := io.TeeReader(limitReader, p)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadPartInfo.UploadUrl, r)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, r)
 		if err != nil {
 			return err
 		}
@@ -704,6 +811,7 @@ func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, 
 		req.Header.Set("Content-Length", fmt.Sprint(partSize))
 		req.Header.Set("Origin", "https://yun.139.com")
 		req.Header.Set("Referer", "https://yun.139.com/")
+		req.Header.Set("User-Agent", personalUploadUserAgent)
 		req.ContentLength = partSize
 		err = func() error {
 			res, err := base.HttpClient.Do(req)
@@ -721,6 +829,99 @@ func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, 
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (d *Yun139) uploadPersonalPartsWithRefresh(ctx context.Context, partInfos []PartInfo, uploadPartInfos []PersonalPartInfo, stream model.FileStreamer, p *driver.Progress, firstPartNumber, lastPartNumber int64, refresh func([]PartInfo) ([]PersonalPartInfo, error)) error {
+	const maxRefreshAttempts = 3
+	for attempt := 0; ; attempt++ {
+		err := d.uploadPersonalPartsFromStream(ctx, partInfos, uploadPartInfos, stream, p, firstPartNumber)
+		if err == nil {
+			return nil
+		}
+		if !isPersonalUploadURLExpired(err) {
+			return err
+		}
+		if attempt >= maxRefreshAttempts {
+			return fmt.Errorf("refresh expired upload URL for part %d after %d attempts: %w", firstPartNumber, maxRefreshAttempts, err)
+		}
+		var partErr *personalUploadPartError
+		if !errors.As(err, &partErr) || partErr.PartNumber <= 0 {
+			return err
+		}
+		firstPartNumber = int64(partErr.PartNumber)
+		remaining := make([]PartInfo, 0, len(partInfos))
+		for _, partInfo := range partInfos {
+			if partInfo.PartNumber >= firstPartNumber && partInfo.PartNumber <= lastPartNumber {
+				remaining = append(remaining, partInfo)
+			}
+		}
+		if len(remaining) == 0 {
+			return fmt.Errorf("expired upload URL references unknown part %d: %w", partErr.PartNumber, err)
+		}
+		uploadPartInfos, err = refresh(remaining)
+		if err != nil {
+			return fmt.Errorf("refresh upload URL for part %d: %w", partErr.PartNumber, err)
+		}
+	}
+}
+
+func (d *Yun139) uploadPersonalPartsFromStream(ctx context.Context, partInfos []PartInfo, uploadPartInfos []PersonalPartInfo, stream model.FileStreamer, p *driver.Progress, firstPartNumber int64) error {
+	sort.Slice(uploadPartInfos, func(i, j int) bool {
+		return uploadPartInfos[i].PartNumber < uploadPartInfos[j].PartNumber
+	})
+	for _, uploadPartInfo := range uploadPartInfos {
+		partNumber := int64(uploadPartInfo.PartNumber)
+		if partNumber < firstPartNumber {
+			continue
+		}
+		index := uploadPartInfo.PartNumber - 1
+		if index < 0 || index >= len(partInfos) {
+			return fmt.Errorf("invalid PartNumber %d: index out of bounds (partInfos length: %d)", uploadPartInfo.PartNumber, len(partInfos))
+		}
+		partInfo := partInfos[index]
+		partSize := partInfo.PartSize
+		uploadURL := uploadPartInfo.UploadUrl
+		if uploadURL == "" {
+			uploadURL = uploadPartInfo.CdnUploadUrl
+		}
+		if uploadURL == "" {
+			return fmt.Errorf("part %d upload url is empty", uploadPartInfo.PartNumber)
+		}
+		reader, err := stream.RangeRead(http_range.Range{Start: partInfo.ParallelHashCtx.PartOffset, Length: partSize})
+		if err != nil {
+			return fmt.Errorf("read part %d: %w", uploadPartInfo.PartNumber, err)
+		}
+		rateLimited := driver.NewLimitedUploadStream(ctx, reader)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, rateLimited)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Content-Length", fmt.Sprint(partSize))
+		req.Header.Set("Origin", "https://yun.139.com")
+		req.Header.Set("Referer", "https://yun.139.com/")
+		req.Header.Set("User-Agent", personalUploadUserAgent)
+		req.ContentLength = partSize
+		res, err := base.HttpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(res.Body)
+		res.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if res.StatusCode != http.StatusOK {
+			responseErr := fmt.Errorf("unexpected status code: %d, body: %s", res.StatusCode, string(body))
+			return &personalUploadPartError{
+				PartNumber: int(uploadPartInfo.PartNumber),
+				Expired:    isPersonalUploadURLExpired(responseErr),
+				Err:        responseErr,
+			}
+		}
+		p.Add(partSize)
 	}
 	return nil
 }

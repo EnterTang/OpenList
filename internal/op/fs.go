@@ -560,6 +560,9 @@ func Copy(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		}
 	}
 
+	if !srcObj.IsDir() {
+		maybeProcessLocalPlugin(ctx, storage, stdpath.Join(dstDirPath, srcObj.GetName()))
+	}
 	if ctx.Value(conf.SkipHookKey) != nil || !needHandleObjsUpdateHook() {
 		return nil
 	}
@@ -588,10 +591,31 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		}
 		return errors.WithMessage(err, "failed to get object")
 	}
+	return RemoveExact(ctx, storage, path, rawObj)
+}
+
+// RemoveExact removes the already-resolved object without looking the path up
+// again. Callers that verified a remote object ID can use this to avoid a
+// time-of-check/time-of-use deletion race.
+func RemoveExact(ctx context.Context, storage driver.Driver, path string, rawObj model.Obj) error {
+	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+		return errors.WithMessagef(errs.StorageNotInit, "storage status: %s", storage.GetStorage().Status)
+	}
+	path = utils.FixAndCleanPath(path)
+	if utils.PathEqual(path, "/") {
+		return errors.New("delete root folder is not allowed")
+	}
+	if rawObj == nil {
+		return errors.New("exact removal object is required")
+	}
+	if stdpath.Base(path) != rawObj.GetName() {
+		return errors.New("exact removal object name does not match path")
+	}
 	if model.ObjHasMask(rawObj, model.NoRemove) {
 		return errors.WithStack(errs.PermissionDenied)
 	}
 	dirPath := stdpath.Dir(path)
+	var err error
 
 	switch s := storage.(type) {
 	case driver.Remove:
@@ -619,6 +643,15 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		var link string
 		dstDirPath, link = urlTreeSplitLineFormPath(stdpath.Join(dstDirPath, file.GetName()))
 		file = &stream.FileStream{Obj: &model.Object{Name: link}, Closers: utils.Closers{file}}
+	}
+	// Resolve unknown size before upload plugins that need a definite length (AntiHash).
+	if file.GetSize() < 0 {
+		log.Warnf("file size < 0, try to get full size from cache")
+		file.CacheFullAndWriter(nil, nil)
+	}
+	file, err := maybeProcessUploadPlugin(ctx, storage, file)
+	if err != nil {
+		return errors.WithMessagef(err, "upload plugin processing [%s]", file.GetName())
 	}
 	// if file exist and size = 0, delete it
 	dstDirPath = utils.FixAndCleanPath(dstDirPath)
@@ -659,12 +692,6 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		up = func(p float64) {}
 	}
 
-	// 如果小于0，则通过缓存获取完整大小，可能发生于流式上传
-	if file.GetSize() < 0 {
-		log.Warnf("file size < 0, try to get full size from cache")
-		file.CacheFullAndWriter(nil, nil)
-	}
-
 	var newObj model.Obj
 	switch s := storage.(type) {
 	case driver.PutResult:
@@ -695,6 +722,7 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		if ctx.Value(conf.SkipHookKey) == nil && needHandleObjsUpdateHook() {
 			go objsUpdateHook(context.WithoutCancel(ctx), storage, dstDirPath, false)
 		}
+		maybeProcessLocalPlugin(ctx, storage, dstPath)
 	}
 	log.Debugf("put file [%s] done", file.GetName())
 	if storage.Config().NoOverwriteUpload && fi != nil && fi.GetSize() > 0 {

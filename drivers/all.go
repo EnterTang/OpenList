@@ -2,8 +2,10 @@ package drivers
 
 import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/115"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_cd2"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_share"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_sy"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/123"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/123_link"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/123_open"
@@ -41,6 +43,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/github_releases"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/google_drive"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/google_photo"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/guangyapan"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/halalcloud"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/halalcloud_open"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/ilanzou"

@@ -8,6 +8,25 @@ import (
 )
 
 type OnCompletionFunc func(ctx context.Context, groupID string, payloads ...any)
+type PayloadHandler func(ctx context.Context, success bool, payload any)
+
+var payloadHandlers []PayloadHandler
+
+func RegisterPayloadHandler(handler PayloadHandler) {
+	if handler == nil {
+		return
+	}
+	payloadHandlers = append(payloadHandlers, handler)
+}
+
+func dispatchPayloadHandlers(ctx context.Context, success bool, payloads ...any) {
+	for _, payload := range payloads {
+		for _, handler := range payloadHandlers {
+			handler(ctx, success, payload)
+		}
+	}
+}
+
 type TaskGroupCoordinator struct {
 	name string
 	mu   sync.Mutex
@@ -31,7 +50,7 @@ func NewTaskGroupCoordinator(name string, f OnCompletionFunc) *TaskGroupCoordina
 	}
 }
 
-// payload可为nil
+// payload may be nil
 func (tgc *TaskGroupCoordinator) AddTask(groupID string, payload any) {
 	tgc.mu.Lock()
 	defer tgc.mu.Unlock()
@@ -67,12 +86,18 @@ func (tgc *TaskGroupCoordinator) Done(ctx context.Context, groupID string, succe
 	logrus.Debugf("Done:%s ,state=%+v", groupID, state)
 	if state.pending == 1 {
 		payloads := tgc.groupPayloads[groupID]
+		success := state.hasSuccess
 		delete(tgc.groupStates, groupID)
 		delete(tgc.groupPayloads, groupID)
-		if tgc.onCompletion != nil && state.hasSuccess {
+		if tgc.onCompletion != nil && success {
 			logrus.Debugf("OnCompletion:%s", groupID)
 			tgc.mu.Unlock()
 			tgc.onCompletion(ctx, groupID, payloads...)
+			dispatchPayloadHandlers(ctx, success, payloads...)
+			tgc.mu.Lock()
+		} else {
+			tgc.mu.Unlock()
+			dispatchPayloadHandlers(ctx, success, payloads...)
 			tgc.mu.Lock()
 		}
 		return

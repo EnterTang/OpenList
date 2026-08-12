@@ -1,0 +1,15 @@
+services:
+  openlist-etf:
+    image: ${OPENLIST_IMAGE:?set OPENLIST_IMAGE, for example tangente/openlist-etf:latest}
+    container_name: openlist-etf
+    restart: unless-stopped
+    user: "0:0"
+    ports:
+      - "${OPENLIST_HTTP_PORT:-5244}:5244"
+      - "${OPENLIST_SFTP_PORT:-5245}:5245"
+    volumes:
+      - "${OPENLIST_DATA_DIR:-/opt/openlist/data}:/opt/openlist/data"
+    environment:
+      UMASK: "${UMASK:-022}"
+      TZ: "${TZ:-Asia/Shanghai}"
+      OPENLIST_ADMIN_PASSWORD: "${OPENLIST_ADMIN_PASSWORD:-}"

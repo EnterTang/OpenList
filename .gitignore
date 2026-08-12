@@ -1,5 +1,6 @@
 .idea/
 .DS_Store
+.tmp-build/
 output/
 /dist/
 
@@ -8,6 +9,7 @@ output/
 *.exe~
 *.dll
 *.so
+*.syso
 *.dylib
 *.db
 *.bin
@@ -32,3 +34,12 @@ output/
 /!public/dist/README.md
 
 .VSCodeCounter
+.omx/
+.worktrees/
+*.tgz
+/internal/embeddedredis/assets/generated/*
+!/internal/embeddedredis/assets/generated/.gitkeep
+
+# Local agent brainstorm / companion sessions
+.superpowers/
+.gstack/

@@ -60,6 +60,15 @@ const (
 	HandleHookRateLimit     = "handle_hook_rate_limit"
 	IgnoreSystemFiles       = "ignore_system_files"
 
+	PluginAntiHashEnabled    = "plugin_antihash_enabled"
+	PluginISORenameEnabled   = "plugin_iso_rename_enabled"
+	PluginExtensionWhitelist = "plugin_extension_whitelist"
+
+	TMDBApiKey         = "tmdb_api_key"
+	TMDBApiBaseURL     = "tmdb_api_base_url"
+	TMDBLanguage       = "tmdb_language"
+	MediaCategoryRules = "media_category_rules"
+
 	// index
 	SearchIndex     = "search_index"
 	AutoUpdateIndex = "auto_update_index"
@@ -75,7 +84,8 @@ const (
 	TransmissionSeedtime = "transmission_seedtime"
 
 	// 115
-	Pan115TempDir = "115_temp_dir"
+	Pan115TempDir   = "115_temp_dir"
+	Pan115SYTempDir = "115_sy_temp_dir"
 
 	// 123
 	Pan123TempDir = "123_temp_dir"
@@ -94,6 +104,9 @@ const (
 
 	// thunder_browser
 	ThunderBrowserTempDir = "thunder_browser_temp_dir"
+
+	// guangyapan
+	GuangYaPanTempDir = "guangyapan_temp_dir"
 
 	// single
 	Token         = "token"
@@ -180,6 +193,8 @@ const (
 	_ ContextKey = iota
 
 	NoTaskKey
+	ForceTaskKey
+	TransferTaskPayloadKey
 	ApiUrlKey
 	UserKey
 	MetaKey
@@ -191,4 +206,5 @@ const (
 	PathKey
 	SharingIDKey
 	SkipHookKey
+	SkipPluginKey
 )

@@ -25,6 +25,26 @@ type Meta interface {
 	Drop(ctx context.Context) error
 }
 
+// ETFArchiveSettings describes the optional archive policy owned by a storage
+// driver. Cluster coordinators use it when their configured ETF root selects
+// the storage mount itself, so the driver's normal archive folder and target
+// notification settings remain the single source of truth.
+type ETFArchiveSettings struct {
+	RelativeRoot              string
+	AutoSubscriptionEnabled   bool
+	DirectImportEnabled       bool
+	TargetBaseURL             string
+	TargetAPIToken            string
+	TargetSupportsIdempotency bool
+	QuietWindowSeconds        int
+	SharePeriodUnit           int
+	ShareType                 string
+}
+
+type ETFArchiveSettingsProvider interface {
+	ETFArchiveSettings() ETFArchiveSettings
+}
+
 type Other interface {
 	Other(ctx context.Context, args model.OtherArgs) (interface{}, error)
 }
@@ -74,6 +94,10 @@ type Copy interface {
 
 type Remove interface {
 	Remove(ctx context.Context, obj model.Obj) error
+}
+
+type RecycleEntryCleaner interface {
+	ClearRecycleEntry(ctx context.Context, obj model.Obj) error
 }
 
 type Put interface {
@@ -217,4 +241,12 @@ type DirectUploader interface {
 	// actualPath is the path relative to the storage root (after removing mount path prefix)
 	// return errs.NotImplement if the driver does not support the given direct upload tool
 	GetDirectUploadInfo(ctx context.Context, tool string, dstDir model.Obj, fileName string, fileSize int64) (any, error)
+}
+
+type ETFPreviewNamer interface {
+	ETFPreviewName(ctx context.Context, file model.Obj) (string, error)
+}
+
+type ETFDownloadRestoreController interface {
+	ETFDownloadRestoreEnabled() bool
 }

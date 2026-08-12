@@ -1,6 +1,7 @@
 package static
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -13,22 +14,49 @@ type SiteConfig struct {
 }
 
 func getSiteConfig() SiteConfig {
-	siteConfig := SiteConfig{
-		BasePath: conf.URL.Path,
-		Cdn:      strings.ReplaceAll(strings.TrimSuffix(conf.Conf.Cdn, "/"), "$version", strings.TrimPrefix(conf.WebVersion, "v")),
-	}
-	if siteConfig.BasePath != "" {
-		siteConfig.BasePath = utils.FixAndCleanPath(siteConfig.BasePath)
+	basePath := conf.URL.Path
+	if basePath != "" {
+		basePath = utils.FixAndCleanPath(basePath)
 		// Keep consistent with frontend: trim trailing slash unless it's root
-		if siteConfig.BasePath != "/" && strings.HasSuffix(siteConfig.BasePath, "/") {
-			siteConfig.BasePath = strings.TrimSuffix(siteConfig.BasePath, "/")
+		if basePath != "/" && strings.HasSuffix(basePath, "/") {
+			basePath = strings.TrimSuffix(basePath, "/")
 		}
 	}
-	if siteConfig.BasePath == "" {
-		siteConfig.BasePath = "/"
+	if basePath == "" {
+		basePath = "/"
 	}
-	if siteConfig.Cdn == "" {
-		siteConfig.Cdn = strings.TrimSuffix(siteConfig.BasePath, "/")
+
+	siteConfig := SiteConfig{
+		BasePath: basePath,
+		Cdn:      normalizeDynamicBase(conf.Conf.Cdn, basePath),
 	}
 	return siteConfig
+}
+
+func normalizeDynamicBase(rawCdn string, basePath string) string {
+	fallback := strings.TrimSuffix(basePath, "/")
+	cdn := strings.TrimSpace(strings.ReplaceAll(rawCdn, "$version", strings.TrimPrefix(conf.WebVersion, "v")))
+	if cdn == "" {
+		return fallback
+	}
+
+	cdn = strings.TrimRight(cdn, "/")
+	if cdn == "" {
+		return fallback
+	}
+
+	parsed, err := url.Parse(cdn)
+	if err != nil {
+		return fallback
+	}
+	if parsed.Scheme != "" && parsed.Host == "" {
+		return fallback
+	}
+	if strings.HasPrefix(cdn, "//") && parsed.Host == "" {
+		return fallback
+	}
+	if parsed.Scheme == "" && !strings.HasPrefix(cdn, "/") {
+		return fallback
+	}
+	return cdn
 }

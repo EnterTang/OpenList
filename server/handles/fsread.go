@@ -1,12 +1,14 @@
 package handles
 
 import (
+	"context"
 	"fmt"
 	stdpath "path"
 	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -107,12 +109,11 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 		return
 	}
 	total, objs := pagination(objs, &req.PageReq)
-	provider := "unknown"
+	storage, storageErr := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
+	provider := storageProviderName(storage)
 	var directUploadTools []string
-	if canWriteContentAtPath {
-		if storage, err := fs.GetStorage(reqPath, &fs.GetStoragesArgs{}); err == nil {
-			directUploadTools = op.GetDirectUploadTools(storage)
-		}
+	if canWriteContentAtPath && storageErr == nil {
+		directUploadTools = op.GetDirectUploadTools(storage)
 	}
 	common.SuccessResp(c, FsListResp{
 		Content:            toObjsResp(objs, reqPath, isEncrypt(meta, reqPath)),
@@ -124,6 +125,17 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 		Provider:           provider,
 		DirectUploadTools:  directUploadTools,
 	})
+}
+
+type storageProvider interface {
+	Config() driver.Config
+}
+
+func storageProviderName(storage storageProvider) string {
+	if storage == nil || storage.Config().Name == "" {
+		return "unknown"
+	}
+	return storage.Config().Name
 }
 
 func FsDirs(c *gin.Context) {
@@ -310,6 +322,10 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	if !ok && err == nil {
 		provider = storage.Config().Name
 	}
+	typeName := obj.GetName()
+	if err == nil {
+		typeName = resolveETFPreviewTypeName(c.Request.Context(), storage, obj)
+	}
 	if !obj.IsDir() {
 		if err != nil {
 			common.ErrorResp(c, err, 500)
@@ -327,6 +343,8 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 					utils.EncodePath(reqPath, true),
 					query)
 			}
+		} else if typeName != obj.GetName() {
+			rawURL = buildObjectAccessURL(c, reqPath, isEncrypt(meta, reqPath), common.ShouldProxy(storage, typeName))
 		} else {
 			// file have raw url
 			if url, ok := model.GetUrl(obj); ok {
@@ -366,7 +384,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 			HashInfoStr:  obj.GetHash().String(),
 			HashInfo:     obj.GetHash().Export(),
 			Sign:         common.Sign(obj, parentPath, isEncrypt(meta, reqPath)),
-			Type:         utils.GetFileType(obj.GetName()),
+			Type:         utils.GetFileType(typeName),
 			Thumb:        thumb,
 			MountDetails: mountDetails,
 		},
@@ -376,6 +394,33 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 		Provider: provider,
 		Related:  toObjsResp(related, parentPath, isEncrypt(parentMeta, parentPath)),
 	})
+}
+
+func resolveETFPreviewTypeName(ctx context.Context, storage driver.Driver, obj model.Obj) string {
+	if obj == nil {
+		return ""
+	}
+	namer, ok := storage.(driver.ETFPreviewNamer)
+	if !ok || obj.IsDir() {
+		return obj.GetName()
+	}
+	name, err := namer.ETFPreviewName(ctx, obj)
+	if err != nil || name == "" {
+		return obj.GetName()
+	}
+	return name
+}
+
+func buildObjectAccessURL(c *gin.Context, reqPath string, encrypt bool, proxy bool) string {
+	query := ""
+	if encrypt || setting.GetBool(conf.SignAll) {
+		query = "?sign=" + sign.Sign(reqPath)
+	}
+	prefix := "/d"
+	if proxy {
+		prefix = "/p"
+	}
+	return fmt.Sprintf("%s%s%s%s", common.GetApiUrl(c), prefix, utils.EncodePath(reqPath, true), query)
 }
 
 func filterRelated(objs []model.Obj, obj model.Obj) []model.Obj {

@@ -5,12 +5,16 @@ type Additional interface{}
 type Select string
 
 type Item struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Default  string `json:"default"`
-	Options  string `json:"options"`
-	Required bool   `json:"required"`
-	Help     string `json:"help"`
+	Name        string `json:"name"`
+	Label       string `json:"label,omitempty"`
+	Type        string `json:"type"`
+	Default     string `json:"default"`
+	Options     string `json:"options"`
+	Required    bool   `json:"required"`
+	Help        string `json:"help"`
+	Group       string `json:"group,omitempty"`
+	Collapsed   bool   `json:"collapsed,omitempty"`
+	VisibleWhen string `json:"visible_when,omitempty"`
 }
 
 type Info struct {

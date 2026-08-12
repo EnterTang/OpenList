@@ -1,0 +1,823 @@
+package subscription
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+)
+
+func TestTrySaveShareLinkToTempCallsProviderWhenConfigured(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "Quark", Status: "work"})
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	var factoryProvider ShareProviderName
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		factoryProvider = provider
+		return &fakeShareSaver{}, nil
+	}
+	var savedRef ShareRef
+	var savedTempRoot string
+	var matchAccepted bool
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		savedRef = ref
+		savedTempRoot = opts.TempRoot
+		matchAccepted = opts.Match(TreeEntry{
+			RootPath: ref.RawURL,
+			Path:     "/Some.Show.S01E01.mkv",
+			Name:     "Some.Show.S01E01.mkv",
+		})
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Quark: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@quark"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "quark"},
+			Cookie:             "cookie",
+		},
+	})
+	sub := &model.Subscription{TMDBName: "Some Show"}
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), sub, cfg, "https://pan.quark.cn/s/bc18e4ea5fb8")
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled {
+		t.Fatal("handled = false, want true")
+	}
+	if source.Name != "quark" || factoryProvider != ShareProviderQuark {
+		t.Fatalf("source=%#v factoryProvider=%s, want quark", source, factoryProvider)
+	}
+	if savedRef.ShareID != "bc18e4ea5fb8" || savedTempRoot != "/tmp/quark" {
+		t.Fatalf("saved ref/root = %#v %q", savedRef, savedTempRoot)
+	}
+	if !matchAccepted {
+		t.Fatal("expected subscription media match to be accepted")
+	}
+}
+
+func TestTrySaveShareLinkToTempSkipsIncompleteConfig(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "Quark", Status: "work"})
+	oldFactory := newShareSaverForProvider
+	defer func() { newShareSaverForProvider = oldFactory }()
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		t.Fatal("factory should not be called without provider credentials")
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Quark: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@quark"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "quark"},
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "Some Show"}, cfg, "https://pan.quark.cn/s/bc18e4ea5fb8")
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if handled {
+		t.Fatal("handled = true, want false")
+	}
+	if source.Name != "quark" {
+		t.Fatalf("source = %#v, want quark fallback source", source)
+	}
+}
+
+type fakeAliyunOpenAddition struct{}
+
+type fakeAliyunOpenStorage struct {
+	model.Storage
+	driveID string
+}
+
+func (d *fakeAliyunOpenStorage) Config() driver.Config {
+	return driver.Config{Name: "AliyundriveOpen"}
+}
+
+func (d *fakeAliyunOpenStorage) GetAddition() driver.Additional {
+	return &fakeAliyunOpenAddition{}
+}
+
+func (d *fakeAliyunOpenStorage) Init(ctx context.Context) error {
+	return nil
+}
+
+func (d *fakeAliyunOpenStorage) Drop(ctx context.Context) error {
+	return nil
+}
+
+func (d *fakeAliyunOpenStorage) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	return nil, nil
+}
+
+func (d *fakeAliyunOpenStorage) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	return nil, nil
+}
+
+func (d *fakeAliyunOpenStorage) AliyunDriveID() string {
+	return d.driveID
+}
+
+func TestTrySaveShareLinkToTempDerivesAliyunDriveIDFromTempRootStorage(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	op.RegisterDriver(func() driver.Driver {
+		return &fakeAliyunOpenStorage{driveID: "storage-drive-1"}
+	})
+	storageID, err := op.CreateStorage(context.Background(), model.Storage{
+		MountPath: "/ali",
+		Driver:    "AliyundriveOpen",
+		Addition:  `{}`,
+		Status:    "work",
+	})
+	if err != nil {
+		t.Fatalf("create fake aliyun storage: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = op.DeleteStorageById(context.Background(), storageID)
+	})
+
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+	var factoryConfig model.SubscriptionTelegramPanConfig
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderAliyunDrive {
+			t.Fatalf("provider = %s, want aliyun", provider)
+		}
+		factoryConfig = cfg
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		if ref.ShareID != "odeXVKsEKxr" || opts.TempRoot != "/ali/.tmp-share" {
+			t.Fatalf("save ref/root = %#v %q", ref, opts.TempRoot)
+		}
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		AliyunDrive: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: ".tmp-share"},
+			AccessToken:        "access-1",
+			DriveID:            "stale-config-drive",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "Some Show"}, cfg, "https://www.alipan.com/s/odeXVKsEKxr")
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled {
+		t.Fatal("handled = false, want true")
+	}
+	if source.Name != "aliyun_drive" {
+		t.Fatalf("source = %#v, want aliyun fallback source", source)
+	}
+	if factoryConfig.AccessToken != "access-1" || factoryConfig.DriveID != "storage-drive-1" {
+		t.Fatalf("factory config = %#v, want access token and storage drive id", factoryConfig)
+	}
+}
+
+func TestTrySaveShareLinkToTempAllowsAliyunAccessTokenWithDriveID(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "AliyundriveOpen", Status: "work"})
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	var factoryProvider ShareProviderName
+	var factoryConfig model.SubscriptionTelegramPanConfig
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		factoryProvider = provider
+		factoryConfig = cfg
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		if ref.ShareID != "odeXVKsEKxr" || opts.TempRoot != "/tmp/aliyun" {
+			t.Fatalf("save ref/root = %#v %q", ref, opts.TempRoot)
+		}
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		AliyunDrive: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: "aliyun"},
+			AccessToken:        "access-1",
+			DriveID:            "drive-1",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "Some Show"}, cfg, "https://www.alipan.com/s/odeXVKsEKxr")
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled {
+		t.Fatal("handled = false, want true")
+	}
+	if source.Name != "aliyun_drive" || factoryProvider != ShareProviderAliyunDrive {
+		t.Fatalf("source=%#v factoryProvider=%s, want aliyun", source, factoryProvider)
+	}
+	if factoryConfig.AccessToken != "access-1" || factoryConfig.DriveID != "drive-1" {
+		t.Fatalf("factory config = %#v, want access token and drive id", factoryConfig)
+	}
+}
+
+func TestTrySaveShareLinkToTempAcceptsBareEpisodesForBoundShare(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "AliyundriveOpen", Status: "work"})
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderAliyunDrive {
+			t.Fatalf("provider = %s, want aliyun", provider)
+		}
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		cases := []struct {
+			entry TreeEntry
+			want  bool
+		}{
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/09 4K.mp4", Name: "09 4K.mp4"},
+				want:  true,
+			},
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/第 2季/02 4k.mp4", Name: "02 4k.mp4"},
+				want:  true,
+			},
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/第一季/01 4k.mp4", Name: "01 4k.mp4"},
+				want:  false,
+			},
+			{
+				entry: TreeEntry{RootPath: ref.RawURL, Path: "/poster.jpg", Name: "poster.jpg"},
+				want:  false,
+			},
+		}
+		for _, tc := range cases {
+			if got := opts.Match(tc.entry); got != tc.want {
+				t.Fatalf("match(%q) = %v, want %v", tc.entry.Path, got, tc.want)
+			}
+		}
+		return []TreeEntry{cases[0].entry, cases[1].entry}, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		AliyunDrive: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: "aliyun"},
+			AccessToken:        "access-1",
+			DriveID:            "drive-1",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{
+		TMDBName:  "非份之罪",
+		TMDBYear:  2026,
+		MediaType: "tv",
+		Seasons:   []int{2},
+	}, cfg, "https://www.alipan.com/s/odeXVKsEKxr")
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled {
+		t.Fatal("handled = false, want true")
+	}
+	if _, ok := source.BoundShareNames["09 4K.mp4"]; !ok {
+		t.Fatalf("bound names = %#v, want 09 4K.mp4", source.BoundShareNames)
+	}
+}
+
+func TestTrySaveShareLinkToTempUsesPan123StorageAccessTokenFallback(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/123",
+		Driver:    "123Pan",
+		Addition:  `{"AccessToken":" storage-token-123 ","username":"u","password":"p"}`,
+		Status:    "work",
+	}); err != nil {
+		t.Fatalf("create 123 storage: %v", err)
+	}
+
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	var factoryConfig model.SubscriptionTelegramPanConfig
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderPan123 {
+			t.Fatalf("provider = %s, want pan123", provider)
+		}
+		factoryConfig = cfg
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:         []string{"@pan123"},
+			TempTransferRoot: "/123/.tmp-share",
+		},
+	})
+
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#SomeShow.2025.S02E05.mp4"
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "SomeShow"}, cfg, fastLink)
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled || source.Name != "pan123" {
+		t.Fatalf("handled/source = %v/%#v, want pan123 handled", handled, source)
+	}
+	if !source.runtimeConfigResolved {
+		t.Fatal("runtime config resolved = false, want true after successful storage fallback")
+	}
+	if factoryConfig.AccessToken != "storage-token-123" {
+		t.Fatalf("factory access token = %q, want storage-token-123", factoryConfig.AccessToken)
+	}
+}
+
+func TestTrySaveShareLinkToTempLeavesRuntimeConfigUnresolvedWhenStorageResolutionFails(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@pan123"},
+			TempTransferRoot:   "/123-legacy/temp",
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+			AccessToken:        "stale-token",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "SomeShow"}, cfg, "https://www.123pan.com/s/7Tx1jv-pVu7v?pwd=xoxo")
+	if err == nil || !strings.Contains(err.Error(), "no compatible provider account for pan123") {
+		t.Fatalf("save share link error = %v, want storage resolution error", err)
+	}
+	if handled {
+		t.Fatal("handled = true, want false")
+	}
+	if source.runtimeConfigResolved {
+		t.Fatal("runtime config resolved = true after failed storage fallback")
+	}
+	if source.Config.TempTransferRoot != "/123-legacy/temp" {
+		t.Fatalf("temp transfer root = %q, want preserved legacy root", source.Config.TempTransferRoot)
+	}
+}
+
+func TestMergeBoundShareSourcePreservesResolvedRuntimeConfig(t *testing.T) {
+	existing := telegramPanSubscriptionSource{
+		Name:                  "pan123",
+		runtimeConfigResolved: true,
+		Config: model.SubscriptionTelegramPanConfig{
+			TempTransferRoot: "/123-selected/temp",
+			AccessToken:      "selected-token",
+		},
+		BoundShareNames: map[string]struct{}{"old.mkv": {}},
+	}
+	incoming := telegramPanSubscriptionSource{
+		Name: "pan123",
+		Config: model.SubscriptionTelegramPanConfig{
+			TempTransferRoot:   "/123-legacy/temp",
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "temp"},
+		},
+		BoundSharePaths: map[string]struct{}{`/new.mkv`: {}},
+	}
+
+	merged := mergeBoundShareSource(existing, incoming)
+	if !merged.runtimeConfigResolved || merged.Config.TempTransferRoot != "/123-selected/temp" || merged.Config.AccessToken != "selected-token" {
+		t.Fatalf("merged source = %#v, want existing resolved runtime config", merged)
+	}
+	if _, ok := merged.BoundShareNames["old.mkv"]; !ok {
+		t.Fatalf("bound names = %#v, want existing marker", merged.BoundShareNames)
+	}
+	if _, ok := merged.BoundSharePaths["/new.mkv"]; !ok {
+		t.Fatalf("bound paths = %#v, want incoming marker", merged.BoundSharePaths)
+	}
+}
+
+func TestPan123ConfigWithStorageFallbackPrefersStorageToken(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/123",
+		Driver:    "123Pan",
+		Addition:  `{"AccessToken":"live-storage-token"}`,
+	}); err != nil {
+		t.Fatalf("create 123 storage: %v", err)
+	}
+
+	cfg := pan123ConfigWithStorageFallback(model.SubscriptionTelegramPanConfig{
+		AccessToken: "stale-manual-token",
+	})
+	if got, want := cfg.AccessToken, "live-storage-token"; got != want {
+		t.Fatalf("access token = %q, want %q", got, want)
+	}
+}
+
+func TestResolveShareInspectConfigUsesPan115StorageCookie(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/115",
+		Driver:    "115 Cloud",
+		Addition:  `{"cookie":"storage-cookie"}`,
+	}); err != nil {
+		t.Fatalf("create 115 storage: %v", err)
+	}
+
+	cfg := ResolveShareInspectConfig(ShareProviderPan115, model.SubscriptionTelegramPanConfig{
+		Cookie: "stale-subscription-cookie",
+	})
+	if got, want := cfg.Cookie, "storage-cookie"; got != want {
+		t.Fatalf("cookie = %q, want live storage cookie %q", got, want)
+	}
+}
+
+func TestResolveShareInspectConfigUsesPan115SYStorageCookie(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/115sy",
+		Driver:    "115 SY",
+		Addition:  `{"cookie":"sy-storage-cookie"}`,
+	}); err != nil {
+		t.Fatalf("create 115 SY storage: %v", err)
+	}
+
+	cfg := ResolveShareInspectConfig(ShareProviderPan115, model.SubscriptionTelegramPanConfig{
+		Cookie: "stale-subscription-cookie",
+	})
+	if got, want := cfg.Cookie, "sy-storage-cookie"; got != want {
+		t.Fatalf("cookie = %q, want 115 SY storage cookie %q", got, want)
+	}
+}
+
+func TestIsPan115CookieStorageDriver(t *testing.T) {
+	for _, tc := range []struct {
+		driver string
+		want   bool
+	}{
+		{driver: "115 Cloud", want: true},
+		{driver: "115 SY", want: true},
+		{driver: "115 Open", want: false},
+		{driver: "115 CD2", want: false},
+		{driver: "123Pan", want: false},
+	} {
+		if got := isPan115CookieStorageDriver(tc.driver); got != tc.want {
+			t.Fatalf("isPan115CookieStorageDriver(%q) = %v, want %v", tc.driver, got, tc.want)
+		}
+	}
+}
+
+func TestTrySaveShareLinkToTempHandlesPan123FastLink(t *testing.T) {
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "123Pan", Status: "work"})
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#食神·百厨大战.2025.S02E05.mp4"
+	var factoryProvider ShareProviderName
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		factoryProvider = provider
+		return &fakeShareSaver{}, nil
+	}
+	var savedRef ShareRef
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		savedRef = ref
+		if opts.TempRoot != "/tmp/pan123" {
+			t.Fatalf("temp root = %q, want /tmp/pan123", opts.TempRoot)
+		}
+		if !opts.Match(TreeEntry{
+			RootPath: ref.RawURL,
+			Path:     "/食神·百厨大战.2025.S02E05.mp4",
+			Name:     "食神·百厨大战.2025.S02E05.mp4",
+		}) {
+			t.Fatal("expected fastlink media match to be accepted")
+		}
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		Pan123: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@pan123"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "pan123"},
+			AccessToken:        "access-123",
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "食神·百厨大战"}, cfg, fastLink)
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled {
+		t.Fatal("handled = false, want true")
+	}
+	if source.Name != "pan123" || factoryProvider != ShareProviderPan123 {
+		t.Fatalf("source=%#v factoryProvider=%s, want pan123", source, factoryProvider)
+	}
+	if savedRef.RawURL != fastLink || savedRef.ShareID != "a3531a60736740a152e931a6ecee9bfb" {
+		t.Fatalf("saved ref = %#v, want fastlink ref", savedRef)
+	}
+}
+
+func TestTrySaveShareLinkToTempUsesAliyunOpenWebRefreshTokenFallback(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/ali",
+		Driver:    "AliyundriveOpen",
+		Addition:  `{"web_refresh_token":" web-refresh-1 ","drive_type":"resource"}`,
+		Status:    "work",
+	}); err != nil {
+		t.Fatalf("create aliyun open storage: %v", err)
+	}
+
+	oldFactory := newShareSaverForProvider
+	oldSave := saveShareToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveShareToTemp = oldSave
+	}()
+
+	var factoryConfig model.SubscriptionTelegramPanConfig
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderAliyunDrive {
+			t.Fatalf("provider = %s, want aliyun", provider)
+		}
+		factoryConfig = cfg
+		return &fakeShareSaver{}, nil
+	}
+	saveShareToTemp = func(ctx context.Context, provider ShareSaver, ref ShareRef, opts SaveShareOptions) ([]TreeEntry, error) {
+		return nil, nil
+	}
+	cfg := normalizeTelegramSourceConfig(model.SubscriptionTelegramSourceConfig{
+		AliyunDrive: model.SubscriptionTelegramPanConfig{
+			Channels:           []string{"@aliyun"},
+			TempTransferTarget: model.SubscriptionStorageTarget{Provider: "aliyun_drive", Folder: ".tmp-share"},
+		},
+	})
+
+	source, handled, err := trySaveShareLinkToTemp(context.Background(), &model.Subscription{TMDBName: "Some Show"}, cfg, "https://www.alipan.com/s/odeXVKsEKxr")
+	if err != nil {
+		t.Fatalf("save share link: %v", err)
+	}
+	if !handled || source.Name != "aliyun_drive" {
+		t.Fatalf("handled/source = %v/%#v, want aliyun handled", handled, source)
+	}
+	if factoryConfig.RefreshToken != "web-refresh-1" {
+		t.Fatalf("factory refresh token = %q, want web-refresh-1", factoryConfig.RefreshToken)
+	}
+	if factoryConfig.DriveType != "resource" {
+		t.Fatalf("factory drive type = %q, want resource", factoryConfig.DriveType)
+	}
+}
+
+func TestTelegramPanTempRootWithStorageFallbackRejectsBareProviderRoot(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/123",
+		Driver:    "123Pan",
+		Status:    "work",
+	}); err != nil {
+		t.Fatalf("create 123 storage: %v", err)
+	}
+
+	_, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferRoot: "转存至移动",
+	})
+	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
+		t.Fatalf("error = %v, want manual confirmation", err)
+	}
+
+	cfg, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferRoot: "/123/转存至移动",
+	})
+	if err != nil {
+		t.Fatalf("resolve mounted temp config: %v", err)
+	}
+	if got, want := cfg.TempTransferRoot, "/123/转存至移动"; got != want {
+		t.Fatalf("mounted temp root = %q, want %q", got, want)
+	}
+}
+
+func TestTelegramPanTempRootWithStorageFallbackSkipsAmbiguousProviderStorage(t *testing.T) {
+	_, err := telegramPanSourceConfigWithStorageFallback(ShareProviderPan123, model.SubscriptionTelegramPanConfig{
+		TempTransferRoot: "转存至移动",
+	})
+	if err == nil || !strings.Contains(err.Error(), "manual confirmation") {
+		t.Fatalf("error = %v, want manual confirmation", err)
+	}
+}
+
+func TestRunManualShareProviderSavesTempRoot(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "Quark", Status: "work"})
+	if _, err := SaveConfig(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Quark: model.SubscriptionTelegramPanConfig{
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "quark", Folder: "quark"},
+				Cookie:             "cookie",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	oldInspect := inspectShareLinkCandidatesFn
+	oldSave := saveShareTransferCandidatesFn
+	defer func() {
+		inspectShareLinkCandidatesFn = oldInspect
+		saveShareTransferCandidatesFn = oldSave
+	}()
+
+	sub := &model.Subscription{
+		ID:           1,
+		SourceConfig: `{"links":["https://pan.quark.cn/s/bc18e4ea5fb8"]}`,
+		TMDBName:     "Some Show",
+		TargetRoot:   "/target",
+		MediaType:    "tv",
+		Category:     "test",
+	}
+	inspectShareLinkCandidatesFn = func(ctx context.Context, gotSub *model.Subscription, cfg model.SubscriptionTelegramSourceConfig, rawLink string, seenAt time.Time) (telegramPanSubscriptionSource, []shareTransferCandidate, bool, error) {
+		if rawLink != "https://pan.quark.cn/s/bc18e4ea5fb8" {
+			t.Fatalf("raw link = %q", rawLink)
+		}
+		source := telegramPanSubscriptionSource{
+			Name: string(ShareProviderQuark),
+			Config: model.SubscriptionTelegramPanConfig{
+				TempTransferRoot: "/tmp/quark",
+				Cookie:           "cookie",
+			},
+		}
+		entry := TreeEntry{
+			RootPath: rawLink,
+			Path:     "/Some.Show.S01E01.mkv",
+			Name:     "Some.Show.S01E01.mkv",
+			ID:       "file-1",
+			Size:     1024,
+			Modified: time.Unix(1700000000, 0),
+		}
+		item := itemFromEntry(gotSub, entry, seenAt)
+		item.SourceProvider = string(ShareProviderQuark)
+		return source, []shareTransferCandidate{{
+			Source: source,
+			Ref:    ShareRef{Provider: ShareProviderQuark, RawURL: rawLink, ShareID: "bc18e4ea5fb8"},
+			Pair:   shareTreePair{entry: entry, item: ShareItem{ID: "file-1", Name: entry.Name, Size: entry.Size}},
+			Entry:  entry,
+			Item:   item,
+		}}, true, nil
+	}
+	saveShareTransferCandidatesFn = func(ctx context.Context, selected []shareTransferCandidate) ([]shareTransferCandidate, error) {
+		if len(selected) != 1 {
+			t.Fatalf("selected = %#v, want 1", selected)
+		}
+		selected[0].Entry.RootPath = "/tmp/quark"
+		return selected, nil
+	}
+
+	items, _, added, _, _, err := runManual(context.Background(), sub, false)
+	if err != nil {
+		t.Fatalf("run manual: %v", err)
+	}
+	if added != 1 || len(items) != 1 {
+		t.Fatalf("added/items = %d/%d, want 1/1", added, len(items))
+	}
+	if items[0].Status != model.SubscriptionItemStatusPending || items[0].SourcePath != "/tmp/quark/Some.Show.S01E01.mkv" {
+		t.Fatalf("item = %#v, want pending temp file item", items[0])
+	}
+}
+
+func TestRunManualImportsTextSavesMatchingPan123Files(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	stubProviderTargetStorage(t, model.Storage{ID: 1, MountPath: "/tmp", Driver: "123Pan", Status: "work"})
+	if _, err := SaveConfig(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			Pan123: model.SubscriptionTelegramPanConfig{
+				TempTransferTarget: model.SubscriptionStorageTarget{Provider: "pan123", Folder: "pan123"},
+				AccessToken:        "token-1",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	oldFactory := newShareSaverForProvider
+	oldSaveImported := saveImportedFilesToTemp
+	defer func() {
+		newShareSaverForProvider = oldFactory
+		saveImportedFilesToTemp = oldSaveImported
+	}()
+
+	newShareSaverForProvider = func(provider ShareProviderName, cfg model.SubscriptionTelegramPanConfig) (ShareSaver, error) {
+		if provider != ShareProviderPan123 {
+			t.Fatalf("provider = %s, want pan123", provider)
+		}
+		if cfg.AccessToken != "token-1" || cfg.TempTransferRoot != "/tmp/pan123" {
+			t.Fatalf("cfg = %#v, want pan123 token and temp root", cfg)
+		}
+		return &fakeShareSaver{}, nil
+	}
+	var importedRoot string
+	var importedFiles []pan123ImportedFile
+	saveImportedFilesToTemp = func(ctx context.Context, provider ShareSaver, rootPath string, files []pan123ImportedFile, opts SaveShareOptions) ([]TreeEntry, error) {
+		importedRoot = rootPath
+		importedFiles = append([]pan123ImportedFile(nil), files...)
+		if opts.TempRoot != "/tmp/pan123" {
+			t.Fatalf("temp root = %q, want /tmp/pan123", opts.TempRoot)
+		}
+		if opts.Subscription != nil || opts.Match != nil {
+			t.Fatal("preselected import saves must not re-match or re-filter by subscription")
+		}
+		return []TreeEntry{{
+			RootPath: "/tmp/pan123",
+			Path:     "/达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
+			Name:     "达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv",
+		}}, nil
+	}
+
+	items, _, added, _, _, err := runManual(context.Background(), &model.Subscription{
+		ID:           1,
+		SourceConfig: `{"imports_text":"123FLCPV2$%69Y8N4KosSpjpcVCReGVzy#3531063629#达顿牧场 (2026) {tmdbid-299167}/Season 1/达顿牧场.S01E02.2026.1080p.Amazon Prime.WEB-DL.H.264.DDP 5.1-Ocat.mkv"}`,
+		TMDBName:     "达顿牧场",
+		TargetRoot:   "/target",
+		MediaType:    "tv",
+		Category:     "test",
+	}, false)
+	if err != nil {
+		t.Fatalf("run manual: %v", err)
+	}
+	if importedRoot == "" || len(importedFiles) != 1 {
+		t.Fatalf("root/files = %q %#v", importedRoot, importedFiles)
+	}
+	if added != 1 || len(items) != 1 {
+		t.Fatalf("added/items = %d/%d, want 1/1", added, len(items))
+	}
+}
+
+func TestRunManualImportsTextRequiresPan123Config(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if _, err := SaveConfig(model.SubscriptionConfig{}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	_, _, _, _, _, err := runManual(context.Background(), &model.Subscription{
+		ID:           1,
+		SourceConfig: `{"imports_text":"123FSLinkV2$bc18e4ea5fb89ec5778d1f38c9772f5f#1024#Movie.mkv"}`,
+		TMDBName:     "Movie",
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "pan123") {
+		t.Fatalf("err = %v, want pan123 config error", err)
+	}
+}
+
+func setupSubscriptionRuntimeDB(t *testing.T) {
+	t.Helper()
+	dsn := "file:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "?mode=memory&cache=shared"
+	database, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig("data")
+	db.Init(database)
+	op.SettingCacheUpdate()
+	t.Cleanup(func() {
+		op.SettingCacheUpdate()
+		sqlDB, err := database.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+}
+
+func stubProviderTargetStorage(t *testing.T, storage model.Storage) {
+	t.Helper()
+	oldList := listProviderTargetStorages
+	oldFree := storageFreeBytesForMountPath
+	listProviderTargetStorages = func() ([]model.Storage, error) { return []model.Storage{storage}, nil }
+	storageFreeBytesForMountPath = func(context.Context, string) (int64, bool) { return 1 << 40, true }
+	t.Cleanup(func() {
+		listProviderTargetStorages = oldList
+		storageFreeBytesForMountPath = oldFree
+	})
+}

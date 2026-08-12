@@ -190,12 +190,16 @@ func getAdditionalItems(t reflect.Type, defaultRoot string) []driver.Item {
 			continue
 		}
 		item := driver.Item{
-			Name:     name,
-			Type:     strings.ToLower(field.Type.Name()),
-			Default:  tag.Get("default"),
-			Options:  tag.Get("options"),
-			Required: tag.Get("required") == "true",
-			Help:     tag.Get("help"),
+			Name:        name,
+			Label:       tag.Get("label"),
+			Type:        strings.ToLower(field.Type.Name()),
+			Default:     tag.Get("default"),
+			Options:     tag.Get("options"),
+			Required:    tag.Get("required") == "true",
+			Help:        tag.Get("help"),
+			Group:       tag.Get("group"),
+			Collapsed:   tag.Get("collapsed") == "true",
+			VisibleWhen: tag.Get("visible_when"),
 		}
 		if tag.Get("type") != "" {
 			item.Type = tag.Get("type")

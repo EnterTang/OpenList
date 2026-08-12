@@ -17,6 +17,72 @@ import (
 	"gorm.io/gorm"
 )
 
+const defaultMediaCategoryRulesYAML = `movie:
+  动画片:
+    genre_ids: '16'
+  纪录片:
+    genre_ids: '99'
+  儿童家庭:
+    genre_ids: '10751'
+  动作片:
+    genre_ids: '28'
+  冒险片:
+    genre_ids: '12'
+  科幻片:
+    genre_ids: '878'
+  奇幻片:
+    genre_ids: '14'
+  悬疑片:
+    genre_ids: '9648'
+  惊悚片:
+    genre_ids: '53'
+  恐怖片:
+    genre_ids: '27'
+  犯罪片:
+    genre_ids: '80'
+  战争片:
+    genre_ids: '10752'
+  西部片:
+    genre_ids: '37'
+  喜剧片:
+    genre_ids: '35'
+  爱情片:
+    genre_ids: '10749'
+  剧情片:
+    genre_ids: '18'
+  历史片:
+    genre_ids: '36'
+  音乐片:
+    genre_ids: '10402'
+  电视电影:
+    genre_ids: '10770'
+  华语电影:
+    original_language: 'zh,cn,tw,hk'
+  外语电影:
+    original_language: '!zh,!cn,!tw,!hk'
+tv:
+  动漫:
+    genre_ids: '16'
+  纪录片:
+    genre_ids: '99'
+  综艺:
+    genre_ids: '10764,10767'
+  儿童节目:
+    genre_ids: '10762'
+  国产剧:
+    origin_country: 'CN'
+    original_language: 'zh,cn'
+  港台剧:
+    origin_country: 'TW,HK'
+  日韩剧:
+    origin_country: 'JP,KR'
+  欧美剧:
+    origin_country: 'US,GB,CA,AU,FR,DE,IT,ES'
+  海外其他剧:
+    origin_country: '!CN,!TW,!HK,!JP,!KR,!US,!GB'
+  未分类:
+`
+
 func initSettings() {
 	initialSettingItems := InitialSettings()
 	isActive := func(key string) bool {
@@ -187,6 +253,13 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.HandleHookAfterWriting, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.HandleHookRateLimit, Value: "0", Type: conf.TypeNumber, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.IgnoreSystemFiles, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `When enabled, ignores common system files during upload (.DS_Store, desktop.ini, Thumbs.db, and files starting with ._)`},
+		{Key: conf.PluginAntiHashEnabled, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
+		{Key: conf.PluginISORenameEnabled, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
+		{Key: conf.PluginExtensionWhitelist, Value: "", Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "Comma-separated extensions without dots, e.g. mkv,mp4,avi. Empty means no files are processed."},
+		{Key: conf.TMDBApiKey, Value: "", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "TMDB API key used for media search and metadata requests."},
+		{Key: conf.TMDBApiBaseURL, Value: "https://api.themoviedb.org/3", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "TMDB API root URL, for example https://api.themoviedb.org/3. The endpoint path is appended automatically."},
+		{Key: conf.TMDBLanguage, Value: "zh-CN", Type: conf.TypeString, Group: model.GLOBAL, Flag: model.PRIVATE, Help: "TMDB language tag, for example zh-CN or en-US."},
+		{Key: conf.MediaCategoryRules, Value: defaultMediaCategoryRulesYAML, Type: conf.TypeText, Group: model.GLOBAL, Flag: model.PRIVATE},
 
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},
@@ -243,6 +316,7 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.TaskOfflineDownloadTransferThreadsNum, Value: strconv.Itoa(conf.Conf.Tasks.Transfer.Workers), Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
 		{Key: conf.TaskUploadThreadsNum, Value: strconv.Itoa(conf.Conf.Tasks.Upload.Workers), Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
 		{Key: conf.TaskCopyThreadsNum, Value: strconv.Itoa(conf.Conf.Tasks.Copy.Workers), Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
+		{Key: conf.TaskMoveThreadsNum, Value: strconv.Itoa(conf.Conf.Tasks.Move.Workers), Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
 		{Key: conf.TaskDecompressDownloadThreadsNum, Value: strconv.Itoa(conf.Conf.Tasks.Decompress.Workers), Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
 		{Key: conf.TaskDecompressUploadThreadsNum, Value: strconv.Itoa(conf.Conf.Tasks.DecompressUpload.Workers), Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
 		{Key: conf.StreamMaxClientDownloadSpeed, Value: "-1", Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},

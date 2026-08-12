@@ -9,6 +9,7 @@ type Addition struct {
 	DriveType string `json:"drive_type" type:"select" options:"default,resource,backup" default:"resource"`
 	driver.RootID
 	RefreshToken       string `json:"refresh_token" required:"true"`
+	WebRefreshToken    string `json:"web_refresh_token" type:"text" help:"Aliyun web refresh token used by subscription share transfer; this is different from the OpenAPI refresh token"`
 	OrderBy            string `json:"order_by" type:"select" options:"name,size,updated_at,created_at"`
 	OrderDirection     string `json:"order_direction" type:"select" options:"ASC,DESC"`
 	UseOnlineAPI       bool   `json:"use_online_api" default:"true"`

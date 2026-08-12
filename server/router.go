@@ -2,6 +2,7 @@ package server
 
 import (
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
+	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/message"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
@@ -30,6 +31,9 @@ func Init(e *gin.Engine) {
 	g.Any("/ping", func(c *gin.Context) {
 		c.String(200, "pong")
 	})
+	if cluster.ParseRole(conf.Conf.Cluster.Role).RunsCoordinator() {
+		g.GET(conf.Conf.Cluster.WebSocketPath, gin.WrapH(cluster.WebSocketHandler()))
+	}
 	g.GET("/favicon.ico", handles.Favicon)
 	g.GET("/robots.txt", handles.Robots)
 	g.GET("/manifest.json", static.ManifestJSON)
@@ -67,6 +71,7 @@ func Init(e *gin.Engine) {
 	g.HEAD("/sad/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, handles.SharingArchiveExtract)
 
 	api := g.Group("/api")
+	api.GET("/115-cd2/oauth/callback", handles.CD2OAuthCallback)
 	auth := api.Group("", middlewares.Auth(false))
 	webauthn := api.Group("/authn", middlewares.Authn)
 
@@ -106,6 +111,8 @@ func Init(e *gin.Engine) {
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))
 	_sharing(auth.Group("/share", middlewares.AuthNotGuest))
+	externalSubscriptions(api.Group("/subscriptions", middlewares.ExternalSubscriptionAuth))
+	externalSubscriptions(api.Group("/v1/subscriptions", middlewares.ExternalSubscriptionAuth))
 	admin(auth.Group("/admin", middlewares.AuthAdmin))
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
@@ -115,7 +122,40 @@ func Init(e *gin.Engine) {
 	})
 }
 
+func externalSubscriptions(g *gin.RouterGroup) {
+	g.POST("", handles.ExternalCreateSubscription)
+	g.POST("/manual", handles.ExternalCreateSubscription)
+	g.GET("", handles.ExternalGetSubscription)
+	g.GET("/lookup", handles.ExternalLookupSubscription)
+	g.GET("/:id", handles.ExternalGetSubscription)
+	g.POST("/:id/check", handles.ExternalCheckSubscription)
+	g.POST("/:id/update", handles.ExternalUpdateSubscription)
+}
+
 func admin(g *gin.RouterGroup) {
+	clusterAdmin := g.Group("/cluster")
+	clusterAdmin.GET("/config", handles.GetClusterConfig)
+	clusterAdmin.POST("/config", handles.SaveClusterConfig)
+	clusterAdmin.GET("/nodes", handles.ListClusterNodes)
+	clusterAdmin.POST("/nodes/:id/delete", handles.DeleteClusterNode)
+	clusterAdmin.POST("/nodes/:id/inventory/query", handles.QueryClusterNodeInventory)
+	clusterAdmin.POST("/nodes/:id/state", handles.SetClusterNodeState)
+	clusterAdmin.POST("/nodes/:id/config", handles.ApplyClusterNodeConfig)
+	clusterAdmin.GET("/results", handles.ListClusterUploadResults)
+	clusterAdmin.GET("/jobs", handles.ListClusterJobs)
+	clusterAdmin.POST("/jobs/dispatch", handles.DispatchClusterMediaJob)
+	clusterAdmin.POST("/jobs/dispatch_batch", handles.DispatchClusterMediaBatch)
+	clusterAdmin.POST("/jobs/:id/retry", handles.RetryClusterJob)
+	clusterAdmin.POST("/jobs/clear_failed", handles.ArchiveFailedClusterJobs)
+	clusterAdmin.GET("/result_queue/stats", handles.GetClusterResultQueueStats)
+	clusterAdmin.POST("/result_queue/enqueue", handles.EnqueueClusterUploadResult)
+	clusterAdmin.GET("/secrets", handles.ListClusterSecrets)
+	clusterAdmin.POST("/secrets", handles.WriteClusterSecret)
+	clusterAdmin.POST("/secrets/:id/revoke", handles.RevokeClusterSecret)
+	clusterAdmin.GET("/storage-profiles", handles.ListClusterStorageProfiles)
+	clusterAdmin.POST("/storage-profiles", handles.ApplyClusterStorageProfile)
+	clusterAdmin.GET("/audit", handles.ListClusterControlAudit)
+
 	meta := g.Group("/meta")
 	meta.GET("/list", handles.ListMetas)
 	meta.GET("/get", handles.GetMeta)
@@ -160,6 +200,7 @@ func admin(g *gin.RouterGroup) {
 	setting.POST("/set_qbit", handles.SetQbittorrent)
 	setting.POST("/set_transmission", handles.SetTransmission)
 	setting.POST("/set_115", handles.Set115)
+	setting.POST("/set_115_sy", handles.Set115SY)
 	setting.POST("/set_115_open", handles.Set115Open)
 	setting.POST("/set_123_pan", handles.Set123Pan)
 	setting.POST("/set_123_open", handles.Set123Open)
@@ -167,6 +208,7 @@ func admin(g *gin.RouterGroup) {
 	setting.POST("/set_thunder", handles.SetThunder)
 	setting.POST("/set_thunderx", handles.SetThunderX)
 	setting.POST("/set_thunder_browser", handles.SetThunderBrowser)
+	setting.POST("/set_guangyapan", handles.SetGuangYaPan)
 
 	// retain /admin/task API to ensure compatibility with legacy automation scripts
 	_task(g.Group("/task"))
@@ -181,6 +223,54 @@ func admin(g *gin.RouterGroup) {
 	index.POST("/stop", middlewares.SearchIndex, handles.StopIndex)
 	index.POST("/clear", middlewares.SearchIndex, handles.ClearIndex)
 	index.GET("/progress", middlewares.SearchIndex, handles.GetProgress)
+
+	etfArchive := g.Group("/etf_archive")
+	etfArchive.GET("/list", handles.ListETFArchiveRecords)
+	etfArchive.POST("/correct", handles.CorrectETFArchiveRecord)
+	etfArchive.GET("/tmdb/search", handles.SearchETFArchiveTMDB)
+	etfArchive.POST("/manual/preview", handles.PreviewManualETFArchive)
+	etfArchive.POST("/manual/apply", handles.ApplyManualETFArchive)
+	etfArchive.POST("/recreate_archive", handles.RecreateArchiveETFFiles)
+	etfArchive.POST("/recreate_files", handles.RecreateETFFiles)
+	etfArchive.POST("/direct_import", handles.DirectImportETF)
+
+	etfAuto := g.Group("/etf_auto")
+	etfAuto.GET("/roots", handles.ListETFAutoMediaRoots)
+	etfAuto.GET("/jobs", handles.ListETFAutoJobs)
+	etfAuto.POST("/jobs/:id/retry_unknown", handles.RetryUnknownETFAutoJob)
+	etfAuto.POST("/check", handles.TriggerETFAutoSubscriptionCheck)
+	etfAuto.POST("/process", handles.ProcessETFAutoSubscriptionJobs)
+
+	mobileShare := g.Group("/mobile_share")
+	mobileShare.GET("/list", handles.ListMobileShareRecords)
+	mobileShare.POST("/create", handles.CreateMobileShare)
+	mobileShare.POST("/delete", handles.DeleteMobileShare)
+
+	subscription := g.Group("/subscription")
+	subscription.GET("/list", handles.ListSubscriptions)
+	subscription.GET("/get", handles.GetSubscription)
+	subscription.POST("/create", handles.CreateSubscription)
+	subscription.POST("/update", handles.UpdateSubscription)
+	subscription.POST("/delete", handles.DeleteSubscription)
+	subscription.POST("/preview", handles.PreviewSubscription)
+	subscription.POST("/check", handles.CheckSubscription)
+	subscription.POST("/retry_failed", handles.RetryFailedSubscription)
+	subscription.GET("/runs", handles.ListSubscriptionRuns)
+	subscription.GET("/board", handles.ListSubscriptionBoard)
+	subscription.GET("/episode_sources", handles.ListSubscriptionEpisodeSources)
+	subscription.POST("/runs/delete", handles.DeleteSubscriptionRun)
+	subscription.POST("/runs/clear_failed", handles.ClearFailedSubscriptionRuns)
+	subscription.POST("/resource/search", handles.SearchSubscriptionResources)
+	subscription.POST("/resource/unlock", handles.UnlockSubscriptionResource)
+	subscription.POST("/resource/bind", handles.BindSubscriptionResource)
+	subscription.POST("/resource/unbind", handles.UnbindSubscriptionResource)
+	subscription.GET("/config", handles.GetSubscriptionConfig)
+	subscription.POST("/config", handles.SaveSubscriptionConfig)
+	subscription.POST("/telegram/status", handles.TelegramSubscriptionStatus)
+	subscription.POST("/telegram/send_code", handles.TelegramSubscriptionSendCode)
+	subscription.POST("/telegram/signin", handles.TelegramSubscriptionSignIn)
+	subscription.POST("/telegram/logout", handles.TelegramSubscriptionLogout)
+	subscription.POST("/pansou/status", handles.PanSouSubscriptionStatus)
 
 	scan := g.Group("/scan")
 	scan.POST("/start", handles.StartManualScan)

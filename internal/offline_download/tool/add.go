@@ -10,8 +10,10 @@ import (
 
 	_115 "github.com/OpenListTeam/OpenList/v4/drivers/115"
 	_115_open "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
+	_115_sy "github.com/OpenListTeam/OpenList/v4/drivers/115_sy"
 	_123 "github.com/OpenListTeam/OpenList/v4/drivers/123"
 	_123_open "github.com/OpenListTeam/OpenList/v4/drivers/123_open"
+	"github.com/OpenListTeam/OpenList/v4/drivers/guangyapan"
 	"github.com/OpenListTeam/OpenList/v4/drivers/pikpak"
 	"github.com/OpenListTeam/OpenList/v4/drivers/thunder"
 	"github.com/OpenListTeam/OpenList/v4/drivers/thunder_browser"
@@ -124,6 +126,12 @@ func AddURL(ctx context.Context, args *AddURLArgs) (task.TaskExtensionInfo, erro
 		} else {
 			tempDir = filepath.Join(setting.GetStr(conf.Pan115OpenTempDir), uid)
 		}
+	case "115 SY":
+		if _, ok := storage.(*_115_sy.Pan115SY); ok {
+			tempDir = args.DstDirPath
+		} else {
+			tempDir = filepath.Join(setting.GetStr(conf.Pan115SYTempDir), uid)
+		}
 	case "123 Open":
 		if _, ok := storage.(*_123_open.Open123); ok && dstDirActualPath != "/" {
 			// directly offline downloading to the root path is not allowed via 123 open platform
@@ -155,6 +163,16 @@ func AddURL(ctx context.Context, args *AddURLArgs) (task.TaskExtensionInfo, erro
 			tempDir = args.DstDirPath
 		default:
 			tempDir = filepath.Join(setting.GetStr(conf.ThunderBrowserTempDir), uid)
+		}
+	case "GuangYaPan":
+		if _, ok := storage.(*guangyapan.GuangYaPan); ok {
+			tempDir = args.DstDirPath
+		} else {
+			tempBase := setting.GetStr(conf.GuangYaPanTempDir)
+			if tempBase == "" {
+				return nil, errors.New("GuangYaPan temp dir is not set")
+			}
+			tempDir = filepath.Join(tempBase, uid)
 		}
 	case "ThunderX":
 		if _, ok := storage.(*thunderx.ThunderX); ok {

@@ -1,0 +1,308 @@
+package subscription
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+)
+
+func TestNormalizeResourceSearchSources(t *testing.T) {
+	got := normalizeResourceSearchSources([]string{" telegram ", "pansou", "telegram"})
+	want := []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("sources = %#v, want %#v", got, want)
+	}
+	got = normalizeResourceSearchSources(nil)
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("default sources = %#v, want %#v", got, want)
+	}
+	got = normalizeResourceSearchSources([]string{"hdhive"})
+	if !stringSlicesEqual(got, []string{model.SubscriptionSourceHDHive}) {
+		t.Fatalf("hdhive sources = %#v, want hdhive only", got)
+	}
+	got = normalizeResourceSearchSources([]string{"all"})
+	if !stringSlicesEqual(got, []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive}) {
+		t.Fatalf("all sources = %#v, want all configured search sources", got)
+	}
+}
+
+func TestResourceSearchSourceCapabilitiesExposeMissingPanSouConfiguration(t *testing.T) {
+	capabilities := ResourceSearchSourceCapabilities(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{
+			APIID:    12345,
+			APIHash:  "configured",
+			Channels: []string{"@channel"},
+		},
+	})
+	if !capabilities[model.SubscriptionSourceTelegram].Available {
+		t.Fatalf("telegram capability = %#v, want available", capabilities[model.SubscriptionSourceTelegram])
+	}
+	panSou := capabilities[model.SubscriptionSourcePanSou]
+	if panSou.Configured || panSou.Available || panSou.UnavailableReason != "not_configured" {
+		t.Fatalf("pansou capability = %#v, want explicit unavailable status", panSou)
+	}
+
+	capabilities = ResourceSearchSourceCapabilities(model.SubscriptionConfig{
+		PanSou: model.SubscriptionPanSouSourceConfig{BaseURL: " https://pansou.example "},
+	})
+	panSou = capabilities[model.SubscriptionSourcePanSou]
+	if !panSou.Configured || !panSou.Available || panSou.UnavailableReason != "" {
+		t.Fatalf("configured pansou capability = %#v", panSou)
+	}
+
+	capabilities = ResourceSearchSourceCapabilities(model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{HDHive: model.SubscriptionTelegramHDHiveConfig{
+			Enabled:      true,
+			BaseURL:      "https://hdhive.example",
+			UserID:       "user-1",
+			ProxyUserKey: "user-key",
+			ProxySecret:  "secret",
+		}},
+	})
+	hdhive := capabilities[model.SubscriptionSourceHDHive]
+	if !hdhive.Configured || !hdhive.Available || hdhive.UnavailableReason != "" {
+		t.Fatalf("hdhive capability = %#v, want available", hdhive)
+	}
+}
+
+func TestFilterHDHiveResourcesByCloudType(t *testing.T) {
+	resources := []hdhive.Resource{
+		{Slug: "115-resource", PanType: "115"},
+		{Slug: "ed2k-resource", PanType: "ed2k"},
+		{Slug: "189-resource", PanType: "189"},
+	}
+	filtered := filterHDHiveResources(resources, "channel_115")
+	if len(filtered) != 2 || filtered[0].PanType != "115" || filtered[1].PanType != "ed2k" {
+		t.Fatalf("filtered = %#v, want 115 and ed2k", filtered)
+	}
+}
+
+func TestParseResourceSearchOutputExtractsLinks(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"data": []map[string]any{
+			{
+				"title":   "测试剧集 S01",
+				"channel": "tg_channel",
+				"links": []map[string]any{
+					{
+						"url":      "https://pan.quark.cn/s/abc123",
+						"password": "ABCD",
+					},
+				},
+			},
+			{
+				"name":    "115 资源",
+				"content": "链接 https://115.com/s/example 提取码：wxyz",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := parseResourceSearchOutput(model.SubscriptionSourcePanSou, body, 10)
+	if err != nil {
+		t.Fatalf("parse resource output: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results len = %d, want 2: %#v", len(results), results)
+	}
+	if results[0].Provider != string(ShareProviderQuark) || len(results[0].Links) != 1 {
+		t.Fatalf("first result links = %#v", results[0])
+	}
+	if results[0].Links[0].URL != "https://pan.quark.cn/s/abc123,ABCD" {
+		t.Fatalf("quark link = %q", results[0].Links[0].URL)
+	}
+	if results[1].Provider != string(ShareProviderPan115) {
+		t.Fatalf("second provider = %q", results[1].Provider)
+	}
+}
+
+func TestParseResourceSearchOutputFiltersByTitleAndSupportedShareLinks(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"data": []map[string]any{
+			{
+				"title":   "完全无关的资源",
+				"content": "正文里提到了 雨人，但标题不匹配 https://www.123pan.com/s/abc123",
+			},
+			{
+				"title":   "雨人 Rain Man 1988",
+				"content": "只有跳转链接 https://t.me/share_123pan_bot?start=2993 和论坛页 https://123panfx.com/thread-2993.htm",
+			},
+			{
+				"title":   "雨人 Rain Man 1988",
+				"content": "可用分享 https://www.123pan.com/s/realshare 提取码：Guce",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := parseResourceSearchOutput(model.SubscriptionSourcePanSou, body, 10)
+	if err != nil {
+		t.Fatalf("parse resource output: %v", err)
+	}
+	results = filterResourceSearchResults(results, "雨人", 10)
+	if len(results) != 1 {
+		t.Fatalf("filtered results len = %d, want 1: %#v", len(results), results)
+	}
+	if results[0].Title != "雨人 Rain Man 1988" {
+		t.Fatalf("title = %q, want %q", results[0].Title, "雨人 Rain Man 1988")
+	}
+	if len(results[0].Links) != 1 || results[0].Links[0].Provider != string(ShareProviderPan123) {
+		t.Fatalf("links = %#v, want single 123pan share link", results[0].Links)
+	}
+}
+
+func TestFilterResourceSearchResultsRejectsDocumentaryStyleSuffixTitles(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{{
+		Title: "千与千寻诞生秘话",
+		Links: []model.SubscriptionResourceSearchLink{{
+			URL:      "https://www.123pan.com/s/abc-def",
+			Provider: string(ShareProviderPan123),
+		}},
+	}}
+
+	filtered := filterResourceSearchResults(results, "千与千寻", 10)
+	if len(filtered) != 0 {
+		t.Fatalf("filtered len = %d, want 0: %#v", len(filtered), filtered)
+	}
+}
+
+func TestFilterResourceSearchResultsRejectsLongerChineseTitleSubstring(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{
+		{
+			Title: "老九门 2016",
+			Links: []model.SubscriptionResourceSearchLink{{
+				URL:      "https://www.123pan.com/s/abc-def",
+				Provider: string(ShareProviderPan123),
+			}},
+		},
+		{
+			Title: "九门 2025",
+			Links: []model.SubscriptionResourceSearchLink{{
+				URL:      "https://www.123pan.com/s/def-ghi",
+				Provider: string(ShareProviderPan123),
+			}},
+		},
+	}
+
+	filtered := filterResourceSearchResults(results, "九门", 10)
+	if len(filtered) != 1 || filtered[0].Title != "九门 2025" {
+		t.Fatalf("filtered = %#v, want only exact Chinese title", filtered)
+	}
+}
+
+func TestFilterResourceSearchResultsRejectsContentOnlyKeywordHits(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{{
+		Title:   "完全无关标题",
+		Content: "这里提到了 雨人 和 Rain Man",
+		Links: []model.SubscriptionResourceSearchLink{{
+			URL:      "https://www.123pan.com/s/abc-def",
+			Provider: string(ShareProviderPan123),
+		}},
+	}}
+
+	filtered := filterResourceSearchResults(results, "雨人", 10)
+	if len(filtered) != 0 {
+		t.Fatalf("filtered len = %d, want 0: %#v", len(filtered), filtered)
+	}
+}
+
+func TestResourceLinksFromTextIgnoresUnsupportedURLs(t *testing.T) {
+	links := resourceLinksFromText("论坛页 https://123panfx.com/thread-2993.htm 机器人 https://t.me/share_123pan_bot?start=2993", "")
+	if len(links) != 0 {
+		t.Fatalf("links = %#v, want empty", links)
+	}
+}
+
+func TestResourceLinksFromTextExtractsPan123FastLink(t *testing.T) {
+	fastLink := "123FSLinkV2$a3531a60736740a152e931a6ecee9bfb#500797103#食神·百厨大战.2025.S02E05.mp4"
+	links := resourceLinksFromText("分享链接 : \n"+fastLink+"\n", "")
+	if len(links) != 1 {
+		t.Fatalf("links len = %d, want 1: %#v", len(links), links)
+	}
+	if links[0].URL != fastLink || links[0].Provider != string(ShareProviderPan123) {
+		t.Fatalf("link = %#v, want pan123 fastlink", links[0])
+	}
+	if got := filterResourceSearchResults([]model.SubscriptionResourceSearchResult{{
+		Title: "食神·百厨大战 (2025) S02 E05",
+		Links: links,
+	}}, "食神·百厨大战", 10); len(got) != 1 {
+		t.Fatalf("filtered results = %#v, want single match", got)
+	}
+}
+
+func TestPanSouSearchEndpoint(t *testing.T) {
+	cases := map[string]string{
+		"https://example.com":            "https://example.com/api/search",
+		"https://example.com/api":        "https://example.com/api/search",
+		"https://example.com/api/search": "https://example.com/api/search",
+	}
+	for input, want := range cases {
+		got, err := panSouSearchEndpoint(input)
+		if err != nil {
+			t.Fatalf("endpoint(%q): %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("endpoint(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestPanSouResourceSearchForSubscriptionRanksAndFilters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/search" {
+			t.Fatalf("path = %q, want /api/search", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"title":"示例剧 S01E01-E04 4K","links":[{"url":"https://www.123pan.com/s/partial"}]},
+			{"title":"示例剧 S01 1080p 12集全 中字","links":[{"url":"https://www.123pan.com/s/complete"}]},
+			{"title":"完全无关的合集","content":"提到示例剧 https://www.123pan.com/s/noise"},
+			{"title":"示例剧 S02 1080p","links":[{"url":"https://www.123pan.com/s/wrong-season"}]}
+		]}`))
+	}))
+	defer server.Close()
+
+	results, err := searchPanSouResourcesForSubscription(context.Background(), &model.Subscription{
+		TMDBName:  "示例剧",
+		MediaType: "tv",
+		Seasons:   []int{1},
+	}, model.SubscriptionPanSouSourceConfig{BaseURL: server.URL, Limit: 10})
+	if err != nil {
+		t.Fatalf("search PanSou resources: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %#v, want partial and complete season 1 results", results)
+	}
+	if results[0].Title != "示例剧 S01 1080p 12集全 中字" {
+		t.Fatalf("first result = %#v, want complete pack first", results[0])
+	}
+}
+
+func TestFilterResourceSearchResultsDeduplicatesSharedLinksAndKeepsRicherTitle(t *testing.T) {
+	results := []model.SubscriptionResourceSearchResult{
+		{
+			Title: "示例剧 S01E01 1080p",
+			Links: []model.SubscriptionResourceSearchLink{{URL: "https://www.123pan.com/s/same"}},
+		},
+		{
+			Title: "示例剧 S01 12集全 1080p 中字",
+			Links: []model.SubscriptionResourceSearchLink{{URL: "https://www.123pan.com/s/same"}},
+		},
+	}
+	target := buildResourceMatchTarget(&model.Subscription{
+		TMDBName:  "示例剧",
+		MediaType: "tv",
+		Seasons:   []int{1},
+	}, "")
+	filtered := filterResourceSearchResultsForTarget(results, target, 10)
+	if len(filtered) != 1 || filtered[0].Title != "示例剧 S01 12集全 1080p 中字" {
+		t.Fatalf("filtered = %#v, want one richer result", filtered)
+	}
+}

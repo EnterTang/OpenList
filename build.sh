@@ -14,9 +14,57 @@ fi
 
 # Check for lite parameter
 useLite=false
-if [[ "$*" == *"lite"* ]]; then
-  useLite=true
-fi
+for arg in "$@"; do
+  if [ "$arg" = "lite" ]; then
+    useLite=true
+    break
+  fi
+done
+
+ResolveLatestFrontendTag() {
+  if [ -n "$FRONTEND_VERSION" ]; then
+    echo "$FRONTEND_VERSION"
+    return
+  fi
+  latest_url=$(curl -fsSLI --max-time 10 -o /dev/null -w '%{url_effective}' "https://github.com/$frontendRepo/releases/latest" 2>/dev/null || true)
+  latest_tag="${latest_url##*/}"
+  if [ -n "$latest_tag" ] && [ "$latest_tag" != "latest" ]; then
+    echo "$latest_tag"
+  else
+    echo "latest"
+  fi
+}
+
+ResolveLocalFrontendVersion() {
+  if [ -n "${FRONTEND_VERSION:-}" ]; then
+    echo "$FRONTEND_VERSION"
+    return 0
+  fi
+  local dir="${FRONTEND_DIR:-}"
+  if [ -z "$dir" ] || [ ! -f "$dir/package.json" ]; then
+    return 1
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -p "require('$dir/package.json').version" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
+
+installLocalFrontendDist() {
+  local dir="${FRONTEND_DIR:-}"
+  if [ -z "$dir" ]; then
+    return 1
+  fi
+  if [ ! -d "$dir/dist" ]; then
+    echo "FRONTEND_DIR dist not found: $dir/dist" >&2
+    exit 1
+  fi
+  rm -rf public/dist && mkdir -p public/dist
+  cp -R "$dir/dist/." public/dist/
+  echo "using local frontend from $dir/dist"
+  return 0
+}
 
 if [ "$1" = "dev" ]; then
   version="dev"
@@ -25,10 +73,15 @@ elif [ "$1" = "beta" ]; then
   version="beta"
   webVersion="rolling"
 else
-  git tag -d beta || true
+  git tag -d beta >/dev/null 2>&1 || true
   # Always true if there's no tag
   version=$(git describe --abbrev=0 --tags 2>/dev/null || echo "v0.0.0")
-  webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+  webVersion="$(ResolveLatestFrontendTag)"
+fi
+
+localFrontendVersion="$(ResolveLocalFrontendVersion 2>/dev/null || true)"
+if [ -n "$localFrontendVersion" ]; then
+  webVersion="$localFrontendVersion"
 fi
 
 echo "backend version: $version"
@@ -47,6 +100,61 @@ ldflags="\
 -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=$version' \
 -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=$webVersion' \
 "
+
+# Generate Windows resource (.syso) with version info and application manifest.
+# This embeds version metadata and a trustInfo manifest into the .exe, which
+# helps Windows application control policies (Smart App Control, AppLocker)
+# identify the binary and reduces false-positive blocks.
+GenerateWindowsResource() {
+  if [ ! -f resource/windows.syso ]; then
+    echo "generating Windows resource (.syso) with manifest and version info"
+    if ! command -v rsrc >/dev/null 2>&1; then
+      go install github.com/akavel/rsrc@latest >/dev/null 2>&1
+    fi
+    # Parse version (e.g. v3.25.0 → 3,25,0,0) for Windows VS_VERSION_INFO
+    ver_major=$(echo "$version" | sed 's/^v//' | cut -d. -f1)
+    ver_minor=$(echo "$version" | sed 's/^v//' | cut -d. -f2)
+    ver_patch=$(echo "$version" | sed 's/^v//' | cut -d. -f3)
+    ver_build=0
+    [ -z "$ver_major" ] && ver_major=0
+    [ -z "$ver_minor" ] && ver_minor=0
+    [ -z "$ver_patch" ] && ver_patch=0
+
+    cat > resource/versioninfo.json <<EOF
+{
+  "FixedInfo": {
+    "FileVersion":    { "Major": $ver_major, "Minor": $ver_minor, "Patch": $ver_patch, "Build": $ver_build },
+    "ProductVersion": { "Major": $ver_major, "Minor": $ver_minor, "Patch": $ver_patch, "Build": $ver_build },
+    "FileFlagsMask": "3f",
+    "FileFlags ": "00",
+    "FileOS": "04000",
+    "FileType": "01",
+    "FileSubType": "00",
+  },
+  "StringTable": {
+    "CompanyName":      "OpenListTeam",
+    "FileDescription":  "OpenList - File List Program",
+    "FileVersion":      "$ver_major.$ver_minor.$ver_patch.$ver_build",
+    "InternalName":     "openlist",
+    "LegalCopyright":   "MIT License",
+    "OriginalFilename": "openlist.exe",
+    "ProductName":      "OpenList",
+    "ProductVersion":   "$version"
+  },
+  "IconPath": "",
+  "ManifestPath": "resource/app.manifest"
+}
+EOF
+    rsrc -manifest resource/app.manifest -json resource/versioninfo.json -arch amd64 -o resource/windows.syso || {
+      echo "Warning: rsrc failed, building without Windows resource" >&2
+      rm -f resource/versioninfo.json
+      return 0
+    }
+    rm -f resource/versioninfo.json
+    # Copy .syso to project root so go build automatically links it
+    cp resource/windows.syso windows.syso
+  fi
+}
 
 # Keep sqlite driver tag selection centralized to avoid target drift.
 GetBuildTagsForTarget() {
@@ -97,36 +205,94 @@ AssertStaticBinary() {
 }
 
 FetchWebRolling() {
-  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
-  pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
-  
-  # There is no lite for rolling
-  pre_release_tar_url=$(echo "$pre_release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
-
-  curl -fsSL "$pre_release_tar_url" -o dist.tar.gz
+  if installLocalFrontendDist; then
+    return 0
+  fi
+  # There is no lite for rolling.
+  if ! FetchWebDistForTag "rolling" false; then
+    FetchWebRollingFromAPI
+  fi
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
 }
 
 FetchWebRelease() {
-  release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
-  release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
-  
-  if [ "$useLite" = true ]; then
-    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist-lite" | grep "\.tar\.gz$")
-  else
-    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+  if installLocalFrontendDist; then
+    return 0
   fi
-  
-  curl -fsSL "$release_tar_url" -o dist.tar.gz
+  if ! FetchWebDistForTag "$webVersion" "$useLite"; then
+    FetchWebReleaseFromAPI
+  fi
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
 }
 
+FetchWebDistForTag() {
+  tag="$1"
+  lite="$2"
+  if [ -n "$FRONTEND_DIST_URL" ]; then
+    frontend_tar_url="$FRONTEND_DIST_URL"
+  else
+    frontend_tar_url="$(ResolveFrontendAssetURL "$tag" "$lite")"
+  fi
+  [ -n "$frontend_tar_url" ] || return 1
+  curl -fsSL --retry 3 "$frontend_tar_url" -o dist.tar.gz
+}
+
+ResolveFrontendAssetURL() {
+  tag="$1"
+  lite="$2"
+  assets_html=$(curl -fsSL --max-time 20 "https://github.com/$frontendRepo/releases/expanded_assets/$tag" 2>/dev/null || true)
+  if [ -z "$assets_html" ]; then
+    return 1
+  fi
+  if [ "$lite" = true ]; then
+    asset_href=$(echo "$assets_html" | grep -o 'href="[^"]*openlist-frontend-dist-lite[^"]*\.tar\.gz"' | head -n 1 | sed 's/^href="//;s/"$//')
+  else
+    asset_href=$(echo "$assets_html" | grep -o 'href="[^"]*openlist-frontend-dist[^"]*\.tar\.gz"' | grep -v 'lite' | head -n 1 | sed 's/^href="//;s/"$//')
+  fi
+  if [ -z "$asset_href" ]; then
+    return 1
+  fi
+  case "$asset_href" in
+    http*) echo "$asset_href" ;;
+    *) echo "https://github.com$asset_href" ;;
+  esac
+}
+
+FetchWebRollingFromAPI() {
+  if [ -z "$GITHUB_TOKEN" ]; then
+    echo "failed to download rolling frontend without GitHub API; set FRONTEND_DIST_URL to a reachable tar.gz mirror" >&2
+    return 1
+  fi
+  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
+  pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
+  pre_release_tar_url=$(echo "$pre_release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+  curl -fsSL "$pre_release_tar_url" -o dist.tar.gz
+}
+
+FetchWebReleaseFromAPI() {
+  if [ -z "$GITHUB_TOKEN" ]; then
+    echo "failed to download release frontend without GitHub API; set FRONTEND_DIST_URL to a reachable tar.gz mirror" >&2
+    return 1
+  fi
+  release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
+  release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
+
+  if [ "$useLite" = true ]; then
+    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist-lite" | grep "\.tar\.gz$")
+  else
+    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+  fi
+
+  curl -fsSL "$release_tar_url" -o dist.tar.gz
+}
+
 BuildWinArm64() {
   echo building for windows-arm64
+  GenerateWindowsResource
   chmod +x ./wrapper/zcc-arm64
   chmod +x ./wrapper/zcxx-arm64
   export GOOS=windows
@@ -138,6 +304,7 @@ BuildWinArm64() {
 }
 
 BuildWin7() {
+  GenerateWindowsResource
   # Setup Win7 Go compiler (patched version that supports Windows 7)
   go_version=$(go version | grep -o 'go[0-9]\+\.[0-9]\+\.[0-9]\+' | sed 's/go//')
   echo "Detected Go version: $go_version"
@@ -282,6 +449,99 @@ BuildRelease() {
   # Separate from musl builds to avoid cache conflicts
   BuildLoongGLIBC ./build/$appName-linux-loong64-abi1.0 abi1.0
   BuildLoongGLIBC ./build/$appName-linux-loong64 abi2.0
+}
+
+InstallLinuxAmd64MuslToolchain() {
+  mkdir -p build/musl-libs
+  if [ -x build/musl-libs/bin/x86_64-linux-musl-gcc ]; then
+    export PATH="$PATH:$PWD/build/musl-libs/bin"
+    return 0
+  fi
+  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
+  FILE=x86_64-linux-musl-cross
+  lib_tgz="build/${FILE}.tgz"
+  curl -fsSL -o "${lib_tgz}" "${BASE}${FILE}.tgz"
+  tar xf "${lib_tgz}" --strip-components 1 -C build/musl-libs
+  rm -f "${lib_tgz}"
+  export PATH="$PATH:$PWD/build/musl-libs/bin"
+}
+
+UseZigCrossCompiler() {
+  command -v zig >/dev/null 2>&1
+}
+
+UseXgoDocker() {
+  command -v xgo >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+BuildReleaseLinuxAmd64Musl() {
+  mkdir -p build
+  muslflags="$(GetMuslStaticLdflags)"
+  echo building for linux-musl-amd64
+  export GOOS=linux
+  export GOARCH=amd64
+  export CGO_ENABLED=1
+  if UseZigCrossCompiler; then
+    export CC="zig cc -target x86_64-linux-musl"
+    export CXX="zig c++ -target x86_64-linux-musl"
+  else
+    InstallLinuxAmd64MuslToolchain
+    export CC=x86_64-linux-musl-gcc
+  fi
+  CGO_LDFLAGS="-static" go build -o ./build/$appName-linux-musl-amd64 -ldflags="$muslflags" -tags=jsoniter .
+  AssertStaticBinary "./build/$appName-linux-musl-amd64"
+}
+
+BuildReleaseWindowsAmd64() {
+  mkdir -p build
+  echo building for windows-amd64
+  GenerateWindowsResource
+  if UseXgoDocker; then
+    xgo -targets=windows/amd64 -out "$appName" -ldflags="$ldflags" -tags=jsoniter .
+    mv "$appName"-windows-amd64.exe build/
+    return
+  fi
+  if ! UseZigCrossCompiler; then
+    echo "windows-amd64 build requires docker+xgo or zig" >&2
+    exit 1
+  fi
+  chmod +x ./wrapper/zcc-win7 ./wrapper/zcxx-win7
+  export GOOS=windows
+  export GOARCH=amd64
+  export CGO_ENABLED=1
+  export CC="$(pwd)/wrapper/zcc-win7"
+  export CXX="$(pwd)/wrapper/zcxx-win7"
+  go build -o build/$appName-windows-amd64.exe -ldflags="$ldflags" -tags=jsoniter .
+}
+
+BuildReleaseDarwinAmd64() {
+  mkdir -p build
+  echo building for darwin-amd64
+  if UseXgoDocker; then
+    xgo -targets=darwin/amd64 -out "$appName" -ldflags="$ldflags" -tags=jsoniter .
+    mv "$appName"-darwin-amd64 build/
+    return
+  fi
+  if ! UseZigCrossCompiler; then
+    echo "darwin-amd64 build requires docker+xgo or zig" >&2
+    exit 1
+  fi
+  export GOOS=darwin
+  export GOARCH=amd64
+  export CGO_ENABLED=1
+  export CC="zig cc -target x86_64-macos"
+  export CXX="zig c++ -target x86_64-macos"
+  go build -o build/$appName-darwin-amd64 -ldflags="$ldflags" -tags=jsoniter .
+}
+
+BuildReleaseAmd64() {
+  BuildReleaseWindowsAmd64
+  if [ "$(uname -m)" = "x86_64" ]; then
+    BuildReleaseDarwinAmd64
+  else
+    echo "skipping darwin-amd64 on $(uname -m); use docker+xgo or an Intel Mac to build it"
+  fi
+  BuildReleaseLinuxAmd64Musl
 }
 
 BuildLoongGLIBC() {
@@ -620,7 +880,7 @@ for arg in "$@"; do
         buildType="$arg"
       fi
       ;;
-    docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web)
+    docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web|windows_amd64|linux_amd64_musl|darwin_amd64|amd64)
       if [ -z "$dockerType" ]; then
         dockerType="$arg"
       fi
@@ -687,6 +947,34 @@ elif [ "$buildType" = "release" -o "$buildType" = "beta" ]; then
     fi
   elif [ "$dockerType" = "web" ]; then
     echo "web only"
+  elif [ "$dockerType" = "windows_amd64" ]; then
+    BuildReleaseWindowsAmd64
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-windows-amd64-lite.txt"
+    else
+      MakeRelease "md5-windows-amd64.txt"
+    fi
+  elif [ "$dockerType" = "linux_amd64_musl" ]; then
+    BuildReleaseLinuxAmd64Musl
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-linux-amd64-musl-lite.txt"
+    else
+      MakeRelease "md5-linux-amd64-musl.txt"
+    fi
+  elif [ "$dockerType" = "darwin_amd64" ]; then
+    BuildReleaseDarwinAmd64
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-darwin-amd64-lite.txt"
+    else
+      MakeRelease "md5-darwin-amd64.txt"
+    fi
+  elif [ "$dockerType" = "amd64" ]; then
+    BuildReleaseAmd64
+    if [ "$useLite" = true ]; then
+      MakeRelease "md5-amd64-lite.txt"
+    else
+      MakeRelease "md5-amd64.txt"
+    fi
   else
     BuildRelease
     if [ "$useLite" = true ]; then
@@ -721,7 +1009,7 @@ elif [ "$buildType" = "zip" ]; then
   fi
 else
   echo -e "Parameter error"
-  echo -e "Usage: $0 {dev|beta|release|zip|prepare} [docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web] [lite] [other_params]"
+  echo -e "Usage: $0 {dev|beta|release|zip|prepare} [docker|docker-multiplatform|linux_musl_arm|linux_musl|android|freebsd|web|windows_amd64|linux_amd64_musl|darwin_amd64|amd64] [lite] [other_params]"
   echo -e "Examples:"
   echo -e "  $0 dev"
   echo -e "  $0 dev lite"

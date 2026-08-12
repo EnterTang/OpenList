@@ -131,6 +131,9 @@ type UserInfoResp struct {
 		SpacePermanent int64  `json:"SpacePermanent"`
 		SpaceTemp      int64  `json:"SpaceTemp"`
 		FileCount      int    `json:"FileCount"`
+		Vip            bool   `json:"Vip"`
+		VipLevel       int    `json:"VipLevel"`
+		VipExpire      string `json:"VipExpire"`
 	} `json:"data"`
 }
 

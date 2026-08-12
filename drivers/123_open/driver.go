@@ -3,9 +3,11 @@ package _123_open
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strconv"
 	"time"
 
+	_123 "github.com/OpenListTeam/OpenList/v4/drivers/123"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -88,46 +90,41 @@ func (d *Open123) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 
 func (d *Open123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	fileId, _ := strconv.ParseInt(file.GetID(), 10, 64)
-
-	if d.DirectLink {
-		res, err := d.getDirectLink(fileId)
-		if err != nil {
-			return nil, err
-		}
-
-		if d.DirectLinkPrivateKey == "" {
-			duration := 365 * 24 * time.Hour // 缓存1年
-			return &model.Link{
-				URL:        res.Data.URL,
-				Expiration: &duration,
-			}, nil
-		}
-
-		uid, err := d.getUID(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		duration := time.Duration(d.DirectLinkValidDuration) * time.Minute
-
-		newURL, err := d.SignURL(res.Data.URL, d.DirectLinkPrivateKey,
-			uid, duration)
-		if err != nil {
-			return nil, err
-		}
-
-		return &model.Link{
-			URL:        newURL,
-			Expiration: &duration,
-		}, nil
-	}
-
-	res, err := d.getDownloadInfo(fileId)
+	initialURL, header, err := d.resolveDownload(ctx, fileId)
 	if err != nil {
 		return nil, err
 	}
+	return _123.NewRefreshableLink(file.GetSize(), initialURL, header, func(refreshCtx context.Context) (string, http.Header, error) {
+		return d.resolveDownload(refreshCtx, fileId)
+	}), nil
+}
 
-	return &model.Link{URL: res.Data.DownloadUrl}, nil
+func (d *Open123) resolveDownload(ctx context.Context, fileID int64) (string, http.Header, error) {
+	if d.DirectLink {
+		res, err := d.getDirectLink(fileID)
+		if err != nil {
+			return "", nil, err
+		}
+		url := res.Data.URL
+		if d.DirectLinkPrivateKey != "" {
+			uid, err := d.getUID(ctx)
+			if err != nil {
+				return "", nil, err
+			}
+			signedURL, err := d.SignURL(url, d.DirectLinkPrivateKey, uid, time.Duration(d.DirectLinkValidDuration)*time.Minute)
+			if err != nil {
+				return "", nil, err
+			}
+			url = signedURL
+		}
+		return url, nil, nil
+	}
+
+	res, err := d.getDownloadInfo(fileID)
+	if err != nil {
+		return "", nil, err
+	}
+	return res.Data.DownloadUrl, nil, nil
 }
 
 func (d *Open123) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
@@ -162,8 +159,11 @@ func (d *Open123) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
 		return err
 	}
 	// 是否秒传
-	if createResp.Data.Reuse {
+	if createResp.Data.Reuse && createResp.Data.FileID != 0 {
 		return nil
+	}
+	if createResp.Data.Reuse {
+		return fmt.Errorf("123 open copy reported reuse without a confirmed file id")
 	}
 	return errs.NotSupport
 }

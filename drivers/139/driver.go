@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
@@ -19,17 +20,19 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/cron"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
+	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
 
 type Yun139 struct {
 	model.Storage
 	Addition
-	cron              *cron.Cron
-	Account           string
-	ref               *Yun139
-	PersonalCloudHost string
-	RootPath          string
+	cron                  *cron.Cron
+	Account               string
+	ref                   *Yun139
+	runtimeMembershipTier string
+	PersonalCloudHost     string
+	RootPath              string
 }
 
 func (d *Yun139) Config() driver.Config {
@@ -42,7 +45,11 @@ func (d *Yun139) GetAddition() driver.Additional {
 
 func (d *Yun139) Init(ctx context.Context) error {
 	if d.ref == nil {
-		if len(d.Authorization) == 0 {
+		if d.useCookieAuthMode() {
+			if strings.TrimSpace(d.CookieHeader) == "" {
+				return fmt.Errorf("cookie_header is empty")
+			}
+		} else if len(d.Authorization) == 0 {
 			if d.Username != "" && d.Password != "" {
 				log.Infof("139yun: authorization is empty, trying to login with password.")
 				newAuth, err := d.loginWithPassword()
@@ -58,6 +65,7 @@ func (d *Yun139) Init(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		d.updateRuntimeMembershipTier(ctx)
 
 		// Query Route Policy
 		var resp QueryRoutePolicyResp
@@ -158,6 +166,9 @@ func (d *Yun139) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 }
 
 func (d *Yun139) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	if d.shouldPlayETF(file, args) {
+		return d.linkETFVideo(ctx, file, args)
+	}
 	var url string
 	var err error
 	switch d.Addition.Type {
@@ -532,7 +543,13 @@ func (d *Yun139) Remove(ctx context.Context, obj model.Obj) error {
 		}
 		pathname := "/recyclebin/batchTrash"
 		_, err := d.personalPost(pathname, data, nil)
-		return err
+		if err != nil {
+			return err
+		}
+		if d.shouldCleanAfterPersonalRemove(obj) {
+			return d.emptyPersonalRecycleBin(ctx)
+		}
+		return nil
 	case MetaGroup:
 		var contentList []string
 		var catalogList []string
@@ -604,20 +621,121 @@ func (d *Yun139) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Yun139) getPartSize(size int64) int64 {
-	if d.CustomUploadPartSize != 0 {
-		return d.CustomUploadPartSize
-	}
+	var partSize int64
 	// 网盘对于分片数量存在上限
-	if size/utils.GB > 30 {
-		return 512 * utils.MB
+	if d.CustomUploadPartSize != 0 {
+		partSize = d.CustomUploadPartSize
+	} else if size/utils.GB > 30 {
+		partSize = 512 * utils.MB
+	} else {
+		partSize = 100 * utils.MB
 	}
-	return 100 * utils.MB
+	if personalUploadPartCount(size, partSize) <= personalUploadURLBatchLimit {
+		return partSize
+	}
+	return (size + personalUploadURLBatchLimit - 1) / personalUploadURLBatchLimit
+}
+
+const (
+	personalUploadURLBatchLimit         = 100
+	personalUploadBasePartSize          = 5 * utils.MB
+	personalUploadMaxConfiguredPartSize = 100 * utils.MB
+	personalUploadTargetPartCount       = 4000
+)
+
+func personalUploadPartCount(size, partSize int64) int64 {
+	if size <= 0 || partSize <= 0 {
+		return 1
+	}
+	count := size / partSize
+	if size%partSize != 0 {
+		count++
+	}
+	if count == 0 {
+		return 1
+	}
+	return count
+}
+
+func (d *Yun139) buildPersonalUploadPartInfos(size int64) []PartInfo {
+	partSize := d.getPersonalNewPartSize(size)
+	partCount := personalUploadPartCount(size, partSize)
+	partInfos := make([]PartInfo, 0, partCount)
+	for i := int64(0); i < partCount; i++ {
+		start := i * partSize
+		byteSize := min(size-start, partSize)
+		partInfos = append(partInfos, PartInfo{
+			PartNumber: i + 1,
+			PartSize:   byteSize,
+			ParallelHashCtx: ParallelHashCtx{
+				PartOffset: start,
+			},
+		})
+	}
+	return partInfos
+}
+
+func (d *Yun139) getPersonalNewPartSize(size int64) int64 {
+	// Match the desktop client's makeUploadSlice behavior: clamp the configured
+	// slice size to 5-100 MiB, then rebalance files that would use at least 4001
+	// slices to size/4000, rounded down to a 64-byte boundary. The rebalance is
+	// intentionally not clamped again; this is why very large files can exceed
+	// the configured 100 MiB value in the official client.
+	partSize := d.CustomUploadPartSize
+	if partSize == 0 {
+		partSize = personalUploadBasePartSize
+	}
+	if partSize < personalUploadBasePartSize {
+		partSize = personalUploadBasePartSize
+	}
+	if partSize > personalUploadMaxConfiguredPartSize {
+		partSize = personalUploadMaxConfiguredPartSize
+	}
+	if personalUploadPartCount(size, partSize) <= personalUploadTargetPartCount {
+		return partSize
+	}
+
+	partSize = size / personalUploadTargetPartCount
+	partSize -= partSize % 64
+	return partSize
+}
+
+func personalUploadNeedsPartUpload(resp PersonalUploadResp) bool {
+	for _, partInfo := range resp.Data.PartInfos {
+		if partInfo.UploadUrl != "" || partInfo.CdnUploadUrl != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Yun139) getPersonalUploadURLs(ctx context.Context, fileID, uploadID string, partInfos []PartInfo) ([]PersonalPartInfo, error) {
+	data := base.Json{
+		"fileId":    fileID,
+		"uploadId":  uploadID,
+		"partInfos": partInfos,
+		"commonAccountInfo": base.Json{
+			"account":     d.getAccount(),
+			"accountType": 1,
+		},
+	}
+	var resp PersonalUploadUrlResp
+	if _, err := d.personalRequestWithHeaders("/file/getUploadUrl", http.MethodPost, func(req *resty.Request) {
+		req.SetContext(ctx)
+		req.SetBody(data)
+	}, &resp, d.personalUploadHeaders()); err != nil {
+		return nil, err
+	}
+	return resp.Data.PartInfos, nil
 }
 
 func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
 	switch d.Addition.Type {
 	case MetaPersonalNew:
 		var err error
+		if restored, err := d.restorePersonalFromETFUpload(ctx, dstDir, stream); restored || err != nil {
+			return err
+		}
 		fullHash := stream.GetHash().GetHash(utils.SHA256)
 		if len(fullHash) != utils.SHA256.Width {
 			_, fullHash, err = streamPkg.CacheFullAndHash(stream, &up, utils.SHA256)
@@ -627,44 +745,15 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		}
 
 		size := stream.GetSize()
-		partSize := d.getPartSize(size)
-		part := int64(1)
-		if size > partSize {
-			part = (size + partSize - 1) / partSize
-		}
+		partInfos := d.buildPersonalUploadPartInfos(size)
 
-		// 生成所有 partInfos
-		partInfos := make([]PartInfo, 0, part)
-		for i := int64(0); i < part; i++ {
-			if utils.IsCanceled(ctx) {
-				return ctx.Err()
-			}
-			start := i * partSize
-			byteSize := min(size-start, partSize)
-			partNumber := i + 1
-			partInfo := PartInfo{
-				PartNumber: partNumber,
-				PartSize:   byteSize,
-				ParallelHashCtx: ParallelHashCtx{
-					PartOffset: start,
-				},
-			}
-			partInfos = append(partInfos, partInfo)
-		}
-
-		// 筛选出前 100 个 partInfos
-		firstPartInfos := partInfos
-		if len(firstPartInfos) > 100 {
-			firstPartInfos = firstPartInfos[:100]
-		}
-
-		// 创建任务，获取上传信息和前100个分片的上传地址
+		// 创建任务，获取上传信息和分片上传地址
 		data := base.Json{
 			"contentHash":          fullHash,
 			"contentHashAlgorithm": "SHA256",
 			"contentType":          "application/octet-stream",
 			"parallelUpload":       false,
-			"partInfos":            firstPartInfos,
+			"partInfos":            partInfos[:min(len(partInfos), personalUploadURLBatchLimit)],
 			"size":                 size,
 			"parentFileId":         dstDir.GetID(),
 			"name":                 stream.GetName(),
@@ -673,34 +762,41 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		}
 		pathname := "/file/create"
 		var resp PersonalUploadResp
-		_, err = d.personalPost(pathname, data, &resp)
+		_, err = d.personalUploadPost(pathname, data, &resp)
 		if err != nil {
 			return err
+		}
+		uploadedObj := &model.Object{
+			ID:   resp.Data.FileId,
+			Name: stream.GetName(),
+			Size: size,
 		}
 
 		// 判断文件是否已存在
 		// resp.Data.Exist: true 已存在同名文件且校验相同，云端不会重复增加文件，无需手动处理冲突
 		if resp.Data.Exist {
-			return nil
+			return d.afterPersonalUploadETF(ctx, dstDir, stream.GetName(), size, fullHash, uploadedObj)
 		}
 
 		// 判断文件是否支持快传
 		// resp.Data.RapidUpload: true 支持快传，但此处直接检测是否返回分片的上传地址
 		// 快传的情况下同样需要手动处理冲突
-		if resp.Data.PartInfos != nil {
+		if personalUploadNeedsPartUpload(resp) {
 			// Progress
 			p := driver.NewProgress(size, up)
-			rateLimited := driver.NewLimitedUploadStream(ctx, stream)
 
 			// 先上传前100个分片
-			err = d.uploadPersonalParts(ctx, partInfos, resp.Data.PartInfos, rateLimited, p)
+			firstBatchEnd := min(int64(personalUploadURLBatchLimit), int64(len(partInfos)))
+			err = d.uploadPersonalPartsWithRefresh(ctx, partInfos, resp.Data.PartInfos, stream, p, 1, firstBatchEnd, func(remaining []PartInfo) ([]PersonalPartInfo, error) {
+				return d.getPersonalUploadURLs(ctx, resp.Data.FileId, resp.Data.UploadId, remaining)
+			})
 			if err != nil {
 				return err
 			}
 
 			// 如果还有剩余分片，分批获取上传地址并上传
-			for i := 100; i < len(partInfos); i += 100 {
-				end := min(i+100, len(partInfos))
+			for i := personalUploadURLBatchLimit; i < len(partInfos); i += personalUploadURLBatchLimit {
+				end := min(i+personalUploadURLBatchLimit, len(partInfos))
 				batchPartInfos := partInfos[i:end]
 				moredata := base.Json{
 					"fileId":    resp.Data.FileId,
@@ -713,11 +809,13 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 				}
 				pathname := "/file/getUploadUrl"
 				var moreresp PersonalUploadUrlResp
-				_, err = d.personalPost(pathname, moredata, &moreresp)
+				_, err = d.personalUploadPost(pathname, moredata, &moreresp)
 				if err != nil {
 					return err
 				}
-				err = d.uploadPersonalParts(ctx, partInfos, moreresp.Data.PartInfos, rateLimited, p)
+				err = d.uploadPersonalPartsWithRefresh(ctx, partInfos, moreresp.Data.PartInfos, stream, p, batchPartInfos[0].PartNumber, batchPartInfos[len(batchPartInfos)-1].PartNumber, func(remaining []PartInfo) ([]PersonalPartInfo, error) {
+					return d.getPersonalUploadURLs(ctx, resp.Data.FileId, resp.Data.UploadId, remaining)
+				})
 				if err != nil {
 					return err
 				}
@@ -730,7 +828,7 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 				"fileId":               resp.Data.FileId,
 				"uploadId":             resp.Data.UploadId,
 			}
-			_, err = d.personalPost("/file/complete", data, nil)
+			_, err = d.personalUploadPost("/file/complete", data, nil)
 			if err != nil {
 				return err
 			}
@@ -774,7 +872,7 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 				}
 			}
 		}
-		return nil
+		return d.afterPersonalUploadETF(ctx, dstDir, stream.GetName(), size, fullHash, uploadedObj)
 	case MetaPersonal:
 		fallthrough
 	case MetaGroup:

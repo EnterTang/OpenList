@@ -15,6 +15,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	jsoniter "github.com/json-iterator/go"
@@ -181,9 +182,10 @@ func (d *Pan123) login() error {
 		return err
 	}
 	if utils.Json.Get(res.Body(), "code").ToInt() != 200 {
-		err = fmt.Errorf(utils.Json.Get(res.Body(), "message").ToString())
+		err = errors.New(utils.Json.Get(res.Body(), "message").ToString())
 	} else {
 		d.AccessToken = utils.Json.Get(res.Body(), "data", "token").ToString()
+		op.MustSaveDriverStorage(d)
 	}
 	return err
 }

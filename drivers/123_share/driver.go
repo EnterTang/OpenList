@@ -2,10 +2,11 @@ package _123Share
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
-	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,15 +19,16 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
-	log "github.com/sirupsen/logrus"
+	"github.com/pkg/errors"
 )
 
 type Pan123Share struct {
 	model.Storage
 	Addition
-	apiRateLimit sync.Map
-	ref          *_123.Pan123
+	ref *_123.Pan123
 }
+
+var pan123ShareAccountLimiters sync.Map
 
 func (d *Pan123Share) Config() driver.Config {
 	return config
@@ -37,8 +39,12 @@ func (d *Pan123Share) GetAddition() driver.Additional {
 }
 
 func (d *Pan123Share) Init(ctx context.Context) error {
-	// TODO login / refresh token
-	//op.MustSaveDriverStorage(d)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(d.ShareKey) == "" {
+		return errors.New("123pan share key is required")
+	}
 	return nil
 }
 
@@ -70,57 +76,34 @@ func (d *Pan123Share) List(ctx context.Context, dir model.Obj, args model.ListAr
 func (d *Pan123Share) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	// TODO return link of file, required
 	if f, ok := file.(File); ok {
-		data := base.Json{
-			"shareKey":  d.ShareKey,
-			"SharePwd":  d.SharePwd,
-			"etag":      f.Etag,
-			"fileId":    f.FileId,
-			"s3keyFlag": f.S3KeyFlag,
-			"size":      f.Size,
-		}
-		resp, err := d.request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
-			req.SetBody(data)
-		}, nil)
+		initialURL, header, err := d.resolveDownload(ctx, f)
 		if err != nil {
 			return nil, err
 		}
-		downloadUrl := utils.Json.Get(resp, "data", "DownloadURL").ToString()
-		ou, err := url.Parse(downloadUrl)
-		if err != nil {
-			return nil, err
-		}
-		u_ := ou.String()
-		nu := ou.Query().Get("params")
-		if nu != "" {
-			du, _ := base64.StdEncoding.DecodeString(nu)
-			u, err := url.Parse(string(du))
-			if err != nil {
-				return nil, err
-			}
-			u_ = u.String()
-		}
-
-		log.Debug("download url: ", u_)
-		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://yun.123pan.com/").Get(u_)
-		if err != nil {
-			return nil, err
-		}
-		log.Debug(res.String())
-		link := model.Link{
-			URL: u_,
-		}
-		log.Debugln("res code: ", res.StatusCode())
-		if res.StatusCode() == 302 {
-			link.URL = res.Header().Get("location")
-		} else if res.StatusCode() < 300 {
-			link.URL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
-		}
-		link.Header = http.Header{
-			"Referer": []string{fmt.Sprintf("%s://%s/", ou.Scheme, ou.Host)},
-		}
-		return &link, nil
+		return _123.NewRefreshableLink(f.Size, initialURL, header, func(refreshCtx context.Context) (string, http.Header, error) {
+			return d.resolveDownload(refreshCtx, f)
+		}), nil
 	}
 	return nil, fmt.Errorf("can't convert obj")
+}
+
+func (d *Pan123Share) resolveDownload(ctx context.Context, file File) (string, http.Header, error) {
+	data := base.Json{
+		"shareKey":  d.ShareKey,
+		"SharePwd":  d.SharePwd,
+		"etag":      file.Etag,
+		"fileId":    file.FileId,
+		"s3keyFlag": file.S3KeyFlag,
+		"size":      file.Size,
+	}
+	resp, err := d.request(ctx, DownloadInfo, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data).SetContext(ctx)
+	}, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	downloadURL := utils.Json.Get(resp, "data", "DownloadURL").ToString()
+	return _123.ResolveRedirectedDownload(ctx, downloadURL)
 }
 
 func (d *Pan123Share) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
@@ -158,7 +141,14 @@ func (d *Pan123Share) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 //}
 
 func (d *Pan123Share) APIRateLimit(ctx context.Context, api string) error {
-	value, _ := d.apiRateLimit.LoadOrStore(api,
+	_ = api // all share operations share one account/public-share gate
+	keyMaterial := strings.TrimSpace(d.AccessToken)
+	if keyMaterial == "" {
+		keyMaterial = "public:" + strings.TrimSpace(d.ShareKey)
+	}
+	sum := sha256.Sum256([]byte(keyMaterial))
+	key := hex.EncodeToString(sum[:])
+	value, _ := pan123ShareAccountLimiters.LoadOrStore(key,
 		rate.NewLimiter(rate.Every(700*time.Millisecond), 1))
 	limiter := value.(*rate.Limiter)
 

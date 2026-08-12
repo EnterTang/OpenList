@@ -3,7 +3,9 @@ package _123
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -29,7 +32,9 @@ import (
 type Pan123 struct {
 	model.Storage
 	Addition
-	apiRateLimit sync.Map
+	apiRateLimit      sync.Map
+	membershipMu      sync.RWMutex
+	runtimeMembership model.MembershipDetails
 }
 
 func (d *Pan123) Config() driver.Config {
@@ -41,10 +46,51 @@ func (d *Pan123) GetAddition() driver.Additional {
 }
 
 func (d *Pan123) Init(ctx context.Context) error {
+	var userInfo UserInfoResp
 	_, err := d.Request(UserInfo, http.MethodGet, func(req *resty.Request) {
 		req.SetHeader("platform", "web")
-	}, nil)
+		req.SetContext(ctx)
+	}, &userInfo)
+	if err == nil {
+		d.setRuntimeMembership(membershipDetailsFromUserInfo(&userInfo))
+	}
 	return err
+}
+
+func membershipDetailsFromUserInfo(userInfo *UserInfoResp) model.MembershipDetails {
+	details := model.MembershipDetails{
+		Tier:       "ordinary",
+		Status:     "inactive",
+		ExpireDate: userInfo.Data.VipExpire,
+	}
+	if userInfo.Data.Vip {
+		details.Tier = "vip"
+		details.Status = "active"
+		if userInfo.Data.VipLevel == 2 {
+			details.Tier = "svip"
+		}
+	}
+	return details
+}
+
+func (d *Pan123) setRuntimeMembership(details model.MembershipDetails) {
+	d.membershipMu.Lock()
+	d.runtimeMembership = details
+	d.membershipMu.Unlock()
+}
+
+func (d *Pan123) ClusterMembershipDetails() model.MembershipDetails {
+	d.membershipMu.RLock()
+	details := d.runtimeMembership
+	d.membershipMu.RUnlock()
+	if configured := strings.ToLower(strings.TrimSpace(d.MembershipTier)); configured != "" && configured != "unknown" {
+		details.Tier = configured
+	}
+	return details
+}
+
+func (d *Pan123) ClusterMembershipTier() string {
+	return d.ClusterMembershipDetails().Tier
 }
 
 func (d *Pan123) Drop(ctx context.Context) error {
@@ -65,59 +111,113 @@ func (d *Pan123) List(ctx context.Context, dir model.Obj, args model.ListArgs) (
 }
 
 func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	if f, ok := file.(File); ok {
-		data := base.Json{
-			"driveId":   0,
-			"etag":      f.Etag,
-			"fileId":    f.FileId,
-			"fileName":  f.FileName,
-			"s3keyFlag": f.S3KeyFlag,
-			"size":      f.Size,
-			"type":      f.Type,
-		}
-		resp, err := d.Request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
-			req.SetBody(data)
-		}, nil)
-		if err != nil {
-			return nil, err
-		}
-		downloadUrl := utils.Json.Get(resp, "data", "DownloadUrl").ToString()
-		ou, err := url.Parse(downloadUrl)
-		if err != nil {
-			return nil, err
-		}
-		u_ := ou.String()
-		nu := ou.Query().Get("params")
-		if nu != "" {
-			du, _ := base64.StdEncoding.DecodeString(nu)
-			u, err := url.Parse(string(du))
-			if err != nil {
-				return nil, err
-			}
-			u_ = u.String()
-		}
-
-		log.Debug("download url: ", u_)
-		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://yun.123pan.com/").Get(u_)
-		if err != nil {
-			return nil, err
-		}
-		log.Debug(res.String())
-		link := model.Link{
-			URL: u_,
-		}
-		log.Debugln("res code: ", res.StatusCode())
-		if res.StatusCode() == 302 {
-			link.URL = res.Header().Get("location")
-		} else if res.StatusCode() < 300 {
-			link.URL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
-		}
-		link.Header = http.Header{
-			"Referer": []string{fmt.Sprintf("%s://%s/", ou.Scheme, ou.Host)},
-		}
-		return &link, nil
-	} else {
+	f, ok := file.(File)
+	if !ok {
 		return nil, fmt.Errorf("can't convert obj")
+	}
+	initial, err := d.resolveDownload(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	return NewRefreshableLink(f.Size, initial.URL, initial.Header, func(refreshCtx context.Context) (string, http.Header, error) {
+		refreshed, err := d.resolveDownload(refreshCtx, f)
+		if err != nil {
+			return "", nil, err
+		}
+		return refreshed.URL, refreshed.Header, nil
+	}), nil
+}
+
+func (d *Pan123) resolveDownload(ctx context.Context, file File) (pan123ResolvedDownload, error) {
+	data := base.Json{
+		"driveId":   0,
+		"etag":      file.Etag,
+		"fileId":    file.FileId,
+		"fileName":  file.FileName,
+		"s3keyFlag": file.S3KeyFlag,
+		"size":      file.Size,
+		"type":      file.Type,
+	}
+	resp, err := d.Request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data).SetContext(ctx)
+	}, nil)
+	if err != nil {
+		return pan123ResolvedDownload{}, err
+	}
+	downloadURL := utils.Json.Get(resp, "data", "DownloadUrl").ToString()
+	directURL, header, err := ResolveRedirectedDownload(ctx, downloadURL)
+	if err != nil {
+		return pan123ResolvedDownload{}, err
+	}
+	return pan123ResolvedDownload{
+		URL:    directURL,
+		Header: header,
+	}, nil
+}
+
+func ResolveRedirectedDownload(ctx context.Context, downloadURL string) (string, http.Header, error) {
+	originalURL, err := url.Parse(downloadURL)
+	if err != nil {
+		return "", nil, err
+	}
+	requestURL := originalURL.String()
+	if params := originalURL.Query().Get("params"); params != "" {
+		decoded, decodeErr := base64.StdEncoding.DecodeString(params)
+		if decodeErr != nil {
+			return "", nil, fmt.Errorf("decode 123pan download parameters: %w", decodeErr)
+		}
+		parsed, parseErr := url.Parse(string(decoded))
+		if parseErr != nil {
+			return "", nil, parseErr
+		}
+		requestURL = parsed.String()
+	}
+	res, err := base.NoRedirectClient.R().
+		SetContext(ctx).
+		SetHeader("Referer", "https://yun.123pan.com/").
+		Get(requestURL)
+	if err != nil {
+		return "", nil, err
+	}
+	directURL := requestURL
+	if res.StatusCode() == http.StatusFound {
+		directURL = res.Header().Get("location")
+	} else if res.StatusCode() < http.StatusMultipleChoices {
+		directURL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
+	}
+	if directURL == "" {
+		return "", nil, errors.New("123pan download URL resolution returned an empty redirect")
+	}
+	return directURL, http.Header{
+		"Referer": []string{fmt.Sprintf("%s://%s/", originalURL.Scheme, originalURL.Host)},
+	}, nil
+}
+
+func NewRefreshableLink(totalSize int64, initialURL string, header http.Header, refresh func(context.Context) (string, http.Header, error)) *model.Link {
+	rangeReader := stream.RangeReaderFunc(func(readCtx context.Context, requested http_range.Range) (io.ReadCloser, error) {
+		return newPan123DownloadReader(
+			readCtx,
+			totalSize,
+			requested,
+			pan123ResolvedDownload{URL: initialURL, Header: header},
+			func(refreshCtx context.Context) (pan123ResolvedDownload, error) {
+				if refresh == nil {
+					return pan123ResolvedDownload{}, errors.New("123pan direct link refresher is unavailable")
+				}
+				url, refreshedHeader, err := refresh(refreshCtx)
+				if err != nil {
+					return pan123ResolvedDownload{}, err
+				}
+				return pan123ResolvedDownload{URL: url, Header: refreshedHeader}, nil
+			},
+			pan123FallbackConfig{},
+		)
+	})
+	return &model.Link{
+		URL:           initialURL,
+		Header:        header,
+		RangeReader:   rangeReader,
+		ContentLength: totalSize,
 	}
 }
 
@@ -205,8 +305,38 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 		return err
 	}
 	log.Debugln("upload request res: ", string(res))
-	if resp.Data.Reuse || resp.Data.Key == "" {
-		return nil
+	if resp.Data.Reuse {
+		if resp.Data.FileId > 0 {
+			return nil
+		}
+		confirmed, err := d.probeUploadedFile(ctx, dstDir, file.GetName(), file.GetSize(), etag)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			return nil
+		}
+		return fmt.Errorf("123pan upload request reported reuse without a valid file id")
+	}
+	if resp.Data.Key == "" {
+		confirmed, err := d.probeUploadedFile(ctx, dstDir, file.GetName(), file.GetSize(), etag)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			return nil
+		}
+		return fmt.Errorf("123pan upload request returned an empty storage key without a confirmed destination file")
+	}
+	if resp.Data.FileId == 0 {
+		confirmed, err := d.probeUploadedFile(ctx, dstDir, file.GetName(), file.GetSize(), etag)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			return nil
+		}
+		return fmt.Errorf("123pan upload request returned an empty file id without a confirmed destination file")
 	}
 	if resp.Data.AccessKeyId == "" || resp.Data.SecretAccessKey == "" || resp.Data.SessionToken == "" {
 		err = d.newUpload(ctx, &resp, file, up)
@@ -247,6 +377,25 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 	return err
 }
 
+func (d *Pan123) probeUploadedFile(ctx context.Context, dstDir model.Obj, name string, size int64, etag string) (bool, error) {
+	files, err := d.getFiles(ctx, dstDir.GetID(), dstDir.GetName())
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range files {
+		if candidate.IsDir() || strings.TrimSpace(candidate.FileName) != name || candidate.Size != size {
+			continue
+		}
+		if etag != "" && !strings.EqualFold(strings.TrimSpace(candidate.Etag), etag) {
+			continue
+		}
+		if candidate.FileId > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (d *Pan123) APIRateLimit(ctx context.Context, api string) error {
 	value, _ := d.apiRateLimit.LoadOrStore(api,
 		rate.NewLimiter(rate.Every(700*time.Millisecond), 1))
@@ -260,11 +409,14 @@ func (d *Pan123) GetDetails(ctx context.Context) (*model.StorageDetails, error) 
 	if err != nil {
 		return nil, err
 	}
+	membership := membershipDetailsFromUserInfo(userInfo)
+	d.setRuntimeMembership(membership)
 	return &model.StorageDetails{
 		DiskUsage: model.DiskUsage{
 			TotalSpace: userInfo.Data.SpacePermanent + userInfo.Data.SpaceTemp,
 			UsedSpace:  userInfo.Data.SpaceUsed,
 		},
+		Membership: &membership,
 	}, nil
 }
 

@@ -19,9 +19,10 @@ import (
 type Pan115 struct {
 	model.Storage
 	Addition
-	client     *driver115.Pan115Client
-	limiter    *rate.Limiter
-	appVerOnce sync.Once
+	client                *driver115.Pan115Client
+	limiter               *rate.Limiter
+	appVerOnce            sync.Once
+	runtimeMembershipTier string
 }
 
 func (d *Pan115) Config() driver.Config {
@@ -37,7 +38,25 @@ func (d *Pan115) Init(ctx context.Context) error {
 	if d.LimitRate > 0 {
 		d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate), 1)
 	}
-	return d.login()
+	if err := d.login(); err != nil {
+		return err
+	}
+	if user, err := d.client.GetUser(); err == nil && user != nil {
+		if user.Vip > 0 {
+			d.runtimeMembershipTier = "vip"
+		} else {
+			d.runtimeMembershipTier = "ordinary"
+		}
+	}
+	return nil
+}
+
+func (d *Pan115) ClusterMembershipTier() string {
+	configured := strings.ToLower(strings.TrimSpace(d.Addition.MembershipTier))
+	if configured != "" && configured != "unknown" {
+		return configured
+	}
+	return d.runtimeMembershipTier
 }
 
 func (d *Pan115) WaitLimit(ctx context.Context) error {
@@ -151,6 +170,29 @@ func (d *Pan115) Remove(ctx context.Context, obj model.Obj) error {
 		return err
 	}
 	return d.client.Delete(obj.GetID())
+}
+
+func (d *Pan115) ClearRecycleEntry(ctx context.Context, obj model.Obj) error {
+	if obj == nil {
+		return nil
+	}
+	if err := d.WaitLimit(ctx); err != nil {
+		return err
+	}
+	recycled, err := d.client.ListRecycleBin(0, 200)
+	if err != nil {
+		return err
+	}
+	var recycleIDs []string
+	for _, item := range recycled {
+		if item.FileId == obj.GetID() {
+			recycleIDs = append(recycleIDs, item.FileId)
+		}
+	}
+	if len(recycleIDs) == 0 {
+		return nil
+	}
+	return d.client.CleanRecycleBin("", recycleIDs...)
 }
 
 func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {

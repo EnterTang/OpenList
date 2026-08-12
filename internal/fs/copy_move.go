@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	stdpath "path"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -42,8 +43,16 @@ const (
 
 type FileTransferTask struct {
 	TaskData
-	TaskType taskType
-	groupID  string
+	TaskType       taskType
+	ClusterBinding *task_group.ClusterTransferBinding `json:"cluster_binding,omitempty"`
+	groupID        string
+}
+
+func (t *FileTransferTask) SetCtx(ctx context.Context) {
+	if t.ClusterBinding != nil {
+		ctx = task_group.WithClusterTransferBinding(ctx, *t.ClusterBinding)
+	}
+	t.TaskData.TaskExtension.SetCtx(ctx)
 }
 
 func (t *FileTransferTask) GetName() string {
@@ -94,7 +103,7 @@ func (t *FileTransferTask) SetRetry(retry int, maxRetry int) {
 		t.groupID = stdpath.Join(t.DstStorageMp, t.DstActualPath)
 		var payload any
 		if t.TaskType == move {
-			payload = task_group.SrcPathToRemove(stdpath.Join(t.SrcStorageMp, t.SrcActualPath))
+			task_group.TransferCoordinator.AppendPayload(t.groupID, task_group.SrcPathToRemove(stdpath.Join(t.SrcStorageMp, t.SrcActualPath)))
 		}
 		task_group.TransferCoordinator.AddTask(t.groupID, payload)
 	}
@@ -110,7 +119,7 @@ func transfer(ctx context.Context, taskType taskType, srcObjPath, dstDirPath str
 		return nil, errors.WithMessage(err, "failed get dst storage")
 	}
 
-	if srcStorage.GetStorage() == dstStorage.GetStorage() {
+	if srcStorage.GetStorage() == dstStorage.GetStorage() && ctx.Value(conf.ForceTaskKey) == nil {
 		if utils.IsBool(skipHook...) {
 			ctx = context.WithValue(ctx, conf.SkipHookKey, struct{}{})
 		}
@@ -139,9 +148,12 @@ func transfer(ctx context.Context, taskType taskType, srcObjPath, dstDirPath str
 		},
 		TaskType: taskType,
 	}
+	if binding, ok := task_group.ClusterTransferBindingFromContext(ctx); ok {
+		t.ClusterBinding = &binding
+	}
 
 	t.groupID = stdpath.Join(t.DstStorageMp, t.DstActualPath)
-	task_group.TransferCoordinator.AddTask(t.groupID, nil)
+	task_group.TransferCoordinator.AddTask(t.groupID, ctx.Value(conf.TransferTaskPayloadKey))
 	if ctx.Value(conf.NoTaskKey) != nil {
 		var callback func(nextTask *FileTransferTask) error
 		hasSuccess := false
@@ -234,7 +246,8 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 					SrcStorageMp:  t.SrcStorageMp,
 					DstStorageMp:  t.DstStorageMp,
 				},
-				groupID: t.groupID,
+				ClusterBinding: t.ClusterBinding,
+				groupID:        t.groupID,
 			})
 			if err != nil {
 				return err
@@ -243,6 +256,12 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 		t.Status = fmt.Sprintf("src object is dir, added all %s tasks of objs", t.TaskType)
 		return nil
 	}
+
+	releaseSourceSlot, err := t.waitSourceDownloadSlot()
+	if err != nil {
+		return err
+	}
+	defer releaseSourceSlot()
 
 	t.Status = "getting src object link"
 	link, srcObj, err := op.Link(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.LinkArgs{})
@@ -264,6 +283,27 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 }
 
 var (
-	CopyTaskManager *tache.Manager[*FileTransferTask]
-	MoveTaskManager *tache.Manager[*FileTransferTask]
+	CopyTaskManager                 *tache.Manager[*FileTransferTask]
+	MoveTaskManager                 *tache.Manager[*FileTransferTask]
+	aliyunTransferSourceConcurrency = make(chan struct{}, 1)
 )
+
+func isAliyunTransferSourceDriver(driverName string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(driverName)), "aliyundrive")
+}
+
+func (t *FileTransferTask) waitSourceDownloadSlot() (func(), error) {
+	if t == nil || t.SrcStorage == nil || !isAliyunTransferSourceDriver(t.SrcStorage.GetStorage().Driver) {
+		return func() {}, nil
+	}
+	ctx := t.Ctx()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case aliyunTransferSourceConcurrency <- struct{}{}:
+		return func() { <-aliyunTransferSourceConcurrency }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}

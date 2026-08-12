@@ -15,6 +15,7 @@ type Addition struct {
 	PageSize       int64   `json:"page_size" type:"number" default:"200" help:"list api per page size of 115open driver"`
 	AccessToken    string  `json:"access_token" required:"true"`
 	RefreshToken   string  `json:"refresh_token" required:"true"`
+	MembershipTier string  `json:"membership_tier" type:"select" options:"unknown,ordinary,vip,svip" default:"unknown" label:"会员等级" help:"用于多账号集群调度权重；unknown 时登录后尝试从 115 Open 用户信息自动采集。"`
 }
 
 var config = driver.Config{
