@@ -31,7 +31,7 @@ func pan115CookieFromStorage() string {
 		return ""
 	}
 	for _, storage := range storages {
-		if storage.Driver != "115 Cloud" {
+		if !isPan115CookieStorageDriver(storage.Driver) {
 			continue
 		}
 		if cookie := pan115CookieFromAddition(storage.Addition); cookie != "" {
@@ -50,7 +50,7 @@ func pan115CookieFromLiveStorage() string {
 		return ""
 	}
 	for _, storage := range storages {
-		if storage.Driver != "115 Cloud" {
+		if !isPan115CookieStorageDriver(storage.Driver) {
 			continue
 		}
 		driverStorage, err := op.GetStorageByMountPath(storage.MountPath)
@@ -62,6 +62,18 @@ func pan115CookieFromLiveStorage() string {
 		}
 	}
 	return ""
+}
+
+// isPan115CookieStorageDriver reports whether a mounted storage can supply the
+// Cookie used by pan115 share.inspect / share.save snapshot clients.
+// Workers commonly mount "115 SY" rather than legacy "115 Cloud".
+func isPan115CookieStorageDriver(driver string) bool {
+	switch strings.TrimSpace(driver) {
+	case "115 Cloud", "115 SY":
+		return true
+	default:
+		return false
+	}
 }
 
 func pan115CookieFromDriverAddition(addition any) string {

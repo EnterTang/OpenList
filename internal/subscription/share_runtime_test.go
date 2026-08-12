@@ -439,7 +439,7 @@ func TestPan123ConfigWithStorageFallbackPrefersStorageToken(t *testing.T) {
 func TestResolveShareInspectConfigUsesPan115StorageCookie(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	if err := db.CreateStorage(&model.Storage{
-		MountPath: "/115sy",
+		MountPath: "/115",
 		Driver:    "115 Cloud",
 		Addition:  `{"cookie":"storage-cookie"}`,
 	}); err != nil {
@@ -451,6 +451,41 @@ func TestResolveShareInspectConfigUsesPan115StorageCookie(t *testing.T) {
 	})
 	if got, want := cfg.Cookie, "storage-cookie"; got != want {
 		t.Fatalf("cookie = %q, want live storage cookie %q", got, want)
+	}
+}
+
+func TestResolveShareInspectConfigUsesPan115SYStorageCookie(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	if err := db.CreateStorage(&model.Storage{
+		MountPath: "/115sy",
+		Driver:    "115 SY",
+		Addition:  `{"cookie":"sy-storage-cookie"}`,
+	}); err != nil {
+		t.Fatalf("create 115 SY storage: %v", err)
+	}
+
+	cfg := ResolveShareInspectConfig(ShareProviderPan115, model.SubscriptionTelegramPanConfig{
+		Cookie: "stale-subscription-cookie",
+	})
+	if got, want := cfg.Cookie, "sy-storage-cookie"; got != want {
+		t.Fatalf("cookie = %q, want 115 SY storage cookie %q", got, want)
+	}
+}
+
+func TestIsPan115CookieStorageDriver(t *testing.T) {
+	for _, tc := range []struct {
+		driver string
+		want   bool
+	}{
+		{driver: "115 Cloud", want: true},
+		{driver: "115 SY", want: true},
+		{driver: "115 Open", want: false},
+		{driver: "115 CD2", want: false},
+		{driver: "123Pan", want: false},
+	} {
+		if got := isPan115CookieStorageDriver(tc.driver); got != tc.want {
+			t.Fatalf("isPan115CookieStorageDriver(%q) = %v, want %v", tc.driver, got, tc.want)
+		}
 	}
 }
 
