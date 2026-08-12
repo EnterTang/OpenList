@@ -1192,6 +1192,27 @@ func TestListJobsIncludesStageProgress(t *testing.T) {
 	}
 }
 
+func TestListJobsActiveAliasReturnsOnlyRunnableJobs(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	jobs := []model.ClusterJob{
+		{ID: "active-job", IdempotencyKey: "active-job", Status: model.ClusterJobStatusRunning},
+		{ID: "done-job", IdempotencyKey: "done-job", Status: model.ClusterJobStatusSucceeded},
+	}
+	for i := range jobs {
+		if err := database.Create(&jobs[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := New(database, "token").ListJobs(context.Background(), "active", false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "active-job" {
+		t.Fatalf("active jobs = %#v, want active-job only", got)
+	}
+}
+
 func TestReconcileNodeSessionsMarksConnectedSessionsAndOnlineNodesOffline(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	now := time.Unix(1721110000, 0).UTC()

@@ -78,6 +78,11 @@ const (
 
 var workerInventoryRefreshInterval = 5 * time.Minute
 
+const (
+	noCompatibleWorkerRetryDelay = time.Minute
+	noCompatibleWorkerMaxWait    = 24 * time.Hour
+)
+
 type runtimeDispatchTransport interface {
 	ConnectedNodes() []string
 	Session(string) (transport.Peer, bool)
@@ -748,9 +753,19 @@ func (r *Runtime) redispatchQueuedJobs(ctx context.Context, limit int) error {
 			continue
 		}
 		if len(available) == 0 {
-			_ = db.GetDb().WithContext(ctx).Model(&model.ClusterJob{}).Where("id = ?", jobs[i].ID).Updates(map[string]any{
-				"last_error_code": "no_compatible_worker", "last_error": "no connected worker satisfies provider, target mount, Redis, and capability requirements",
-			}).Error
+			updates := noCompatibleWorkerJobUpdates(&jobs[i], time.Now().UTC())
+			if _, blocked := updates["status"]; blocked {
+				log.Warnf("cluster job %s blocked after waiting for a compatible worker", jobs[i].ID)
+				if service := r.CoordinatorService(); service != nil {
+					if err := service.FailQueuedJob(ctx, jobs[i].ID, "no_compatible_worker_timeout", "no compatible worker became available before the queue wait limit; manual retry is required"); err != nil {
+						log.Errorf("fail queued cluster job %s after worker wait timeout: %v", jobs[i].ID, err)
+					}
+					continue
+				}
+			} else {
+				log.Debugf("cluster job %s waiting for a compatible worker", jobs[i].ID)
+			}
+			_ = db.GetDb().WithContext(ctx).Model(&model.ClusterJob{}).Where("id = ?", jobs[i].ID).Updates(updates).Error
 			continue
 		}
 		var taskContext protocol.TaskContext
@@ -765,6 +780,25 @@ func (r *Runtime) redispatchQueuedJobs(ctx context.Context, limit int) error {
 		}
 	}
 	return nil
+}
+
+func noCompatibleWorkerJobUpdates(job *model.ClusterJob, now time.Time) map[string]any {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	updates := map[string]any{
+		"last_error_code": "no_compatible_worker",
+		"last_error":      "no connected worker satisfies provider, target mount, Redis, and capability requirements",
+		"available_at":    now.Add(noCompatibleWorkerRetryDelay),
+	}
+	if job != nil && !job.CreatedAt.IsZero() && now.Sub(job.CreatedAt) >= noCompatibleWorkerMaxWait {
+		updates["status"] = model.ClusterJobStatusFailed
+		updates["finished_at"] = now
+		updates["available_at"] = now
+		updates["last_error_code"] = "no_compatible_worker_timeout"
+		updates["last_error"] = "no compatible worker became available before the queue wait limit; manual retry is required"
+	}
+	return updates
 }
 
 func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.ClusterNode, job *model.ClusterJob, reservations ...map[string]int) ([]string, error) {

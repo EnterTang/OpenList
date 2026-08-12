@@ -192,6 +192,7 @@ func TestReconcileSubscriptionExecutionClassifiesRecoverableFailures(t *testing.
 	cases := []struct {
 		key      string
 		code     string
+		message  string
 		want     string
 		wantCode string
 	}{
@@ -201,6 +202,9 @@ func TestReconcileSubscriptionExecutionClassifiesRecoverableFailures(t *testing.
 		{key: "unknown", code: "share_save_result_unknown", want: model.SubscriptionItemStatusUnknown, wantCode: "share_save_result_unknown"},
 		{key: "blocked", code: "no_compatible_worker", want: model.SubscriptionItemStatusBlocked, wantCode: "no_compatible_worker"},
 		{key: "direct-reauthorize", code: "direct_share_reauthorize", want: model.SubscriptionItemStatusBlocked, wantCode: "direct_share_reauthorize"},
+		{key: "generic-eof", code: "worker_execution_failed", message: "failed to read all data: unexpected EOF", want: model.SubscriptionItemStatusRetryWait, wantCode: "worker_execution_failed"},
+		{key: "generic-confirmation", code: "worker_execution_failed", message: "同名文件，是否继续？", want: model.SubscriptionItemStatusBlocked, wantCode: "worker_execution_failed"},
+		{key: "generic-policy", code: "worker_execution_failed", message: "文件涉及违规内容", want: model.SubscriptionItemStatusFailed, wantCode: "worker_execution_failed"},
 	}
 	for i, tc := range cases {
 		item := &model.SubscriptionItem{
@@ -213,7 +217,10 @@ func TestReconcileSubscriptionExecutionClassifiesRecoverableFailures(t *testing.
 		job := &model.ClusterJob{
 			ID: "job-" + tc.key, Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusFailed,
 			IdempotencyKey: "idem-" + tc.key, SubscriptionID: sub.ID, SubscriptionItemID: item.ID,
-			LastErrorCode: tc.code, LastError: "safe test error", AvailableAt: now.Add(time.Duration(i) * time.Second), FinishedAt: &now,
+			LastErrorCode: tc.code, LastError: tc.message, AvailableAt: now.Add(time.Duration(i) * time.Second), FinishedAt: &now,
+		}
+		if job.LastError == "" {
+			job.LastError = "safe test error"
 		}
 		if err := db.GetDb().Create(job).Error; err != nil {
 			t.Fatal(err)

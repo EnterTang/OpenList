@@ -1929,7 +1929,18 @@ func (s *Service) ListJobs(ctx context.Context, status string, includeArchived b
 		query = query.Where("archived_at IS NULL")
 	}
 	if status = strings.TrimSpace(status); status != "" {
-		query = query.Where("status = ?", status)
+		if strings.EqualFold(status, "active") || strings.EqualFold(status, "undone") {
+			query = query.Where("status IN ?", []string{
+				model.ClusterJobStatusQueued,
+				model.ClusterJobStatusPlanning,
+				model.ClusterJobStatusLeased,
+				model.ClusterJobStatusRunning,
+				model.ClusterJobStatusRetryWait,
+				model.ClusterJobStatusCancelRequested,
+			})
+		} else {
+			query = query.Where("status = ?", status)
+		}
 	}
 	var jobs []model.ClusterJob
 	if err := query.Order("created_at DESC").Limit(limit).Find(&jobs).Error; err != nil || len(jobs) == 0 {
@@ -1971,6 +1982,48 @@ func (s *Service) RetryJob(ctx context.Context, jobID string) error {
 	now := time.Now().UTC()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return retryJobTx(tx, jobID, now)
+	})
+}
+
+// FailQueuedJob moves a queued job to a terminal failure and reconciles its
+// parent batch in the same transaction. It is used for coordinator-side
+// failures where no worker attempt was created, so the normal result handler
+// cannot close the parent job for us.
+func (s *Service) FailQueuedJob(ctx context.Context, jobID, errorCode, reason string) error {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("cluster job id is required")
+	}
+	errorCode = strings.TrimSpace(errorCode)
+	if errorCode == "" {
+		return errors.New("cluster job error code is required")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = errorCode
+	}
+	now := time.Now().UTC()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job model.ClusterJob
+		if err := tx.Select("id", "parent_job_id").First(&job, "id = ?", jobID).Error; err != nil {
+			return err
+		}
+		updated := tx.Model(&model.ClusterJob{}).Where("id = ? AND status = ?", jobID, model.ClusterJobStatusQueued).Updates(map[string]any{
+			"status":             model.ClusterJobStatusFailed,
+			"finished_at":        now,
+			"available_at":       now,
+			"assigned_node_id":   "",
+			"current_attempt_id": "",
+			"last_error_code":    errorCode,
+			"last_error":         reason,
+		})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected == 0 {
+			return nil
+		}
+		return reconcileParentJobTx(tx, job.ParentJobID, now)
 	})
 }
 

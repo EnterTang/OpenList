@@ -161,3 +161,43 @@ func TestRetryFailedChildReopensAndEventuallyCompletesParent(t *testing.T) {
 		t.Fatalf("completed parent = %#v", completedParent)
 	}
 }
+
+func TestFailQueuedJobReconcilesParentBatch(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	parent := model.ClusterJob{
+		ID:             "timeout-parent",
+		Type:           model.ClusterJobTypeShareBatch,
+		Status:         model.ClusterJobStatusRunning,
+		IdempotencyKey: "timeout-parent",
+		ExpectedItems:  1,
+	}
+	child := model.ClusterJob{
+		ID:             "timeout-child",
+		ParentJobID:    parent.ID,
+		Type:           model.ClusterJobTypeMediaTransfer,
+		Status:         model.ClusterJobStatusQueued,
+		IdempotencyKey: "timeout-child",
+	}
+	if err := database.Create(&parent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&child).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := New(database, "token").FailQueuedJob(context.Background(), child.ID, "no_compatible_worker_timeout", "worker wait exceeded"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&child, "id = ?", child.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if child.Status != model.ClusterJobStatusFailed || child.FinishedAt == nil {
+		t.Fatalf("child = %#v, want terminal failure", child)
+	}
+	if err := database.First(&parent, "id = ?", parent.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if parent.Status != model.ClusterJobStatusPartialFailed || parent.FinishedAt == nil {
+		t.Fatalf("parent = %#v, want finished partial failure", parent)
+	}
+}

@@ -367,7 +367,7 @@ func reconcileSubscriptionItemTx(tx *gorm.DB, item *model.SubscriptionItem, job 
 			"updated_at":      now,
 		}
 		if job.Status != model.ClusterJobStatusDeadLetter {
-			switch classifySubscriptionFailure(lastErrorCode) {
+			switch classifySubscriptionFailure(lastErrorCode, lastError) {
 			case model.SubscriptionItemStatusRetryWait:
 				nextRetryCount := item.RetryCount + 1
 				if nextRetryCount >= maxAttempts {
@@ -417,17 +417,31 @@ const (
 	subscriptionUnknownProbeDelay = 5 * time.Minute
 )
 
-func classifySubscriptionFailure(errorCode string) string {
-	switch strings.ToLower(strings.TrimSpace(errorCode)) {
+func classifySubscriptionFailure(errorCode, message string) string {
+	code := strings.ToLower(strings.TrimSpace(errorCode))
+	normalizedMessage := strings.ToLower(strings.TrimSpace(message))
+	switch code {
 	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_unexpected_eof", "source_range_failed", "source_link_expired", "network_timeout", "timeout", "rate_limited", "worker_capacity_unavailable", "worker_cleanup_backlog", "worker_journal_unavailable", "worker_start_timeout", "worker_lease_expired", "lease_expired":
 		return model.SubscriptionItemStatusRetryWait
 	case "share_save_result_unknown", "result_unknown", "request_result_unknown", "operation_result_unknown":
 		return model.SubscriptionItemStatusUnknown
-	case "no_compatible_worker", "worker_unavailable", "provider_health_stale", "reauthorization_required", "direct_share_reauthorize":
+	case "no_compatible_worker", "no_compatible_worker_timeout", "worker_unavailable", "provider_health_stale", "reauthorization_required", "direct_share_reauthorize":
 		return model.SubscriptionItemStatusBlocked
-	default:
-		return model.SubscriptionItemStatusFailed
 	}
+	if strings.Contains(normalizedMessage, "是否继续") || strings.Contains(normalizedMessage, "manual reconciliation") || strings.Contains(normalizedMessage, "manual confirmation") {
+		return model.SubscriptionItemStatusBlocked
+	}
+	if code == "worker_execution_failed" || code == "" {
+		switch {
+		case strings.Contains(normalizedMessage, "unexpected eof"), strings.Contains(normalizedMessage, "range failed"), strings.Contains(normalizedMessage, "read all data"):
+			return model.SubscriptionItemStatusRetryWait
+		case strings.Contains(normalizedMessage, "accessdenied"), strings.Contains(normalizedMessage, "signed url"), strings.Contains(normalizedMessage, "request has expired"):
+			return model.SubscriptionItemStatusRetryWait
+		case strings.Contains(normalizedMessage, "rate limit"), strings.Contains(normalizedMessage, "too many requests"):
+			return model.SubscriptionItemStatusRetryWait
+		}
+	}
+	return model.SubscriptionItemStatusFailed
 }
 
 func updateSubscriptionItemReconcileTx(tx *gorm.DB, item *model.SubscriptionItem, updates map[string]any, status, jobID string, result *ExecutionReconcileResult) error {

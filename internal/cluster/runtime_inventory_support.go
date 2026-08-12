@@ -88,7 +88,7 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	// free_bytes=0 because the quota API is unavailable.
 	stagingRequirement.RequiredBytes = 0
 	if stagingRequirement.Provider != "" && !containsFold(capabilities.SupportedProviders, stagingRequirement.Provider) {
-		utils.Log.Warnf("[cluster-dispatch] node=%s staging provider=%s not in supported=%v", nodeID, stagingRequirement.Provider, capabilities.SupportedProviders)
+		utils.Log.Debugf("[cluster-dispatch] node=%s staging provider=%s not in supported=%v", nodeID, stagingRequirement.Provider, capabilities.SupportedProviders)
 		return nodeProviderAccountMatch{}, false, nil
 	}
 	var providerAccounts []protocol.ProviderAccountInventory
@@ -132,12 +132,12 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	}
 	staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", !directDownload)
 	if !ok {
-		utils.Log.Warnf("[cluster-dispatch] node=%s staging failed: provider=%s needShareSave=%v requiredBytes=%d accounts=%d", nodeID, stagingRequirement.Provider, stagingRequirement.NeedShareSave, stagingRequirement.RequiredBytes, len(providerAccounts))
+		utils.Log.Debugf("[cluster-dispatch] node=%s staging unavailable: provider=%s needShareSave=%v requiredBytes=%d accounts=%d", nodeID, stagingRequirement.Provider, stagingRequirement.NeedShareSave, stagingRequirement.RequiredBytes, len(providerAccounts))
 		return nodeProviderAccountMatch{}, false, nil
 	}
 	delivery, ok := selectProviderAccount(providerAccounts, deliveryRequirement, targetPath, false)
 	if !ok {
-		utils.Log.Warnf("[cluster-dispatch] node=%s delivery failed: provider=%s needUpload=%v requiredBytes=%d targetPath=%s accounts=%d", nodeID, deliveryRequirement.Provider, deliveryRequirement.NeedUpload, deliveryRequirement.RequiredBytes, targetPath, len(providerAccounts))
+		utils.Log.Debugf("[cluster-dispatch] node=%s delivery unavailable: provider=%s needUpload=%v requiredBytes=%d targetPath=%s accounts=%d", nodeID, deliveryRequirement.Provider, deliveryRequirement.NeedUpload, deliveryRequirement.RequiredBytes, targetPath, len(providerAccounts))
 		return nodeProviderAccountMatch{}, false, nil
 	}
 	var nodeActiveJobs int64
