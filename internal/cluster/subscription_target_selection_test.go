@@ -98,6 +98,38 @@ func TestChooseDispatchTargetIgnoresLegacySubscriptionDeliveryProvider(t *testin
 	}
 }
 
+func TestChooseDispatchTargetSkipsWorkerAtAdvertisedMediaCapacity(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	configureProviderPipelineDB(t, database)
+	capabilities, err := json.Marshal(protocol.NodeCapabilities{
+		SupportedProviders:   []string{"pan123", "yidong139"},
+		SupportedOperations:  []string{"share.save", "mobile.upload", "result.report"},
+		DownloadConcurrency:  1,
+		RedisDurabilityReady: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := json.Marshal(preferredWorkerTestAccounts(100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNode{ID: "worker-full", Name: "worker-full", Role: model.ClusterRoleWorker, Status: model.ClusterNodeStatusOnline}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeInventory{ID: "worker-full-inventory", NodeID: "worker-full", Revision: 1, CollectedAt: time.Now().UTC(), CapabilitiesJSON: string(capabilities), ProviderAccountsJSON: string(accounts), MountsJSON: "[]"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterJob{ID: "active-media", Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusRunning, AssignedNodeID: "worker-full"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	target := (&Runtime{}).chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-full"}}, subscription.ClusterMediaTask{ShareProvider: "pan123", SourceSize: 1 << 30})
+	if target != nil {
+		t.Fatalf("target = %#v, want nil while worker capacity is full", target)
+	}
+}
+
 func TestChooseDispatchTargetAppliesPreferredWorkerAfterEligibility(t *testing.T) {
 	database := openClusterRuntimeTestDB(t)
 	configureProviderPipelineDB(t, database)

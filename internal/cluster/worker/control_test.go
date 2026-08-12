@@ -134,6 +134,22 @@ func TestLimitGateHonorsUpdatedLimit(t *testing.T) {
 	release()
 }
 
+func TestLimitGateTryAcquireDoesNotBlockWhenFull(t *testing.T) {
+	gate := newLimitGate(1)
+	release, ok := gate.TryAcquire()
+	require.True(t, ok)
+
+	secondRelease, ok := gate.TryAcquire()
+	require.False(t, ok)
+	require.Nil(t, secondRelease)
+
+	release()
+	secondRelease, ok = gate.TryAcquire()
+	require.True(t, ok)
+	require.NotNil(t, secondRelease)
+	secondRelease()
+}
+
 func TestStorageFailureDoesNotExposeOperatorError(t *testing.T) {
 	keys, err := secure.GenerateKeyPair()
 	require.NoError(t, err)

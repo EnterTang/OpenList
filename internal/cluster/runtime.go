@@ -560,6 +560,9 @@ func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coo
 	if _, err := service.ProcessPendingShareInspects(ctx, 20); err != nil {
 		log.Errorf("process cluster share inspection manifests: %v", err)
 	}
+	if _, err := service.SweepStalledAttempts(ctx, time.Now().UTC(), 10*time.Minute); err != nil {
+		log.Errorf("sweep stalled cluster attempts: %v", err)
+	}
 	if _, err := service.SweepExpiredLeases(ctx, time.Now().UTC()); err != nil {
 		log.Errorf("sweep expired cluster leases: %v", err)
 	}
@@ -737,8 +740,9 @@ func (r *Runtime) redispatchQueuedJobs(ctx context.Context, limit int) error {
 		Limit(limit).Find(&jobs).Error; err != nil {
 		return err
 	}
+	reservedByNode := make(map[string]int)
 	for i := range jobs {
-		available, err := compatibleNodeIDs(ctx, hub, nodes, &jobs[i])
+		available, err := compatibleNodeIDs(ctx, hub, nodes, &jobs[i], reservedByNode)
 		if err != nil {
 			log.Errorf("match cluster job %s to nodes: %v", jobs[i].ID, err)
 			continue
@@ -755,6 +759,7 @@ func (r *Runtime) redispatchQueuedJobs(ctx context.Context, limit int) error {
 			continue
 		}
 		nodeID := selectRedispatchNodeID(available, taskContext, i)
+		reservedByNode[nodeID]++
 		if err := r.redispatchJob(ctx, hub, &jobs[i], nodeID); err != nil && !errors.Is(err, transport.ErrNotConnected) {
 			log.Errorf("redispatch cluster job %s: %v", jobs[i].ID, err)
 		}
@@ -762,7 +767,7 @@ func (r *Runtime) redispatchQueuedJobs(ctx context.Context, limit int) error {
 	return nil
 }
 
-func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.ClusterNode, job *model.ClusterJob) ([]string, error) {
+func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.ClusterNode, job *model.ClusterJob, reservations ...map[string]int) ([]string, error) {
 	var taskContext protocol.TaskContext
 	if err := json.Unmarshal([]byte(job.TaskContextJSON), &taskContext); err != nil {
 		return nil, err
@@ -774,13 +779,21 @@ func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.Cl
 		}
 	}
 	matched := make([]string, 0, len(nodes))
+	reservedByNode := map[string]int(nil)
+	if len(reservations) > 0 {
+		reservedByNode = reservations[0]
+	}
 	for i := range nodes {
 		if _, online := hub.Session(nodes[i].ID); !online {
 			continue
 		}
-		ok, err := nodeInventorySupports(ctx, nodes[i].ID, taskContext, required, job.ExpectedBytes)
+		match, ok, err := nodeInventoryProviderMatch(ctx, nodes[i].ID, taskContext, required, job.ExpectedBytes)
 		if err != nil {
 			return nil, err
+		}
+		if ok && job.Type == model.ClusterJobTypeMediaTransfer && match.MediaConcurrency > 0 && match.NodeActiveJobs+int64(reservedByNode[nodes[i].ID]) >= int64(match.MediaConcurrency) {
+			ok = false
+			log.Debugf("skip redispatch of media job %s to node %s at capacity active=%d reserved=%d limit=%d", job.ID, nodes[i].ID, match.NodeActiveJobs, reservedByNode[nodes[i].ID], match.MediaConcurrency)
 		}
 		if ok {
 			matched = append(matched, nodes[i].ID)

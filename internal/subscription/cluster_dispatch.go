@@ -29,11 +29,18 @@ const (
 var ErrClusterWorkerUnavailable = errors.New("no compatible cluster worker is available")
 
 type ClusterWorkerUnavailableError struct {
+	Code    string
 	Message string
 }
 
 func (e *ClusterWorkerUnavailableError) Error() string {
 	if e == nil {
+		return ErrClusterWorkerUnavailable.Error()
+	}
+	if strings.TrimSpace(e.Message) == "" {
+		if strings.TrimSpace(e.Code) != "" {
+			return e.Code
+		}
 		return ErrClusterWorkerUnavailable.Error()
 	}
 	return e.Message

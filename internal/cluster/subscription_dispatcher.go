@@ -401,6 +401,7 @@ func (d subscriptionDispatcher) planSubscriptionMediaDispatch(ctx context.Contex
 		target := d.runtime.chooseDispatchTarget(ctx, targets, task)
 		if target == nil {
 			return nil, &subscription.ClusterWorkerUnavailableError{
+				Code:    "worker_capacity_unavailable",
 				Message: fmt.Sprintf("subscription media task %q has no connected compatible cluster worker", subscriptionDispatchTaskKey(task, i)),
 			}
 		}
@@ -569,6 +570,10 @@ func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchT
 		}
 		match.ActiveJobs += target.pendingAssignments
 		match.NodeActiveJobs += int64(target.pendingAssignments)
+		if match.MediaConcurrency > 0 && match.NodeActiveJobs >= int64(match.MediaConcurrency) {
+			utils.Log.Warnf("[cluster-dispatch] target node=%s is at media capacity active=%d limit=%d", target.nodeID, match.NodeActiveJobs, match.MediaConcurrency)
+			continue
+		}
 		target.match = match
 		eligible = append(eligible, target)
 	}

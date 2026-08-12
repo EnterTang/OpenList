@@ -23,6 +23,7 @@ type nodeProviderAccountMatch struct {
 	FreeBytes        int64
 	ActiveJobs       int
 	NodeActiveJobs   int64
+	MediaConcurrency int
 }
 
 func resolveInventoryTargetPath(ctx context.Context, nodeID string, targetPath string) (string, bool) {
@@ -100,11 +101,11 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	// requires a healthy provider account with read/share credentials.
 	if containsFold(required, model.ClusterJobTypeShareInspect) && strings.TrimSpace(taskContext.TargetProfile) == "" {
 		if len(providerAccounts) == 0 {
-			return nodeProviderAccountMatch{}, true, nil
+			return nodeProviderAccountMatch{MediaConcurrency: capabilities.DownloadConcurrency}, true, nil
 		}
 		stagingRequirement.RequiredBytes = 0
 		staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", true)
-		return nodeProviderAccountMatch{Staging: staging}, ok, nil
+		return nodeProviderAccountMatch{Staging: staging, MediaConcurrency: capabilities.DownloadConcurrency}, ok, nil
 	}
 	deliveryRequirement := taskContext.DeliveryTarget
 	if deliveryRequirement.RequiredBytes <= 0 {
@@ -127,7 +128,7 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 		if err := json.Unmarshal([]byte(inventory.MountsJSON), &mounts); err != nil {
 			return nodeProviderAccountMatch{}, false, err
 		}
-		return nodeProviderAccountMatch{}, mountsSupportTarget(mounts, targetPath, expectedBytes), nil
+		return nodeProviderAccountMatch{MediaConcurrency: capabilities.DownloadConcurrency}, mountsSupportTarget(mounts, targetPath, expectedBytes), nil
 	}
 	staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", !directDownload)
 	if !ok {
@@ -141,11 +142,13 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	}
 	var nodeActiveJobs int64
 	if err := db.GetDb().WithContext(ctx).Model(&model.ClusterJob{}).
-		Where("assigned_node_id = ? AND status IN ?", nodeID, []string{model.ClusterJobStatusLeased, model.ClusterJobStatusRunning, model.ClusterJobStatusCancelRequested}).
+		Where("assigned_node_id = ? AND type = ? AND status IN ?", nodeID, model.ClusterJobTypeMediaTransfer, []string{model.ClusterJobStatusLeased, model.ClusterJobStatusRunning, model.ClusterJobStatusCancelRequested}).
 		Count(&nodeActiveJobs).Error; err != nil {
 		return nodeProviderAccountMatch{}, false, err
 	}
-	return combineProviderAccountMatch(staging, delivery, nodeActiveJobs), true, nil
+	match := combineProviderAccountMatch(staging, delivery, nodeActiveJobs)
+	match.MediaConcurrency = capabilities.DownloadConcurrency
+	return match, true, nil
 }
 
 func providerAccountsSupportSource(accounts []protocol.ProviderAccountInventory, provider string) bool {

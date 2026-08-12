@@ -87,12 +87,20 @@ func getFreshCleanupObject(ctx context.Context, storage driver.Driver, actualPat
 }
 
 type activeTask struct {
-	attempt       protocol.AttemptRef
-	offer         protocol.JobOffer
-	ctx           context.Context
-	cancel        context.CancelCauseFunc
-	stagingMount  string
-	deliveryMount string
+	attempt         protocol.AttemptRef
+	offer           protocol.JobOffer
+	ctx             context.Context
+	cancel          context.CancelCauseFunc
+	stagingMount    string
+	deliveryMount   string
+	capacityRelease func()
+}
+
+func (t *activeTask) releaseCapacity() {
+	if t == nil || t.capacityRelease == nil {
+		return
+	}
+	t.capacityRelease()
 }
 
 type Service struct {
@@ -516,21 +524,30 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		return err
 	}
 	if !offer.LeaseUntil.After(time.Now()) {
-		return errors.New("cluster job lease has already expired")
+		return s.sendJobReject(ctx, offer, "worker_lease_expired", "cluster job lease has already expired", true)
 	}
 	if err := s.queue.ValidateDurability(ctx); err != nil {
-		return fmt.Errorf("worker result queue is not durable: %w", err)
+		return s.sendJobReject(ctx, offer, "worker_queue_unavailable", err.Error(), true)
 	}
 	if err := s.cleanupBacklogBlocksOffer(ctx, offer); err != nil {
-		return err
+		return s.sendJobReject(ctx, offer, "worker_cleanup_backlog", err.Error(), true)
 	}
 	attemptKey := executionAttemptKey(offer.AttemptRef)
 	claimed, err := s.queue.ClaimAttempt(ctx, attemptKey, 7*24*time.Hour)
 	if err != nil {
-		return fmt.Errorf("journal cluster job attempt: %w", err)
+		return s.sendJobReject(ctx, offer, "worker_journal_unavailable", err.Error(), true)
 	}
 	if !claimed {
-		return s.sendJobAccept(ctx, offer)
+		s.mu.Lock()
+		running, active := s.active[offer.JobID]
+		s.mu.Unlock()
+		if active && running != nil && sameAttempt(running.attempt, offer.AttemptRef) {
+			return s.sendJobAccept(ctx, offer)
+		}
+		// The durable claim can survive a Worker restart. Do not acknowledge a
+		// replay unless this process still owns the active execution; the
+		// coordinator will retry the offer or recover it after the lease ends.
+		return fmt.Errorf("cluster attempt %s is already claimed without an active execution", offer.AttemptRef.AttemptID)
 	}
 	// Detach execution from the websocket session context so transport loss
 	// cannot cancel an in-flight share-save / move. Explicit job.cancel and
@@ -551,21 +568,58 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		if offer.Generation <= running.attempt.Generation {
 			s.mu.Unlock()
 			cancelCause(nil)
+			_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
 			return fmt.Errorf("cluster job %s generation %d is already active", offer.JobID, running.attempt.Generation)
 		}
 		running.cancel(errors.New("cluster job superseded by a newer generation"))
+	}
+	s.mu.Unlock()
+
+	if offer.JobType == model.ClusterJobTypeMediaTransfer {
+		release, ok := s.tryAcquireMediaCapacity()
+		if !ok {
+			active, limit := s.downloadGate.Snapshot()
+			log.Warnf("cluster job %s admission rejected attempt=%s generation=%d code=worker_capacity_unavailable active=%d limit=%d", offer.JobID, offer.AttemptID, offer.Generation, active, limit)
+			cancelCause(nil)
+			_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
+			return s.sendJobReject(ctx, offer, "worker_capacity_unavailable", "worker media concurrency limit is full", true)
+		}
+		var releaseOnce sync.Once
+		current.capacityRelease = func() { releaseOnce.Do(release) }
+	}
+
+	s.mu.Lock()
+	if running, exists := s.active[offer.JobID]; exists {
+		if sameAttempt(running.attempt, offer.AttemptRef) {
+			s.mu.Unlock()
+			current.releaseCapacity()
+			cancelCause(nil)
+			if running.ctx.Err() != nil {
+				return fmt.Errorf("cluster job %s previous execution is still stopping", offer.JobID)
+			}
+			return s.sendJobAccept(ctx, offer)
+		}
+		if offer.Generation <= running.attempt.Generation {
+			s.mu.Unlock()
+			current.releaseCapacity()
+			cancelCause(nil)
+			_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
+			return fmt.Errorf("cluster job %s generation %d is already active", offer.JobID, running.attempt.Generation)
+		}
 	}
 	s.active[offer.JobID] = current
 	s.mu.Unlock()
 	if err := s.sendJobAccept(ctx, offer); err != nil {
 		_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
 		s.finishActive(offer.JobID, current)
+		current.releaseCapacity()
 		cancelCause(err)
 		return err
 	}
 	go func() {
 		defer cancelCause(nil)
 		defer s.finishActive(offer.JobID, current)
+		defer current.releaseCapacity()
 		go s.maintainLease(jobCtx, cancelCause, offer)
 
 		var result map[string]any
@@ -948,6 +1002,9 @@ func safeClusterPathSegment(value string) string {
 	return "id-" + hex.EncodeToString(sum[:8])
 }
 
+// executeMediaTransfer runs after acceptJob has reserved the media slot. The
+// direct-download fallback deliberately calls this function with the same
+// reservation, so this method must not acquire a second gate slot.
 func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOffer) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -955,11 +1012,6 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if offer.JobType != "media.transfer" {
 		return fmt.Errorf("unsupported cluster job type %q", offer.JobType)
 	}
-	releaseExec, err := s.acquireDownloadCapacity(ctx)
-	if err != nil {
-		return fmt.Errorf("wait for cluster media concurrency slot: %w", err)
-	}
-	defer releaseExec()
 	targetProfileRef := strings.TrimSpace(offer.TaskContext.TargetProfile)
 	if strings.TrimSpace(offer.TaskContext.DeliveryTarget.Provider) == "" && (targetProfileRef == "" || targetProfileRef == "/") {
 		return errors.New("cluster target profile must be a mounted destination path")
@@ -1404,6 +1456,9 @@ func findExistingStagedSource(ctx context.Context, tempRoot string, primary prot
 }
 
 func (s *Service) reportStageStatus(ctx context.Context, offer protocol.JobOffer, stage, status, stageError string) {
+	if status == model.ClusterStageStatusRunning {
+		log.Infof("cluster job %s stage started attempt=%s generation=%d stage=%s", offer.JobID, offer.AttemptID, offer.Generation, stage)
+	}
 	if err := s.sendStageStatus(ctx, offer, stage, status, stageError); err != nil {
 		log.Warnf("cluster job %s stage %s/%s notify failed: %v", offer.JobID, stage, status, err)
 	}
@@ -1516,6 +1571,23 @@ func (s *Service) requestStagePermit(ctx context.Context, offer protocol.JobOffe
 func (s *Service) sendJobAccept(ctx context.Context, offer protocol.JobOffer) error {
 	payload := protocol.JobAccept{AttemptRef: offer.AttemptRef, AcceptedAt: time.Now().UTC()}
 	message, err := protocol.NewEnvelope(protocol.MessageJobAccept, payload)
+	if err != nil {
+		return err
+	}
+	return s.sender.Send(ctx, *message)
+}
+
+func (s *Service) sendJobReject(ctx context.Context, offer protocol.JobOffer, code, reason string, retryable bool) error {
+	if strings.TrimSpace(code) != "worker_capacity_unavailable" {
+		log.Warnf("cluster job %s admission rejected attempt=%s generation=%d code=%s retryable=%t", offer.JobID, offer.AttemptID, offer.Generation, strings.TrimSpace(code), retryable)
+	}
+	payload := protocol.JobReject{
+		AttemptRef: offer.AttemptRef,
+		Code:       strings.TrimSpace(code),
+		Reason:     strings.TrimSpace(reason),
+		Retryable:  retryable,
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageJobReject, payload)
 	if err != nil {
 		return err
 	}

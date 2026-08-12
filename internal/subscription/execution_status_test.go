@@ -196,6 +196,8 @@ func TestReconcileSubscriptionExecutionClassifiesRecoverableFailures(t *testing.
 		wantCode string
 	}{
 		{key: "retry", code: "share_save_retryable", want: model.SubscriptionItemStatusRetryWait, wantCode: "share_save_retryable"},
+		{key: "capacity", code: "worker_capacity_unavailable", want: model.SubscriptionItemStatusRetryWait, wantCode: "worker_capacity_unavailable"},
+		{key: "start-timeout", code: "worker_start_timeout", want: model.SubscriptionItemStatusRetryWait, wantCode: "worker_start_timeout"},
 		{key: "unknown", code: "share_save_result_unknown", want: model.SubscriptionItemStatusUnknown, wantCode: "share_save_result_unknown"},
 		{key: "blocked", code: "no_compatible_worker", want: model.SubscriptionItemStatusBlocked, wantCode: "no_compatible_worker"},
 		{key: "direct-reauthorize", code: "direct_share_reauthorize", want: model.SubscriptionItemStatusBlocked, wantCode: "direct_share_reauthorize"},

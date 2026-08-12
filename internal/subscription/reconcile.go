@@ -11,6 +11,8 @@ import (
 	"gorm.io/gorm"
 )
 
+var ErrSubscriptionItemChanged = errors.New("subscription item changed during reconciliation")
+
 // ExecutionReconcileResult is deliberately small and operational: callers
 // can expose it in logs/metrics without exposing provider response bodies.
 type ExecutionReconcileResult struct {
@@ -41,90 +43,102 @@ func ReconcileSubscriptionExecution(ctx context.Context, subscriptionID uint) (E
 	} else if cfg.MaxReconcileAttempts > 0 {
 		maxAttempts = cfg.MaxReconcileAttempts
 	}
-	now := time.Now().UTC()
-	err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var sub model.Subscription
-		if err := tx.First(&sub, subscriptionID).Error; err != nil {
-			return err
-		}
-		var items []model.SubscriptionItem
-		if err := tx.Where("subscription_id = ?", subscriptionID).Order("id ASC").Find(&items).Error; err != nil {
-			return err
-		}
-		var jobs []model.ClusterJob
-		if err := tx.Where("subscription_id = ? AND type = ?", subscriptionID, model.ClusterJobTypeMediaTransfer).
-			Order("created_at DESC, id DESC").Find(&jobs).Error; err != nil {
-			return err
-		}
-		result.Inspected = len(items) + len(jobs)
+	var err error
+	for reconcileAttempt := 0; reconcileAttempt < 3; reconcileAttempt++ {
+		result = ExecutionReconcileResult{SubscriptionID: subscriptionID}
+		now := time.Now().UTC()
+		err = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var sub model.Subscription
+			if err := tx.First(&sub, subscriptionID).Error; err != nil {
+				return err
+			}
+			var items []model.SubscriptionItem
+			if err := tx.Where("subscription_id = ?", subscriptionID).Order("id ASC").Find(&items).Error; err != nil {
+				return err
+			}
+			var jobs []model.ClusterJob
+			if err := tx.Where("subscription_id = ? AND type = ?", subscriptionID, model.ClusterJobTypeMediaTransfer).
+				Order("created_at DESC, id DESC").Find(&jobs).Error; err != nil {
+				return err
+			}
+			result.Inspected = len(items) + len(jobs)
 
-		jobsByID := make(map[string]*model.ClusterJob, len(jobs))
-		latestByItemID := make(map[uint]*model.ClusterJob)
-		for i := range jobs {
-			job := &jobs[i]
-			jobsByID[strings.TrimSpace(job.ID)] = job
-			if job.SubscriptionItemID != 0 {
-				if _, exists := latestByItemID[job.SubscriptionItemID]; !exists {
-					latestByItemID[job.SubscriptionItemID] = job
+			jobsByID := make(map[string]*model.ClusterJob, len(jobs))
+			latestByItemID := make(map[uint]*model.ClusterJob)
+			for i := range jobs {
+				job := &jobs[i]
+				jobsByID[strings.TrimSpace(job.ID)] = job
+				if job.SubscriptionItemID != 0 {
+					if _, exists := latestByItemID[job.SubscriptionItemID]; !exists {
+						latestByItemID[job.SubscriptionItemID] = job
+					}
 				}
 			}
-		}
-		itemsByID := make(map[uint]*model.SubscriptionItem, len(items))
-		for i := range items {
-			itemsByID[items[i].ID] = &items[i]
-		}
-
-		for i := range items {
-			item := &items[i]
-			job := jobsByID[strings.TrimSpace(item.ClusterJobID)]
-			if job == nil {
-				job = latestByItemID[item.ID]
-			}
-			if err := reconcileSubscriptionItemTx(tx, item, job, now, maxAttempts, &result); err != nil {
-				return err
-			}
-		}
-		for i := range jobs {
-			job := &jobs[i]
-			if job.SubscriptionItemID == 0 {
-				continue
-			}
-			if _, exists := itemsByID[job.SubscriptionItemID]; exists {
-				continue
-			}
-			if !subscriptionJobActive(job.Status) {
-				continue
-			}
-			if err := tx.Model(&model.ClusterJob{}).Where("id = ? AND status IN ?", job.ID, subscriptionActiveJobStatuses()).Updates(map[string]any{
-				"status": model.ClusterJobStatusCancelled, "finished_at": now,
-				"last_error_code": "orphaned_subscription_item",
-				"last_error":      "subscription item no longer exists; job cancelled by reconciliation",
-			}).Error; err != nil {
-				return err
-			}
-			result.Repaired++
-		}
-
-		status := aggregateSubscriptionStatus(items)
-		lastError := ""
-		if status == model.SubscriptionStatusFailed {
+			itemsByID := make(map[uint]*model.SubscriptionItem, len(items))
 			for i := range items {
-				if items[i].Status == model.SubscriptionItemStatusFailed && strings.TrimSpace(items[i].LastError) != "" {
-					lastError = items[i].LastError
-					break
+				itemsByID[items[i].ID] = &items[i]
+			}
+
+			for i := range items {
+				item := &items[i]
+				job := jobsByID[strings.TrimSpace(item.ClusterJobID)]
+				if job == nil {
+					job = latestByItemID[item.ID]
+				}
+				if err := reconcileSubscriptionItemTx(tx, item, job, now, maxAttempts, &result); err != nil {
+					return err
 				}
 			}
-			if lastError == "" {
-				lastError = "one or more subscription items failed; retry is available"
+			for i := range jobs {
+				job := &jobs[i]
+				if job.SubscriptionItemID == 0 {
+					continue
+				}
+				if _, exists := itemsByID[job.SubscriptionItemID]; exists {
+					continue
+				}
+				if !subscriptionJobActive(job.Status) {
+					continue
+				}
+				if err := tx.Model(&model.ClusterJob{}).Where("id = ? AND status IN ?", job.ID, subscriptionActiveJobStatuses()).Updates(map[string]any{
+					"status": model.ClusterJobStatusCancelled, "finished_at": now,
+					"last_error_code": "orphaned_subscription_item",
+					"last_error":      "subscription item no longer exists; job cancelled by reconciliation",
+				}).Error; err != nil {
+					return err
+				}
+				result.Repaired++
 			}
+
+			status := aggregateSubscriptionStatus(items)
+			lastError := ""
+			if status == model.SubscriptionStatusFailed {
+				for i := range items {
+					if items[i].Status == model.SubscriptionItemStatusFailed && strings.TrimSpace(items[i].LastError) != "" {
+						lastError = items[i].LastError
+						break
+					}
+				}
+				if lastError == "" {
+					lastError = "one or more subscription items failed; retry is available"
+				}
+			}
+			if err := reconcileLatestSubscriptionRunTx(tx, subscriptionID, items, jobs, now); err != nil {
+				return err
+			}
+			return tx.Model(&model.Subscription{}).Where("id = ?", subscriptionID).Updates(map[string]any{
+				"last_status": status, "last_error": lastError, "updated_at": now,
+			}).Error
+		})
+		if !errors.Is(err, ErrSubscriptionItemChanged) || reconcileAttempt == 2 {
+			break
 		}
-		if err := reconcileLatestSubscriptionRunTx(tx, subscriptionID, items, jobs, now); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		case <-time.After(time.Duration(reconcileAttempt+1) * 25 * time.Millisecond):
 		}
-		return tx.Model(&model.Subscription{}).Where("id = ?", subscriptionID).Updates(map[string]any{
-			"last_status": status, "last_error": lastError, "updated_at": now,
-		}).Error
-	})
+	}
 	return result, err
 }
 
@@ -405,7 +419,7 @@ const (
 
 func classifySubscriptionFailure(errorCode string) string {
 	switch strings.ToLower(strings.TrimSpace(errorCode)) {
-	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_unexpected_eof", "source_range_failed", "source_link_expired", "network_timeout", "timeout", "rate_limited":
+	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_unexpected_eof", "source_range_failed", "source_link_expired", "network_timeout", "timeout", "rate_limited", "worker_capacity_unavailable", "worker_cleanup_backlog", "worker_journal_unavailable", "worker_start_timeout", "worker_lease_expired", "lease_expired":
 		return model.SubscriptionItemStatusRetryWait
 	case "share_save_result_unknown", "result_unknown", "request_result_unknown", "operation_result_unknown":
 		return model.SubscriptionItemStatusUnknown
@@ -429,7 +443,7 @@ func updateSubscriptionItemReconcileTx(tx *gorm.DB, item *model.SubscriptionItem
 		return updated.Error
 	}
 	if updated.RowsAffected != 1 {
-		return errors.New("subscription item changed during reconciliation")
+		return ErrSubscriptionItemChanged
 	}
 	if err := tx.Model(&model.SubscriptionEpisodeSource{}).
 		Where("subscription_id = ? AND source_item_id = ? AND file_hash = ?", item.SubscriptionID, item.ID, item.FileHash).

@@ -67,21 +67,19 @@ func (g *limitGate) SetLimit(limit int) {
 	g.mu.Unlock()
 }
 
+func (g *limitGate) Snapshot() (active, limit int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.active, g.limit
+}
+
 func (g *limitGate) Acquire(ctx context.Context) (func(), error) {
 	for {
 		g.mu.Lock()
 		if g.limit == 0 || g.active < g.limit {
 			g.active++
 			g.mu.Unlock()
-			return func() {
-				g.mu.Lock()
-				if g.active > 0 {
-					g.active--
-				}
-				close(g.wake)
-				g.wake = make(chan struct{})
-				g.mu.Unlock()
-			}, nil
+			return g.releaseOne, nil
 		}
 		wake := g.wake
 		g.mu.Unlock()
@@ -91,6 +89,33 @@ func (g *limitGate) Acquire(ctx context.Context) (func(), error) {
 		case <-wake:
 		}
 	}
+}
+
+// TryAcquire reserves a slot without waiting. It is used at the job admission
+// boundary so a worker never acknowledges a job that can only sit blocked in
+// the execution goroutine while its lease is renewed.
+func (g *limitGate) TryAcquire() (func(), bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.limit > 0 && g.active >= g.limit {
+		return nil, false
+	}
+	g.active++
+	return g.releaseOne, true
+}
+
+func (g *limitGate) releaseOne() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.releaseOneLocked()
+}
+
+func (g *limitGate) releaseOneLocked() {
+	if g.active > 0 {
+		g.active--
+	}
+	close(g.wake)
+	g.wake = make(chan struct{})
 }
 
 func (s *Service) ConfigureControlPlane(nodeID string, keys *secure.KeyPair, operator StorageOperator) {
@@ -139,6 +164,8 @@ func (s *Service) DecorateInventory(report *protocol.InventoryReport) {
 	}
 	report.KeyAgreement, report.ObservedRevision = s.ControlIdentity()
 	s.mu.Lock()
+	report.Capabilities.DownloadConcurrency = effectiveConcurrency(s.desiredConfig.DownloadConcurrency)
+	report.Capabilities.UploadConcurrency = effectiveConcurrency(s.desiredConfig.UploadConcurrency)
 	activeMounts := make([][2]string, 0, len(s.active))
 	for _, task := range s.active {
 		activeMounts = append(activeMounts, [2]string{task.stagingMount, task.deliveryMount})
@@ -464,6 +491,11 @@ func safeControlError(err error) string {
 func (s *Service) acquireDownloadCapacity(ctx context.Context) (func(), error) {
 	s.refreshDefaultMediaConcurrency()
 	return s.downloadGate.Acquire(ctx)
+}
+
+func (s *Service) tryAcquireMediaCapacity() (func(), bool) {
+	s.refreshDefaultMediaConcurrency()
+	return s.downloadGate.TryAcquire()
 }
 
 func (s *Service) acquireUploadCapacity(ctx context.Context) (func(), error) {

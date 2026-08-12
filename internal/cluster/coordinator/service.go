@@ -519,6 +519,12 @@ func (s *Service) HandleMessage(ctx context.Context, peer transport.Peer, messag
 			return err
 		}
 		return s.handleJobAccept(ctx, peer, message, payload)
+	case protocol.MessageJobReject:
+		payload, err := protocol.DecodePayload[protocol.JobReject](message)
+		if err != nil {
+			return err
+		}
+		return s.handleJobReject(ctx, peer, message, payload)
 	case protocol.MessageJobResult:
 		payload, err := protocol.DecodePayload[protocol.JobResult](message)
 		if err != nil {
@@ -658,6 +664,15 @@ func (s *Service) handleStageStatus(ctx context.Context, peer transport.Peer, me
 		}
 		if err := tx.Model(&model.ClusterJobStage{}).Where("id = ? AND attempt_id = ?", stage.ID, attempt.ID).Updates(updates).Error; err != nil {
 			return err
+		}
+		if update.Status == model.ClusterStageStatusRunning {
+			attemptUpdates := map[string]any{"status": model.ClusterAttemptStatusRunning}
+			if attempt.StartedAt == nil {
+				attemptUpdates["started_at"] = now
+			}
+			if err := tx.Model(&model.ClusterJobAttempt{}).Where("id = ?", attempt.ID).Updates(attemptUpdates).Error; err != nil {
+				return err
+			}
 		}
 		if update.Stage == model.ClusterStageWorkerMediaCleanup {
 			cleanupStatus := model.ClusterCleanupStatusRunning
@@ -850,6 +865,80 @@ func (s *Service) handleJobAccept(ctx context.Context, peer transport.Peer, mess
 			return errors.New("cluster job attempt is stale or belongs to another node")
 		}
 		if err := tx.Model(&model.ClusterJob{}).Where("id = ?", accepted.JobID).Update("status", model.ClusterJobStatusRunning).Error; err != nil {
+			return err
+		}
+		return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
+	})
+}
+
+const workerAdmissionRetryDelay = 10 * time.Second
+
+func (s *Service) handleJobReject(ctx context.Context, peer transport.Peer, message protocol.Envelope, rejected protocol.JobReject) error {
+	code := strings.TrimSpace(rejected.Code)
+	if code == "" {
+		return errors.New("cluster job rejection code is required")
+	}
+	reason := strings.TrimSpace(rejected.Reason)
+	if reason == "" {
+		reason = code
+	}
+	now := time.Now().UTC()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		duplicate, err := s.claimInboxTx(tx, peer, message)
+		if err != nil || duplicate {
+			return err
+		}
+		var job model.ClusterJob
+		if err := tx.First(&job, "id = ?", rejected.JobID).Error; err != nil {
+			return err
+		}
+		if job.CurrentAttemptID != rejected.AttemptID || job.CurrentGeneration != rejected.Generation || job.AssignedNodeID != peer.NodeID() {
+			return errors.New("cluster job rejection is stale")
+		}
+		attempt, err := loadAndValidateAttempt(tx, peer, rejected.AttemptRef)
+		if err != nil {
+			return err
+		}
+		if !containsString([]string{model.ClusterAttemptStatusOffered, model.ClusterAttemptStatusAccepted, model.ClusterAttemptStatusRunning}, attempt.Status) {
+			return fmt.Errorf("cluster job attempt cannot be rejected from status %q", attempt.Status)
+		}
+		if err := tx.Model(attempt).Updates(map[string]any{
+			"status": model.ClusterAttemptStatusRejected, "finished_at": now,
+			"error_code": code, "error": reason,
+		}).Error; err != nil {
+			return err
+		}
+		jobUpdates := map[string]any{
+			"assigned_node_id": "", "current_attempt_id": "",
+			"last_error_code": code, "last_error": reason,
+		}
+		exhausted := rejected.Retryable && job.Type == model.ClusterJobTypeMediaTransfer && attempt.Generation >= automaticMediaTransferAttemptLimit
+		if rejected.Retryable && !exhausted {
+			jobUpdates["status"] = model.ClusterJobStatusQueued
+			jobUpdates["finished_at"] = nil
+			jobUpdates["archived_at"] = nil
+			jobUpdates["available_at"] = now.Add(workerAdmissionRetryDelay)
+		} else if exhausted {
+			jobUpdates["status"] = model.ClusterJobStatusDeadLetter
+			jobUpdates["finished_at"] = now
+			jobUpdates["last_error_code"] = "retry_limit_exceeded"
+			jobUpdates["last_error"] = "worker rejected the media job and the automatic retry limit was reached"
+		} else {
+			jobUpdates["status"] = model.ClusterJobStatusFailed
+			jobUpdates["finished_at"] = now
+		}
+		updated := tx.Model(&model.ClusterJob{}).
+			Where("id = ? AND current_attempt_id = ? AND current_generation = ?", job.ID, attempt.ID, attempt.Generation).
+			Updates(jobUpdates)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected == 0 {
+			return errors.New("cluster job rejection is stale or belongs to another attempt")
+		}
+		if err := tx.Model(&model.ClusterOutbox{}).
+			Where("correlation_id = ? AND message_type = ? AND status IN ?", job.ID, protocol.MessageJobOffer, []string{model.ClusterMessageStatusPending, model.ClusterMessageStatusSending}).
+			Updates(map[string]any{"status": model.ClusterMessageStatusFailed, "last_error": "worker rejected offer: " + code}).Error; err != nil {
 			return err
 		}
 		return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
@@ -1325,6 +1414,82 @@ func (s *Service) SweepExpiredLeases(ctx context.Context, now time.Time) (int64,
 				}
 			}
 			affected += result.RowsAffected
+		}
+		return nil
+	})
+	return affected, err
+}
+
+// SweepStalledAttempts recovers media attempts that were accepted by a
+// worker but never emitted a stage event. A worker must not be allowed to
+// renew such an attempt forever: without this guard the subscription item
+// remains transferring while no download/upload task is actually running.
+func (s *Service) SweepStalledAttempts(ctx context.Context, now time.Time, grace time.Duration) (int64, error) {
+	if grace <= 0 {
+		grace = 10 * time.Minute
+	}
+	cutoff := now.Add(-grace)
+	var affected int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var attempts []model.ClusterJobAttempt
+		if err := tx.Where("status IN ? AND (accepted_at <= ? OR (accepted_at IS NULL AND offered_at <= ?))", []string{model.ClusterAttemptStatusAccepted, model.ClusterAttemptStatusRunning}, cutoff, cutoff).Find(&attempts).Error; err != nil {
+			return err
+		}
+		for i := range attempts {
+			attempt := &attempts[i]
+			var job model.ClusterJob
+			if err := tx.First(&job, "id = ?", attempt.JobID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				return err
+			}
+			if job.Type != model.ClusterJobTypeMediaTransfer || job.CurrentAttemptID != attempt.ID || job.CurrentGeneration != attempt.Generation || job.Status != model.ClusterJobStatusRunning && job.Status != model.ClusterJobStatusLeased {
+				continue
+			}
+			var stageCount int64
+			if err := tx.Model(&model.ClusterJobStage{}).Where("job_id = ? AND attempt_id = ?", job.ID, attempt.ID).Count(&stageCount).Error; err != nil {
+				return err
+			}
+			if stageCount > 0 {
+				continue
+			}
+			if err := tx.Model(attempt).Updates(map[string]any{
+				"status": model.ClusterAttemptStatusLost, "finished_at": now,
+				"error_code": "worker_start_timeout", "error": "worker accepted the job but did not start a stage",
+			}).Error; err != nil {
+				return err
+			}
+			jobUpdates := map[string]any{
+				"assigned_node_id": "", "current_attempt_id": "",
+				"last_error_code": "worker_start_timeout",
+				"last_error":      "worker accepted the job but did not start a stage",
+				"available_at":    now,
+			}
+			if attempt.Generation >= automaticMediaTransferAttemptLimit {
+				jobUpdates["status"] = model.ClusterJobStatusDeadLetter
+				jobUpdates["finished_at"] = now
+				jobUpdates["last_error_code"] = "worker_start_timeout_attempt_limit"
+				jobUpdates["last_error"] = "worker accepted the job but did not start a stage and automatic retry limit was reached"
+			} else {
+				jobUpdates["status"] = model.ClusterJobStatusQueued
+				jobUpdates["finished_at"] = nil
+			}
+			updated := tx.Model(&model.ClusterJob{}).
+				Where("id = ? AND current_attempt_id = ? AND current_generation = ?", job.ID, attempt.ID, attempt.Generation).
+				Updates(jobUpdates)
+			if updated.Error != nil {
+				return updated.Error
+			}
+			if updated.RowsAffected == 0 {
+				continue
+			}
+			if err := tx.Model(&model.ClusterOutbox{}).
+				Where("correlation_id = ? AND message_type = ? AND status IN ?", job.ID, protocol.MessageJobOffer, []string{model.ClusterMessageStatusPending, model.ClusterMessageStatusSending}).
+				Updates(map[string]any{"status": model.ClusterMessageStatusFailed, "last_error": "worker start timeout; superseded by retry"}).Error; err != nil {
+				return err
+			}
+			affected++
 		}
 		return nil
 	})

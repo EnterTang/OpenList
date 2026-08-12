@@ -76,6 +76,8 @@ func BuildInventory(ctx context.Context, nodeID string, redisReady bool) (protoc
 		Capabilities: protocol.NodeCapabilities{
 			SupportedProviders:   providerList,
 			SupportedOperations:  supportedOperations,
+			DownloadConcurrency:  effectiveMediaConcurrency(),
+			UploadConcurrency:    effectiveMediaConcurrency(),
 			RedisDurabilityReady: redisReady,
 		},
 		Mounts:           mounts,

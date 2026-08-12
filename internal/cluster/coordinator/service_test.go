@@ -306,6 +306,125 @@ func TestJobAcceptAndResultRequireCurrentLease(t *testing.T) {
 	}
 }
 
+func TestJobRejectRequeuesRetryableCapacityFailure(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	ctx := testTaskContext()
+	ctxHash, err := protocol.HashTaskContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(ctx, ctxHash, model.ClusterAttemptStatusOffered)
+	job.Status = model.ClusterJobStatusLeased
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	reject, err := protocol.NewEnvelope(protocol.MessageJobReject, protocol.JobReject{
+		AttemptRef: attemptRefForTest(attempt), Code: "worker_capacity_unavailable",
+		Reason: "media concurrency limit is full", Retryable: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject.Seq = 1
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *reject); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusQueued || job.AssignedNodeID != "" || job.CurrentAttemptID != "" || job.LastErrorCode != "worker_capacity_unavailable" {
+		t.Fatalf("job after reject = %#v", job)
+	}
+	if !job.AvailableAt.After(time.Now().UTC()) {
+		t.Fatalf("job available_at = %s, want backoff in the future", job.AvailableAt)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != model.ClusterAttemptStatusRejected || attempt.ErrorCode != "worker_capacity_unavailable" {
+		t.Fatalf("attempt after reject = %#v", attempt)
+	}
+}
+
+func TestJobRejectDeadLettersAfterMediaAttemptLimit(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	ctx := testTaskContext()
+	ctxHash, err := protocol.HashTaskContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(ctx, ctxHash, model.ClusterAttemptStatusOffered)
+	job.CurrentGeneration = automaticMediaTransferAttemptLimit
+	attempt.Generation = automaticMediaTransferAttemptLimit
+	attempt.LeaseTokenHash = fmt.Sprintf("%x", sha256.Sum256([]byte("lease")))
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	reject, err := protocol.NewEnvelope(protocol.MessageJobReject, protocol.JobReject{
+		AttemptRef: attemptRefForTest(attempt), Code: "worker_capacity_unavailable", Retryable: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject.Seq = 1
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *reject); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusDeadLetter || job.LastErrorCode != "retry_limit_exceeded" || job.FinishedAt == nil {
+		t.Fatalf("job after exhausted rejection = %#v", job)
+	}
+}
+
+func TestSweepStalledAttemptsRequeuesAcceptedMediaWithoutStages(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	ctx := testTaskContext()
+	ctxHash, err := protocol.HashTaskContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(ctx, ctxHash, model.ClusterAttemptStatusAccepted)
+	acceptedAt := time.Now().UTC().Add(-20 * time.Minute)
+	attempt.AcceptedAt = &acceptedAt
+	job.Status = model.ClusterJobStatusRunning
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := New(database, "").SweepStalledAttempts(context.Background(), time.Now().UTC(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Fatalf("affected = %d", affected)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusQueued || job.AssignedNodeID != "" || job.CurrentAttemptID != "" || job.LastErrorCode != "worker_start_timeout" {
+		t.Fatalf("job after stalled sweep = %#v", job)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != model.ClusterAttemptStatusLost || attempt.ErrorCode != "worker_start_timeout" {
+		t.Fatalf("attempt after stalled sweep = %#v", attempt)
+	}
+}
+
 func TestFailedMediaResultConvergesNotificationAndActiveStages(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	task := testTaskContext()
@@ -1341,6 +1460,10 @@ func testJobAndAttempt(ctx protocol.TaskContext, ctxHash, status string) (model.
 		LeaseTokenHash: fmt.Sprintf("%x", sha256.Sum256([]byte("lease"))), LeaseUntil: time.Now().UTC().Add(time.Hour),
 	}
 	return job, attempt
+}
+
+func attemptRefForTest(attempt model.ClusterJobAttempt) protocol.AttemptRef {
+	return protocol.AttemptRef{JobID: attempt.JobID, AttemptID: attempt.ID, Generation: attempt.Generation, LeaseToken: "lease"}
 }
 
 func testManifest(job model.ClusterJob, ctx protocol.TaskContext, ctxHash string) protocol.UploadETFManifest {

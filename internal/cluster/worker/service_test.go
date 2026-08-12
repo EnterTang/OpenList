@@ -514,6 +514,32 @@ func TestCancelActiveCancelsConnectionBoundTasks(t *testing.T) {
 	require.ErrorIs(t, context.Cause(ctx), want)
 }
 
+func TestAcceptJobRejectsMediaWhenCapacityIsFull(t *testing.T) {
+	sender := make(channelSender, 1)
+	queue := &fakeResultQueue{}
+	service := New(queue, sender)
+	service.desiredConfig.DownloadConcurrency = 1
+	service.downloadGate.SetLimit(1)
+	release, ok := service.tryAcquireMediaCapacity()
+	require.True(t, ok)
+	defer release()
+	offer := protocol.JobOffer{
+		AttemptRef: protocol.AttemptRef{JobID: "capacity-job", AttemptID: "capacity-attempt", Generation: 1, LeaseToken: "lease"},
+		JobType:    model.ClusterJobTypeMediaTransfer,
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}
+
+	require.NoError(t, service.acceptJob(context.Background(), offer))
+	rejected := <-sender
+	require.Equal(t, protocol.MessageJobReject, rejected.Type)
+	payload, err := protocol.DecodePayload[protocol.JobReject](rejected)
+	require.NoError(t, err)
+	require.Equal(t, "worker_capacity_unavailable", payload.Code)
+	require.True(t, payload.Retryable)
+	require.False(t, queue.claimed, "rejected admission must release its durable attempt claim")
+	require.Empty(t, service.active)
+}
+
 func TestMaintainLeaseKeepsRunningWhenRenewTransportFails(t *testing.T) {
 	service := New(&fakeResultQueue{}, failSender{})
 	offer := protocol.JobOffer{
