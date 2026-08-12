@@ -498,6 +498,42 @@ func TestSearchCandidatesReturnsTVSeasonInfo(t *testing.T) {
 	}
 }
 
+func TestSearchCandidatesLimitsResultsAndCachesResponses(t *testing.T) {
+	searchRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/search/multi" {
+			t.Fatalf("path = %q, want /search/multi", r.URL.Path)
+		}
+		searchRequests++
+		results := make([]map[string]any, 0, tmdbSearchResultLimit+5)
+		for i := 0; i < tmdbSearchResultLimit+5; i++ {
+			results = append(results, map[string]any{
+				"id":           9000 + i,
+				"media_type":   "movie",
+				"title":        "Cached title",
+				"release_date": "2020-01-01",
+			})
+		}
+		writeJSON(t, w, map[string]any{"results": results})
+	}))
+	defer server.Close()
+
+	first, err := SearchCandidates(context.Background(), Config{APIKey: "key", BaseURL: server.URL}, "Cached title")
+	if err != nil {
+		t.Fatalf("first SearchCandidates returned error: %v", err)
+	}
+	second, err := SearchCandidates(context.Background(), Config{APIKey: "key", BaseURL: server.URL}, "Cached title")
+	if err != nil {
+		t.Fatalf("second SearchCandidates returned error: %v", err)
+	}
+	if len(first) != tmdbSearchResultLimit || len(second) != tmdbSearchResultLimit {
+		t.Fatalf("candidate counts = %d and %d, want %d", len(first), len(second), tmdbSearchResultLimit)
+	}
+	if searchRequests != 2 {
+		t.Fatalf("search requests = %d, want two language requests before caching", searchRequests)
+	}
+}
+
 func TestScoreCandidatePrefersExactBilingualEquivalentTitle(t *testing.T) {
 	recognized := recognize.Result{Title: "雨人 Rain Man 1988 蓝光原盘", Year: 1988, MediaTypeHint: "movie"}
 	exact := tmdbItem{Title: "雨人", OriginalTitle: "Rain Man", ReleaseDate: "1988-12-12", MediaType: "movie"}

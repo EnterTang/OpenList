@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -23,7 +24,13 @@ import (
 
 const defaultBaseURL = "https://api.themoviedb.org/3"
 
-const tmdbRequestTimeout = 15 * time.Second
+const (
+	tmdbRequestTimeout    = 15 * time.Second
+	tmdbSearchTimeout     = 10 * time.Second
+	tmdbSearchResultLimit = 20
+	tmdbCacheTTL          = 5 * time.Minute
+	tmdbCacheLimit        = 512
+)
 
 type Config struct {
 	APIKey        string
@@ -89,6 +96,25 @@ type tmdbAliasTitle struct {
 
 type tmdbTranslationsResp struct {
 	Translations []tmdbTranslation `json:"translations"`
+}
+
+type tmdbSearchCacheEntry struct {
+	ExpiresAt time.Time
+	Response  searchResp
+}
+
+type tmdbItemCacheEntry struct {
+	ExpiresAt time.Time
+	Item      tmdbItem
+}
+
+var tmdbCache = struct {
+	sync.Mutex
+	searches map[string]tmdbSearchCacheEntry
+	items    map[string]tmdbItemCacheEntry
+}{
+	searches: make(map[string]tmdbSearchCacheEntry),
+	items:    make(map[string]tmdbItemCacheEntry),
 }
 
 type tmdbTranslation struct {
@@ -186,10 +212,15 @@ func FetchCandidateByID(ctx context.Context, cfg Config, id int64, mediaType str
 
 func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ETFArchiveTMDBCandidate, error) {
 	cfg = normalizeConfig(cfg)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	searchCtx, cancel := context.WithTimeout(ctx, tmdbSearchTimeout)
+	defer cancel()
 	if id, ok := parseNumericID(query); ok {
 		candidates := make([]model.ETFArchiveTMDBCandidate, 0, 2)
 		for _, mediaType := range []string{"tv", "movie"} {
-			candidate, err := FetchCandidateByID(ctx, cfg, id, mediaType)
+			candidate, err := FetchCandidateByID(searchCtx, cfg, id, mediaType)
 			if err != nil {
 				continue
 			}
@@ -206,7 +237,7 @@ func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ET
 	items := make([]tmdbItem, 0)
 	seen := map[string]struct{}{}
 	for _, q := range queries {
-		found, err := searchAllLanguages(ctx, cfg, q)
+		found, err := searchAllLanguages(searchCtx, cfg, q)
 		if err != nil {
 			return nil, err
 		}
@@ -220,11 +251,20 @@ func SearchCandidates(ctx context.Context, cfg Config, query string) ([]model.ET
 			}
 			seen[key] = struct{}{}
 			items = append(items, item)
+			if len(items) >= tmdbSearchResultLimit {
+				break
+			}
 		}
+		if len(items) >= tmdbSearchResultLimit {
+			break
+		}
+	}
+	if len(items) > tmdbSearchResultLimit {
+		items = items[:tmdbSearchResultLimit]
 	}
 	candidates := make([]model.ETFArchiveTMDBCandidate, 0, len(items))
 	for _, item := range items {
-		item = hydrateCandidateItem(ctx, cfg, item)
+		item = hydrateCandidateItem(searchCtx, cfg, item)
 		candidates = append(candidates, tmdbCandidate(cfg, item))
 	}
 	return candidates, nil
@@ -271,6 +311,10 @@ func search(ctx context.Context, cfg Config, query, mediaType string) (*searchRe
 	if mediaType == "tv" || mediaType == "movie" {
 		endpoint = "/search/" + mediaType
 	}
+	cacheKey := tmdbCacheKey(cfg, endpoint, params)
+	if cached, ok := loadSearchCache(cacheKey); ok {
+		return cached, nil
+	}
 	if err := request(ctx, cfg, endpoint, params, &resp); err != nil {
 		return nil, err
 	}
@@ -279,6 +323,7 @@ func search(ctx context.Context, cfg Config, query, mediaType string) (*searchRe
 			resp.Results[i].MediaType = mediaType
 		}
 	}
+	storeSearchCache(cacheKey, resp)
 	return &resp, nil
 }
 
@@ -394,11 +439,135 @@ func enrichCandidateAliases(ctx context.Context, cfg Config, item tmdbItem) tmdb
 }
 
 func requestItem(ctx context.Context, cfg Config, endpoint string, params url.Values) (*tmdbItem, error) {
+	cacheKey := tmdbCacheKey(cfg, endpoint, params)
+	if cached, ok := loadItemCache(cacheKey); ok {
+		return cached, nil
+	}
 	var item tmdbItem
 	if err := request(ctx, cfg, endpoint, params, &item); err != nil {
 		return nil, err
 	}
+	storeItemCache(cacheKey, item)
 	return &item, nil
+}
+
+func tmdbCacheKey(cfg Config, endpoint string, params url.Values) string {
+	return cfg.BaseURL + "\x00" + cfg.Language + "\x00" + endpoint + "\x00" + params.Encode()
+}
+
+func loadSearchCache(key string) (*searchResp, bool) {
+	now := time.Now()
+	tmdbCache.Lock()
+	defer tmdbCache.Unlock()
+	entry, ok := tmdbCache.searches[key]
+	if !ok {
+		return nil, false
+	}
+	if !entry.ExpiresAt.After(now) {
+		delete(tmdbCache.searches, key)
+		return nil, false
+	}
+	response := cloneSearchResponse(entry.Response)
+	return &response, true
+}
+
+func storeSearchCache(key string, response searchResp) {
+	now := time.Now()
+	tmdbCache.Lock()
+	defer tmdbCache.Unlock()
+	pruneSearchCacheLocked(now)
+	if len(tmdbCache.searches) >= tmdbCacheLimit {
+		deleteOldestSearchCacheEntryLocked()
+	}
+	tmdbCache.searches[key] = tmdbSearchCacheEntry{ExpiresAt: now.Add(tmdbCacheTTL), Response: cloneSearchResponse(response)}
+}
+
+func loadItemCache(key string) (*tmdbItem, bool) {
+	now := time.Now()
+	tmdbCache.Lock()
+	defer tmdbCache.Unlock()
+	entry, ok := tmdbCache.items[key]
+	if !ok {
+		return nil, false
+	}
+	if !entry.ExpiresAt.After(now) {
+		delete(tmdbCache.items, key)
+		return nil, false
+	}
+	item := cloneTMDBItem(entry.Item)
+	return &item, true
+}
+
+func storeItemCache(key string, item tmdbItem) {
+	now := time.Now()
+	tmdbCache.Lock()
+	defer tmdbCache.Unlock()
+	pruneItemCacheLocked(now)
+	if len(tmdbCache.items) >= tmdbCacheLimit {
+		deleteOldestItemCacheEntryLocked()
+	}
+	tmdbCache.items[key] = tmdbItemCacheEntry{ExpiresAt: now.Add(tmdbCacheTTL), Item: cloneTMDBItem(item)}
+}
+
+func pruneSearchCacheLocked(now time.Time) {
+	for key, entry := range tmdbCache.searches {
+		if !entry.ExpiresAt.After(now) {
+			delete(tmdbCache.searches, key)
+		}
+	}
+}
+
+func pruneItemCacheLocked(now time.Time) {
+	for key, entry := range tmdbCache.items {
+		if !entry.ExpiresAt.After(now) {
+			delete(tmdbCache.items, key)
+		}
+	}
+}
+
+func deleteOldestSearchCacheEntryLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for key, entry := range tmdbCache.searches {
+		if oldestKey == "" || entry.ExpiresAt.Before(oldest) {
+			oldestKey, oldest = key, entry.ExpiresAt
+		}
+	}
+	if oldestKey != "" {
+		delete(tmdbCache.searches, oldestKey)
+	}
+}
+
+func deleteOldestItemCacheEntryLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for key, entry := range tmdbCache.items {
+		if oldestKey == "" || entry.ExpiresAt.Before(oldest) {
+			oldestKey, oldest = key, entry.ExpiresAt
+		}
+	}
+	if oldestKey != "" {
+		delete(tmdbCache.items, oldestKey)
+	}
+}
+
+func cloneSearchResponse(response searchResp) searchResp {
+	clone := response
+	clone.Results = make([]tmdbItem, len(response.Results))
+	for i := range response.Results {
+		clone.Results[i] = cloneTMDBItem(response.Results[i])
+	}
+	return clone
+}
+
+func cloneTMDBItem(item tmdbItem) tmdbItem {
+	clone := item
+	clone.GenreIDs = append([]int(nil), item.GenreIDs...)
+	clone.Genres = append([]genre(nil), item.Genres...)
+	clone.OriginCountry = append([]string(nil), item.OriginCountry...)
+	clone.Seasons = append([]tmdbSeason(nil), item.Seasons...)
+	clone.Aliases = append([]string(nil), item.Aliases...)
+	return clone
 }
 
 func request(ctx context.Context, cfg Config, endpoint string, params url.Values, out any) error {
