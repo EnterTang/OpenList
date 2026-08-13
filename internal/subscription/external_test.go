@@ -3,11 +3,57 @@ package subscription
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
+
+func TestProjectExternalSubscriptionFallsBackWhenProgressDetailsFail(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	request := &model.ExternalSubscriptionRequest{
+		IdempotencyKey:     t.Name(),
+		LookupKey:          "movie:" + t.Name(),
+		RequestFingerprint: "fingerprint:" + t.Name(),
+		RequestJSON:        "{}",
+		LastStatus:         "running",
+		LastMessage:        "processing",
+		ProgressJSON:       "{}",
+		SeasonsJSON:        "[]",
+	}
+	subscription := &model.Subscription{
+		Name:       t.Name(),
+		MediaType:  "movie",
+		TMDBID:     1399,
+		LastStatus: model.SubscriptionStatusRunning,
+	}
+	if err := db.CreateExternalSubscriptionRequest(context.Background(), request, subscription); err != nil {
+		t.Fatalf("create external subscription request: %v", err)
+	}
+	item := model.SubscriptionItem{
+		SubscriptionID: subscription.ID,
+		SourceKey:      "pending-item",
+		Status:         model.SubscriptionItemStatusPending,
+	}
+	if _, _, err := db.UpsertSubscriptionItem(&item); err != nil {
+		t.Fatalf("upsert subscription item: %v", err)
+	}
+
+	originalLoader := listSubscriptionEpisodeSourceDetails
+	listSubscriptionEpisodeSourceDetails = func(uint) ([]model.SubscriptionEpisodeSourceDetail, error) {
+		return nil, errors.New("progress details unavailable")
+	}
+	t.Cleanup(func() { listSubscriptionEpisodeSourceDetails = originalLoader })
+
+	response, err := ProjectExternalSubscription(context.Background(), request.ID)
+	if err != nil {
+		t.Fatalf("project external subscription: %v", err)
+	}
+	if response.ProgressStatus != model.SubscriptionProgressStatusSearching {
+		t.Fatalf("progress status = %q, want %q", response.ProgressStatus, model.SubscriptionProgressStatusSearching)
+	}
+}
 
 func TestNormalizeExternalSubscriptionAcceptsHDHiveSource(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)

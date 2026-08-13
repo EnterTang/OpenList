@@ -26,9 +26,10 @@ const (
 )
 
 var (
-	ErrExternalSubscriptionInvalid  = errors.New("invalid external subscription request")
-	ErrExternalSubscriptionConflict = errors.New("external subscription request conflicts with an existing subscription")
-	externalSubscriptionRuns        sync.Map
+	ErrExternalSubscriptionInvalid       = errors.New("invalid external subscription request")
+	ErrExternalSubscriptionConflict      = errors.New("external subscription request conflicts with an existing subscription")
+	externalSubscriptionRuns             sync.Map
+	listSubscriptionEpisodeSourceDetails = db.ListSubscriptionEpisodeSourceDetails
 )
 
 type ExternalSubscriptionCreateRequest struct {
@@ -149,9 +150,10 @@ func ProjectExternalSubscription(ctx context.Context, externalID uint) (*Externa
 	if err != nil {
 		return nil, err
 	}
-	details, err := db.ListSubscriptionEpisodeSourceDetails(subscription.ID)
-	if err != nil {
-		return nil, err
+	details, detailsErr := listSubscriptionEpisodeSourceDetails(subscription.ID)
+	if detailsErr != nil {
+		log.WithError(detailsErr).Warnf("subscription progress details unavailable subscription_id=%d", subscription.ID)
+		details = nil
 	}
 	progress := CalculateSubscriptionProgress(subscription, items, time.Now())
 	progressJSON, err := json.Marshal(progress)
