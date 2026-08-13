@@ -49,6 +49,7 @@ var _ transport.Peer = (*testPeer)(nil)
 func TestUploadManifestIsPersistedBeforeAcceptedAck(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	ctx := testTaskContext()
+	ctx.Media.TMDBName = "Example"
 	ctxHash, err := protocol.HashTaskContext(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -77,6 +78,9 @@ func TestUploadManifestIsPersistedBeforeAcceptedAck(t *testing.T) {
 	var stored model.ClusterUploadManifest
 	if err := database.First(&stored, "job_id = ?", job.ID).Error; err != nil {
 		t.Fatalf("manifest was not persisted: %v", err)
+	}
+	if stored.TMDBName != ctx.Media.TMDBName {
+		t.Fatalf("manifest TMDB name = %q, want %q", stored.TMDBName, ctx.Media.TMDBName)
 	}
 	if len(peer.sent) != 1 || peer.sent[0].Type != protocol.MessageUploadETFManifestAck {
 		t.Fatalf("sent = %#v, want one manifest ack", peer.sent)

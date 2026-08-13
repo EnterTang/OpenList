@@ -22,7 +22,7 @@ func TestRapidJSONPayloadFromRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if payload.TMDBID != 123 || payload.MediaType != "tv" || len(payload.Items) != 1 {
+	if payload.TMDBID != 123 || payload.MediaType != "tv" || payload.Title != "Example" || len(payload.Items) != 1 {
 		t.Fatalf("payload = %#v", payload)
 	}
 	if payload.Items[0].Season == nil || *payload.Items[0].Season != season || payload.Items[0].Episode == nil || *payload.Items[0].Episode != episode {

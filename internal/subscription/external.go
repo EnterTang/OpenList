@@ -61,6 +61,7 @@ type ExternalSubscriptionResponse struct {
 	TaskStatus             string                        `json:"task_status"`
 	LastStatus             string                        `json:"last_status"`
 	LastMessage            string                        `json:"last_message"`
+	ProgressStatus         string                        `json:"progress_status"`
 	ProgressJSON           string                        `json:"progress_json"`
 	Progress               model.SubscriptionProgress    `json:"progress"`
 	SeasonsJSON            string                        `json:"seasons_json"`
@@ -75,6 +76,7 @@ type ExternalSubscriptionLookupResponse struct {
 	TaskID         string `json:"task_id,omitempty"`
 	TaskStatus     string `json:"task_status,omitempty"`
 	Status         string `json:"status,omitempty"`
+	ProgressStatus string `json:"progress_status,omitempty"`
 }
 
 func CreateExternalSubscription(ctx context.Context, input ExternalSubscriptionCreateRequest, idempotencyKey string) (*ExternalSubscriptionResponse, bool, error) {
@@ -147,6 +149,10 @@ func ProjectExternalSubscription(ctx context.Context, externalID uint) (*Externa
 	if err != nil {
 		return nil, err
 	}
+	details, err := db.ListSubscriptionEpisodeSourceDetails(subscription.ID)
+	if err != nil {
+		return nil, err
+	}
 	progress := CalculateSubscriptionProgress(subscription, items, time.Now())
 	progressJSON, err := json.Marshal(progress)
 	if err != nil {
@@ -164,6 +170,7 @@ func ProjectExternalSubscription(ctx context.Context, externalID uint) (*Externa
 		return nil, err
 	}
 	status, message := projectExternalSubscriptionStatus(request, subscription, items)
+	progressStatus := projectExternalSubscriptionProgressStatus(request, subscription, items, details)
 	taskID := strconv.FormatUint(uint64(request.ID), 10)
 	return &ExternalSubscriptionResponse{
 		ID:                     request.ID,
@@ -175,6 +182,7 @@ func ProjectExternalSubscription(ctx context.Context, externalID uint) (*Externa
 		TaskStatus:             status,
 		LastStatus:             status,
 		LastMessage:            message,
+		ProgressStatus:         progressStatus,
 		ProgressJSON:           string(progressJSON),
 		Progress:               progress,
 		SeasonsJSON:            string(seasonsJSON),
@@ -212,6 +220,7 @@ func LookupExternalSubscription(ctx context.Context, mediaType string, tmdbID in
 		TaskID:         response.TaskID,
 		TaskStatus:     response.TaskStatus,
 		Status:         response.Status,
+		ProgressStatus: response.ProgressStatus,
 	}, nil
 }
 
@@ -469,6 +478,93 @@ func projectExternalSubscriptionStatus(request *model.ExternalSubscriptionReques
 	default:
 		return "pending", firstNonEmptyString(request.LastMessage, "queued")
 	}
+}
+
+func projectExternalSubscriptionProgressStatus(
+	request *model.ExternalSubscriptionRequest,
+	subscription *model.Subscription,
+	items []model.SubscriptionItem,
+	details []model.SubscriptionEpisodeSourceDetail,
+) string {
+	hasActiveSearchingStage := false
+	hasActiveDownloadingStage := false
+	hasActiveUploadingStage := false
+	for _, detail := range details {
+		if !isExternalSubscriptionStageActive(detail.CurrentStageStatus) {
+			continue
+		}
+		switch detail.CurrentStage {
+		case model.ClusterStageDownloading:
+			hasActiveDownloadingStage = true
+		case model.ClusterStageSourceCleanup,
+			model.ClusterStageUploadingMobile,
+			model.ClusterStageResultPersisting,
+			model.ClusterStageWorkerMediaCleanup,
+			model.ClusterStageResultReporting,
+			model.ClusterStageETFMaterializing,
+			model.ClusterStageETFArchiving,
+			model.ClusterStageTargetNotifying:
+			hasActiveUploadingStage = true
+		default:
+			hasActiveSearchingStage = true
+		}
+	}
+	if hasActiveUploadingStage {
+		return model.SubscriptionProgressStatusUploading
+	}
+	if hasActiveDownloadingStage {
+		return model.SubscriptionProgressStatusDownloading
+	}
+	if hasActiveSearchingStage {
+		return model.SubscriptionProgressStatusSearching
+	}
+
+	hasPendingItem := false
+	hasUploadingItem := false
+	hasFailedItem := false
+	for _, item := range items {
+		switch item.Status {
+		case model.SubscriptionItemStatusTransferring, model.SubscriptionItemStatusNotifying:
+			hasUploadingItem = true
+		case model.SubscriptionItemStatusPending, model.SubscriptionItemStatusRetryWait,
+			model.SubscriptionItemStatusBlocked, model.SubscriptionItemStatusUnknown:
+			hasPendingItem = true
+		case model.SubscriptionItemStatusFailed:
+			hasFailedItem = true
+		}
+	}
+	if hasUploadingItem {
+		return model.SubscriptionProgressStatusUploading
+	}
+	if hasPendingItem {
+		return model.SubscriptionProgressStatusSearching
+	}
+	if hasFailedItem || subscriptionStatusFailed(request, subscription) {
+		return model.SubscriptionProgressStatusFailed
+	}
+	if subscription != nil && subscription.LastStatus == model.SubscriptionStatusSuccess {
+		return model.SubscriptionProgressStatusCompleted
+	}
+	if request != nil && strings.EqualFold(strings.TrimSpace(request.LastStatus), "completed") {
+		return model.SubscriptionProgressStatusCompleted
+	}
+	return model.SubscriptionProgressStatusSearching
+}
+
+func isExternalSubscriptionStageActive(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case model.ClusterStageStatusPermitted, model.ClusterStageStatusRunning:
+		return true
+	default:
+		return false
+	}
+}
+
+func subscriptionStatusFailed(request *model.ExternalSubscriptionRequest, subscription *model.Subscription) bool {
+	if subscription != nil && subscription.LastStatus == model.SubscriptionStatusFailed {
+		return true
+	}
+	return request != nil && strings.EqualFold(strings.TrimSpace(request.LastStatus), "failed")
 }
 
 func externalSubscriptionLookupKey(mediaType string, tmdbID int64) string {

@@ -99,6 +99,7 @@ func (s *Service) materializeManifest(ctx context.Context, manifest *model.Clust
 		ArchiveEnabled:   true,
 		TMDBMatched:      manifest.TMDBID > 0,
 		TMDBID:           manifest.TMDBID,
+		TMDBName:         manifest.TMDBName,
 		MediaType:        manifest.MediaType,
 		Season:           manifest.Season,
 		Episode:          manifest.Episode,

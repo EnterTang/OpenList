@@ -237,3 +237,85 @@ func TestProjectExternalSubscriptionStatus(t *testing.T) {
 		})
 	}
 }
+
+func TestProjectExternalSubscriptionProgressStatus(t *testing.T) {
+	tests := []struct {
+		name         string
+		request      model.ExternalSubscriptionRequest
+		subscription model.Subscription
+		items        []model.SubscriptionItem
+		details      []model.SubscriptionEpisodeSourceDetail
+		want         string
+	}{
+		{
+			name:         "active discovery stage is searching",
+			request:      model.ExternalSubscriptionRequest{LastStatus: "running"},
+			subscription: model.Subscription{LastStatus: model.SubscriptionStatusRunning},
+			details: []model.SubscriptionEpisodeSourceDetail{{
+				CurrentStage:       model.ClusterStageDiscoveringFiles,
+				CurrentStageStatus: model.ClusterStageStatusRunning,
+			}},
+			want: model.SubscriptionProgressStatusSearching,
+		},
+		{
+			name:         "active download stage is downloading",
+			request:      model.ExternalSubscriptionRequest{LastStatus: "running"},
+			subscription: model.Subscription{LastStatus: model.SubscriptionStatusRunning},
+			details: []model.SubscriptionEpisodeSourceDetail{{
+				CurrentStage:       model.ClusterStageDownloading,
+				CurrentStageStatus: model.ClusterStageStatusRunning,
+			}},
+			want: model.SubscriptionProgressStatusDownloading,
+		},
+		{
+			name:         "active upload stage is uploading",
+			request:      model.ExternalSubscriptionRequest{LastStatus: "running"},
+			subscription: model.Subscription{LastStatus: model.SubscriptionStatusRunning},
+			details: []model.SubscriptionEpisodeSourceDetail{{
+				CurrentStage:       model.ClusterStageUploadingMobile,
+				CurrentStageStatus: model.ClusterStageStatusPermitted,
+			}},
+			want: model.SubscriptionProgressStatusUploading,
+		},
+		{
+			name:         "advanced active stage wins when multiple items are running",
+			request:      model.ExternalSubscriptionRequest{LastStatus: "running"},
+			subscription: model.Subscription{LastStatus: model.SubscriptionStatusRunning},
+			details: []model.SubscriptionEpisodeSourceDetail{
+				{CurrentStage: model.ClusterStageDiscoveringFiles, CurrentStageStatus: model.ClusterStageStatusRunning},
+				{CurrentStage: model.ClusterStageDownloading, CurrentStageStatus: model.ClusterStageStatusRunning},
+				{CurrentStage: model.ClusterStageUploadingMobile, CurrentStageStatus: model.ClusterStageStatusRunning},
+			},
+			want: model.SubscriptionProgressStatusUploading,
+		},
+		{
+			name:         "pending item is searching",
+			request:      model.ExternalSubscriptionRequest{LastStatus: "running"},
+			subscription: model.Subscription{LastStatus: model.SubscriptionStatusRunning},
+			items:        []model.SubscriptionItem{{Status: model.SubscriptionItemStatusPending}},
+			want:         model.SubscriptionProgressStatusSearching,
+		},
+		{
+			name:         "transferred items are completed",
+			request:      model.ExternalSubscriptionRequest{LastStatus: "completed"},
+			subscription: model.Subscription{LastStatus: model.SubscriptionStatusSuccess},
+			items:        []model.SubscriptionItem{{Status: model.SubscriptionItemStatusTransferred}},
+			want:         model.SubscriptionProgressStatusCompleted,
+		},
+		{
+			name:         "failed request remains failed",
+			request:      model.ExternalSubscriptionRequest{LastStatus: "failed"},
+			subscription: model.Subscription{LastStatus: model.SubscriptionStatusFailed},
+			want:         model.SubscriptionProgressStatusFailed,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := projectExternalSubscriptionProgressStatus(&tc.request, &tc.subscription, tc.items, tc.details)
+			if got != tc.want {
+				t.Fatalf("progress status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -312,6 +312,7 @@ type SubscriptionTaskContext struct {
 type MediaTaskContext struct {
 	MediaType         string `json:"media_type"`
 	TMDBID            int64  `json:"tmdb_id"`
+	TMDBName          string `json:"tmdb_name,omitempty"`
 	Season            int    `json:"season"`
 	Episode           int    `json:"episode"`
 	LogicalMediaRoot  string `json:"logical_media_root"`

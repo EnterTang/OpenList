@@ -459,7 +459,7 @@ func subscriptionMediaTaskContext(task subscription.ClusterMediaTask, targetProf
 		},
 		Share: protocol.ShareTaskContext{Provider: task.ShareProvider, URL: task.ShareURL, Passcode: task.SharePasscode},
 		Media: protocol.MediaTaskContext{
-			MediaType: task.MediaType, TMDBID: task.TMDBID, Season: task.Season, Episode: task.Episode,
+			MediaType: task.MediaType, TMDBID: task.TMDBID, TMDBName: task.TMDBName, Season: task.Season, Episode: task.Episode,
 			LogicalMediaRoot: task.LogicalMediaRoot, LogicalTargetPath: task.LogicalTargetPath,
 		},
 		SourceObjects: []protocol.SourceObject{{

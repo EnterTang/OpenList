@@ -75,6 +75,19 @@ func TestSubscriptionMediaTaskContextUsesWorkerManagedProviderTargets(t *testing
 	}
 }
 
+func TestSubscriptionMediaTaskContextCarriesTMDBName(t *testing.T) {
+	task := subscription.ClusterMediaTask{
+		MediaType: "movie",
+		TMDBID:    455569,
+		TMDBName:  "僵尸再翻生",
+	}
+
+	context := subscriptionMediaTaskContext(task, "mobile-primary")
+	if context.Media.TMDBName != task.TMDBName {
+		t.Fatalf("wire TMDB name = %q, want %q", context.Media.TMDBName, task.TMDBName)
+	}
+}
+
 func TestDispatcherWireContextPreservesWorkerProviderAccountBindings(t *testing.T) {
 	task := subscription.ClusterMediaTask{
 		ShareProvider: "pan123", SourceSize: 4 << 30,

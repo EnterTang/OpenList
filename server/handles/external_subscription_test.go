@@ -45,12 +45,12 @@ func TestExternalSubscriptionCreateProjectAndLookup(t *testing.T) {
 	if !ok || id <= 0 {
 		t.Fatalf("create response id = %#v", first["id"])
 	}
-	for _, field := range []string{"last_status", "last_message", "progress_json", "seasons_json", "completed"} {
+	for _, field := range []string{"last_status", "last_message", "progress_json", "progress_status", "seasons_json", "completed"} {
 		if _, exists := first[field]; !exists {
 			t.Fatalf("create response missing etflix field %q: %#v", field, first)
 		}
 	}
-	if first["last_status"] != "pending" || first["last_message"] != "queued" || first["completed"] != false {
+	if first["last_status"] != "pending" || first["last_message"] != "queued" || first["progress_status"] != "searching" || first["completed"] != false {
 		t.Fatalf("initial status projection = %#v", first)
 	}
 	seasons, ok := first["seasons_selected"].([]any)

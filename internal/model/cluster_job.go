@@ -182,6 +182,7 @@ type ClusterUploadManifest struct {
 	SubscriptionItemID   uint       `json:"subscription_item_id" gorm:"index"`
 	MediaType            string     `json:"media_type" gorm:"size:32;index"`
 	TMDBID               int64      `json:"tmdb_id" gorm:"index"`
+	TMDBName             string     `json:"tmdb_name"`
 	Season               int        `json:"season" gorm:"index"`
 	Episode              int        `json:"episode" gorm:"index"`
 	LogicalTargetPath    string     `json:"logical_target_path" gorm:"type:text"`

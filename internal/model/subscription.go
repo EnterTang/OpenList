@@ -14,6 +14,12 @@ const (
 	SubscriptionStatusSuccess = "success"
 	SubscriptionStatusFailed  = "failed"
 
+	SubscriptionProgressStatusSearching   = "searching"
+	SubscriptionProgressStatusDownloading = "downloading"
+	SubscriptionProgressStatusUploading   = "uploading"
+	SubscriptionProgressStatusCompleted   = "completed"
+	SubscriptionProgressStatusFailed      = "failed"
+
 	SubscriptionItemStatusRetryWait = "retry_wait"
 	SubscriptionItemStatusBlocked   = "blocked"
 	SubscriptionItemStatusUnknown   = "unknown"
