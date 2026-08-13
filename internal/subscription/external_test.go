@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -75,6 +76,23 @@ func TestNormalizeExternalSubscriptionAcceptsHDHiveSource(t *testing.T) {
 	}
 	if source.CloudType != "all" || source.Limit <= 0 {
 		t.Fatalf("source config = %#v", source)
+	}
+}
+
+func TestNormalizeExternalSubscriptionKeepsSeasonEpisodeCounts(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	_, sub, _, _, _, err := normalizeExternalSubscriptionCreateRequest(ExternalSubscriptionCreateRequest{
+		Name:                "Season counts",
+		MediaType:           "tv",
+		TMDBID:              1399,
+		SeasonsSelected:     []int{1, 2},
+		SeasonEpisodeCounts: map[int]int{1: 10, 2: 8, 3: 99, 0: 5},
+	})
+	if err != nil {
+		t.Fatalf("normalize season counts: %v", err)
+	}
+	if got := sub.SeasonEpisodeCounts; !reflect.DeepEqual(got, map[int]int{1: 10, 2: 8}) {
+		t.Fatalf("season episode counts = %#v, want %#v", got, map[int]int{1: 10, 2: 8})
 	}
 }
 
@@ -358,10 +376,21 @@ func TestProjectExternalSubscriptionProgressStatus(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := projectExternalSubscriptionProgressStatus(&tc.request, &tc.subscription, tc.items, tc.details)
+			got := projectExternalSubscriptionProgressStatus(&tc.request, &tc.subscription, tc.items, tc.details, model.SubscriptionProgress{})
 			if got != tc.want {
 				t.Fatalf("progress status = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestProjectExternalSubscriptionProgressStatusKeepsPartialRangeInProgress(t *testing.T) {
+	request := &model.ExternalSubscriptionRequest{LastStatus: "completed"}
+	subscription := &model.Subscription{LastStatus: model.SubscriptionStatusSuccess}
+	progress := model.SubscriptionProgress{ExpectedEpisodes: 10, CompletedEpisodes: 3}
+
+	got := projectExternalSubscriptionProgressStatus(request, subscription, nil, nil, progress)
+	if got != model.SubscriptionProgressStatusSearching {
+		t.Fatalf("progress status = %q, want %q", got, model.SubscriptionProgressStatusSearching)
 	}
 }

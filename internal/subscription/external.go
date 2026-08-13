@@ -33,18 +33,19 @@ var (
 )
 
 type ExternalSubscriptionCreateRequest struct {
-	Name            string          `json:"name,omitempty"`
-	MediaType       string          `json:"media_type"`
-	TMDBID          int64           `json:"tmdb_id"`
-	SourceType      string          `json:"source_type,omitempty"`
-	SourceConfig    json.RawMessage `json:"source_config,omitempty"`
-	SeasonsSelected []int           `json:"seasons_selected,omitempty"`
-	EpisodeStart    int             `json:"episode_start,omitempty"`
-	EpisodeEnd      int             `json:"episode_end,omitempty"`
-	ShareURL        string          `json:"share_url,omitempty"`
-	AccessCode      string          `json:"access_code,omitempty"`
-	ShareType       string          `json:"share_type,omitempty"`
-	SeasonStart     int             `json:"season_start,omitempty"`
+	Name                string          `json:"name,omitempty"`
+	MediaType           string          `json:"media_type"`
+	TMDBID              int64           `json:"tmdb_id"`
+	SourceType          string          `json:"source_type,omitempty"`
+	SourceConfig        json.RawMessage `json:"source_config,omitempty"`
+	SeasonsSelected     []int           `json:"seasons_selected,omitempty"`
+	SeasonEpisodeCounts map[int]int     `json:"season_episode_counts,omitempty"`
+	EpisodeStart        int             `json:"episode_start,omitempty"`
+	EpisodeEnd          int             `json:"episode_end,omitempty"`
+	ShareURL            string          `json:"share_url,omitempty"`
+	AccessCode          string          `json:"access_code,omitempty"`
+	ShareType           string          `json:"share_type,omitempty"`
+	SeasonStart         int             `json:"season_start,omitempty"`
 }
 
 type ExternalSubscriptionIdentity struct {
@@ -172,7 +173,7 @@ func ProjectExternalSubscription(ctx context.Context, externalID uint) (*Externa
 		return nil, err
 	}
 	status, message := projectExternalSubscriptionStatus(request, subscription, items)
-	progressStatus := projectExternalSubscriptionProgressStatus(request, subscription, items, details)
+	progressStatus := projectExternalSubscriptionProgressStatus(request, subscription, items, details, progress)
 	taskID := strconv.FormatUint(uint64(request.ID), 10)
 	return &ExternalSubscriptionResponse{
 		ID:                     request.ID,
@@ -299,6 +300,7 @@ func normalizeExternalSubscriptionCreateRequest(input ExternalSubscriptionCreate
 
 	if input.MediaType == "movie" {
 		input.SeasonsSelected = nil
+		input.SeasonEpisodeCounts = nil
 		input.SeasonStart = 0
 		input.EpisodeStart = 0
 		input.EpisodeEnd = 0
@@ -314,6 +316,7 @@ func normalizeExternalSubscriptionCreateRequest(input ExternalSubscriptionCreate
 			return input, nil, "", "", "", err
 		}
 		input.SeasonsSelected = seasons
+		input.SeasonEpisodeCounts = normalizeExternalSeasonEpisodeCounts(input.SeasonEpisodeCounts, input.SeasonsSelected)
 		input.SeasonStart = 0
 		if input.EpisodeStart < 0 || input.EpisodeEnd < 0 {
 			return input, nil, "", "", "", invalidExternalSubscription("episode range cannot be negative")
@@ -339,6 +342,7 @@ func normalizeExternalSubscriptionCreateRequest(input ExternalSubscriptionCreate
 		TransferEnabled:          true,
 		CheckIntervalMinutes:     60,
 		Seasons:                  append([]int(nil), input.SeasonsSelected...),
+		SeasonEpisodeCounts:      cloneSeasonEpisodeCounts(input.SeasonEpisodeCounts),
 		LatestSeasonEpisodeStart: input.EpisodeStart,
 		LatestSeasonEpisodeEnd:   input.EpisodeEnd,
 		LastStatus:               model.SubscriptionStatusIdle,
@@ -356,6 +360,33 @@ func normalizeExternalSubscriptionCreateRequest(input ExternalSubscriptionCreate
 	digest := sha256.Sum256(requestBody)
 	fingerprint := hex.EncodeToString(digest[:])
 	return input, subscription, string(requestBody), fingerprint, externalSubscriptionLookupKey(input.MediaType, input.TMDBID), nil
+}
+
+func normalizeExternalSeasonEpisodeCounts(counts map[int]int, seasons []int) map[int]int {
+	if len(counts) == 0 || len(seasons) == 0 {
+		return nil
+	}
+	result := make(map[int]int, len(seasons))
+	for _, season := range seasons {
+		if count := counts[season]; count > 0 {
+			result[season] = count
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func cloneSeasonEpisodeCounts(counts map[int]int) map[int]int {
+	if len(counts) == 0 {
+		return nil
+	}
+	clone := make(map[int]int, len(counts))
+	for season, count := range counts {
+		clone[season] = count
+	}
+	return clone
 }
 
 func normalizeExternalSourceConfig(input ExternalSubscriptionCreateRequest) (json.RawMessage, error) {
@@ -487,6 +518,7 @@ func projectExternalSubscriptionProgressStatus(
 	subscription *model.Subscription,
 	items []model.SubscriptionItem,
 	details []model.SubscriptionEpisodeSourceDetail,
+	progress model.SubscriptionProgress,
 ) string {
 	hasActiveSearchingStage := false
 	hasActiveDownloadingStage := false
@@ -543,6 +575,9 @@ func projectExternalSubscriptionProgressStatus(
 	}
 	if hasFailedItem || subscriptionStatusFailed(request, subscription) {
 		return model.SubscriptionProgressStatusFailed
+	}
+	if progress.ExpectedEpisodes > 0 && progress.CompletedEpisodes < progress.ExpectedEpisodes {
+		return model.SubscriptionProgressStatusSearching
 	}
 	if subscription != nil && subscription.LastStatus == model.SubscriptionStatusSuccess {
 		return model.SubscriptionProgressStatusCompleted

@@ -68,6 +68,7 @@ type Subscription struct {
 	Category                 string                     `json:"category"`
 	Season                   int                        `json:"season"`
 	Seasons                  []int                      `json:"seasons" gorm:"serializer:json"`
+	SeasonEpisodeCounts      map[int]int                `json:"season_episode_counts,omitempty" gorm:"serializer:json"`
 	LatestSeasonEpisodeStart int                        `json:"latest_season_episode_start"`
 	LatestSeasonEpisodeEnd   int                        `json:"latest_season_episode_end"`
 	TMDBEpisodeSyncedAt      *time.Time                 `json:"tmdb_episode_synced_at,omitempty"`
@@ -120,6 +121,7 @@ type SubscriptionProgress struct {
 	LatestEpisode      int        `json:"latest_episode,omitempty"`
 	MissingEpisodes    []int      `json:"missing_episodes"`
 	CompletedEpisodes  int        `json:"completed_episodes"`
+	FailedEpisodes     int        `json:"failed_episodes,omitempty"`
 	ExpectedEpisodes   int        `json:"expected_episodes,omitempty"`
 	LastEpisodeAddedAt *time.Time `json:"last_episode_added_at,omitempty"`
 }

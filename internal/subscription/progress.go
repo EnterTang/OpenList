@@ -22,6 +22,9 @@ func CalculateSubscriptionProgress(sub *model.Subscription, items []model.Subscr
 	if sub.MediaType == "movie" {
 		return calculateMovieSubscriptionProgress(sub, items, now, progress)
 	}
+	if hasSeasonEpisodeCounts(sub) {
+		return calculateSeasonEpisodeCountProgress(sub, items, now, progress)
+	}
 
 	latestSeason := latestSubscriptionSeason(sub)
 	if latestSeason <= 0 {
@@ -56,6 +59,8 @@ func CalculateSubscriptionProgress(sub *model.Subscription, items []model.Subscr
 		}
 		if item.Status == model.SubscriptionItemStatusTransferred {
 			transferred[item.Episode] = struct{}{}
+		} else if item.Status == model.SubscriptionItemStatusFailed {
+			progress.FailedEpisodes++
 		}
 	}
 	if !latestAddedAt.IsZero() {
@@ -83,6 +88,104 @@ func CalculateSubscriptionProgress(sub *model.Subscription, items []model.Subscr
 	return archiveStalledProgress(sub, now, progress)
 }
 
+func hasSeasonEpisodeCounts(sub *model.Subscription) bool {
+	if sub == nil {
+		return false
+	}
+	for _, count := range sub.SeasonEpisodeCounts {
+		if count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func calculateSeasonEpisodeCountProgress(sub *model.Subscription, items []model.SubscriptionItem, now time.Time, progress model.SubscriptionProgress) model.SubscriptionProgress {
+	latestSeason := latestSubscriptionSeason(sub)
+	progress.LatestSeason = latestSeason
+	seasons := make(map[int]struct{}, len(sub.SeasonEpisodeCounts))
+	for _, season := range sub.Seasons {
+		if sub.SeasonEpisodeCounts[season] > 0 {
+			seasons[season] = struct{}{}
+		}
+	}
+	if len(seasons) == 0 {
+		for season, count := range sub.SeasonEpisodeCounts {
+			if season > 0 && count > 0 {
+				seasons[season] = struct{}{}
+			}
+		}
+	}
+
+	startBySeason := make(map[int]int, len(seasons))
+	endBySeason := make(map[int]int, len(seasons))
+	for season := range seasons {
+		start := 1
+		end := sub.SeasonEpisodeCounts[season]
+		if season == latestSeason {
+			if sub.LatestSeasonEpisodeStart > 0 {
+				start = sub.LatestSeasonEpisodeStart
+			}
+			if sub.LatestSeasonEpisodeEnd > 0 && sub.LatestSeasonEpisodeEnd < end {
+				end = sub.LatestSeasonEpisodeEnd
+			}
+		}
+		if end < start {
+			continue
+		}
+		startBySeason[season] = start
+		endBySeason[season] = end
+		progress.ExpectedEpisodes += end - start + 1
+	}
+
+	type episodeKey struct {
+		season  int
+		episode int
+	}
+	discovered := make(map[episodeKey]struct{})
+	transferred := make(map[episodeKey]struct{})
+	failed := make(map[episodeKey]struct{})
+	var latestAddedAt time.Time
+	for _, item := range items {
+		start, ok := startBySeason[item.Season]
+		if !ok || item.Episode < start || item.Episode > endBySeason[item.Season] || item.Status == model.SubscriptionItemStatusSkipped {
+			continue
+		}
+		key := episodeKey{season: item.Season, episode: item.Episode}
+		discovered[key] = struct{}{}
+		if item.Season == latestSeason && item.Episode > progress.LatestEpisode {
+			progress.LatestEpisode = item.Episode
+		}
+		if item.CreatedAt.After(latestAddedAt) {
+			latestAddedAt = item.CreatedAt
+		}
+		switch item.Status {
+		case model.SubscriptionItemStatusTransferred:
+			transferred[key] = struct{}{}
+		case model.SubscriptionItemStatusFailed:
+			failed[key] = struct{}{}
+		}
+	}
+
+	progress.CompletedEpisodes = len(transferred)
+	progress.FailedEpisodes = len(failed)
+	if !latestAddedAt.IsZero() {
+		progress.LastEpisodeAddedAt = &latestAddedAt
+	}
+	if latestStart, ok := startBySeason[latestSeason]; ok && progress.LatestEpisode >= latestStart {
+		for episode := latestStart; episode <= progress.LatestEpisode; episode++ {
+			if _, ok := discovered[episodeKey{season: latestSeason, episode: episode}]; !ok {
+				progress.MissingEpisodes = append(progress.MissingEpisodes, episode)
+			}
+		}
+	}
+	if progress.ExpectedEpisodes > 0 && progress.CompletedEpisodes == progress.ExpectedEpisodes {
+		progress.ArchiveStatus = model.SubscriptionArchiveStatusCompleted
+		return progress
+	}
+	return archiveStalledProgress(sub, now, progress)
+}
+
 func calculateMovieSubscriptionProgress(sub *model.Subscription, items []model.SubscriptionItem, now time.Time, progress model.SubscriptionProgress) model.SubscriptionProgress {
 	var lastAddedAt time.Time
 	for _, item := range items {
@@ -96,6 +199,8 @@ func calculateMovieSubscriptionProgress(sub *model.Subscription, items []model.S
 			progress.CompletedEpisodes = 1
 			progress.ExpectedEpisodes = 1
 			progress.ArchiveStatus = model.SubscriptionArchiveStatusCompleted
+		} else if item.Status == model.SubscriptionItemStatusFailed {
+			progress.FailedEpisodes = 1
 		}
 	}
 	if !lastAddedAt.IsZero() {

@@ -63,6 +63,45 @@ func TestCalculateSubscriptionProgressArchivesCompletedRange(t *testing.T) {
 	}
 }
 
+func TestCalculateSubscriptionProgressCountsFailedEpisodes(t *testing.T) {
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	progress := CalculateSubscriptionProgress(&model.Subscription{
+		MediaType:                "tv",
+		Seasons:                  []int{1},
+		LatestSeasonEpisodeStart: 1,
+		LatestSeasonEpisodeEnd:   4,
+	}, []model.SubscriptionItem{
+		{Season: 1, Episode: 1, Status: model.SubscriptionItemStatusTransferred, CreatedAt: now.Add(-4 * time.Hour)},
+		{Season: 1, Episode: 2, Status: model.SubscriptionItemStatusFailed, CreatedAt: now.Add(-3 * time.Hour)},
+		{Season: 1, Episode: 3, Status: model.SubscriptionItemStatusTransferring, CreatedAt: now.Add(-2 * time.Hour)},
+		{Season: 1, Episode: 4, Status: model.SubscriptionItemStatusTransferred, CreatedAt: now.Add(-time.Hour)},
+	}, now)
+
+	if progress.CompletedEpisodes != 2 || progress.ExpectedEpisodes != 4 || progress.FailedEpisodes != 1 {
+		t.Fatalf("progress counts = completed:%d expected:%d failed:%d, want 2/4/1", progress.CompletedEpisodes, progress.ExpectedEpisodes, progress.FailedEpisodes)
+	}
+}
+
+func TestCalculateSubscriptionProgressAggregatesSelectedSeasonEpisodeCounts(t *testing.T) {
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	progress := CalculateSubscriptionProgress(&model.Subscription{
+		MediaType:           "tv",
+		Seasons:             []int{1, 2},
+		SeasonEpisodeCounts: map[int]int{1: 10, 2: 8},
+	}, []model.SubscriptionItem{
+		{Season: 1, Episode: 1, Status: model.SubscriptionItemStatusTransferred, CreatedAt: now.Add(-2 * time.Hour)},
+		{Season: 2, Episode: 1, Status: model.SubscriptionItemStatusTransferred, CreatedAt: now.Add(-time.Hour)},
+		{Season: 2, Episode: 2, Status: model.SubscriptionItemStatusFailed, CreatedAt: now},
+	}, now)
+
+	if progress.CompletedEpisodes != 2 || progress.ExpectedEpisodes != 18 || progress.FailedEpisodes != 1 {
+		t.Fatalf("progress counts = completed:%d expected:%d failed:%d, want 2/18/1", progress.CompletedEpisodes, progress.ExpectedEpisodes, progress.FailedEpisodes)
+	}
+	if progress.ArchiveStatus != model.SubscriptionArchiveStatusOngoing {
+		t.Fatalf("archive status = %q, want ongoing", progress.ArchiveStatus)
+	}
+}
+
 func TestCalculateSubscriptionProgressArchivesStalledRangeAfterThirtyDaysWithoutANewerEpisode(t *testing.T) {
 	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
 	progress := CalculateSubscriptionProgress(&model.Subscription{
