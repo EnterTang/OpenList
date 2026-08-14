@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -206,13 +207,22 @@ func (c *SymediaClient) Unlock(ctx context.Context, slug string) (UnlockResult, 
 }
 
 func (c *SymediaClient) signedRequest(ctx context.Context, method, requestPath string, body []byte) (map[string]any, error) {
+	payload, err := c.doSignedRequest(ctx, method, requestPath, body)
+	if err != nil && isProxyAuthError(err) {
+		c.clearSession()
+		payload, err = c.doSignedRequest(ctx, method, requestPath, body)
+	}
+	return payload, err
+}
+
+func (c *SymediaClient) doSignedRequest(ctx context.Context, method, requestPath string, body []byte) (map[string]any, error) {
 	if err := c.ensureSession(ctx); err != nil {
 		return nil, err
 	}
 	c.mu.Lock()
 	sequence := c.sequence + 1
 	bodyHash := sha256.Sum256(body)
-	canonical := strings.Join([]string{method, requestPath, c.sessionID, strconv.FormatInt(sequence, 10), hex.EncodeToString(bodyHash[:]), c.proxyUserKey}, "\n")
+	canonical := strings.Join([]string{method, signaturePath(requestPath), c.sessionID, strconv.FormatInt(sequence, 10), hex.EncodeToString(bodyHash[:]), c.proxyUserKey}, "\n")
 	signature := hmacHex(c.sessionKey, []byte(canonical))
 	c.sequence = sequence
 	sessionID := c.sessionID
@@ -230,6 +240,39 @@ func (c *SymediaClient) signedRequest(ctx context.Context, method, requestPath s
 		headers.Set("Content-Type", "application/json")
 	}
 	return c.request(ctx, method, requestPath, body, headers)
+}
+
+func (c *SymediaClient) clearSession() {
+	c.mu.Lock()
+	c.sessionID = ""
+	c.sessionKey = nil
+	c.sequence = 0
+	c.mu.Unlock()
+}
+
+func signaturePath(requestPath string) string {
+	parsed, err := url.Parse(requestPath)
+	if err != nil {
+		return requestPath
+	}
+	if parsed.RawQuery == "" {
+		return parsed.Path
+	}
+	return parsed.Path + "?" + parsed.RawQuery
+}
+
+func isProxyAuthError(err error) bool {
+	var proxyErr *Error
+	if !errors.As(err, &proxyErr) {
+		return false
+	}
+	if proxyErr.HTTPStatus == http.StatusUnauthorized {
+		return true
+	}
+	if proxyErr.HTTPStatus != http.StatusForbidden {
+		return false
+	}
+	return strings.Contains(proxyErr.Message, "密钥错误或签名无效") || strings.Contains(proxyErr.Message, "缺少必要请求头")
 }
 
 func (c *SymediaClient) ensureSession(ctx context.Context) error {
