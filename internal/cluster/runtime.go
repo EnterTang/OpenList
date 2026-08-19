@@ -568,6 +568,9 @@ func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coo
 	if _, err := service.SweepStalledAttempts(ctx, time.Now().UTC(), 10*time.Minute); err != nil {
 		log.Errorf("sweep stalled cluster attempts: %v", err)
 	}
+	if _, err := service.SweepStalledParentJobs(ctx, time.Now().UTC(), 10*time.Minute); err != nil {
+		log.Errorf("sweep stalled cluster parent jobs: %v", err)
+	}
 	if _, err := service.SweepExpiredLeases(ctx, time.Now().UTC()); err != nil {
 		log.Errorf("sweep expired cluster leases: %v", err)
 	}
@@ -821,7 +824,7 @@ func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.Cl
 		if _, online := hub.Session(nodes[i].ID); !online {
 			continue
 		}
-		match, ok, err := nodeInventoryProviderMatch(ctx, nodes[i].ID, taskContext, required, job.ExpectedBytes)
+		match, ok, _, err := nodeInventoryProviderMatch(ctx, nodes[i].ID, taskContext, required, job.ExpectedBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -852,7 +855,7 @@ func selectRedispatchNodeID(available []string, taskContext protocol.TaskContext
 }
 
 func nodeInventorySupports(ctx context.Context, nodeID string, taskContext protocol.TaskContext, required []string, expectedBytes int64) (bool, error) {
-	_, ok, err := nodeInventoryProviderMatch(ctx, nodeID, taskContext, required, expectedBytes)
+	_, ok, _, err := nodeInventoryProviderMatch(ctx, nodeID, taskContext, required, expectedBytes)
 	return ok, err
 }
 

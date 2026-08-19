@@ -261,7 +261,13 @@ func SubscriptionNeedsExecutionFollowup(ctx context.Context, subscriptionID uint
 		// A missing worker is a blocked scheduling condition, not a reason to
 		// spin the scheduler every tick. The normal subscription interval will
 		// retry it after inventory/credential health has had time to refresh.
-		if strings.Contains(strings.ToLower(items[i].LastError), "no compatible cluster worker") {
+		lowerErr := strings.ToLower(items[i].LastError)
+		if strings.Contains(lowerErr, "compatible cluster worker") {
+			continue
+		}
+		// Items blocked because no worker supports the share provider should
+		// not spin the scheduler either; they need a config/worker change.
+		if items[i].Status == model.SubscriptionItemStatusBlocked {
 			continue
 		}
 		if items[i].Status == model.SubscriptionItemStatusRetryWait || items[i].Status == model.SubscriptionItemStatusUnknown || strings.TrimSpace(items[i].LastError) == "" || strings.Contains(items[i].LastError, "no durable cluster job") {
@@ -405,6 +411,17 @@ func reconcileSubscriptionItemTx(tx *gorm.DB, item *model.SubscriptionItem, job 
 				updates["status"] = status
 				updates["blocked_reason"] = lastErrorCode
 				updates["retry_at"] = nil
+				// When the share source is permanently invalid, clear the
+				// subscription's bound share so the next run re-searches
+				// HDHive/Telegram for a fresh share link.
+				if lastErrorCode == "share_save_source_invalid" || isShareSourceInvalidError(errors.New(lastError)) {
+					if sub := loadSubscriptionForReconcileTx(tx, item.SubscriptionID); sub != nil && sub.BoundShare != nil {
+						sub.BoundShare = nil
+						if err := tx.Model(&model.Subscription{}).Where("id = ?", sub.ID).Update("bound_share", nil).Error; err != nil {
+							return err
+						}
+					}
+				}
 			}
 		}
 		return updateSubscriptionItemReconcileTx(tx, item, updates, status, job.ID, result)
@@ -425,7 +442,8 @@ func classifySubscriptionFailure(errorCode, message string) string {
 		return model.SubscriptionItemStatusRetryWait
 	case "share_save_result_unknown", "result_unknown", "request_result_unknown", "operation_result_unknown":
 		return model.SubscriptionItemStatusUnknown
-	case "no_compatible_worker", "no_compatible_worker_timeout", "worker_unavailable", "provider_health_stale", "reauthorization_required", "direct_share_reauthorize":
+	case "no_compatible_worker", "no_compatible_worker_timeout", "worker_unavailable", "provider_health_stale", "reauthorization_required", "direct_share_reauthorize",
+		"share_save_source_invalid", "worker_provider_unsupported", "no_replayable_source":
 		return model.SubscriptionItemStatusBlocked
 	}
 	if strings.Contains(normalizedMessage, "是否继续") || strings.Contains(normalizedMessage, "manual reconciliation") || strings.Contains(normalizedMessage, "manual confirmation") {
@@ -442,6 +460,17 @@ func classifySubscriptionFailure(errorCode, message string) string {
 		}
 	}
 	return model.SubscriptionItemStatusFailed
+}
+
+func loadSubscriptionForReconcileTx(tx *gorm.DB, subscriptionID uint) *model.Subscription {
+	if subscriptionID == 0 {
+		return nil
+	}
+	var sub model.Subscription
+	if err := tx.First(&sub, subscriptionID).Error; err != nil {
+		return nil
+	}
+	return &sub
 }
 
 func updateSubscriptionItemReconcileTx(tx *gorm.DB, item *model.SubscriptionItem, updates map[string]any, status, jobID string, result *ExecutionReconcileResult) error {

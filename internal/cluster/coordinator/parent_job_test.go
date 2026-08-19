@@ -201,3 +201,67 @@ func TestFailQueuedJobReconcilesParentBatch(t *testing.T) {
 		t.Fatalf("parent = %#v, want finished partial failure", parent)
 	}
 }
+
+func TestSweepStalledParentJobsReconcilesFinishedChildren(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	now := time.Date(2026, 8, 19, 8, 0, 0, 0, time.UTC)
+	createdAt := now.Add(-time.Hour)
+	parent := model.ClusterJob{
+		ID: "stalled-parent", Type: model.ClusterJobTypeShareBatch,
+		Status: model.ClusterJobStatusRunning, IdempotencyKey: "stalled-parent",
+		ExpectedItems: 2, CreatedAt: createdAt,
+	}
+	children := []model.ClusterJob{
+		{ID: "stalled-child-1", ParentJobID: parent.ID, Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusSucceeded, IdempotencyKey: "stalled-child-1"},
+		{ID: "stalled-child-2", ParentJobID: parent.ID, Type: model.ClusterJobTypeMediaTransfer, Status: model.ClusterJobStatusFailed, IdempotencyKey: "stalled-child-2"},
+	}
+	if err := database.Create(&parent).Error; err != nil {
+		t.Fatal(err)
+	}
+	for i := range children {
+		if err := database.Create(&children[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	affected, err := New(database, "").SweepStalledParentJobs(context.Background(), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Fatalf("affected = %d, want 1", affected)
+	}
+	if err := database.First(&parent, "id = ?", parent.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if parent.Status != model.ClusterJobStatusPartialFailed || parent.FinishedAt == nil || !parent.FinishedAt.Equal(now) {
+		t.Fatalf("parent after stalled sweep = %#v", parent)
+	}
+}
+
+func TestSweepStalledParentJobsFailsEmptyOldParent(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	now := time.Date(2026, 8, 19, 8, 0, 0, 0, time.UTC)
+	parent := model.ClusterJob{
+		ID: "empty-stalled-parent", Type: model.ClusterJobTypeShareBatch,
+		Status: model.ClusterJobStatusPlanning, IdempotencyKey: "empty-stalled-parent",
+		ExpectedItems: 1, CreatedAt: now.Add(-time.Hour),
+	}
+	if err := database.Create(&parent).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := New(database, "").SweepStalledParentJobs(context.Background(), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Fatalf("affected = %d, want 1", affected)
+	}
+	if err := database.First(&parent, "id = ?", parent.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if parent.Status != model.ClusterJobStatusPartialFailed || parent.FinishedAt == nil || parent.LastErrorCode != "share_batch_without_children" {
+		t.Fatalf("empty parent after stalled sweep = %#v", parent)
+	}
+}

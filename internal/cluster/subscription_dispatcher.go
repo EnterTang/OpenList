@@ -395,14 +395,20 @@ func (d subscriptionDispatcher) planSubscriptionMediaDispatch(ctx context.Contex
 	if err != nil {
 		return nil, err
 	}
-	utils.Log.Warnf("[cluster-dispatch] subscriptionDispatchTargets returned %d targets", len(targets))
+	utils.Log.Debugf("[cluster-dispatch] subscriptionDispatchTargets returned %d targets", len(targets))
 	planned := make([]plannedSubscriptionDispatch, 0, len(tasks))
 	for i, task := range tasks {
-		target := d.runtime.chooseDispatchTarget(ctx, targets, task)
+		target, permanent := d.runtime.chooseDispatchTarget(ctx, targets, task)
 		if target == nil {
+			code := "worker_capacity_unavailable"
+			message := fmt.Sprintf("subscription media task %q has no connected compatible cluster worker", subscriptionDispatchTaskKey(task, i))
+			if permanent {
+				code = "worker_provider_unsupported"
+				message = fmt.Sprintf("subscription media task %q share provider %q is not supported by any connected worker", subscriptionDispatchTaskKey(task, i), task.ShareProvider)
+			}
 			return nil, &subscription.ClusterWorkerUnavailableError{
-				Code:    "worker_capacity_unavailable",
-				Message: fmt.Sprintf("subscription media task %q has no connected compatible cluster worker", subscriptionDispatchTaskKey(task, i)),
+				Code:    code,
+				Message: message,
 			}
 		}
 		planned = append(planned, plannedSubscriptionDispatch{
@@ -558,33 +564,46 @@ func (r *Runtime) subscriptionDispatchTargets(ctx context.Context) ([]*dispatchT
 	return targets, nil
 }
 
-func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchTarget, task subscription.ClusterMediaTask) *dispatchTarget {
-	utils.Log.Warnf("[cluster-dispatch] chooseDispatchTarget: targets=%d task.SourceKey=%s shareProvider=%s preferredNode=%s", len(targets), task.SourceKey, task.ShareProvider, task.PreferredWorkerNodeID)
+func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchTarget, task subscription.ClusterMediaTask) (*dispatchTarget, bool) {
+	utils.Log.Debugf("[cluster-dispatch] chooseDispatchTarget: targets=%d task.SourceKey=%s shareProvider=%s preferredNode=%s", len(targets), task.SourceKey, task.ShareProvider, task.PreferredWorkerNodeID)
 	eligible := make([]*dispatchTarget, 0, len(targets))
+	rejections := make([]string, 0, len(targets))
+	providerUnsupportedCount := 0
 	for _, target := range targets {
 		taskContext := subscriptionMediaTaskContext(task, target.targetProfile)
-		match, ok, err := nodeInventoryProviderMatch(ctx, target.nodeID, taskContext, subscriptionMediaRequiredCapabilities(task), task.SourceSize)
-		if err != nil || !ok {
-			utils.Log.Warnf("[cluster-dispatch] target node=%s rejected: ok=%v err=%v", target.nodeID, ok, err)
+		match, ok, reason, err := nodeInventoryProviderMatch(ctx, target.nodeID, taskContext, subscriptionMediaRequiredCapabilities(task), task.SourceSize)
+		if err != nil {
+			utils.Log.Warnf("[cluster-dispatch] target node=%s match error: %v", target.nodeID, err)
+			rejections = append(rejections, fmt.Sprintf("%s: %v", target.nodeID, err))
+			continue
+		}
+		if !ok {
+			if isProviderUnsupportedReason(reason) {
+				providerUnsupportedCount++
+			}
+			rejections = append(rejections, fmt.Sprintf("%s: %s", target.nodeID, reason))
 			continue
 		}
 		match.ActiveJobs += target.pendingAssignments
 		match.NodeActiveJobs += int64(target.pendingAssignments)
 		if match.MediaConcurrency > 0 && match.NodeActiveJobs >= int64(match.MediaConcurrency) {
-			utils.Log.Warnf("[cluster-dispatch] target node=%s is at media capacity active=%d limit=%d", target.nodeID, match.NodeActiveJobs, match.MediaConcurrency)
+			reason := fmt.Sprintf("at media capacity active=%d limit=%d", match.NodeActiveJobs, match.MediaConcurrency)
+			rejections = append(rejections, fmt.Sprintf("%s: %s", target.nodeID, reason))
 			continue
 		}
 		target.match = match
 		eligible = append(eligible, target)
 	}
 	if len(eligible) == 0 {
-		return nil
+		permanent := providerUnsupportedCount > 0 && providerUnsupportedCount == len(targets)
+		utils.Log.Warnf("[cluster-dispatch] no eligible target for task.SourceKey=%s shareProvider=%s permanent=%v rejections=[%s]", task.SourceKey, task.ShareProvider, permanent, strings.Join(rejections, "; "))
+		return nil, permanent
 	}
 	preferredNodeID := strings.TrimSpace(task.PreferredWorkerNodeID)
 	if preferredNodeID != "" {
 		for _, target := range eligible {
 			if target.nodeID == preferredNodeID {
-				return target
+				return target, false
 			}
 		}
 	}
@@ -608,7 +627,17 @@ func (r *Runtime) chooseDispatchTarget(ctx context.Context, targets []*dispatchT
 		}
 		return eligible[i].targetProfile < eligible[j].targetProfile
 	})
-	return eligible[0]
+	return eligible[0], false
+}
+
+// isProviderUnsupportedReason reports whether a rejection reason indicates the
+// share provider is fundamentally not supported by the worker (a permanent
+// condition requiring a config/worker change), as opposed to a temporary
+// capacity or account-health issue.
+func isProviderUnsupportedReason(reason string) bool {
+	lower := strings.ToLower(reason)
+	return strings.Contains(lower, "not in supported=") ||
+		strings.Contains(lower, "missing operation")
 }
 
 func bindTaskContextProviderAccounts(taskContext *protocol.TaskContext, match nodeProviderAccountMatch) {

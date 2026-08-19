@@ -23,6 +23,11 @@ type ShareRef struct {
 	ShareID  string
 	Passcode string
 	ParentID string
+
+	// quarkSToken is an execution-local token used to keep Quark share
+	// metadata and the subsequent save request in the same share session.
+	// It is intentionally unexported so it cannot enter persisted task data.
+	quarkSToken string
 }
 
 type ShareProvider interface {
@@ -100,6 +105,13 @@ type ShareSaver interface {
 	EnsureDir(ctx context.Context, path string) (string, error)
 	SaveShareItems(ctx context.Context, ref ShareRef, parentID string, items []ShareItem, dstDirID string) ([]string, error)
 	WaitSaveComplete(ctx context.Context, taskIDs []string) error
+}
+
+// shareSessionRefProvider prepares an execution-local ShareRef before the
+// share tree is listed. Providers use it when metadata and the save request
+// must share a short-lived session token.
+type shareSessionRefProvider interface {
+	prepareShareRef(ctx context.Context, ref ShareRef) (ShareRef, error)
 }
 
 // ShareDirectDownloader is optional. Providers only implement it after a

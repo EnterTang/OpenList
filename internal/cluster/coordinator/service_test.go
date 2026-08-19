@@ -429,6 +429,86 @@ func TestSweepStalledAttemptsRequeuesAcceptedMediaWithoutStages(t *testing.T) {
 	}
 }
 
+func TestSweepStalledAttemptsRequeuesShareInspectWithoutManifest(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	ctx := testTaskContext()
+	ctxHash, err := protocol.HashTaskContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(ctx, ctxHash, model.ClusterAttemptStatusAccepted)
+	job.Type = model.ClusterJobTypeShareInspect
+	acceptedAt := time.Now().UTC().Add(-40 * time.Minute)
+	attempt.AcceptedAt = &acceptedAt
+	job.Status = model.ClusterJobStatusRunning
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := New(database, "").SweepStalledAttempts(context.Background(), time.Now().UTC(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Fatalf("affected = %d", affected)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusQueued || job.AssignedNodeID != "" || job.CurrentAttemptID != "" || job.LastErrorCode != "share_inspect_timeout" {
+		t.Fatalf("job after stalled inspect sweep = %#v", job)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != model.ClusterAttemptStatusLost || attempt.ErrorCode != "share_inspect_timeout" {
+		t.Fatalf("attempt after stalled inspect sweep = %#v", attempt)
+	}
+}
+
+func TestSweepStalledAttemptsKeepsShareInspectWithManifest(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	ctx := testTaskContext()
+	ctxHash, err := protocol.HashTaskContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(ctx, ctxHash, model.ClusterAttemptStatusAccepted)
+	job.Type = model.ClusterJobTypeShareInspect
+	acceptedAt := time.Now().UTC().Add(-40 * time.Minute)
+	attempt.AcceptedAt = &acceptedAt
+	job.Status = model.ClusterJobStatusRunning
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterShareInspectManifest{
+		ID: "inspect-manifest-1", JobID: job.ID, AttemptID: attempt.ID,
+		Generation: attempt.Generation, Status: model.ClusterShareInspectStatusPending,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	affected, err := New(database, "").SweepStalledAttempts(context.Background(), time.Now().UTC(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 0 {
+		t.Fatalf("affected = %d, want 0", affected)
+	}
+	if err := database.First(&job, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != model.ClusterJobStatusRunning {
+		t.Fatalf("job status = %q, want running", job.Status)
+	}
+}
+
 func TestFailedMediaResultConvergesNotificationAndActiveStages(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	task := testTaskContext()

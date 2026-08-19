@@ -1444,33 +1444,60 @@ func (s *Service) SweepStalledAttempts(ctx context.Context, now time.Time, grace
 				}
 				return err
 			}
-			if job.Type != model.ClusterJobTypeMediaTransfer || job.CurrentAttemptID != attempt.ID || job.CurrentGeneration != attempt.Generation || job.Status != model.ClusterJobStatusRunning && job.Status != model.ClusterJobStatusLeased {
+			if (job.Type != model.ClusterJobTypeMediaTransfer && job.Type != model.ClusterJobTypeShareInspect) ||
+				job.CurrentAttemptID != attempt.ID || job.CurrentGeneration != attempt.Generation ||
+				(job.Status != model.ClusterJobStatusRunning && job.Status != model.ClusterJobStatusLeased) {
 				continue
 			}
-			var stageCount int64
-			if err := tx.Model(&model.ClusterJobStage{}).Where("job_id = ? AND attempt_id = ?", job.ID, attempt.ID).Count(&stageCount).Error; err != nil {
-				return err
+			if job.Type == model.ClusterJobTypeMediaTransfer {
+				var stageCount int64
+				if err := tx.Model(&model.ClusterJobStage{}).Where("job_id = ? AND attempt_id = ?", job.ID, attempt.ID).Count(&stageCount).Error; err != nil {
+					return err
+				}
+				if stageCount > 0 {
+					continue
+				}
+			} else {
+				// Share inspection jobs do not emit resumable stages. Their durable
+				// completion marker is the sealed inspect manifest instead.
+				var manifestCount int64
+				if err := tx.Model(&model.ClusterShareInspectManifest{}).
+					Where("job_id = ? AND attempt_id = ?", job.ID, attempt.ID).
+					Count(&manifestCount).Error; err != nil {
+					return err
+				}
+				if manifestCount > 0 {
+					continue
+				}
 			}
-			if stageCount > 0 {
-				continue
+			errorCode := "worker_start_timeout"
+			errorMessage := "worker accepted the job but did not start a stage"
+			if job.Type == model.ClusterJobTypeShareInspect {
+				errorCode = "share_inspect_timeout"
+				errorMessage = "worker accepted the share inspection but did not report a manifest"
 			}
 			if err := tx.Model(attempt).Updates(map[string]any{
 				"status": model.ClusterAttemptStatusLost, "finished_at": now,
-				"error_code": "worker_start_timeout", "error": "worker accepted the job but did not start a stage",
+				"error_code": errorCode, "error": errorMessage,
 			}).Error; err != nil {
 				return err
 			}
 			jobUpdates := map[string]any{
 				"assigned_node_id": "", "current_attempt_id": "",
-				"last_error_code": "worker_start_timeout",
-				"last_error":      "worker accepted the job but did not start a stage",
+				"last_error_code": errorCode,
+				"last_error":      errorMessage,
 				"available_at":    now,
 			}
 			if attempt.Generation >= automaticMediaTransferAttemptLimit {
-				jobUpdates["status"] = model.ClusterJobStatusDeadLetter
-				jobUpdates["finished_at"] = now
-				jobUpdates["last_error_code"] = "worker_start_timeout_attempt_limit"
-				jobUpdates["last_error"] = "worker accepted the job but did not start a stage and automatic retry limit was reached"
+				if job.Type != model.ClusterJobTypeMediaTransfer {
+					jobUpdates["status"] = model.ClusterJobStatusQueued
+					jobUpdates["finished_at"] = nil
+				} else {
+					jobUpdates["status"] = model.ClusterJobStatusDeadLetter
+					jobUpdates["finished_at"] = now
+					jobUpdates["last_error_code"] = "worker_start_timeout_attempt_limit"
+					jobUpdates["last_error"] = "worker accepted the job but did not start a stage and automatic retry limit was reached"
+				}
 			} else {
 				jobUpdates["status"] = model.ClusterJobStatusQueued
 				jobUpdates["finished_at"] = nil
@@ -1494,6 +1521,79 @@ func (s *Service) SweepStalledAttempts(ctx context.Context, now time.Time, grace
 		return nil
 	})
 	return affected, err
+}
+
+// SweepStalledParentJobs periodically re-aggregates share.batch parents. A
+// parent normally closes when its last child reports a result, but that
+// callback may be lost during a coordinator or worker restart. Reconciliation
+// is safe because the child statuses remain the source of truth.
+func (s *Service) SweepStalledParentJobs(ctx context.Context, now time.Time, grace time.Duration) (int64, error) {
+	if grace <= 0 {
+		grace = 10 * time.Minute
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	cutoff := now.Add(-grace)
+	var affected int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var parents []model.ClusterJob
+		if err := tx.Where("type = ? AND status IN ? AND created_at <= ?", model.ClusterJobTypeShareBatch, []string{
+			model.ClusterJobStatusPlanning,
+			model.ClusterJobStatusLeased,
+			model.ClusterJobStatusRunning,
+		}, cutoff).Order("created_at ASC").Find(&parents).Error; err != nil {
+			return err
+		}
+		for i := range parents {
+			parent := &parents[i]
+			beforeStatus := parent.Status
+			beforeFinished := parent.FinishedAt
+			if err := reconcileParentJobTx(tx, parent.ID, now); err != nil {
+				return err
+			}
+
+			var childCount int64
+			if err := tx.Model(&model.ClusterJob{}).Where("parent_job_id = ?", parent.ID).Count(&childCount).Error; err != nil {
+				return err
+			}
+			if childCount == 0 && parent.ExpectedItems > 0 {
+				updated := tx.Model(&model.ClusterJob{}).
+					Where("id = ? AND status IN ?", parent.ID, []string{model.ClusterJobStatusPlanning, model.ClusterJobStatusLeased, model.ClusterJobStatusRunning}).
+					Updates(map[string]any{
+						"status":          model.ClusterJobStatusPartialFailed,
+						"finished_at":     now,
+						"last_error_code": "share_batch_without_children",
+						"last_error":      "share batch remained active without any child jobs",
+						"updated_at":      now,
+					})
+				if updated.Error != nil {
+					return updated.Error
+				}
+				if updated.RowsAffected > 0 {
+					affected += updated.RowsAffected
+					continue
+				}
+			}
+
+			var refreshed model.ClusterJob
+			if err := tx.Select("status", "finished_at").First(&refreshed, "id = ?", parent.ID).Error; err != nil {
+				return err
+			}
+			if refreshed.Status != beforeStatus || !sameTimePointer(refreshed.FinishedAt, beforeFinished) {
+				affected++
+			}
+		}
+		return nil
+	})
+	return affected, err
+}
+
+func sameTimePointer(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
 }
 
 func (s *Service) handleHeartbeat(ctx context.Context, peer transport.Peer, heartbeat protocol.Heartbeat) error {

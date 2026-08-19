@@ -706,6 +706,36 @@ func classifyPan115ClusterErrorCode(message string) string {
 	}
 }
 
+// isShareSourceInvalidError reports whether an error from share inspect or
+// transfer indicates the share link is permanently invalid (cancelled, expired,
+// removed, banned, or violates content policy). When this returns true the
+// caller should clear any bound share so a fresh link can be discovered via
+// HDHive, Telegram, or another source on the next subscription run.
+func isShareSourceInvalidError(err error) bool {
+	if err == nil {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(normalized, "share_save_source_invalid") {
+		return true
+	}
+	// Provider-specific permanent failure messages observed in production.
+	permanentMarkers := []string{
+		"分享已失效", "分享已取消", "分享不存在", "分享地址已失效",
+		"好友已取消了分享", "分享者用户封禁链接查看受限",
+		"文件涉及违规内容", "文件不存在",
+		"share expired", "share invalid", "share canceled", "share cancelled",
+		"share_link is cancelled", "sharelink.cancelled",
+		"object not found", "path component not found",
+	}
+	for _, marker := range permanentMarkers {
+		if strings.Contains(normalized, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
 func classifyPan115HTTPResponse(resp *resty.Response) string {
 	if resp == nil {
 		return ""

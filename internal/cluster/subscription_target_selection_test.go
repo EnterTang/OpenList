@@ -88,7 +88,7 @@ func TestChooseDispatchTargetIgnoresLegacySubscriptionDeliveryProvider(t *testin
 	}
 
 	runtime := &Runtime{}
-	target := runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-4", targetProfile: "mobile-primary"}}, subscription.ClusterMediaTask{
+	target, _ := runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-4", targetProfile: "mobile-primary"}}, subscription.ClusterMediaTask{
 		ShareProvider:    "pan123",
 		SourceSize:       1 << 30,
 		LogicalMediaRoot: "/115/剧集",
@@ -124,7 +124,7 @@ func TestChooseDispatchTargetSkipsWorkerAtAdvertisedMediaCapacity(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	target := (&Runtime{}).chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-full"}}, subscription.ClusterMediaTask{ShareProvider: "pan123", SourceSize: 1 << 30})
+	target, _ := (&Runtime{}).chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-full"}}, subscription.ClusterMediaTask{ShareProvider: "pan123", SourceSize: 1 << 30})
 	if target != nil {
 		t.Fatalf("target = %#v, want nil while worker capacity is full", target)
 	}
@@ -139,14 +139,14 @@ func TestChooseDispatchTargetAppliesPreferredWorkerAfterEligibility(t *testing.T
 	runtime := &Runtime{}
 	targets := []*dispatchTarget{{nodeID: "worker-auto"}, {nodeID: "worker-preferred"}}
 	automaticTask := subscription.ClusterMediaTask{ShareProvider: "pan123", SourceSize: 1 << 30}
-	automatic := runtime.chooseDispatchTarget(context.Background(), targets, automaticTask)
+	automatic, _ := runtime.chooseDispatchTarget(context.Background(), targets, automaticTask)
 	if automatic == nil || automatic.nodeID != "worker-auto" {
 		t.Fatalf("automatic target = %#v, want highest-scoring worker-auto", automatic)
 	}
 
 	preferredTask := automaticTask
 	preferredTask.PreferredWorkerNodeID = "worker-preferred"
-	preferred := runtime.chooseDispatchTarget(context.Background(), targets, preferredTask)
+	preferred, _ := runtime.chooseDispatchTarget(context.Background(), targets, preferredTask)
 	if preferred == nil || preferred.nodeID != "worker-preferred" {
 		t.Fatalf("preferred target = %#v, want eligible worker-preferred", preferred)
 	}
@@ -164,13 +164,13 @@ func TestChooseDispatchTargetFallsBackWhenPreferredWorkerIsUnavailableOrIncompat
 	task := subscription.ClusterMediaTask{
 		ShareProvider: "pan123", SourceSize: 1 << 30, PreferredWorkerNodeID: "worker-offline",
 	}
-	target := runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-auto"}}, task)
+	target, _ := runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-auto"}}, task)
 	if target == nil || target.nodeID != "worker-auto" {
 		t.Fatalf("offline preferred fallback = %#v, want worker-auto", target)
 	}
 
 	task.PreferredWorkerNodeID = "worker-incompatible"
-	target = runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-auto"}, {nodeID: "worker-incompatible"}}, task)
+	target, _ = runtime.chooseDispatchTarget(context.Background(), []*dispatchTarget{{nodeID: "worker-auto"}, {nodeID: "worker-incompatible"}}, task)
 	if target == nil || target.nodeID != "worker-auto" {
 		t.Fatalf("incompatible preferred fallback = %#v, want worker-auto", target)
 	}
@@ -198,7 +198,7 @@ func TestSubscriptionDispatchTargetsFallsBackFromDrainingOrDisabledPreferredWork
 			if err != nil {
 				t.Fatal(err)
 			}
-			target := runtime.chooseDispatchTarget(t.Context(), targets, subscription.ClusterMediaTask{
+			target, _ := runtime.chooseDispatchTarget(t.Context(), targets, subscription.ClusterMediaTask{
 				ShareProvider: "pan123", SourceSize: 1 << 30, PreferredWorkerNodeID: "worker-preferred",
 			})
 			if target == nil || target.nodeID != "worker-auto" {

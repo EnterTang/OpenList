@@ -50,6 +50,20 @@ func (e *ClusterWorkerUnavailableError) Unwrap() error {
 	return ErrClusterWorkerUnavailable
 }
 
+// isProviderUnsupportedError reports whether a cluster dispatch error indicates
+// the share provider is fundamentally not supported by any connected worker.
+// These items are marked blocked instead of pending to avoid infinite retry.
+func isProviderUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var target *ClusterWorkerUnavailableError
+	if errors.As(err, &target) {
+		return target.Code == "worker_provider_unsupported"
+	}
+	return false
+}
+
 // ClusterMediaTask is deliberately owned by the subscription package. The
 // cluster runtime adapts it to its wire protocol, avoiding a subscription ->
 // cluster -> subscription import cycle.
@@ -225,6 +239,17 @@ func RetryOrphanedClusterSubscriptionItems(ctx context.Context, subscriptionID u
 		}
 		ref, parseErr := retryShareRef(item)
 		if parseErr != nil {
+			// Items with no replayable share URL and no source message text
+			// cannot be retried. Mark them blocked so the scheduler stops
+			// spinning on them every tick; a new source scan or manual retry
+			// will reset them if a fresh share link is discovered.
+			item.Status = model.SubscriptionItemStatusBlocked
+			item.BlockedReason = "no_replayable_source"
+			item.LastError = parseErr.Error()
+			item.StateVersion++
+			if _, _, err := db.UpsertSubscriptionItemForceStatus(item); err != nil {
+				return recovered, err
+			}
 			recovered.Unmatched++
 			continue
 		}
@@ -800,7 +825,7 @@ type clusterSourceMessage struct {
 }
 
 func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []*model.SubscriptionItem, ref ShareRef, message clusterSourceMessage) (int, error) {
-	log.Warnf("[cluster-dispatch] dispatchClusterItems: sub=%d items=%d transferEnabled=%v", sub.ID, len(items), sub.TransferEnabled)
+	log.Debugf("[cluster-dispatch] dispatchClusterItems: sub=%d items=%d transferEnabled=%v", sub.ID, len(items), sub.TransferEnabled)
 	if sub == nil || !sub.TransferEnabled {
 		return 0, nil
 	}
@@ -849,14 +874,22 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 	dispatched := 0
 	var firstErr error
 	waitingForWorker := errors.Is(dispatchErr, ErrClusterWorkerUnavailable)
+	providerUnsupported := waitingForWorker && isProviderUnsupportedError(dispatchErr)
 	for _, item := range dispatchItems {
 		result, ok := resultByKey[item.SourceKey]
 		item.StateVersion++
 		if !ok {
 			if waitingForWorker {
-				item.Status = model.SubscriptionItemStatusPending
-				item.ClusterJobID = ""
-				item.LastError = dispatchErr.Error()
+				if providerUnsupported {
+					item.Status = model.SubscriptionItemStatusBlocked
+					item.ClusterJobID = ""
+					item.LastError = dispatchErr.Error()
+					item.BlockedReason = "worker_provider_unsupported"
+				} else {
+					item.Status = model.SubscriptionItemStatusPending
+					item.ClusterJobID = ""
+					item.LastError = dispatchErr.Error()
+				}
 				if _, _, err := db.UpsertSubscriptionItem(item); err != nil && firstErr == nil {
 					firstErr = err
 				}
@@ -878,7 +911,12 @@ func dispatchClusterItems(ctx context.Context, sub *model.Subscription, items []
 			}
 		} else if result.Error != nil {
 			if errors.Is(result.Error, ErrClusterWorkerUnavailable) {
-				item.Status = model.SubscriptionItemStatusPending
+				if isProviderUnsupportedError(result.Error) {
+					item.Status = model.SubscriptionItemStatusBlocked
+					item.BlockedReason = "worker_provider_unsupported"
+				} else {
+					item.Status = model.SubscriptionItemStatusPending
+				}
 				item.ClusterJobID = ""
 				item.LastError = result.Error.Error()
 				if _, _, err := db.UpsertSubscriptionItem(item); err != nil && firstErr == nil {

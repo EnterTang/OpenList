@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -79,6 +80,66 @@ func TestQuarkShareProviderListsChildren(t *testing.T) {
 	if items[1].ID != "dir-2" || !items[1].IsDir {
 		t.Fatalf("dir item = %#v", items[1])
 	}
+}
+
+func TestQuarkShareProviderReusesShareTokenForListAndSave(t *testing.T) {
+	var (
+		tokenCalls  int
+		detailToken string
+		saveToken   string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/1/clouddrive/share/sharepage/token":
+			tokenCalls++
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"stoken":"stoken-%d"}}`, tokenCalls)
+		case "/1/clouddrive/share/sharepage/detail":
+			detailToken = r.URL.Query().Get("stoken")
+			_, _ = w.Write([]byte(`{
+				"code":0,
+				"data":{"list":[{"fid":"file-1","pdir_fid":"dir-1","file_name":"Movie.mkv","dir":false,"size":1024,"share_fid_token":"share-token-1"}]}
+			}`))
+		case "/1/clouddrive/share/sharepage/save":
+			var body struct {
+				SToken string `json:"stoken"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode save body: %v", err)
+			}
+			saveToken = body.SToken
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	provider := &quarkShareProviderTestSaver{
+		quarkShareProvider: NewQuarkShareProvider(model.SubscriptionTelegramPanConfig{Cookie: "quark-cookie"}).(*quarkShareProvider),
+	}
+	provider.baseURL = server.URL + "/1/clouddrive"
+	ref := ShareRef{Provider: ShareProviderQuark, ShareID: "bc18e4ea5fb8"}
+	if _, err := SaveShareToTemp(context.Background(), provider, ref, SaveShareOptions{TempRoot: "/tmp/quark"}); err != nil {
+		t.Fatalf("save share: %v", err)
+	}
+	if tokenCalls != 1 {
+		t.Fatalf("token calls = %d, want 1", tokenCalls)
+	}
+	if detailToken != "stoken-1" || saveToken != "stoken-1" {
+		t.Fatalf("token pairing = detail:%q save:%q, want stoken-1 for both", detailToken, saveToken)
+	}
+}
+
+type quarkShareProviderTestSaver struct {
+	*quarkShareProvider
+}
+
+func (p *quarkShareProviderTestSaver) EnsureDir(context.Context, string) (string, error) {
+	return "dst-dir", nil
+}
+
+func (p *quarkShareProviderTestSaver) WaitSaveComplete(context.Context, []string) error {
+	return nil
 }
 
 func TestQuarkShareProviderSavesItemsAndWaitsTask(t *testing.T) {

@@ -64,8 +64,27 @@ func (p *quarkShareProvider) EnsureDir(ctx context.Context, path string) (string
 	return obj.GetID(), nil
 }
 
-func (p *quarkShareProvider) ListShareChildren(ctx context.Context, ref ShareRef, parentID string) ([]ShareItem, error) {
+func (p *quarkShareProvider) prepareShareRef(ctx context.Context, ref ShareRef) (ShareRef, error) {
+	if strings.TrimSpace(ref.quarkSToken) != "" {
+		return ref, nil
+	}
 	stoken, err := p.getSToken(ctx, ref)
+	if err != nil {
+		return ShareRef{}, err
+	}
+	ref.quarkSToken = stoken
+	return ref, nil
+}
+
+func (p *quarkShareProvider) shareSToken(ctx context.Context, ref ShareRef) (string, error) {
+	if stoken := strings.TrimSpace(ref.quarkSToken); stoken != "" {
+		return stoken, nil
+	}
+	return p.getSToken(ctx, ref)
+}
+
+func (p *quarkShareProvider) ListShareChildren(ctx context.Context, ref ShareRef, parentID string) ([]ShareItem, error) {
+	stoken, err := p.shareSToken(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +133,7 @@ func (p *quarkShareProvider) SaveShareItems(ctx context.Context, ref ShareRef, p
 	if len(items) == 0 {
 		return nil, nil
 	}
-	stoken, err := p.getSToken(ctx, ref)
+	stoken, err := p.shareSToken(ctx, ref)
 	if err != nil {
 		return nil, err
 	}

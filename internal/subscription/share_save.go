@@ -37,6 +37,13 @@ func SaveShareToTemp(ctx context.Context, provider ShareSaver, ref ShareRef, opt
 	if tempRoot == "" || tempRoot == "/" {
 		return nil, fmt.Errorf("share temp root is required")
 	}
+	if sessionProvider, ok := provider.(shareSessionRefProvider); ok {
+		preparedRef, err := sessionProvider.prepareShareRef(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		ref = preparedRef
+	}
 	pairs, err := collectShareTreePairs(ctx, provider, ref)
 	if err != nil {
 		return nil, err

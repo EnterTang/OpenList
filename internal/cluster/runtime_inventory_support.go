@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path"
 	"sort"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"gorm.io/gorm"
 )
 
@@ -49,27 +49,25 @@ func resolveInventoryTargetPath(ctx context.Context, nodeID string, targetPath s
 	return path.Clean(binding.MountPath), true
 }
 
-func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext protocol.TaskContext, required []string, expectedBytes int64) (nodeProviderAccountMatch, bool, error) {
+func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext protocol.TaskContext, required []string, expectedBytes int64) (nodeProviderAccountMatch, bool, string, error) {
+	const noReason = ""
 	var inventory model.ClusterNodeInventory
 	if err := db.GetDb().WithContext(ctx).Where("node_id = ?", nodeID).Order("revision DESC").First(&inventory).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			utils.Log.Warnf("[cluster-dispatch] node=%s inventory not found", nodeID)
-			return nodeProviderAccountMatch{}, false, nil
+			return nodeProviderAccountMatch{}, false, "inventory not found", nil
 		}
-		return nodeProviderAccountMatch{}, false, err
+		return nodeProviderAccountMatch{}, false, noReason, err
 	}
 	var capabilities protocol.NodeCapabilities
 	if err := json.Unmarshal([]byte(inventory.CapabilitiesJSON), &capabilities); err != nil {
-		return nodeProviderAccountMatch{}, false, err
+		return nodeProviderAccountMatch{}, false, noReason, err
 	}
 	if !capabilities.RedisDurabilityReady {
-		utils.Log.Warnf("[cluster-dispatch] node=%s redis_durability_ready=false", nodeID)
-		return nodeProviderAccountMatch{}, false, nil
+		return nodeProviderAccountMatch{}, false, "redis_durability_ready=false", nil
 	}
 	for _, operation := range required {
 		if !containsFold(capabilities.SupportedOperations, operation) {
-			utils.Log.Warnf("[cluster-dispatch] node=%s missing operation=%s supported=%v", nodeID, operation, capabilities.SupportedOperations)
-			return nodeProviderAccountMatch{}, false, nil
+			return nodeProviderAccountMatch{}, false, fmt.Sprintf("missing operation %q supported=%v", operation, capabilities.SupportedOperations), nil
 		}
 	}
 	stagingRequirement := taskContext.StagingTarget
@@ -88,24 +86,27 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	// free_bytes=0 because the quota API is unavailable.
 	stagingRequirement.RequiredBytes = 0
 	if stagingRequirement.Provider != "" && !containsFold(capabilities.SupportedProviders, stagingRequirement.Provider) {
-		utils.Log.Debugf("[cluster-dispatch] node=%s staging provider=%s not in supported=%v", nodeID, stagingRequirement.Provider, capabilities.SupportedProviders)
-		return nodeProviderAccountMatch{}, false, nil
+		return nodeProviderAccountMatch{}, false, fmt.Sprintf("staging provider %q not in supported=%v", stagingRequirement.Provider, capabilities.SupportedProviders), nil
 	}
 	var providerAccounts []protocol.ProviderAccountInventory
 	if strings.TrimSpace(inventory.ProviderAccountsJSON) != "" {
 		if err := json.Unmarshal([]byte(inventory.ProviderAccountsJSON), &providerAccounts); err != nil {
-			return nodeProviderAccountMatch{}, false, err
+			return nodeProviderAccountMatch{}, false, noReason, err
 		}
 	}
 	// share.inspect is metadata-only and has no delivery account. It still
 	// requires a healthy provider account with read/share credentials.
 	if containsFold(required, model.ClusterJobTypeShareInspect) && strings.TrimSpace(taskContext.TargetProfile) == "" {
 		if len(providerAccounts) == 0 {
-			return nodeProviderAccountMatch{MediaConcurrency: capabilities.DownloadConcurrency}, true, nil
+			return nodeProviderAccountMatch{MediaConcurrency: capabilities.DownloadConcurrency}, true, noReason, nil
 		}
 		stagingRequirement.RequiredBytes = 0
 		staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", true)
-		return nodeProviderAccountMatch{Staging: staging, MediaConcurrency: capabilities.DownloadConcurrency}, ok, nil
+		reason := ""
+		if !ok {
+			reason = fmt.Sprintf("share-inspect staging account unavailable: provider=%s accounts=%d", stagingRequirement.Provider, len(providerAccounts))
+		}
+		return nodeProviderAccountMatch{Staging: staging, MediaConcurrency: capabilities.DownloadConcurrency}, ok, reason, nil
 	}
 	deliveryRequirement := taskContext.DeliveryTarget
 	if deliveryRequirement.RequiredBytes <= 0 {
@@ -113,42 +114,43 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	}
 	deliveryRequirement.NeedUpload = true
 	if deliveryRequirement.Provider != "" && !containsFold(capabilities.SupportedProviders, deliveryRequirement.Provider) {
-		return nodeProviderAccountMatch{}, false, nil
+		return nodeProviderAccountMatch{}, false, fmt.Sprintf("delivery provider %q not in supported=%v", deliveryRequirement.Provider, capabilities.SupportedProviders), nil
 	}
 	targetPath := ""
 	if strings.TrimSpace(taskContext.TargetProfile) != "" {
 		var ok bool
 		targetPath, ok = resolveInventoryTargetPath(ctx, nodeID, taskContext.TargetProfile)
 		if !ok {
-			return nodeProviderAccountMatch{}, false, nil
+			return nodeProviderAccountMatch{}, false, fmt.Sprintf("target profile %q not resolved", taskContext.TargetProfile), nil
 		}
 	}
 	if len(providerAccounts) == 0 {
 		var mounts []protocol.MountInventory
 		if err := json.Unmarshal([]byte(inventory.MountsJSON), &mounts); err != nil {
-			return nodeProviderAccountMatch{}, false, err
+			return nodeProviderAccountMatch{}, false, noReason, err
 		}
-		return nodeProviderAccountMatch{MediaConcurrency: capabilities.DownloadConcurrency}, mountsSupportTarget(mounts, targetPath, expectedBytes), nil
+		if ok := mountsSupportTarget(mounts, targetPath, expectedBytes); ok {
+			return nodeProviderAccountMatch{MediaConcurrency: capabilities.DownloadConcurrency}, true, noReason, nil
+		}
+		return nodeProviderAccountMatch{}, false, fmt.Sprintf("no mount supports target=%s expectedBytes=%d", targetPath, expectedBytes), nil
 	}
 	staging, ok := selectProviderAccount(providerAccounts, stagingRequirement, "", !directDownload)
 	if !ok {
-		utils.Log.Debugf("[cluster-dispatch] node=%s staging unavailable: provider=%s needShareSave=%v requiredBytes=%d accounts=%d", nodeID, stagingRequirement.Provider, stagingRequirement.NeedShareSave, stagingRequirement.RequiredBytes, len(providerAccounts))
-		return nodeProviderAccountMatch{}, false, nil
+		return nodeProviderAccountMatch{}, false, fmt.Sprintf("staging account unavailable: provider=%s needShareSave=%v accounts=%d", stagingRequirement.Provider, stagingRequirement.NeedShareSave, len(providerAccounts)), nil
 	}
 	delivery, ok := selectProviderAccount(providerAccounts, deliveryRequirement, targetPath, false)
 	if !ok {
-		utils.Log.Debugf("[cluster-dispatch] node=%s delivery unavailable: provider=%s needUpload=%v requiredBytes=%d targetPath=%s accounts=%d", nodeID, deliveryRequirement.Provider, deliveryRequirement.NeedUpload, deliveryRequirement.RequiredBytes, targetPath, len(providerAccounts))
-		return nodeProviderAccountMatch{}, false, nil
+		return nodeProviderAccountMatch{}, false, fmt.Sprintf("delivery account unavailable: provider=%s needUpload=%v targetPath=%s accounts=%d", deliveryRequirement.Provider, deliveryRequirement.NeedUpload, targetPath, len(providerAccounts)), nil
 	}
 	var nodeActiveJobs int64
 	if err := db.GetDb().WithContext(ctx).Model(&model.ClusterJob{}).
 		Where("assigned_node_id = ? AND type = ? AND status IN ?", nodeID, model.ClusterJobTypeMediaTransfer, []string{model.ClusterJobStatusLeased, model.ClusterJobStatusRunning, model.ClusterJobStatusCancelRequested}).
 		Count(&nodeActiveJobs).Error; err != nil {
-		return nodeProviderAccountMatch{}, false, err
+		return nodeProviderAccountMatch{}, false, noReason, err
 	}
 	match := combineProviderAccountMatch(staging, delivery, nodeActiveJobs)
 	match.MediaConcurrency = capabilities.DownloadConcurrency
-	return match, true, nil
+	return match, true, noReason, nil
 }
 
 func providerAccountsSupportSource(accounts []protocol.ProviderAccountInventory, provider string) bool {

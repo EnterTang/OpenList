@@ -10,7 +10,13 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const defaultMaxConcurrentSubscriptionRuns = 2
+const (
+	defaultMaxConcurrentSubscriptionRuns = 2
+	// A source/provider outage must not hold a scheduler slot forever. Cluster
+	// jobs have their own durable recovery, while this bounds the discovery and
+	// dispatch goroutine that owns the in-memory slot.
+	defaultSubscriptionRunTimeout = 30 * time.Minute
+)
 
 var defaultScheduler = &scheduler{
 	stop:              make(chan struct{}),
@@ -107,15 +113,18 @@ func (s *scheduler) tick() {
 			continue
 		}
 		if !s.markRunning(item.ID) {
+			log.Debugf("subscription %d skipped: scheduler concurrency limit reached", item.ID)
 			continue
 		}
 		go func(id uint, compensate bool) {
 			defer s.markDone(id)
+			runCtx, cancel := context.WithTimeout(context.Background(), defaultSubscriptionRunTimeout)
+			defer cancel()
 			var err error
 			if compensate {
-				_, err = RetryFailedForRole(context.Background(), id, conf.Conf.Cluster.Role)
+				_, err = RetryFailedForRole(runCtx, id, conf.Conf.Cluster.Role)
 			} else {
-				_, err = RunForRole(context.Background(), id, true, conf.Conf.Cluster.Role)
+				_, err = RunForRole(runCtx, id, true, conf.Conf.Cluster.Role)
 			}
 			if err != nil {
 				log.Errorf("subscription %d run failed: %+v", id, err)

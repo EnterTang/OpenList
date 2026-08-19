@@ -6,8 +6,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	log "github.com/sirupsen/logrus"
 	"github.com/pkg/errors"
 )
 
@@ -124,6 +126,17 @@ func runHDHiveFederated(ctx context.Context, sub *model.Subscription, sourceCfg 
 		_, candidates, handled, err := inspectShareLinkCandidatesFn(ctx, sub, globalCfg.Telegram, rawShare, now)
 		if err != nil {
 			firstErr = err
+			// If the bound share is permanently invalid (cancelled, expired,
+			// removed, banned), clear it so the next run re-searches HDHive
+			// or Telegram for a fresh share link instead of retrying the dead
+			// one forever.
+			if isShareSourceInvalidError(err) {
+				log.Warnf("subscription %d bound share %s is invalid (%v); clearing for re-search", sub.ID, rawShare, err)
+				sub.BoundShare = nil
+				if updateErr := db.UpdateSubscription(sub); updateErr != nil && firstErr == nil {
+					firstErr = updateErr
+				}
+			}
 		} else if handled {
 			boundCandidate = len(candidates) > 0
 			selected := selectShareTransferCandidates(sub, candidates, globalCfg.Telegram.TransferPriority)
