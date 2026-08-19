@@ -167,7 +167,7 @@ func (s *Service) ProcessPendingShareInspects(ctx context.Context, limit int) (i
 		limit = 20
 	}
 	var items []model.ClusterShareInspectManifest
-	if err := s.db.WithContext(ctx).Where("status = ?", model.ClusterShareInspectStatusPending).Order("created_at ASC").Limit(limit).Find(&items).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("status = ?", model.ClusterShareInspectStatusPending).Order("julianday(updated_at) ASC, julianday(created_at) ASC").Limit(limit).Find(&items).Error; err != nil {
 		return 0, err
 	}
 	consumed := 0
@@ -181,12 +181,19 @@ func (s *Service) ProcessPendingShareInspects(ctx context.Context, limit int) (i
 		}
 		var manifest protocol.ShareInspectManifest
 		if err := json.Unmarshal([]byte(items[i].PayloadJSON), &manifest); err != nil {
-			_ = s.db.WithContext(ctx).Model(&items[i]).Update("last_error", err.Error()).Error
+			_ = s.db.WithContext(ctx).Model(&items[i]).Updates(map[string]any{
+				"last_error": err.Error(), "updated_at": time.Now().UTC(),
+			}).Error
 			continue
 		}
 		if err := consumer(ctx, items[i], manifest); err != nil {
 			if !errors.Is(err, ErrShareInspectObservationIncomplete) {
-				_ = s.db.WithContext(ctx).Model(&items[i]).Update("last_error", err.Error()).Error
+				// Move failed records to the back of the pending queue. A stale
+				// observation must not starve newer providers, especially when a
+				// rate-limited HDHive observation keeps failing validation.
+				_ = s.db.WithContext(ctx).Model(&items[i]).Updates(map[string]any{
+					"last_error": err.Error(), "updated_at": time.Now().UTC(),
+				}).Error
 			}
 			continue
 		}

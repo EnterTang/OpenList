@@ -328,6 +328,35 @@ func TestNewSourceCleanupTargetRequiresExactRemoteID(t *testing.T) {
 	require.True(t, target.ExactFile)
 }
 
+func TestNewSourceCleanupTargetRetriesEventuallyConsistentListing(t *testing.T) {
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/123"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	originalDelay := cleanupLookupDelay
+	cleanupLookupDelay = 0
+	lookups := 0
+	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
+		return d, "/转存至移动/Episode.mkv", nil
+	}
+	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
+		lookups++
+		if lookups == 1 {
+			return nil, errs.ObjectNotFound
+		}
+		return &model.Object{ID: "source-file", Name: "Episode.mkv"}, nil
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+		cleanupLookupDelay = originalDelay
+	})
+
+	target, err := NewSourceCleanupTarget(context.Background(), validUploadManifest(t), "/123/转存至移动", "/123/转存至移动/Episode.mkv")
+	require.NoError(t, err)
+	require.Equal(t, "source-file", target.RemoteFileID)
+	require.Equal(t, 2, lookups)
+}
+
 func TestMediaTransfer_CollisionBatchUsesDistinctPartitionRootsAndCleanupOwnership(t *testing.T) {
 	tempRoot := "/123/share-save"
 	shareSaveObjects := []protocol.SourceObject{

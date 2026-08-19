@@ -86,6 +86,7 @@ func ProcessPendingRealtimeTelegramEvents(ctx context.Context, limit int) (int, 
 }
 
 func processRealtimeTelegramEvent(ctx context.Context, event *model.SubscriptionTelegramEvent) (string, error) {
+	ctx = ensureClusterObservationRunContext(ctx)
 	if event == nil {
 		return "", errors.New("realtime Telegram event is nil")
 	}
@@ -142,7 +143,7 @@ func processRealtimeTelegramEvent(ctx context.Context, event *model.Subscription
 	if len(items) == 0 {
 		return "", nil
 	}
-	observationKey := clusterObservationKey(sub.ID, "telegram-realtime", items)
+	observationKey := clusterObservationKey(ctx, sub.ID, "telegram-realtime", items)
 	for _, item := range items {
 		if _, err := dispatchRealtimeClusterInspectObservation(ctx, sub, item.ref, item.message, observationKey, len(items)); err != nil {
 			return observationKey, err

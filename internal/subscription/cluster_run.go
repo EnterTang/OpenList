@@ -10,6 +10,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	log "github.com/sirupsen/logrus"
 )
 
 func runClusterBySource(ctx context.Context, sub *model.Subscription) ([]model.SubscriptionItem, string, int, int, int, error) {
@@ -28,6 +29,7 @@ func runClusterBySource(ctx context.Context, sub *model.Subscription) ([]model.S
 }
 
 func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.SubscriptionItem, string, int, int, int, error) {
+	ctx = ensureClusterObservationRunContext(ctx)
 	cfg, err := parseTelegramConfig(sub.SourceConfig)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
@@ -38,15 +40,23 @@ func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.S
 	}
 	cursor := parseTelegramCursor(sub.LastCursor)
 	nextCursor := cursor.clone()
+	blockedChannels := make(map[string]struct{})
 	var saved []model.SubscriptionItem
 	added, changed, dispatched := 0, 0, 0
+	var firstErr error
 	items := make([]clusterInspectObservationItem, 0)
 	for _, row := range rows {
 		msgID := rowMessageID(row)
-		if msgID > 0 && telegramCursorHasSeen(cursor, row) {
-			continue
+		if msgID > 0 {
+			channel := telegramCursorChannelKey(row.Channel)
+			if _, blocked := blockedChannels[channel]; blocked {
+				continue
+			}
+			if telegramCursorHasSeen(cursor, row) {
+				continue
+			}
+			nextCursor.advance(row)
 		}
-		nextCursor.advance(row)
 		if !telegramRowMatchesSubscription(sub, row) {
 			continue
 		}
@@ -54,7 +64,12 @@ func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.S
 		links, _ := rowLinksForTelegramPanSources(row, cfg)
 		hdhiveLinks, err := resolveTelegramHDHiveLinks(ctx, row, cfg)
 		if err != nil {
-			return saved, sub.LastTreeHash, added, changed, dispatched, err
+			firstErr = firstNonNilError(firstErr, err)
+			if len(links) == 0 {
+				nextCursor.holdBefore(row)
+				blockedChannels[telegramCursorChannelKey(row.Channel)] = struct{}{}
+				continue
+			}
 		}
 		for _, link := range hdhiveLinks {
 			links = append(links, normalizeTelegramLinkWithAccessCode(link.URL, link.AccessCode))
@@ -70,7 +85,7 @@ func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.S
 		}
 	}
 	items = dedupeClusterInspectObservationItems(items)
-	observationKey := clusterObservationKey(sub.ID, "telegram", items)
+	observationKey := clusterObservationKey(ctx, sub.ID, "telegram", items)
 	for _, item := range items {
 		if _, err := dispatchClusterInspectObservation(ctx, sub, item.ref, item.message, observationKey, len(items)); err != nil {
 			return saved, sub.LastTreeHash, added, changed, dispatched, err
@@ -81,6 +96,12 @@ func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.S
 		sub.LastCursor = formatted
 	}
 	hash := telegramRowsHash(rows)
+	if firstErr != nil {
+		if !isHDHiveRateLimitError(firstErr) {
+			return saved, hash, added, changed, dispatched, firstErr
+		}
+		log.WithError(firstErr).Warn("subscription: HDHive rate limit isolated; direct Telegram sources were dispatched")
+	}
 	return saved, hash, added, changed, dispatched, nil
 }
 
@@ -116,6 +137,7 @@ func runManualCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 }
 
 func runPanSouCluster(ctx context.Context, sub *model.Subscription) ([]model.SubscriptionItem, string, int, int, int, error) {
+	ctx = ensureClusterObservationRunContext(ctx)
 	cfg, err := parsePanSouConfig(sub.SourceConfig)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
@@ -154,16 +176,44 @@ type clusterInspectObservationItem struct {
 	message clusterSourceMessage
 }
 
-func clusterObservationKey(subscriptionID uint, source string, items []clusterInspectObservationItem) string {
+type subscriptionRunContextKey struct{}
+
+func withSubscriptionRunID(ctx context.Context, runID string) context.Context {
+	return context.WithValue(ctx, subscriptionRunContextKey{}, strings.TrimSpace(runID))
+}
+
+func ensureClusterObservationRunContext(ctx context.Context) context.Context {
+	if runID, _ := ctx.Value(subscriptionRunContextKey{}).(string); strings.TrimSpace(runID) != "" {
+		return ctx
+	}
+	return withSubscriptionRunID(ctx, fmt.Sprintf("run-%d", time.Now().UTC().UnixNano()))
+}
+
+func clusterObservationRunID(ctx context.Context) string {
+	if runID, _ := ctx.Value(subscriptionRunContextKey{}).(string); strings.TrimSpace(runID) != "" {
+		return strings.TrimSpace(runID)
+	}
+	return fmt.Sprintf("run-%d", time.Now().UTC().UnixNano())
+}
+
+func clusterObservationKey(ctx context.Context, subscriptionID uint, source string, items []clusterInspectObservationItem) string {
+	return clusterObservationKeyWithRunID(clusterObservationRunID(ctx), subscriptionID, source, items)
+}
+
+func clusterObservationKeyWithRunID(runID string, subscriptionID uint, source string, items []clusterInspectObservationItem) string {
 	identities := make([]string, 0, len(items))
 	for _, item := range items {
 		identities = append(identities, clusterInspectObservationItemIdentity(item))
 	}
 	sort.Strings(identities)
-	return hashClusterSource(
-		"observation", fmt.Sprint(subscriptionID), source,
+	return "run:" + hashClusterSource(
+		"observation", fmt.Sprint(subscriptionID), source, runID,
 		strings.Join(identities, "\x01"),
 	)
+}
+
+func clusterSingleObservationKey(ctx context.Context, subscriptionID uint, source string, identities ...string) string {
+	return "run:" + hashClusterSource("observation", fmt.Sprint(subscriptionID), source, clusterObservationRunID(ctx), strings.Join(identities, "\x00"))
 }
 
 func dedupeClusterInspectObservationItems(items []clusterInspectObservationItem) []clusterInspectObservationItem {

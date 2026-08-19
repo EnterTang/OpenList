@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -18,6 +19,20 @@ import (
 type telegramHDHiveLink struct {
 	URL        string
 	AccessCode string
+}
+
+func isHDHiveRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var proxyErr *hdhive.Error
+	if errors.As(err, &proxyErr) && strings.EqualFold(strings.TrimSpace(proxyErr.Code), "HDHIVE_SYMEDIA_RATE_LIMITED") {
+		return true
+	}
+	normalized := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(normalized, "hdhive_symedia_rate_limited") ||
+		strings.Contains(normalized, "rate limit") ||
+		strings.Contains(normalized, "too many requests")
 }
 
 var (

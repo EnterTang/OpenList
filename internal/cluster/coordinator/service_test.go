@@ -817,6 +817,46 @@ func TestShareInspectResultRejectsInvalidObjectHash(t *testing.T) {
 	}
 }
 
+func TestProcessPendingShareInspectsLetsLaterRecordsProceedAfterAnError(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	now := time.Now().UTC()
+	createRecord := func(id string, createdAt time.Time) {
+		payload, err := json.Marshal(protocol.ShareInspectManifest{Version: "share-inspect/v1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Create(&model.ClusterShareInspectManifest{
+			ID: id, JobID: id, SubscriptionID: 1, ObservationKey: id,
+			ObservationExpected: 1, PayloadJSON: string(payload), Status: model.ClusterShareInspectStatusPending,
+			CreatedAt: createdAt, UpdatedAt: createdAt,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	createRecord("old-pending", now.Add(-time.Minute))
+	createRecord("new-pending", now.Add(-10*time.Second).In(time.FixedZone("CST", 8*60*60)))
+
+	processed := make([]string, 0, 2)
+	service := New(database, "")
+	service.SetShareInspectConsumer(func(_ context.Context, record model.ClusterShareInspectManifest, _ protocol.ShareInspectManifest) error {
+		processed = append(processed, record.ID)
+		if record.ID == "old-pending" {
+			return fmt.Errorf("temporary consumer error")
+		}
+		return nil
+	})
+
+	if consumed, err := service.ProcessPendingShareInspects(context.Background(), 1); err != nil || consumed != 0 {
+		t.Fatalf("first process consumed=%d err=%v, want the old record to be retried", consumed, err)
+	}
+	if consumed, err := service.ProcessPendingShareInspects(context.Background(), 1); err != nil || consumed != 1 {
+		t.Fatalf("second process consumed=%d err=%v processed=%v, want the later record to proceed", consumed, err, processed)
+	}
+	if got := strings.Join(processed, ","); got != "old-pending,new-pending" {
+		t.Fatalf("processed records = %q, want old then new", got)
+	}
+}
+
 func TestShareInspectFailurePersistsEmptyManifest(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	task := protocol.TaskContext{

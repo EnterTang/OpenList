@@ -9,8 +9,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	log "github.com/sirupsen/logrus"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 type hdhiveSubscriptionClient interface {
@@ -161,7 +161,11 @@ func runHDHiveFederated(ctx context.Context, sub *model.Subscription, sourceCfg 
 	} else {
 		loaded, loadErr := loadHDHiveSubscriptionResources(ctx, client, sourceCfg, sub.MediaType, sub.TMDBID)
 		resources = loaded
-		firstErr = firstNonNilError(firstErr, loadErr)
+		if isHDHiveRateLimitError(loadErr) {
+			log.WithError(loadErr).Warn("subscription: HDHive rate limit isolated; regular sources will continue")
+		} else {
+			firstErr = firstNonNilError(firstErr, loadErr)
+		}
 	}
 
 	freeCandidate := false
@@ -185,7 +189,7 @@ func runHDHiveFederated(ctx context.Context, sub *model.Subscription, sourceCfg 
 		candidateAvailable = candidateAvailable || matched
 	}
 
-	return saved, hdhiveSubscriptionHash(sub, hashes, links), added, changed, transferred, firstErr
+	return saved, hdhiveSubscriptionHash(sub, hashes, links), added, changed, transferred, isolateHDHiveRateLimitError(firstErr)
 }
 
 func processHDHiveSubscriptionResource(ctx context.Context, sub *model.Subscription, globalCfg model.SubscriptionConfig, transfer bool, now time.Time, resource hdhiveSubscriptionResource, allowPaid, regularReady, candidateAvailable bool, saved *[]model.SubscriptionItem, hashes, links *[]string, added, changed, transferred *int) (bool, error) {
@@ -256,7 +260,6 @@ func runHDHiveRegularSources(ctx context.Context, sub *model.Subscription, globa
 	ready = true
 	if hasTelegramSearchCommand(globalCfg.Telegram) || hasBuiltinTelegramConfig(globalCfg.Telegram) {
 		telegramCfg := globalCfg.Telegram
-		telegramCfg.HDHive.Enabled = false
 		body, err := json.Marshal(telegramCfg)
 		if err != nil {
 			return false, false
@@ -360,6 +363,7 @@ func hdhiveSubscriptionHash(sub *model.Subscription, hashes, links []string) str
 }
 
 func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.SubscriptionItem, string, int, int, int, error) {
+	ctx = ensureClusterObservationRunContext(ctx)
 	sourceCfg, err := parseHDHiveSourceConfig(sub.SourceConfig)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
@@ -395,7 +399,11 @@ func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 		firstErr = firstNonNilError(firstErr, clientErr)
 	} else {
 		resources, err = loadHDHiveSubscriptionResources(ctx, client, sourceCfg, sub.MediaType, sub.TMDBID)
-		firstErr = firstNonNilError(firstErr, err)
+		if isHDHiveRateLimitError(err) {
+			log.WithError(err).Warn("subscription: HDHive rate limit isolated; regular cluster sources will continue")
+		} else {
+			firstErr = firstNonNilError(firstErr, err)
+		}
 	}
 
 	freeCandidate := false
@@ -410,7 +418,6 @@ func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 
 	if hasTelegramSearchCommand(globalCfg.Telegram) || hasBuiltinTelegramConfig(globalCfg.Telegram) {
 		telegramCfg := globalCfg.Telegram
-		telegramCfg.HDHive.Enabled = false
 		body, marshalErr := json.Marshal(telegramCfg)
 		if marshalErr != nil {
 			return saved, hdhiveSubscriptionHash(sub, hashes, links), 0, 0, dispatched, marshalErr
@@ -464,7 +471,7 @@ func runHDHiveCluster(ctx context.Context, sub *model.Subscription) ([]model.Sub
 		candidateAvailable = candidateAvailable || matched
 	}
 
-	return saved, hdhiveSubscriptionHash(sub, hashes, links), 0, 0, dispatched, firstErr
+	return saved, hdhiveSubscriptionHash(sub, hashes, links), 0, 0, dispatched, isolateHDHiveRateLimitError(firstErr)
 }
 
 func processHDHiveClusterResource(ctx context.Context, sub *model.Subscription, globalCfg model.SubscriptionConfig, now time.Time, resource hdhiveSubscriptionResource, allowPaid, regularReady, candidateAvailable bool, links *[]string, dispatched *int) (bool, error) {
@@ -505,7 +512,8 @@ func processHDHiveClusterResource(ctx context.Context, sub *model.Subscription, 
 	if parseErr != nil {
 		return false, nil
 	}
-	if _, dispatchErr := dispatchClusterInspectObservation(ctx, sub, ref, clusterSourceMessage{ID: "hdhive:" + resource.resourceRef.Slug, Text: rawShare}, "hdhive:"+resource.resourceRef.Slug, 1); dispatchErr != nil {
+	observationKey := clusterSingleObservationKey(ctx, sub.ID, "hdhive", rawShare, resource.resourceRef.Slug)
+	if _, dispatchErr := dispatchClusterInspectObservation(ctx, sub, ref, clusterSourceMessage{ID: "hdhive:" + resource.resourceRef.Slug, Text: rawShare}, observationKey, 1); dispatchErr != nil {
 		if strings.Contains(dispatchErr.Error(), "no compatible cluster worker is connected") {
 			return false, nil
 		}
@@ -518,8 +526,22 @@ func processHDHiveClusterResource(ctx context.Context, sub *model.Subscription, 
 }
 
 func firstNonNilError(first, next error) error {
-	if first != nil {
+	if first == nil {
+		return next
+	}
+	if next == nil {
 		return first
 	}
-	return next
+	if isHDHiveRateLimitError(first) && !isHDHiveRateLimitError(next) {
+		return next
+	}
+	return first
+}
+
+func isolateHDHiveRateLimitError(err error) error {
+	if !isHDHiveRateLimitError(err) {
+		return err
+	}
+	log.WithError(err).Warn("subscription: HDHive rate limit isolated from subscription result")
+	return nil
 }

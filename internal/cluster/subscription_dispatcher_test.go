@@ -618,6 +618,61 @@ func TestConsumeSubscriptionShareInspectWaitsForObservationAndSelectsLargest(t *
 	}
 }
 
+func TestConsumeSubscriptionShareInspectLegacyDuplicateTerminalsConverges(t *testing.T) {
+	database := openClusterRuntimeTestDB(t)
+	originalConfig := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	t.Cleanup(func() { conf.Conf = originalConfig })
+	db.Init(database)
+	dispatcher := &inspectObservationDispatcher{}
+	subscription.RegisterClusterDispatcher(dispatcher)
+	t.Cleanup(func() { subscription.RegisterClusterDispatcher(nil) })
+
+	sub := &model.Subscription{Name: "Legacy duplicate", SourceType: model.SubscriptionSourceManual, MediaType: "tv"}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	const observationKey = "hdhive:legacy-share"
+	create := func(jobID, recordID string) model.ClusterShareInspectManifest {
+		taskJSON, _ := json.Marshal(protocol.TaskContext{
+			Subscription: protocol.SubscriptionTaskContext{
+				SubscriptionID: sub.ID, ObservationKey: observationKey, ObservationExpected: 1,
+			},
+			Share: protocol.ShareTaskContext{Provider: "pan123", URL: "https://www.123pan.com/s/legacy"},
+		})
+		if err := database.Create(&model.ClusterJob{
+			ID: jobID, IdempotencyKey: jobID, Type: model.ClusterJobTypeShareInspect,
+			Status: model.ClusterJobStatusSucceeded, SubscriptionID: sub.ID, TaskContextJSON: string(taskJSON),
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(protocol.ShareInspectManifest{})
+		record := model.ClusterShareInspectManifest{
+			ID: recordID, JobID: jobID, SubscriptionID: sub.ID, ObservationKey: observationKey,
+			ObservationExpected: 1, PayloadJSON: string(payload), Status: model.ClusterShareInspectStatusPending,
+		}
+		if err := database.Create(&record).Error; err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	first := create("legacy-job-1", "legacy-record-1")
+	second := create("legacy-job-2", "legacy-record-2")
+
+	if err := consumeSubscriptionShareInspect(context.Background(), first, protocol.ShareInspectManifest{}); err != nil {
+		t.Fatalf("consume legacy duplicate terminals: %v", err)
+	}
+	if err := database.First(&first, "id = ?", first.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&second, "id = ?", second.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != model.ClusterShareInspectStatusPending || second.Status != model.ClusterShareInspectStatusConsumed {
+		t.Fatalf("legacy records = %#v / %#v, want current pending for caller ack and sibling consumed", first.Status, second.Status)
+	}
+}
+
 func decodeMediaOffersBySourceFileID(t *testing.T, messages []protocol.Envelope) map[string]protocol.JobOffer {
 	t.Helper()
 	offers := make(map[string]protocol.JobOffer, len(messages))

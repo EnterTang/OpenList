@@ -3,12 +3,14 @@ package subscription
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -170,6 +172,65 @@ func TestRunTelegramSkipsMessagesWithoutSubscriptionTitle(t *testing.T) {
 	}
 }
 
+func TestRunTelegramContinuesOtherChannelsWhenHDHiveIsRateLimited(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	oldSearch := builtinTelegramSearch
+	builtinTelegramSearch = func(context.Context, *model.Subscription, model.SubscriptionTelegramSourceConfig) ([]telegramCommandRow, error) {
+		return []telegramCommandRow{
+			{MsgID: int64(101), Channel: "oneonefivewpfx", Text: "九门 S01E28 https://hdhive.com/resource/115/054da9afa2204d33a11831e58776d1e4"},
+			{MsgID: int64(200), Channel: "Pan123Movie", Text: "九门 S01E29 https://example.com/share/next"},
+		}, nil
+	}
+	t.Cleanup(func() { builtinTelegramSearch = oldSearch })
+
+	oldService := newTelegramHDHiveService
+	oldCachedService, oldCachedKey := telegramHDHiveService, telegramHDHiveServiceKey
+	newTelegramHDHiveService = func(model.SubscriptionTelegramHDHiveConfig) (*hdhive.Service, error) {
+		return nil, errors.New("rate limit exceeded")
+	}
+	telegramHDHiveService = nil
+	telegramHDHiveServiceKey = ""
+	t.Cleanup(func() {
+		newTelegramHDHiveService = oldService
+		telegramHDHiveService = oldCachedService
+		telegramHDHiveServiceKey = oldCachedKey
+	})
+
+	config, err := json.Marshal(model.SubscriptionTelegramSourceConfig{
+		APIID:   12345,
+		APIHash: "hash",
+		HDHive: model.SubscriptionTelegramHDHiveConfig{
+			Enabled:      true,
+			BaseURL:      "https://hdhive.example",
+			UserID:       "test-user",
+			ProxyUserKey: "test-key",
+			ProxySecret:  "test-secret",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal Telegram config: %v", err)
+	}
+	sub := &model.Subscription{
+		ID:           90,
+		Name:         "九门",
+		TMDBName:     "九门",
+		SourceType:   model.SubscriptionSourceTelegram,
+		SourceConfig: string(config),
+		LastCursor:   `{"oneonefivewpfx":99}`,
+	}
+	items, _, _, _, _, runErr := runTelegram(context.Background(), sub, false)
+	if runErr != nil {
+		t.Fatalf("run error = %v, want HDHive rate limit to be isolated from direct sources", runErr)
+	}
+	if len(items) != 1 || items[0].SourceURL != "https://example.com/share/next" {
+		t.Fatalf("items = %#v, want the Pan123 channel row to continue", items)
+	}
+	cursor := parseTelegramCursor(sub.LastCursor)
+	if cursor.Channels["oneonefivewpfx"] != 100 || cursor.Channels["pan123movie"] != 200 {
+		t.Fatalf("cursor = %#v, want failed HDHive row held at 100 and Pan123 advanced to 200", cursor)
+	}
+}
+
 func TestTelegramSearchQueryUsesSubscriptionNames(t *testing.T) {
 	if got := telegramSearchQuery(&model.Subscription{TMDBName: " 三体 ", Name: "fallback"}); got != "三体" {
 		t.Fatalf("query = %q, want 三体", got)
@@ -230,6 +291,40 @@ func TestTelegramLegacyCursorDoesNotSkipChannelScopedRows(t *testing.T) {
 	}
 	if !telegramCursorHasSeen(parsed, pan123Row) {
 		t.Fatalf("formatted cursor %q should remember processed Pan123Movie message", formatted)
+	}
+}
+
+func TestTelegramSearchPaginationReachesRowsBeforeCursor(t *testing.T) {
+	pages := map[int64]struct {
+		rows    []telegramCommandRow
+		hasMore bool
+	}{
+		0: {
+			rows: []telegramCommandRow{
+				{MsgID: int64(94781), Channel: "Pan123Movie"},
+				{MsgID: int64(94750), Channel: "Pan123Movie"},
+			},
+			hasMore: true,
+		},
+		94750: {
+			rows: []telegramCommandRow{
+				{MsgID: int64(94705), Channel: "Pan123Movie"},
+			},
+		},
+	}
+
+	rows, err := collectTelegramSearchPages(94700, func(offsetID int64) ([]telegramCommandRow, bool, error) {
+		page, ok := pages[offsetID]
+		if !ok {
+			t.Fatalf("unexpected page offset %d", offsetID)
+		}
+		return page.rows, page.hasMore, nil
+	})
+	if err != nil {
+		t.Fatalf("collect Telegram search pages: %v", err)
+	}
+	if len(rows) != 3 || rowMessageID(rows[2]) != 94705 {
+		t.Fatalf("rows = %#v, want pagination to include message 94705", rows)
 	}
 }
 

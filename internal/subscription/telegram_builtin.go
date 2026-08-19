@@ -117,6 +117,7 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 		limit = 40
 	}
 	perChannelLimit := telegramBuiltinPerChannelLimit(limit, len(channels))
+	cursor := parseTelegramCursor(sub.LastCursor)
 	var rows []telegramCommandRow
 	err := runBuiltinTelegramClient(ctx, cfg, true, func(ctx context.Context, client *telegram.Client) error {
 		status, err := client.Auth().Status(ctx)
@@ -131,20 +132,32 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 			if err != nil {
 				return err
 			}
-			resp, err := client.API().MessagesSearch(ctx, &tg.MessagesSearchRequest{
-				Peer:   peer,
-				Q:      query,
-				Filter: &tg.InputMessagesFilterEmpty{},
-				Limit:  perChannelLimit,
+			channelCursor := int64(0)
+			if cursor.Channels != nil {
+				channelCursor = cursor.Channels[telegramCursorChannelKey(normalized)]
+			}
+			channelRows, err := collectTelegramSearchPages(channelCursor, func(offsetID int64) ([]telegramCommandRow, bool, error) {
+				resp, err := client.API().MessagesSearch(ctx, &tg.MessagesSearchRequest{
+					Peer:     peer,
+					Q:        query,
+					Filter:   &tg.InputMessagesFilterEmpty{},
+					Limit:    perChannelLimit,
+					OffsetID: int(offsetID),
+				})
+				if err != nil {
+					return nil, false, formatBuiltinTelegramError(err)
+				}
+				modified, ok := resp.AsModified()
+				if !ok {
+					return nil, false, nil
+				}
+				messages := modified.GetMessages()
+				return telegramRowsFromMessages(messages, normalized), len(messages) >= perChannelLimit, nil
 			})
 			if err != nil {
-				return formatBuiltinTelegramError(err)
+				return err
 			}
-			modified, ok := resp.AsModified()
-			if !ok {
-				continue
-			}
-			rows = append(rows, telegramRowsFromMessages(modified.GetMessages(), normalized)...)
+			rows = append(rows, channelRows...)
 		}
 		return nil
 	})
@@ -152,6 +165,37 @@ func runBuiltinTelegramSearch(ctx context.Context, sub *model.Subscription, cfg 
 		return nil, err
 	}
 	return rows, nil
+}
+
+func collectTelegramSearchPages(cursor int64, fetch func(offsetID int64) ([]telegramCommandRow, bool, error)) ([]telegramCommandRow, error) {
+	var rows []telegramCommandRow
+	offsetID := int64(0)
+	for {
+		page, hasMore, err := fetch(offsetID)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, page...)
+		minID := telegramSearchPageMinID(page)
+		// Keep paging until the previous cursor is in range; a single full page
+		// can otherwise move the cursor past messages that arrived between runs.
+		if cursor <= 0 || !hasMore || minID <= cursor || minID <= 0 || (offsetID > 0 && minID >= offsetID) {
+			return rows, nil
+		}
+		offsetID = minID
+	}
+}
+
+func telegramSearchPageMinID(rows []telegramCommandRow) int64 {
+	var minID int64
+	for _, row := range rows {
+		id := rowMessageID(row)
+		if id <= 0 || minID != 0 && id >= minID {
+			continue
+		}
+		minID = id
+	}
+	return minID
 }
 
 func telegramBuiltinPerChannelLimit(limit, channelCount int) int {

@@ -1078,7 +1078,7 @@ func sourceMessageFromTelegramRow(row telegramCommandRow) clusterSourceMessage {
 	}
 	return clusterSourceMessage{
 		ID: messageID, Channel: normalizeTelegramChannel(row.Channel),
-		URL: strings.TrimSpace(row.MessageURL), Text: text,
+		URL: telegramMessageURL(row), Text: text,
 	}
 }
 

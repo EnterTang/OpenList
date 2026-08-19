@@ -63,6 +63,8 @@ type resultQueue interface {
 
 var cleanupLookupDelay = 2 * time.Second
 
+const sourceCleanupLookupAttempts = 3
+
 const shareSaveBatchCollisionKeyPrefix = "share-save-batch-collision:"
 
 var (
@@ -851,7 +853,7 @@ func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFMani
 		OpenListPath: path.Clean(sourcePath), StorageMountPath: path.Clean(storage.GetStorage().MountPath),
 		OwnedRootPath: ownedRoot, Name: path.Base(sourcePath), EmptyRecycleBin: false, ExactFile: true,
 	}
-	obj, err := getCleanupObject(ctx, storage, actualPath, true)
+	obj, err := getSourceCleanupObjectWithRetry(ctx, storage, actualPath)
 	if err != nil {
 		return resultqueue.CleanupTarget{}, fmt.Errorf("read cluster source cleanup object: %w", err)
 	}
@@ -869,6 +871,26 @@ func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFMani
 		return resultqueue.CleanupTarget{}, err
 	}
 	return target, nil
+}
+
+func getSourceCleanupObjectWithRetry(ctx context.Context, storage driver.Driver, actualPath string) (model.Obj, error) {
+	var lastErr error
+	for attempt := 0; attempt < sourceCleanupLookupAttempts; attempt++ {
+		obj, err := getCleanupObject(ctx, storage, actualPath, true)
+		if err == nil {
+			return obj, nil
+		}
+		lastErr = err
+		if !errs.IsObjectNotFound(err) || attempt+1 == sourceCleanupLookupAttempts {
+			return nil, err
+		}
+		select {
+		case <-time.After(cleanupLookupDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
 }
 
 func mapClusterDeliveryPath(deliveryRoot, logicalMediaRoot, logicalTargetPath string) (string, error) {

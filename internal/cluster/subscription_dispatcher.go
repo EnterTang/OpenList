@@ -87,7 +87,7 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 	if err != nil {
 		return err
 	}
-	if progress.Terminal > progress.Expected {
+	if progress.Terminal > progress.Expected && !isLegacyShareInspectObservation(progress.ObservationKey) {
 		return fmt.Errorf("cluster share inspect observation %s has %d terminals, expected %d", progress.ObservationKey, progress.Terminal, progress.Expected)
 	}
 	complete := progress.Terminal >= progress.Expected
@@ -178,6 +178,25 @@ func consumeSubscriptionShareInspect(ctx context.Context, record model.ClusterSh
 		}
 	}
 	return nil
+}
+
+func isLegacyShareInspectObservation(observationKey string) bool {
+	observationKey = strings.TrimSpace(observationKey)
+	if strings.HasPrefix(observationKey, "run:") {
+		return false
+	}
+	if strings.HasPrefix(observationKey, "hdhive:") || strings.HasPrefix(observationKey, "hdhive-bound:") {
+		return true
+	}
+	if len(observationKey) != 64 {
+		return false
+	}
+	for _, r := range observationKey {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // pendingShareInspectProviders returns the share providers of sibling

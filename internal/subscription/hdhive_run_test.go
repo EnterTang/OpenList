@@ -2,6 +2,8 @@ package subscription
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,42 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/hdhive"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
+
+func TestHDHiveRegularSourcesKeepHDHiveResolutionEnabled(t *testing.T) {
+	var received model.SubscriptionTelegramSourceConfig
+	oldTelegram := runTelegramForHDHiveSubscription
+	runTelegramForHDHiveSubscription = func(_ context.Context, sub *model.Subscription, _ bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+		if err := json.Unmarshal([]byte(sub.SourceConfig), &received); err != nil {
+			t.Fatalf("decode Telegram fallback config: %v", err)
+		}
+		return nil, "", 0, 0, 0, nil
+	}
+	t.Cleanup(func() { runTelegramForHDHiveSubscription = oldTelegram })
+
+	var saved []model.SubscriptionItem
+	var hashes []string
+	var firstErr error
+	_, _ = runHDHiveRegularSources(
+		context.Background(),
+		&model.Subscription{},
+		model.SubscriptionConfig{
+			Telegram: model.SubscriptionTelegramSourceConfig{
+				SearchCommand: []string{"telegram-search"},
+				HDHive:        model.SubscriptionTelegramHDHiveConfig{Enabled: true},
+			},
+		},
+		false,
+		&saved,
+		&hashes,
+		new(int),
+		new(int),
+		new(int),
+		&firstErr,
+	)
+	if !received.HDHive.Enabled {
+		t.Fatal("Telegram fallback disabled HDHive link resolution")
+	}
+}
 
 func TestHDHiveSubscriptionSkipsPaidUnlockWhenRegularSourceHasCandidate(t *testing.T) {
 	var unlockCalls int
@@ -131,6 +169,36 @@ func TestHDHiveSubscriptionProcessesFreeResourceEvenWhenRegularSourceHasCandidat
 	}
 }
 
+func TestHDHiveRateLimitDoesNotFailFederatedRunWhenRegularSourceHasCandidate(t *testing.T) {
+	client := &hdhiveSubscriptionFakeClient{
+		searchErr: &hdhive.Error{Code: "HDHIVE_SYMEDIA_RATE_LIMITED", Message: "rate limit exceeded"},
+	}
+	cleanup := installHDHiveRunFakes(t, client)
+	defer cleanup()
+	runTelegramForHDHiveSubscription = func(context.Context, *model.Subscription, bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+		return []model.SubscriptionItem{{SourcePath: "/temp/pan123-e28.mkv", Status: model.SubscriptionItemStatusPending}}, "telegram-hash", 1, 0, 0, nil
+	}
+
+	sub := &model.Subscription{ID: 7, Name: "Example", TMDBName: "Example", TMDBID: 1399, MediaType: "tv", SourceType: model.SubscriptionSourceAuto}
+	_, _, _, _, _, err := runHDHiveFederated(context.Background(), sub, model.SubscriptionHDHiveSourceConfig{CloudType: "all", Limit: 10}, model.SubscriptionConfig{
+		Telegram: model.SubscriptionTelegramSourceConfig{SearchCommand: []string{"telegram"}},
+	}, true)
+	if err != nil {
+		t.Fatalf("run HDHive subscription: %v, want HDHive rate limit to be non-fatal", err)
+	}
+}
+
+func TestIsolateHDHiveRateLimitErrorRemovesOnlyRateLimitFailure(t *testing.T) {
+	rateLimit := &hdhive.Error{Code: "HDHIVE_SYMEDIA_RATE_LIMITED", Message: "rate limit exceeded"}
+	if got := isolateHDHiveRateLimitError(rateLimit); got != nil {
+		t.Fatalf("isolated rate-limit error = %v, want nil", got)
+	}
+	nonRateLimit := errors.New("telegram authentication failed")
+	if got := isolateHDHiveRateLimitError(nonRateLimit); got != nonRateLimit {
+		t.Fatalf("non-rate-limit error = %v, want original error", got)
+	}
+}
+
 func TestHDHiveSubscriptionProcessesFreeHDHiveBeforeRegularSources(t *testing.T) {
 	events := make([]string, 0, 4)
 	client := &hdhiveSubscriptionFakeClient{
@@ -241,6 +309,7 @@ type hdhiveSubscriptionFakeClient struct {
 	resources []hdhive.Resource
 	details   hdhive.ResourceDetails
 	events    *[]string
+	searchErr error
 }
 
 type hdhiveRunTestDispatcher struct {
@@ -257,6 +326,9 @@ func (d *hdhiveRunTestDispatcher) DispatchSubscriptionMedia(context.Context, []C
 }
 
 func (f *hdhiveSubscriptionFakeClient) Search(context.Context, string, int64) ([]hdhive.Resource, error) {
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
 	return f.resources, nil
 }
 

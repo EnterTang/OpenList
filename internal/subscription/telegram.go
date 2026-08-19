@@ -26,6 +26,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/media/titlematch"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -227,15 +228,21 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	}
 	cursor := parseTelegramCursor(sub.LastCursor)
 	nextCursor := cursor.clone()
+	blockedChannels := make(map[string]struct{})
 	now := time.Now()
 	added := 0
 	changed := 0
 	transferred := 0
+	var firstErr error
 	var saved []model.SubscriptionItem
 	var inspected []shareTransferCandidate
 	for _, row := range rows {
 		msgID := rowMessageID(row)
 		if msgID > 0 {
+			channel := telegramCursorChannelKey(row.Channel)
+			if _, blocked := blockedChannels[channel]; blocked {
+				continue
+			}
 			if telegramCursorHasSeen(cursor, row) {
 				continue
 			}
@@ -247,7 +254,15 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 		links, sources := rowLinksForTelegramPanSources(row, cfg)
 		hdhiveLinks, err := resolveTelegramHDHiveLinks(ctx, row, cfg)
 		if err != nil {
-			return saved, sub.LastTreeHash, added, changed, transferred, err
+			firstErr = firstNonNilError(firstErr, err)
+			if len(links) == 0 {
+				// Do not let an HDHive-only row advance its channel cursor past
+				// an unresolved message. Older rows in that channel are held
+				// for the next run as well, while other channels continue.
+				nextCursor.holdBefore(row)
+				blockedChannels[telegramCursorChannelKey(row.Channel)] = struct{}{}
+				continue
+			}
 		}
 		for _, link := range hdhiveLinks {
 			links = append(links, normalizeTelegramLinkWithAccessCode(link.URL, link.AccessCode))
@@ -306,6 +321,9 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	if len(selected) > 0 {
 		tempItems, tempHash, tempAdded, tempChanged, tempTransferred, err := transferSelectedShareCandidates(ctx, sub, selected, transfer, now, resultHash)
 		if err != nil {
+			if formatted := formatTelegramCursor(nextCursor); formatted != strings.TrimSpace(sub.LastCursor) {
+				sub.LastCursor = formatted
+			}
 			return saved, sub.LastTreeHash, added, changed, transferred, err
 		}
 		saved = append(saved, tempItems...)
@@ -318,6 +336,12 @@ func runTelegram(ctx context.Context, sub *model.Subscription, transfer bool) ([
 	}
 	if formatted := formatTelegramCursor(nextCursor); formatted != strings.TrimSpace(sub.LastCursor) {
 		sub.LastCursor = formatted
+	}
+	if firstErr != nil {
+		if !isHDHiveRateLimitError(firstErr) {
+			return saved, resultHash, added, changed, transferred, firstErr
+		}
+		log.WithError(firstErr).Warn("subscription: HDHive rate limit isolated; direct Telegram sources were retained")
 	}
 	return saved, resultHash, added, changed, transferred, nil
 }
@@ -1170,6 +1194,27 @@ func (cursor *telegramCursor) advance(row telegramCommandRow) {
 	}
 	if msgID > cursor.Channels[channel] {
 		cursor.Channels[channel] = msgID
+	}
+}
+
+func (cursor *telegramCursor) holdBefore(row telegramCommandRow) {
+	msgID := rowMessageID(row)
+	if msgID <= 0 {
+		return
+	}
+	hold := msgID - 1
+	channel := telegramCursorChannelKey(row.Channel)
+	if channel == "" {
+		if cursor.Legacy > hold {
+			cursor.Legacy = hold
+		}
+		return
+	}
+	if cursor.Channels == nil {
+		return
+	}
+	if current, ok := cursor.Channels[channel]; ok && current > hold {
+		cursor.Channels[channel] = hold
 	}
 }
 

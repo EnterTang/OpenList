@@ -263,11 +263,27 @@ func TestRunPanSouClusterGroupsAllResultsIntoOneObservation(t *testing.T) {
 func TestSourceMessageFromTelegramRowPreservesAllTitleFields(t *testing.T) {
 	message := sourceMessageFromTelegramRow(telegramCommandRow{
 		MsgID:   int64(19576),
+		Channel: "Pan123Movie",
 		Text:    "S01E04",
 		RawText: "小芳.2026.S01E04",
 	})
 	if !subscriptionTitleMatches(&model.Subscription{Name: "小芳", TMDBName: "小芳"}, message.Text) {
 		t.Fatalf("source message lost the title-bearing raw text: %q", message.Text)
+	}
+	if message.URL != "https://t.me/Pan123Movie/19576" {
+		t.Fatalf("source message URL = %q, want Telegram permalink", message.URL)
+	}
+}
+
+func TestClusterObservationKeyChangesAcrossSubscriptionRuns(t *testing.T) {
+	items := []clusterInspectObservationItem{{
+		ref:     ShareRef{Provider: ShareProviderPan123, ShareID: "share-1"},
+		message: clusterSourceMessage{ID: "94705", Channel: "Pan123Movie"},
+	}}
+	first := clusterObservationKeyWithRunID("run-1", 182, "telegram", items)
+	second := clusterObservationKeyWithRunID("run-2", 182, "telegram", items)
+	if first == second {
+		t.Fatalf("observation key reused across runs: %q", first)
 	}
 }
 

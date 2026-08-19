@@ -164,6 +164,7 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 		return nil, err
 	}
 	started := time.Now()
+	ctx = withSubscriptionRunID(ctx, fmt.Sprintf("run-%d", started.UTC().UnixNano()))
 	run := &model.SubscriptionRun{
 		SubscriptionID:   sub.ID,
 		StartedAt:        started,
