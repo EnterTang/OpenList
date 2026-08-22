@@ -80,6 +80,7 @@ type Subscription struct {
 	Progress                 SubscriptionProgress       `json:"progress" gorm:"-"`
 	RealtimeStatus           SubscriptionRealtimeStatus `json:"realtime_status" gorm:"-"`
 	BoundShare               *SubscriptionBoundShare    `json:"bound_share,omitempty" gorm:"serializer:json"`
+	BoundTorrent             *SubscriptionBoundTorrent  `json:"bound_torrent,omitempty" gorm:"serializer:json"`
 }
 
 type SubscriptionBoundShare struct {

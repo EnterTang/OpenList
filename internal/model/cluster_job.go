@@ -3,9 +3,11 @@ package model
 import "time"
 
 const (
-	ClusterJobTypeShareInspect  = "share.inspect"
-	ClusterJobTypeShareBatch    = "share.batch"
-	ClusterJobTypeMediaTransfer = "media.transfer"
+	ClusterJobTypeShareInspect    = "share.inspect"
+	ClusterJobTypeShareBatch      = "share.batch"
+	ClusterJobTypeMediaTransfer   = "media.transfer"
+	ClusterJobTypeTorrentObserve  = "torrent.observe"
+	ClusterJobTypeTorrentTransfer = "torrent.transfer"
 
 	ClusterJobStatusQueued          = "queued"
 	ClusterJobStatusPlanning        = "planning"
@@ -47,6 +49,10 @@ const (
 	ClusterStageETFMaterializing   = "etf_materializing"
 	ClusterStageETFArchiving       = "etf_archiving"
 	ClusterStageTargetNotifying    = "target_notifying"
+	ClusterStageQBObserving        = "qb_observing"
+	ClusterStageQBCopying          = "qb_copying"
+	ClusterStageRetentionCheck     = "retention_check"
+	ClusterStageQBDeleting         = "qb_deleting"
 
 	ClusterNotificationStatusPending     = "pending"
 	ClusterNotificationStatusSending     = "sending"
