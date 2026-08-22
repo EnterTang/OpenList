@@ -66,6 +66,21 @@ func ListSecrets(ctx context.Context) ([]model.ClusterSecret, error) {
 	return secrets, err
 }
 
+// ResolveSecret returns the decrypted JSON payload for an active Coordinator
+// secret. Callers must keep the returned bytes in memory only for the
+// operation that needs them.
+func ResolveSecret(ctx context.Context, id string) ([]byte, string, error) {
+	var secret model.ClusterSecret
+	if err := db.GetDb().WithContext(ctx).First(&secret, "id = ? AND revoked_at IS NULL", strings.TrimSpace(id)).Error; err != nil {
+		return nil, "", err
+	}
+	plaintext, err := decryptCoordinatorSecret(secret)
+	if err != nil {
+		return nil, "", err
+	}
+	return plaintext, secret.Fingerprint, nil
+}
+
 func WriteSecret(ctx context.Context, req SecretWriteRequest, actor ControlActor) (*model.ClusterSecret, error) {
 	if strings.TrimSpace(req.Alias) == "" || strings.TrimSpace(req.Kind) == "" || len(req.Value) == 0 {
 		return nil, errors.New("secret alias, kind, and non-empty value are required")

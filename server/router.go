@@ -5,6 +5,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/message"
+	"github.com/OpenListTeam/OpenList/v4/internal/moviepilotbridge"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -113,7 +114,9 @@ func Init(e *gin.Engine) {
 	_sharing(auth.Group("/share", middlewares.AuthNotGuest))
 	externalSubscriptions(api.Group("/subscriptions", middlewares.ExternalSubscriptionAuth))
 	externalSubscriptions(api.Group("/v1/subscriptions", middlewares.ExternalSubscriptionAuth))
-	admin(auth.Group("/admin", middlewares.AuthAdmin))
+	moviePilotBridge := newMoviePilotBridgeService()
+	api.POST("/v1/cluster/moviepilot/events", middlewares.MoviePilotBridgeAuth(moviePilotBridge), handles.ConsumeMoviePilotBridgeEvent(moviePilotBridge))
+	admin(auth.Group("/admin", middlewares.AuthAdmin), moviePilotBridge)
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
 	}
@@ -132,7 +135,7 @@ func externalSubscriptions(g *gin.RouterGroup) {
 	g.POST("/:id/update", handles.ExternalUpdateSubscription)
 }
 
-func admin(g *gin.RouterGroup) {
+func admin(g *gin.RouterGroup, moviePilotBridge *moviepilotbridge.Service) {
 	clusterAdmin := g.Group("/cluster")
 	clusterAdmin.GET("/config", handles.GetClusterConfig)
 	clusterAdmin.POST("/config", handles.SaveClusterConfig)
@@ -155,6 +158,11 @@ func admin(g *gin.RouterGroup) {
 	clusterAdmin.GET("/storage-profiles", handles.ListClusterStorageProfiles)
 	clusterAdmin.POST("/storage-profiles", handles.ApplyClusterStorageProfile)
 	clusterAdmin.GET("/audit", handles.ListClusterControlAudit)
+
+	bridgeAdmin := g.Group("/moviepilot_bridge")
+	bridgeAdmin.GET("", handles.ListMoviePilotBridges(moviePilotBridge))
+	bridgeAdmin.POST("", handles.UpsertMoviePilotBridge(moviePilotBridge))
+	bridgeAdmin.POST("/:id/disable", handles.DisableMoviePilotBridge(moviePilotBridge))
 
 	meta := g.Group("/meta")
 	meta.GET("/list", handles.ListMetas)
