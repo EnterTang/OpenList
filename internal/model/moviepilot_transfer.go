@@ -53,24 +53,25 @@ type MoviePilotBridgeInstance struct {
 }
 
 type MoviePilotDownloadIntent struct {
-	ID                 string     `json:"id" gorm:"primaryKey;size:64"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
-	RequestID          string     `json:"request_id" gorm:"size:64;uniqueIndex"`
-	BridgeInstanceID   string     `json:"bridge_instance_id" gorm:"size:64;index"`
-	SubscriptionID     uint       `json:"subscription_id" gorm:"index"`
-	SubscriptionItemID uint       `json:"subscription_item_id" gorm:"index"`
-	MediaSource        string     `json:"media_source" gorm:"size:64"`
-	MediaID            string     `json:"media_id" gorm:"size:128"`
-	TorrentFingerprint string     `json:"torrent_fingerprint" gorm:"size:128"`
-	ResourceRef        string     `json:"resource_ref" gorm:"type:text"`
-	Status             string     `json:"status" gorm:"size:32;index"`
-	LastEventID        string     `json:"last_event_id" gorm:"size:64;index"`
-	LastErrorCode      string     `json:"last_error_code" gorm:"size:128"`
-	LastError          string     `json:"last_error" gorm:"type:text"`
-	AcceptedAt         *time.Time `json:"accepted_at,omitempty"`
-	BoundAt            *time.Time `json:"bound_at,omitempty"`
-	FinishedAt         *time.Time `json:"finished_at,omitempty"`
+	ID                  string     `json:"id" gorm:"primaryKey;size:64"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+	RequestID           string     `json:"request_id" gorm:"size:64;uniqueIndex"`
+	BridgeInstanceID    string     `json:"bridge_instance_id" gorm:"size:64;index"`
+	SubscriptionID      uint       `json:"subscription_id" gorm:"index"`
+	SubscriptionItemID  uint       `json:"subscription_item_id" gorm:"index"`
+	MediaSource         string     `json:"media_source" gorm:"size:64"`
+	MediaID             string     `json:"media_id" gorm:"size:128"`
+	TorrentFingerprint  string     `json:"torrent_fingerprint" gorm:"size:128"`
+	ResourceRef         string     `json:"resource_ref" gorm:"type:text"`
+	RetentionPolicyJSON string     `json:"retention_policy_json" gorm:"type:text"`
+	Status              string     `json:"status" gorm:"size:32;index"`
+	LastEventID         string     `json:"last_event_id" gorm:"size:64;index"`
+	LastErrorCode       string     `json:"last_error_code" gorm:"size:128"`
+	LastError           string     `json:"last_error" gorm:"type:text"`
+	AcceptedAt          *time.Time `json:"accepted_at,omitempty"`
+	BoundAt             *time.Time `json:"bound_at,omitempty"`
+	FinishedAt          *time.Time `json:"finished_at,omitempty"`
 }
 
 type TorrentRetentionPolicy struct {
@@ -167,13 +168,16 @@ type MoviePilotBridgeInbox struct {
 }
 
 type SubscriptionBoundTorrent struct {
-	BridgeInstanceID    string    `json:"bridge_instance_id,omitempty"`
-	ResourceRef         string    `json:"resource_ref,omitempty"`
-	SelectedFingerprint string    `json:"selected_fingerprint,omitempty"`
-	MediaSource         string    `json:"media_source,omitempty"`
-	MediaID             string    `json:"media_id,omitempty"`
-	MediaType           string    `json:"media_type,omitempty"`
-	Season              int       `json:"season,omitempty"`
-	Episode             int       `json:"episode,omitempty"`
-	BoundAt             time.Time `json:"bound_at,omitempty"`
+	BridgeInstanceID    string                 `json:"bridge_instance_id,omitempty"`
+	ResourceRef         string                 `json:"resource_ref,omitempty"`
+	SelectedFingerprint string                 `json:"selected_fingerprint,omitempty"`
+	TorrentTitle        string                 `json:"torrent_title,omitempty"`
+	Site                string                 `json:"site,omitempty"`
+	MediaSource         string                 `json:"media_source,omitempty"`
+	MediaID             string                 `json:"media_id,omitempty"`
+	MediaType           string                 `json:"media_type,omitempty"`
+	Season              int                    `json:"season,omitempty"`
+	Episode             int                    `json:"episode,omitempty"`
+	RetentionPolicy     TorrentRetentionPolicy `json:"retention_policy,omitempty"`
+	BoundAt             time.Time              `json:"bound_at,omitempty"`
 }

@@ -32,6 +32,12 @@ URL at `/api/v1/openlist/intent`. The Bridge posts events to Coordinator at
 `/api/v1/cluster/moviepilot/events`. Both sides sign the exact raw JSON body;
 `request_id` is also sent as `X-OpenList-Request-ID` for idempotent retries.
 
+Subscription resource search uses the Bridge base URL at
+`/api/v1/openlist/search`. Search results contain only an opaque
+`resource_ref`, title, site label, size, and seed/leech metadata. Binding a
+result stores that opaque reference in `BoundTorrent`; OpenList does not ask
+MoviePilot to create a subscription.
+
 Bridge secrets are stored through the existing encrypted `ClusterSecret`
 store with kind `moviepilot_bridge_hmac`. API responses expose only the
 configured flag and secret fingerprint, never the key.

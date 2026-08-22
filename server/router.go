@@ -8,6 +8,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/moviepilotbridge"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/OpenListTeam/OpenList/v4/server/handles"
@@ -115,6 +116,7 @@ func Init(e *gin.Engine) {
 	externalSubscriptions(api.Group("/subscriptions", middlewares.ExternalSubscriptionAuth))
 	externalSubscriptions(api.Group("/v1/subscriptions", middlewares.ExternalSubscriptionAuth))
 	moviePilotBridge := newMoviePilotBridgeService()
+	subscription.SetMoviePilotBridgeClient(moviePilotBridge)
 	api.POST("/v1/cluster/moviepilot/events", middlewares.MoviePilotBridgeAuth(moviePilotBridge), handles.ConsumeMoviePilotBridgeEvent(moviePilotBridge))
 	admin(auth.Group("/admin", middlewares.AuthAdmin), moviePilotBridge)
 	if flags.Debug || flags.Dev {
@@ -272,6 +274,8 @@ func admin(g *gin.RouterGroup, moviePilotBridge *moviepilotbridge.Service) {
 	subscription.POST("/resource/unlock", handles.UnlockSubscriptionResource)
 	subscription.POST("/resource/bind", handles.BindSubscriptionResource)
 	subscription.POST("/resource/unbind", handles.UnbindSubscriptionResource)
+	subscription.POST("/resource/bind_moviepilot", handles.BindMoviePilotSubscriptionResource)
+	subscription.POST("/resource/unbind_moviepilot", handles.UnbindMoviePilotSubscriptionResource)
 	subscription.GET("/config", handles.GetSubscriptionConfig)
 	subscription.POST("/config", handles.SaveSubscriptionConfig)
 	subscription.POST("/telegram/status", handles.TelegramSubscriptionStatus)

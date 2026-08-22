@@ -592,6 +592,34 @@ func BindSubscriptionResource(c *gin.Context) {
 	common.SuccessResp(c, result)
 }
 
+func BindMoviePilotSubscriptionResource(c *gin.Context) {
+	var req model.SubscriptionMoviePilotResourceBindReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	result, err := subscription.BindMoviePilotResource(c.Request.Context(), req)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
+func UnbindMoviePilotSubscriptionResource(c *gin.Context) {
+	var req model.SubscriptionMoviePilotResourceUnbindReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	result, err := subscription.UnbindMoviePilotResource(c.Request.Context(), req)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
 func UnbindSubscriptionResource(c *gin.Context) {
 	var req model.SubscriptionResourceUnbindReq
 	if err := c.ShouldBindJSON(&req); err != nil {

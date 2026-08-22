@@ -138,6 +138,18 @@ func (s *Service) DisableInstance(ctx context.Context, id string) error {
 	return nil
 }
 
+func (s *Service) SearchResources(ctx context.Context, bridgeID string, payload ResourceSearchRequest) ([]ResourceSearchResult, error) {
+	if s == nil || s.database == nil {
+		return nil, errors.New("moviepilot bridge database is required")
+	}
+	var bridge model.MoviePilotBridgeInstance
+	if err := s.database.WithContext(ctx).First(&bridge, "id = ? AND enabled = ?", strings.TrimSpace(bridgeID), true).Error; err != nil {
+		return nil, err
+	}
+	client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
+	return client.SearchResources(ctx, bridge, payload)
+}
+
 func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *model.MoviePilotDownloadIntent, payload DownloadIntentRequest) error {
 	if s == nil || s.database == nil {
 		return errors.New("moviepilot bridge database is required")

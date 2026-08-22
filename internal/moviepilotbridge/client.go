@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -34,6 +33,27 @@ func (c *Client) SubmitIntent(ctx context.Context, bridge model.MoviePilotBridge
 	if c.Resolve == nil {
 		return errors.New("moviepilot bridge secret resolver is not configured")
 	}
+	return c.postJSON(ctx, bridge, BridgeIntentPath, payload.RequestID, payload, nil)
+}
+
+func (c *Client) SearchResources(ctx context.Context, bridge model.MoviePilotBridgeInstance, payload ResourceSearchRequest) ([]ResourceSearchResult, error) {
+	if strings.TrimSpace(payload.RequestID) == "" {
+		payload.RequestID = uuid.NewString()
+	}
+	var response ResourceSearchResponse
+	if err := c.postJSON(ctx, bridge, BridgeSearchPath, payload.RequestID, payload, &response); err != nil {
+		return nil, err
+	}
+	return response.Results, nil
+}
+
+func (c *Client) postJSON(ctx context.Context, bridge model.MoviePilotBridgeInstance, endpoint, requestID string, payload any, responsePayload any) error {
+	if c == nil || c.HTTPClient == nil {
+		return errors.New("moviepilot bridge HTTP client is required")
+	}
+	if c.Resolve == nil {
+		return errors.New("moviepilot bridge secret resolver is not configured")
+	}
 	baseURL, err := validateBridgeURL(bridge.BaseURL)
 	if err != nil {
 		return err
@@ -44,7 +64,7 @@ func (c *Client) SubmitIntent(ctx context.Context, bridge model.MoviePilotBridge
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal bridge intent: %w", err)
+		return fmt.Errorf("marshal bridge request: %w", err)
 	}
 	now := time.Now().UTC()
 	if c.Now != nil {
@@ -52,35 +72,35 @@ func (c *Client) SubmitIntent(ctx context.Context, bridge model.MoviePilotBridge
 	}
 	signed := SignRequest{
 		Version: SignatureVersionV1, InstanceID: bridge.ID, Method: http.MethodPost,
-		Path: BridgeIntentPath, Timestamp: now, Nonce: uuid.NewString(), Body: body,
+		Path: endpoint, Timestamp: now, Nonce: uuid.NewString(), Body: body,
 	}
 	headers, err := signed.Headers(key)
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+BridgeIntentPath, strings.NewReader(string(body)))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+endpoint, strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
 	request.Header = headers
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-OpenList-Request-ID", payload.RequestID)
+	request.Header.Set("X-OpenList-Request-ID", requestID)
 	response, err := c.HTTPClient.Do(request)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
+	bodyResponse, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if readErr != nil {
+		return readErr
+	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("moviepilot bridge returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(detail)))
+		return fmt.Errorf("moviepilot bridge returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(bodyResponse)))
+	}
+	if responsePayload != nil && len(bodyResponse) > 0 {
+		if err := json.Unmarshal(bodyResponse, responsePayload); err != nil {
+			return fmt.Errorf("decode moviepilot bridge response: %w", err)
+		}
 	}
 	return nil
-}
-
-func bridgeURLPath(raw string) (string, error) {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" {
-		return "", errors.New("moviepilot bridge URL must use HTTPS")
-	}
-	return strings.TrimRight(u.String(), "/") + BridgeIntentPath, nil
 }

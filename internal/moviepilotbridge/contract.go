@@ -15,7 +15,33 @@ const (
 	EventTorrentStateChanged = "torrent.state_changed"
 	EventTorrentFailed       = "torrent.failed"
 	EventBridgeHealthChanged = "bridge.health_changed"
+
+	BridgeSearchPath = "/api/v1/openlist/search"
 )
+
+type ResourceSearchRequest struct {
+	RequestID   string `json:"request_id"`
+	Query       string `json:"query"`
+	MediaSource string `json:"media_source"`
+	MediaID     string `json:"media_id"`
+	MediaType   string `json:"media_type,omitempty"`
+	Season      int    `json:"season,omitempty"`
+	Episode     int    `json:"episode,omitempty"`
+}
+
+type ResourceSearchResult struct {
+	ResourceRef         string `json:"resource_ref"`
+	Title               string `json:"title"`
+	Site                string `json:"site,omitempty"`
+	Size                int64  `json:"size,omitempty"`
+	Seeders             int    `json:"seeders,omitempty"`
+	Leechers            int    `json:"leechers,omitempty"`
+	SelectedFingerprint string `json:"selected_fingerprint,omitempty"`
+}
+
+type ResourceSearchResponse struct {
+	Results []ResourceSearchResult `json:"results"`
+}
 
 type DownloadIntentRequest struct {
 	RequestID          string                 `json:"request_id"`

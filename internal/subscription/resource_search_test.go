@@ -26,7 +26,7 @@ func TestNormalizeResourceSearchSources(t *testing.T) {
 		t.Fatalf("hdhive sources = %#v, want hdhive only", got)
 	}
 	got = normalizeResourceSearchSources([]string{"all"})
-	if !stringSlicesEqual(got, []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive}) {
+	if !stringSlicesEqual(got, []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive, model.SubscriptionSourceMoviePilot}) {
 		t.Fatalf("all sources = %#v, want all configured search sources", got)
 	}
 }
