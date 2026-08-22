@@ -54,8 +54,22 @@ func TestSubmitIntentPersistsOutboxBeforeSendingSignedBody(t *testing.T) {
 	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, payload); err != nil {
 		t.Fatalf("submit intent: %v", err)
 	}
+	if err := service.SubmitIntent(context.Background(), bridge.ID, &model.MoviePilotDownloadIntent{
+		ID: "intent-client-retry", RequestID: intent.RequestID, BridgeInstanceID: bridge.ID,
+		MediaSource: intent.MediaSource, MediaID: intent.MediaID, ResourceRef: intent.ResourceRef,
+		TorrentFingerprint: intent.TorrentFingerprint,
+	}, payload); err != nil {
+		t.Fatalf("submit idempotent retry: %v", err)
+	}
 	if httpClient.request == nil {
 		t.Fatal("bridge HTTP request was not sent")
+	}
+	var outboxCount int64
+	if err := database.Model(&model.MoviePilotBridgeOutbox{}).Where("request_id = ?", payload.RequestID).Count(&outboxCount).Error; err != nil {
+		t.Fatalf("count outbox: %v", err)
+	}
+	if outboxCount != 1 {
+		t.Fatalf("outbox count = %d, want one idempotent row", outboxCount)
 	}
 	if got, want := httpClient.request.URL.String(), "https://moviepilot.example/base/api/v1/openlist/intent"; got != want {
 		t.Fatalf("bridge URL = %q, want %q", got, want)
