@@ -2,12 +2,18 @@ package qbittorrent
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"path"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -17,6 +23,11 @@ type Client interface {
 	AddFromLink(link string, savePath string, id string) error
 	GetInfo(id string) (TorrentInfo, error)
 	GetFiles(id string) ([]FileInfo, error)
+	GetTorrentByHash(context.Context, string) (TorrentInfo, error)
+	GetFilesByHash(context.Context, string) ([]FileInfo, error)
+	StartByHash(context.Context, string) error
+	StopByHash(context.Context, string) error
+	DeleteByHash(context.Context, string, bool) error
 	Delete(id string, deleteFiles bool) error
 }
 
@@ -120,10 +131,18 @@ func (c *client) login() error {
 }
 
 func (c *client) post(path string, data url.Values) (*http.Response, error) {
+	return c.postContext(context.Background(), path, data)
+}
+
+func (c *client) postContext(ctx context.Context, path string, data url.Values) (*http.Response, error) {
 	u := c.url.JoinPath(path)
 	u.User = nil // remove userinfo for requests
 
-	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader([]byte(data.Encode())))
+	var body io.Reader
+	if data != nil {
+		body = bytes.NewReader([]byte(data.Encode()))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
@@ -357,6 +376,112 @@ func (c *client) GetFiles(id string) ([]FileInfo, error) {
 		return []FileInfo{}, err
 	}
 	return infos, nil
+}
+
+func (c *client) GetTorrentByHash(ctx context.Context, hash string) (TorrentInfo, error) {
+	if err := c.checkAuthorization(); err != nil {
+		return TorrentInfo{}, err
+	}
+	return c.getTorrentByHash(ctx, hash)
+}
+
+func (c *client) getTorrentByHash(ctx context.Context, hash string) (TorrentInfo, error) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return TorrentInfo{}, errors.New("torrent hash is required")
+	}
+	v := url.Values{}
+	v.Set("hashes", hash)
+	response, err := c.postContext(ctx, "/api/v2/torrents/info", v)
+	if err != nil {
+		return TorrentInfo{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return TorrentInfo{}, fmt.Errorf("failed to query qBittorrent torrent info: %s", response.Status)
+	}
+	var infos []TorrentInfo
+	if err := json.NewDecoder(response.Body).Decode(&infos); err != nil {
+		return TorrentInfo{}, err
+	}
+	if len(infos) != 1 {
+		return TorrentInfo{}, NewInfoNotFoundError(hash)
+	}
+	return infos[0], nil
+}
+
+func (c *client) GetFilesByHash(ctx context.Context, hash string) ([]FileInfo, error) {
+	if err := c.checkAuthorization(); err != nil {
+		return nil, err
+	}
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return nil, errors.New("torrent hash is required")
+	}
+	v := url.Values{}
+	v.Set("hash", hash)
+	response, err := c.postContext(ctx, "/api/v2/torrents/files", v)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to query qBittorrent torrent files: %s", response.Status)
+	}
+	var files []FileInfo
+	if err := json.NewDecoder(response.Body).Decode(&files); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+func (c *client) StartByHash(ctx context.Context, hash string) error {
+	return c.controlByHash(ctx, "/api/v2/torrents/start", hash)
+}
+
+func (c *client) StopByHash(ctx context.Context, hash string) error {
+	return c.controlByHash(ctx, "/api/v2/torrents/stop", hash)
+}
+
+func (c *client) controlByHash(ctx context.Context, endpoint, hash string) error {
+	if err := c.checkAuthorization(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(hash) == "" {
+		return errors.New("torrent hash is required")
+	}
+	v := url.Values{}
+	v.Set("hashes", strings.TrimSpace(hash))
+	response, err := c.postContext(ctx, endpoint, v)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("qBittorrent %s failed: %s", path.Base(endpoint), response.Status)
+	}
+	return nil
+}
+
+func (c *client) DeleteByHash(ctx context.Context, hash string, deleteFiles bool) error {
+	if err := c.checkAuthorization(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(hash) == "" {
+		return errors.New("torrent hash is required")
+	}
+	v := url.Values{}
+	v.Set("hashes", strings.TrimSpace(hash))
+	v.Set("deleteFiles", strconv.FormatBool(deleteFiles))
+	response, err := c.postContext(ctx, "/api/v2/torrents/delete", v)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("failed to delete qBittorrent torrent: %s", response.Status)
+	}
+	return nil
 }
 
 func (c *client) Delete(id string, deleteFiles bool) error {

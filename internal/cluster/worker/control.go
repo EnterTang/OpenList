@@ -245,6 +245,9 @@ func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig,
 	}
 	s.downloadGate.SetLimit(effectiveConcurrency(desired.DownloadConcurrency))
 	s.uploadGate.SetLimit(effectiveConcurrency(desired.UploadConcurrency))
+	if s.moviePilotUploadGate != nil {
+		s.moviePilotUploadGate.SetLimit(moviePilotUploadConcurrency(desired.Staging))
+	}
 	for name, binding := range desired.TargetBindings {
 		gate := s.targetGates[name]
 		if gate == nil {
@@ -527,6 +530,13 @@ func (s *Service) acquireDownloadCapacity(ctx context.Context) (func(), error) {
 func (s *Service) tryAcquireMediaCapacity() (func(), bool) {
 	s.refreshDefaultMediaConcurrency()
 	return s.downloadGate.TryAcquire()
+}
+
+func (s *Service) tryAcquireMoviePilotUploadCapacity() (func(), bool) {
+	if s.moviePilotUploadGate == nil {
+		return func() {}, true
+	}
+	return s.moviePilotUploadGate.TryAcquire()
 }
 
 func (s *Service) acquireUploadCapacity(ctx context.Context) (func(), error) {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -25,8 +26,10 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
+	"github.com/OpenListTeam/OpenList/v4/pkg/qbittorrent"
 	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/tache"
@@ -124,7 +127,9 @@ type Service struct {
 	observedRevision      uint64
 	downloadGate          *limitGate
 	uploadGate            *limitGate
+	moviePilotUploadGate  *limitGate
 	targetGates           map[string]*limitGate
+	qbClientFactory       func(protocol.QBClientConfig) (qbittorrent.Client, error)
 	mediaTransferBoundary func(context.Context, protocol.JobOffer, resolvedMediaTransferTargets) error
 	shareSaveSaver        func(context.Context, string, string, string, []string) ([]string, error)
 	shareSaveBatchSaver   func(context.Context, string, string, string, []string) ([]string, error)
@@ -147,8 +152,9 @@ func New(queue resultQueue, sender Sender) *Service {
 		queue: queue, sender: sender,
 		pending: make(map[string]resultqueue.Result), active: make(map[string]*activeTask), control: make(map[string]chan error), permits: make(map[string]chan protocol.StagePermit),
 		storageOperator: openListStorageOperator{}, storageObserved: make(map[string]observedState),
-		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), targetGates: make(map[string]*limitGate),
-		shareSaveSaver: subscription.SaveClusterShareSelection, shareSaveBatchSaver: subscription.SaveClusterShareSelectionBatch, stagedSourceFinder: findExistingStagedSource,
+		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), moviePilotUploadGate: newLimitGate(moviePilotDefaultUploadConcurrency), targetGates: make(map[string]*limitGate),
+		qbClientFactory: newWorkerQBClient,
+		shareSaveSaver:  subscription.SaveClusterShareSelection, shareSaveBatchSaver: subscription.SaveClusterShareSelectionBatch, stagedSourceFinder: findExistingStagedSource,
 	}
 }
 
@@ -282,6 +288,9 @@ func executeCleanup(ctx context.Context, request resultqueue.CleanupRequest) err
 }
 
 func executeCleanupTarget(ctx context.Context, target resultqueue.CleanupTarget) error {
+	if strings.TrimSpace(target.LocalPath) != "" {
+		return resultqueue.ExecuteLocalCleanupTarget(ctx, target)
+	}
 	storage, actualPath, err := getCleanupStorageAndActualPath(target.OpenListPath)
 	if err != nil {
 		return fmt.Errorf("resolve cleanup storage: %w", err)
@@ -578,13 +587,22 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 	s.mu.Unlock()
 
 	if offer.JobType == model.ClusterJobTypeMediaTransfer {
-		release, ok := s.tryAcquireMediaCapacity()
+		acquire := s.tryAcquireMediaCapacity
+		capacityName := "worker media"
+		if offer.TaskContext.Torrent != nil {
+			acquire = s.tryAcquireMoviePilotUploadCapacity
+			capacityName = "MoviePilot qB upload"
+		}
+		release, ok := acquire()
 		if !ok {
 			active, limit := s.downloadGate.Snapshot()
-			log.Warnf("cluster job %s admission rejected attempt=%s generation=%d code=worker_capacity_unavailable active=%d limit=%d", offer.JobID, offer.AttemptID, offer.Generation, active, limit)
+			if offer.TaskContext.Torrent != nil && s.moviePilotUploadGate != nil {
+				active, limit = s.moviePilotUploadGate.Snapshot()
+			}
+			log.Warnf("cluster job %s admission rejected attempt=%s generation=%d code=worker_capacity_unavailable capacity=%s active=%d limit=%d", offer.JobID, offer.AttemptID, offer.Generation, capacityName, active, limit)
 			cancelCause(nil)
 			_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
-			return s.sendJobReject(ctx, offer, "worker_capacity_unavailable", "worker media concurrency limit is full", true)
+			return s.sendJobReject(ctx, offer, "worker_capacity_unavailable", capacityName+" concurrency limit is full", true)
 		}
 		var releaseOnce sync.Once
 		current.capacityRelease = func() { releaseOnce.Do(release) }
@@ -873,6 +891,17 @@ func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFMani
 	return target, nil
 }
 
+func NewLocalSourceCleanupTarget(ownedRoot, sourcePath string) (resultqueue.CleanupTarget, error) {
+	ownedRoot = path.Clean(strings.TrimSpace(ownedRoot))
+	sourcePath = path.Clean(strings.TrimSpace(sourcePath))
+	if !path.IsAbs(ownedRoot) || ownedRoot == "/" || !path.IsAbs(sourcePath) || path.Dir(sourcePath) != ownedRoot {
+		return resultqueue.CleanupTarget{}, errors.New("local cluster source cleanup must target a direct file in a non-root staging directory")
+	}
+	return resultqueue.CleanupTarget{
+		LocalPath: sourcePath, OwnedRootPath: ownedRoot, Name: path.Base(sourcePath), ExactFile: true,
+	}, nil
+}
+
 func getSourceCleanupObjectWithRetry(ctx context.Context, storage driver.Driver, actualPath string) (model.Obj, error) {
 	var lastErr error
 	for attempt := 0; attempt < sourceCleanupLookupAttempts; attempt++ {
@@ -1055,37 +1084,85 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	isQBTransfer := offer.TaskContext.Torrent != nil
 	primary := primarySourceObject(offer.TaskContext.SourceObjects)
-	if primary.SourceFileID == "" {
-		return errors.New("cluster media task has no source object")
+	var stagedSource string
+	var reused bool
+	var stagingTempRoot string
+	var qbStagingConfig protocol.StagingConfig
+	if isQBTransfer {
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusRunning, "")
+		files, discoverErr := s.DiscoverTorrentFiles(ctx, offer.TaskContext.Torrent)
+		if discoverErr != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusFailed, discoverErr.Error())
+			return discoverErr
+		}
+		if len(files) != 1 {
+			err = fmt.Errorf("torrent transfer requires one selected media file, found %d", len(files))
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusFailed, err.Error())
+			return err
+		}
+		file := files[0]
+		primary = protocol.SourceObject{
+			Provider: "qbittorrent", SourceFileID: "torrent:" + file.Hash + ":" + file.Name,
+			SourceRelativePath: file.Name, Size: file.Size,
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusSucceeded, "")
+		s.mu.Lock()
+		stagingConfig := s.desiredConfig.Staging
+		s.mu.Unlock()
+		qbStagingConfig = stagingConfig
+		stagingTempRoot = strings.TrimSpace(stagingConfig.Root)
+		if stagingTempRoot == "" {
+			return errors.New("MoviePilot qB staging root is not configured")
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBCopying, model.ClusterStageStatusRunning, "")
+		stagedSource, err = CopyQBFileToStaging(ctx, QBSource{
+			WorkerPath: file.WorkerPath, DownloadRoot: file.DownloadRoot, Name: file.Name, Size: file.Size,
+		}, QBStagingAdmission{
+			StagingRoot: stagingTempRoot, DownloadRoot: file.DownloadRoot,
+			MaxFileBytes: stagingConfig.MaxFileBytes, ExtensionWhitelist: stagingConfig.ExtensionWhitelist,
+		})
+		if err != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBCopying, model.ClusterStageStatusFailed, err.Error())
+			return err
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBCopying, model.ClusterStageStatusSucceeded, "")
+	} else {
+		if primary.SourceFileID == "" {
+			return errors.New("cluster media task has no source object")
+		}
+		if _, err := s.requestStagePermitWithRetry(ctx, offer, model.ClusterStageSavingShare); err != nil {
+			return err
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusRunning, "")
+		requestedTempRoot, resolveErr := s.resolveStagingTempRoot(ctx, offer.TaskContext)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve cluster staging temp root: %w", resolveErr)
+		}
+		stagingTempRoot = mediaTransferShareSaveTempRoot(offer.TaskContext, requestedTempRoot)
 	}
-	if _, err := s.requestStagePermitWithRetry(ctx, offer, model.ClusterStageSavingShare); err != nil {
-		return err
-	}
-	s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusRunning, "")
-	requestedTempRoot, err := s.resolveStagingTempRoot(ctx, offer.TaskContext)
-	if err != nil {
-		return fmt.Errorf("resolve cluster staging temp root: %w", err)
-	}
-	stagingTempRoot := mediaTransferShareSaveTempRoot(offer.TaskContext, requestedTempRoot)
 	if s.mediaTransferBoundary != nil {
 		return s.mediaTransferBoundary(ctx, offer, resolvedMediaTransferTargets{
 			StagingRoot: stagingTempRoot, DeliveryRoot: targetRootBase, DeliveryMount: targetBindingMount,
 		})
 	}
-	stagingStorage, _, err := op.GetStorageAndActualPath(stagingTempRoot)
-	if err != nil {
-		return fmt.Errorf("resolve cluster staging account: %w", err)
-	}
-	s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
-	stagedSource, reused, err := s.prepareMediaTransferShareSave(ctx, offer, stagingTempRoot)
-	if err != nil {
-		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
-		return err
-	}
-	s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, "")
-	if reused {
-		log.Infof("cluster job %s continuing with existing staged source %s", offer.JobID, stagedSource)
+	var stagingStorage driver.Driver
+	if !isQBTransfer {
+		stagingStorage, _, err = op.GetStorageAndActualPath(stagingTempRoot)
+		if err != nil {
+			return fmt.Errorf("resolve cluster staging account: %w", err)
+		}
+		s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
+		stagedSource, reused, err = s.prepareMediaTransferShareSave(ctx, offer, stagingTempRoot)
+		if err != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
+			return err
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, "")
+		if reused {
+			log.Infof("cluster job %s continuing with existing staged source %s", offer.JobID, stagedSource)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1146,7 +1223,12 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		ShareSaveObjects:      offer.TaskContext.ShareSaveObjects,
 		MobileAccountBinding:  targetStorage.GetStorage().MountPath,
 	}
-	sourceCleanup, err := NewSourceCleanupTarget(ctx, manifest, stagingTempRoot, stagedSource)
+	var sourceCleanup resultqueue.CleanupTarget
+	if isQBTransfer {
+		sourceCleanup, err = NewLocalSourceCleanupTarget(stagingTempRoot, stagedSource)
+	} else {
+		sourceCleanup, err = NewSourceCleanupTarget(ctx, manifest, stagingTempRoot, stagedSource)
+	}
 	if err != nil {
 		return fmt.Errorf("build cluster source cleanup request: %w", err)
 	}
@@ -1154,6 +1236,17 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		AntiHash:  setting.GetBool(conf.PluginAntiHashEnabled),
 		ISORename: setting.GetBool(conf.PluginISORenameEnabled),
 		Whitelist: setting.GetStr(conf.PluginExtensionWhitelist),
+	}
+	if isQBTransfer {
+		pluginOpts.AntiHash = pluginOpts.AntiHash || qbStagingConfig.AntiHashEnabled
+		pluginOpts.ISORename = pluginOpts.ISORename || qbStagingConfig.ISORenameEnabled
+		if len(qbStagingConfig.ExtensionWhitelist) > 0 {
+			whitelist := make([]string, 0, len(qbStagingConfig.ExtensionWhitelist))
+			for _, extension := range qbStagingConfig.ExtensionWhitelist {
+				whitelist = append(whitelist, strings.TrimPrefix(strings.TrimSpace(extension), "."))
+			}
+			pluginOpts.Whitelist = strings.Join(whitelist, ",")
+		}
 	}
 	expectedName := plugin.ApplyUploadName(targetName, pluginOpts)
 	expectedSize := plugin.ExpectedUploadSize(primary.Size, targetName, pluginOpts)
@@ -1215,6 +1308,58 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		UploadManifest: &manifest, AdditionalCleanupTargets: []resultqueue.CleanupTarget{sourceCleanup}, FinalizePayload: &finalizePayload,
 	}
 	creator, err := op.GetAdmin()
+	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
+	if isQBTransfer {
+		if err != nil {
+			return fmt.Errorf("resolve cluster qB upload task creator: %w", err)
+		}
+		if creator == nil {
+			return errors.New("resolve cluster qB upload task creator: admin user is unavailable")
+		}
+		sourceFile, openErr := os.Open(stagedSource)
+		if openErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, openErr.Error())
+			return fmt.Errorf("open staged qB file: %w", openErr)
+		}
+		localFile := &stream.FileStream{
+			Ctx: ctx, Obj: &model.Object{Name: targetName, Size: primary.Size}, Reader: sourceFile,
+			Mimetype: utils.GetMimeType(targetName), Closers: utils.NewClosers(sourceFile),
+		}
+		if putErr := fs.PutDirectly(clusterMoveContext(ctx, binding, creator), targetRoot, localFile, true); putErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, putErr.Error())
+			return fmt.Errorf("upload staged qB file: %w", putErr)
+		}
+		remote, getRemoteErr := fs.Get(ctx, expectedPath, &fs.GetArgs{NoLog: true})
+		if getRemoteErr != nil || remote == nil || remote.IsDir() {
+			if getRemoteErr == nil {
+				getRemoteErr = errors.New("uploaded qB object is missing or is a directory")
+			}
+			finishUploadStage(model.ClusterStageStatusFailed, getRemoteErr.Error())
+			return fmt.Errorf("inspect uploaded qB object: %w", getRemoteErr)
+		}
+		manifest.Name = remote.GetName()
+		manifest.Size = remote.GetSize()
+		manifest.SHA256 = strings.ToUpper(strings.TrimSpace(remote.GetHash().GetHash(utils.SHA256)))
+		if manifest.SHA256 == "" {
+			finishUploadStage(model.ClusterStageStatusFailed, "uploaded qB object has no SHA256 metadata")
+			return errors.New("uploaded qB object has no SHA256 metadata")
+		}
+		manifest.HashSource = "remote_object_metadata"
+		manifest.RemoteFileID = remote.GetID()
+		manifest.RemotePath = expectedPath
+		manifest.UploadReceipt = remote.GetID()
+		cleanup, cleanupErr := NewCleanupRequest(manifest, targetStorage.GetStorage().MountPath, sourceCleanup)
+		if cleanupErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, cleanupErr.Error())
+			return cleanupErr
+		}
+		if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, enqueueErr.Error())
+			return fmt.Errorf("persist qB upload result: %w", enqueueErr)
+		}
+		finishUploadStage(model.ClusterStageStatusSucceeded, "")
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("resolve cluster move task creator: %w", err)
 	}
@@ -1222,7 +1367,6 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return errors.New("resolve cluster move task creator: admin user is unavailable")
 	}
 	taskCtx := clusterMoveContext(ctx, binding, creator)
-	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
 	transferTask, err := fs.Move(taskCtx, stagedSource, targetRoot, true)
 	if err != nil {
 		finishUploadStage(model.ClusterStageStatusFailed, err.Error())
