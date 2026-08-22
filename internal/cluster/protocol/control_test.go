@@ -7,6 +7,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestWorkerDesiredConfigRejectsRouteWithoutPathMapping(t *testing.T) {
+	cfg := WorkerDesiredConfig{
+		QBClients:        []QBClientConfig{{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080"}},
+		MoviePilotRoutes: []MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+	}
+	if err := cfg.Validate(); err == nil || err.Error() != `qB client "qb-a" requires at least one path mapping` {
+		t.Fatalf("validation error = %v", err)
+	}
+}
+
+func TestWorkerDesiredConfigRejectsCaseInsensitiveQBClientAliasCollision(t *testing.T) {
+	cfg := WorkerDesiredConfig{
+		QBClients: []QBClientConfig{
+			{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a", PathMappings: []QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}},
+			{ID: "QB-A", WebUIURL: "http://127.0.0.1:8081", SecretRef: "secret-b", PathMappings: []QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/other"}}},
+		},
+	}
+	if err := cfg.Validate(); err == nil || err.Error() != `qB client "QB-A" is duplicated` {
+		t.Fatalf("Validate() error = %v, want case-insensitive alias collision", err)
+	}
+}
+
 func TestConfigApplySupportsLegacyConfigJSON(t *testing.T) {
 	desired := WorkerDesiredConfig{
 		ProviderTempRoots:   map[string]string{"aliyundrive": "/ali/temp"},

@@ -26,6 +26,20 @@ type nodeProviderAccountMatch struct {
 	MediaConcurrency int
 }
 
+// ResolveTorrentWorker returns the only legal Worker for a torrent transfer.
+// A torrent's qB state and content path are local, so the normal provider
+// capability fallback must never move this task to another Worker.
+func ResolveTorrentWorker(taskContext protocol.TaskContext) (string, error) {
+	if taskContext.Torrent == nil {
+		return "", nil
+	}
+	workerNodeID := strings.TrimSpace(taskContext.Torrent.WorkerNodeID)
+	if workerNodeID == "" {
+		return "", errors.New("torrent task requires a bound worker node")
+	}
+	return workerNodeID, nil
+}
+
 func resolveInventoryTargetPath(ctx context.Context, nodeID string, targetPath string) (string, bool) {
 	targetPath = strings.TrimSpace(targetPath)
 	if targetPath == "" {
@@ -64,6 +78,9 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	}
 	if !capabilities.RedisDurabilityReady {
 		return nodeProviderAccountMatch{}, false, "redis_durability_ready=false", nil
+	}
+	if taskContext.Torrent != nil {
+		return nodeInventoryTorrentMatch(nodeID, taskContext, capabilities)
 	}
 	for _, operation := range required {
 		if !containsFold(capabilities.SupportedOperations, operation) {
@@ -151,6 +168,35 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	match := combineProviderAccountMatch(staging, delivery, nodeActiveJobs)
 	match.MediaConcurrency = capabilities.DownloadConcurrency
 	return match, true, noReason, nil
+}
+
+func nodeInventoryTorrentMatch(nodeID string, taskContext protocol.TaskContext, capabilities protocol.NodeCapabilities) (nodeProviderAccountMatch, bool, string, error) {
+	workerNodeID, err := ResolveTorrentWorker(taskContext)
+	if err != nil {
+		return nodeProviderAccountMatch{}, false, "", err
+	}
+	if workerNodeID != nodeID {
+		return nodeProviderAccountMatch{}, false, fmt.Sprintf("torrent is bound to worker %q", workerNodeID), nil
+	}
+	if !containsFold(capabilities.SupportedOperations, "qb.copy") {
+		return nodeProviderAccountMatch{}, false, "missing operation \"qb.copy\"", nil
+	}
+	torrent := taskContext.Torrent
+	for _, route := range capabilities.MoviePilotRoutes {
+		if !strings.EqualFold(strings.TrimSpace(route.BridgeInstanceID), strings.TrimSpace(torrent.BridgeInstanceID)) ||
+			!strings.EqualFold(strings.TrimSpace(route.Downloader), strings.TrimSpace(torrent.Downloader)) ||
+			!strings.EqualFold(strings.TrimSpace(route.QBClientID), strings.TrimSpace(torrent.QBClientID)) {
+			continue
+		}
+		if health := strings.ToLower(strings.TrimSpace(route.QBHealth)); health != "" && health != "configured" && health != "ready" && health != "healthy" {
+			return nodeProviderAccountMatch{}, false, fmt.Sprintf("qB client %q health=%s", route.QBClientID, route.QBHealth), nil
+		}
+		if route.UploadConcurrency > 0 && route.ActiveUploadSlots >= route.UploadConcurrency {
+			return nodeProviderAccountMatch{}, false, fmt.Sprintf("qB client %q upload slots are full", route.QBClientID), nil
+		}
+		return nodeProviderAccountMatch{MediaConcurrency: route.UploadConcurrency}, true, "", nil
+	}
+	return nodeProviderAccountMatch{}, false, fmt.Sprintf("MoviePilot route %q/%q/%q is not advertised by worker", torrent.BridgeInstanceID, torrent.Downloader, torrent.QBClientID), nil
 }
 
 func providerAccountsSupportSource(accounts []protocol.ProviderAccountInventory, provider string) bool {

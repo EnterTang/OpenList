@@ -163,6 +163,10 @@ func (s *Service) DecorateInventory(report *protocol.InventoryReport) {
 		return
 	}
 	report.KeyAgreement, report.ObservedRevision = s.ControlIdentity()
+	report.Capabilities.MoviePilotRoutes = s.moviePilotRouteInventory()
+	if len(report.Capabilities.MoviePilotRoutes) > 0 && !containsInventoryOperation(report.Capabilities.SupportedOperations, "qb.copy") {
+		report.Capabilities.SupportedOperations = append(report.Capabilities.SupportedOperations, "qb.copy")
+	}
 	s.mu.Lock()
 	report.Capabilities.DownloadConcurrency = effectiveConcurrency(s.desiredConfig.DownloadConcurrency)
 	report.Capabilities.UploadConcurrency = effectiveConcurrency(s.desiredConfig.UploadConcurrency)
@@ -456,6 +460,33 @@ func cloneDesiredConfig(config protocol.WorkerDesiredConfig) protocol.WorkerDesi
 	for key, value := range config.TargetBindings {
 		value.MountPath = path.Clean(value.MountPath)
 		cloned.TargetBindings[normalizeControlKey(key)] = value
+	}
+	cloned.QBClients = make([]protocol.QBClientConfig, 0, len(config.QBClients))
+	for _, client := range config.QBClients {
+		client.ID = strings.TrimSpace(client.ID)
+		client.WebUIURL = strings.TrimSpace(client.WebUIURL)
+		client.SecretRef = strings.TrimSpace(client.SecretRef)
+		client.PathMappings = append([]protocol.QBPathMapping(nil), client.PathMappings...)
+		for i := range client.PathMappings {
+			client.PathMappings[i].QBPath = path.Clean(strings.TrimSpace(client.PathMappings[i].QBPath))
+			client.PathMappings[i].WorkerPath = path.Clean(strings.TrimSpace(client.PathMappings[i].WorkerPath))
+		}
+		cloned.QBClients = append(cloned.QBClients, client)
+	}
+	cloned.MoviePilotRoutes = make([]protocol.MoviePilotRoute, 0, len(config.MoviePilotRoutes))
+	for _, route := range config.MoviePilotRoutes {
+		route.BridgeInstanceID = strings.TrimSpace(route.BridgeInstanceID)
+		route.Downloader = strings.TrimSpace(route.Downloader)
+		route.QBClientID = strings.TrimSpace(route.QBClientID)
+		cloned.MoviePilotRoutes = append(cloned.MoviePilotRoutes, route)
+	}
+	cloned.Staging.Root = strings.TrimSpace(config.Staging.Root)
+	if cloned.Staging.Root != "" {
+		cloned.Staging.Root = path.Clean(cloned.Staging.Root)
+	}
+	cloned.Staging.ExtensionWhitelist = append([]string(nil), config.Staging.ExtensionWhitelist...)
+	for i := range cloned.Staging.ExtensionWhitelist {
+		cloned.Staging.ExtensionWhitelist[i] = strings.ToLower(strings.TrimSpace(cloned.Staging.ExtensionWhitelist[i]))
 	}
 	return cloned
 }

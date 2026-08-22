@@ -840,6 +840,18 @@ func compatibleNodeIDs(ctx context.Context, hub *transport.Hub, nodes []model.Cl
 }
 
 func selectRedispatchNodeID(available []string, taskContext protocol.TaskContext, offset int) string {
+	if taskContext.Torrent != nil {
+		workerNodeID, err := ResolveTorrentWorker(taskContext)
+		if err != nil {
+			return ""
+		}
+		for _, nodeID := range available {
+			if nodeID == workerNodeID {
+				return nodeID
+			}
+		}
+		return ""
+	}
 	preferredNodeID := strings.TrimSpace(taskContext.Subscription.PreferredWorkerNodeID)
 	if preferredNodeID != "" {
 		for _, nodeID := range available {
@@ -876,6 +888,11 @@ func (r *Runtime) redispatchJob(ctx context.Context, hub *transport.Hub, job *mo
 	var taskContext protocol.TaskContext
 	if err := json.Unmarshal([]byte(job.TaskContextJSON), &taskContext); err != nil {
 		return fmt.Errorf("decode cluster job task context: %w", err)
+	}
+	if workerNodeID, err := ResolveTorrentWorker(taskContext); err != nil {
+		return err
+	} else if workerNodeID != "" && workerNodeID != nodeID {
+		return fmt.Errorf("torrent task is bound to worker %q, not %q", workerNodeID, nodeID)
 	}
 	var required []string
 	if strings.TrimSpace(job.RequiredCapabilitiesJSON) != "" {
