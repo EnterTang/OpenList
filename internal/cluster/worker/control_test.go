@@ -64,6 +64,36 @@ func TestConfigApplyUpdatesObservedStateAndBindings(t *testing.T) {
 	require.Equal(t, uint64(7), revision)
 }
 
+func TestConfigApplyDecryptsQBSecretWithoutPersistingPlaintext(t *testing.T) {
+	keys, err := secure.GenerateKeyPair()
+	require.NoError(t, err)
+	sender := make(channelSender, 1)
+	service := New(&fakeResultQueue{}, sender)
+	service.ConfigureControlPlane("worker-qb", keys, nil)
+	desired := protocol.WorkerDesiredConfig{QBClients: []protocol.QBClientConfig{{
+		ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-qb-a",
+		PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+	}}}
+	hash, err := protocol.HashWorkerDesiredConfig(desired)
+	require.NoError(t, err)
+	apply := protocol.ConfigApply{Revision: 8, DesiredHash: hash, DesiredConfig: &desired}
+	apply.QBSecretEnvelopes = map[string]string{"qb-a": ""}
+	apply.QBSecretEnvelopes["qb-a"], err = secure.SealJSON(keys.PublicKey(), map[string]any{"username": "qb-user", "password": "qb-password"}, protocol.QBSecretApplyAAD("worker-qb", apply, "qb-a"))
+	require.NoError(t, err)
+	message, err := protocol.NewEnvelope(protocol.MessageConfigApply, apply)
+	require.NoError(t, err)
+	require.NoError(t, service.HandleMessage(context.Background(), nil, *message))
+	response := <-sender
+	observed, err := protocol.DecodePayload[protocol.ConfigObserved](response)
+	require.NoError(t, err)
+	require.Equal(t, "applied", observed.Status)
+	service.mu.Lock()
+	secret := service.qbSecrets["qb-a"]
+	service.mu.Unlock()
+	require.Equal(t, "qb-user", secret["username"])
+	require.NotContains(t, string(response.Payload), "qb-password")
+}
+
 func TestStorageApplyDecryptsCredentialsWithoutEchoingThem(t *testing.T) {
 	keys, err := secure.GenerateKeyPair()
 	require.NoError(t, err)

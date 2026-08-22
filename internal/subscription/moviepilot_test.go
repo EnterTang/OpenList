@@ -115,3 +115,39 @@ func TestSubmitMoviePilotIntentUsesStableIdempotencyKey(t *testing.T) {
 		t.Fatalf("intent requests = %#v", client.intents)
 	}
 }
+
+func TestUpdateMoviePilotRetentionPropagatesToActiveBinding(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "Retention Show", SourceType: model.SubscriptionSourceMoviePilot, MediaType: "tv", BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-1", RetentionPolicy: model.TorrentRetentionPolicy{MinSeedSeconds: 60}, BoundAt: time.Now().UTC(),
+	}}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	intent := &model.MoviePilotDownloadIntent{ID: "intent-retention", RequestID: "request-retention", BridgeInstanceID: "mp-main", SubscriptionID: sub.ID, Status: model.MoviePilotIntentStatusBound, RetentionPolicyJSON: `{"min_seed_seconds":60}`}
+	binding := &model.MoviePilotTorrentBinding{ID: "binding-retention", IntentID: intent.ID, BridgeInstanceID: "mp-main", DownloaderAlias: "qb-a", WorkerNodeID: "worker-1", QBClientID: "qb-a", TorrentHash: strings.Repeat("a", 40), Status: model.MoviePilotTorrentStatusSeeding, RetentionStatus: model.MoviePilotRetentionStatusEligible, RetentionPolicyJSON: intent.RetentionPolicyJSON}
+	if err := db.GetDb().Create(intent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().Create(binding).Error; err != nil {
+		t.Fatal(err)
+	}
+	updated, err := UpdateMoviePilotRetention(context.Background(), model.SubscriptionMoviePilotRetentionUpdateReq{SubscriptionID: sub.ID, RetentionPolicy: model.TorrentRetentionPolicy{Permanent: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.BoundTorrent == nil || !updated.BoundTorrent.RetentionPolicy.Permanent {
+		t.Fatalf("updated subscription = %#v", updated.BoundTorrent)
+	}
+	var gotIntent model.MoviePilotDownloadIntent
+	var gotBinding model.MoviePilotTorrentBinding
+	if err := db.GetDb().First(&gotIntent, "id = ?", intent.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().First(&gotBinding, "id = ?", binding.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotIntent.RetentionPolicyJSON, "permanent") || gotBinding.RetentionStatus != model.MoviePilotRetentionStatusHeld || !strings.Contains(gotBinding.RetentionPolicyJSON, "permanent") {
+		t.Fatalf("retention snapshots = %#v %#v", gotIntent, gotBinding)
+	}
+}

@@ -80,7 +80,7 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 		return nodeProviderAccountMatch{}, false, "redis_durability_ready=false", nil
 	}
 	if taskContext.Torrent != nil {
-		return nodeInventoryTorrentMatch(nodeID, taskContext, capabilities)
+		return nodeInventoryTorrentMatch(nodeID, taskContext, capabilities, expectedBytes)
 	}
 	for _, operation := range required {
 		if !containsFold(capabilities.SupportedOperations, operation) {
@@ -170,7 +170,7 @@ func nodeInventoryProviderMatch(ctx context.Context, nodeID string, taskContext 
 	return match, true, noReason, nil
 }
 
-func nodeInventoryTorrentMatch(nodeID string, taskContext protocol.TaskContext, capabilities protocol.NodeCapabilities) (nodeProviderAccountMatch, bool, string, error) {
+func nodeInventoryTorrentMatch(nodeID string, taskContext protocol.TaskContext, capabilities protocol.NodeCapabilities, expectedBytes int64) (nodeProviderAccountMatch, bool, string, error) {
 	workerNodeID, err := ResolveTorrentWorker(taskContext)
 	if err != nil {
 		return nodeProviderAccountMatch{}, false, "", err
@@ -178,10 +178,14 @@ func nodeInventoryTorrentMatch(nodeID string, taskContext protocol.TaskContext, 
 	if workerNodeID != nodeID {
 		return nodeProviderAccountMatch{}, false, fmt.Sprintf("torrent is bound to worker %q", workerNodeID), nil
 	}
-	if !containsFold(capabilities.SupportedOperations, "qb.copy") {
-		return nodeProviderAccountMatch{}, false, "missing operation \"qb.copy\"", nil
-	}
 	torrent := taskContext.Torrent
+	operation := "qb.copy"
+	if strings.EqualFold(strings.TrimSpace(torrent.Action), "delete") || strings.EqualFold(strings.TrimSpace(torrent.Action), "pause") || strings.EqualFold(strings.TrimSpace(torrent.Action), "resume") {
+		operation = "qb.control"
+	}
+	if !containsFold(capabilities.SupportedOperations, operation) {
+		return nodeProviderAccountMatch{}, false, fmt.Sprintf("missing operation %q", operation), nil
+	}
 	for _, route := range capabilities.MoviePilotRoutes {
 		if !strings.EqualFold(strings.TrimSpace(route.BridgeInstanceID), strings.TrimSpace(torrent.BridgeInstanceID)) ||
 			!strings.EqualFold(strings.TrimSpace(route.Downloader), strings.TrimSpace(torrent.Downloader)) ||
@@ -191,8 +195,11 @@ func nodeInventoryTorrentMatch(nodeID string, taskContext protocol.TaskContext, 
 		if health := strings.ToLower(strings.TrimSpace(route.QBHealth)); health != "" && health != "configured" && health != "ready" && health != "healthy" {
 			return nodeProviderAccountMatch{}, false, fmt.Sprintf("qB client %q health=%s", route.QBClientID, route.QBHealth), nil
 		}
-		if route.UploadConcurrency > 0 && route.ActiveUploadSlots >= route.UploadConcurrency {
+		if operation == "qb.copy" && route.UploadConcurrency > 0 && route.ActiveUploadSlots >= route.UploadConcurrency {
 			return nodeProviderAccountMatch{}, false, fmt.Sprintf("qB client %q upload slots are full", route.QBClientID), nil
+		}
+		if operation == "qb.copy" && expectedBytes > 0 && route.StagingFreeBytes > 0 && route.StagingFreeBytes < expectedBytes {
+			return nodeProviderAccountMatch{}, false, fmt.Sprintf("qB staging free space %d is below expected file size %d", route.StagingFreeBytes, expectedBytes), nil
 		}
 		return nodeProviderAccountMatch{MediaConcurrency: route.UploadConcurrency}, true, "", nil
 	}

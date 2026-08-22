@@ -167,6 +167,9 @@ func (s *Service) DecorateInventory(report *protocol.InventoryReport) {
 	if len(report.Capabilities.MoviePilotRoutes) > 0 && !containsInventoryOperation(report.Capabilities.SupportedOperations, "qb.copy") {
 		report.Capabilities.SupportedOperations = append(report.Capabilities.SupportedOperations, "qb.copy")
 	}
+	if len(report.Capabilities.MoviePilotRoutes) > 0 && !containsInventoryOperation(report.Capabilities.SupportedOperations, "qb.control") {
+		report.Capabilities.SupportedOperations = append(report.Capabilities.SupportedOperations, "qb.control")
+	}
 	s.mu.Lock()
 	report.Capabilities.DownloadConcurrency = effectiveConcurrency(s.desiredConfig.DownloadConcurrency)
 	report.Capabilities.UploadConcurrency = effectiveConcurrency(s.desiredConfig.UploadConcurrency)
@@ -221,6 +224,10 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 		return controlFailure{"revision_conflict", "desired config revision was already applied with a different hash"}
 	}
 	s.mu.Unlock()
+	qbSecrets, err := s.decodeQBSecretEnvelopes(apply, desired)
+	if err != nil {
+		return err
+	}
 	raw, err := json.Marshal(desired)
 	if err != nil {
 		return controlFailure{"invalid_config", "desired config could not be persisted"}
@@ -233,12 +240,15 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.applyDesiredConfigMemory(desired, apply.Revision, apply.DesiredHash)
+	s.applyDesiredConfigMemory(desired, apply.Revision, apply.DesiredHash, qbSecrets)
 	return nil
 }
 
-func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig, revision uint64, hash string) {
+func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig, revision uint64, hash string, qbSecrets ...map[string]map[string]any) {
 	s.desiredConfig = cloneDesiredConfig(desired)
+	if len(qbSecrets) > 0 && qbSecrets[0] != nil {
+		s.qbSecrets = qbSecrets[0]
+	}
 	s.configObserved = observedState{revision: revision, hash: hash}
 	if revision > s.observedRevision {
 		s.observedRevision = revision
@@ -257,6 +267,38 @@ func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig,
 			gate.SetLimit(defaultTargetConcurrency(binding.MaxConcurrency))
 		}
 	}
+}
+
+func (s *Service) decodeQBSecretEnvelopes(apply protocol.ConfigApply, desired protocol.WorkerDesiredConfig) (map[string]map[string]any, error) {
+	if len(desired.QBClients) == 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	keys := s.controlKeys
+	nodeID := s.controlNodeID
+	s.mu.Unlock()
+	if keys == nil || strings.TrimSpace(nodeID) == "" {
+		return nil, controlFailure{"control_unavailable", "worker qB secure control is not configured"}
+	}
+	secrets := make(map[string]map[string]any, len(desired.QBClients))
+	for _, client := range desired.QBClients {
+		envelope := strings.TrimSpace(apply.QBSecretEnvelopes[strings.TrimSpace(client.ID)])
+		if envelope == "" {
+			return nil, controlFailure{"qb_secret_missing", "qB client credentials were not delivered securely"}
+		}
+		parameters := make(map[string]any)
+		if err := keys.OpenJSON(envelope, protocol.QBSecretApplyAAD(nodeID, apply, client.ID), &parameters); err != nil {
+			return nil, controlFailure{"qb_secret_decryption_failed", "qB client credentials could not be authenticated for this worker"}
+		}
+		if _, ok := firstQBSecretString(parameters, "username", "user"); !ok {
+			return nil, controlFailure{"qb_secret_invalid", "qB client username is missing"}
+		}
+		if _, ok := firstQBSecretString(parameters, "password", "pass"); !ok {
+			return nil, controlFailure{"qb_secret_invalid", "qB client password is missing"}
+		}
+		secrets[strings.TrimSpace(client.ID)] = parameters
+	}
+	return secrets, nil
 }
 
 func effectiveConcurrency(configured int) int {

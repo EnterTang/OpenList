@@ -146,10 +146,11 @@ type ProviderAccountInventory struct {
 }
 
 type ConfigApply struct {
-	Revision      uint64               `json:"revision"`
-	DesiredHash   string               `json:"desired_hash"`
-	ConfigJSON    string               `json:"config_json,omitempty"`
-	DesiredConfig *WorkerDesiredConfig `json:"desired_config,omitempty"`
+	Revision          uint64               `json:"revision"`
+	DesiredHash       string               `json:"desired_hash"`
+	ConfigJSON        string               `json:"config_json,omitempty"`
+	DesiredConfig     *WorkerDesiredConfig `json:"desired_config,omitempty"`
+	QBSecretEnvelopes map[string]string    `json:"qb_secret_envelopes,omitempty"`
 }
 
 type StorageApply struct {
@@ -294,13 +295,13 @@ type TaskContext struct {
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
 	DeliveryMode          string                    `json:"delivery_mode,omitempty"`
+	Torrent               *TorrentTaskContext       `json:"torrent,omitempty"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
 	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
 	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`
 	StagingTarget         ProviderTargetRequirement `json:"staging_target,omitempty"`
 	DeliveryTarget        ProviderTargetRequirement `json:"delivery_target,omitempty"`
 	TargetProfile         string                    `json:"target_profile"`
-	Torrent               *TorrentTaskContext       `json:"torrent,omitempty"`
 }
 
 // TorrentTaskContext pins a torrent transfer to the Worker and qB client that
@@ -315,6 +316,7 @@ type TorrentTaskContext struct {
 	TorrentHash      string `json:"torrent_hash"`
 	RelativePath     string `json:"relative_path"`
 	ContentPath      string `json:"content_path,omitempty"`
+	Action           string `json:"action,omitempty"`
 }
 
 type ShareTaskContext struct {
@@ -377,6 +379,7 @@ type UploadETFManifest struct {
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
 	DeliveryMode          string                    `json:"delivery_mode,omitempty"`
+	Torrent               *TorrentTaskContext       `json:"torrent,omitempty"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
 	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
 	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`

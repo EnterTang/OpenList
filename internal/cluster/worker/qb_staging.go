@@ -8,9 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/shirou/gopsutil/v4/disk"
 )
 
 const maxQBStagingFileBytes int64 = 150 * 1024 * 1024 * 1024
+
+var ErrQBStagingInsufficientSpace = errors.New("qB staging free space is insufficient")
 
 // QBSource is a verified local source selected from qB's file listing.
 type QBSource struct {
@@ -81,11 +85,18 @@ func CopyQBFileToStaging(ctx context.Context, source QBSource, admission QBStagi
 	if info.Size() > maxBytes {
 		return "", fmt.Errorf("qB source file exceeds staging limit of %d bytes", maxBytes)
 	}
-	if source.Size > 0 && info.Size() != source.Size {
-		return "", fmt.Errorf("qB source size changed: qB=%d local=%d", source.Size, info.Size())
-	}
 	if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
 		return "", fmt.Errorf("create qB staging root: %w", err)
+	}
+	usage, err := disk.UsageWithContext(ctx, stagingRoot)
+	if err != nil {
+		return "", fmt.Errorf("inspect qB staging free space: %w", err)
+	}
+	if usage.Free < uint64(info.Size()) {
+		return "", fmt.Errorf("%w: free=%d required=%d", ErrQBStagingInsufficientSpace, usage.Free, info.Size())
+	}
+	if source.Size > 0 && info.Size() != source.Size {
+		return "", fmt.Errorf("qB source size changed: qB=%d local=%d", source.Size, info.Size())
 	}
 	extension := filepath.Ext(sourceName(source))
 	temp, err := os.CreateTemp(stagingRoot, ".openlist-qb-*"+extension)

@@ -145,6 +145,128 @@ func DispatchMediaJob(ctx context.Context, req DispatchMediaJobRequest) (*model.
 	return DefaultRuntime.DispatchMediaJob(ctx, req)
 }
 
+// DispatchTorrentJob routes qB observation and per-file transfer jobs to the
+// Worker pinned in TaskContext.Torrent. It shares the durable offer protocol
+// with ordinary media jobs but intentionally does not use provider fallback.
+func (r *Runtime) DispatchTorrentJob(ctx context.Context, req coordinator.TorrentJobDispatchRequest) (*model.ClusterJob, error) {
+	dispatchTransport := r.mediaDispatchTransport()
+	if dispatchTransport == nil {
+		return nil, errors.New("cluster coordinator is disabled")
+	}
+	if strings.TrimSpace(req.NodeID) == "" {
+		return nil, errors.New("target cluster node is required")
+	}
+	if req.JobType != model.ClusterJobTypeTorrentObserve && req.JobType != model.ClusterJobTypeMediaTransfer && req.JobType != model.ClusterJobTypeTorrentRetention {
+		return nil, fmt.Errorf("unsupported torrent job type %q", req.JobType)
+	}
+	if req.TaskContext.Torrent == nil {
+		return nil, errors.New("torrent job requires torrent context")
+	}
+	if req.JobType == model.ClusterJobTypeMediaTransfer && len(req.TaskContext.SourceObjects) != 1 {
+		return nil, errors.New("torrent media transfer requires exactly one source object")
+	}
+	if err := req.TaskContext.Validate(); err != nil {
+		return nil, err
+	}
+	if len(req.RequiredCapabilities) == 0 {
+		req.RequiredCapabilities = []string{"qb.copy", "result.report"}
+		if req.JobType == model.ClusterJobTypeTorrentRetention {
+			req.RequiredCapabilities = []string{"qb.control", "result.report"}
+		} else if req.JobType == model.ClusterJobTypeMediaTransfer {
+			req.RequiredCapabilities = []string{"qb.copy", "mobile.upload", "result.report"}
+		}
+	}
+	contextHash, err := protocol.HashTaskContext(req.TaskContext)
+	if err != nil {
+		return nil, err
+	}
+	idempotencyKey := strings.TrimSpace(req.IdempotencyKey)
+	if idempotencyKey == "" {
+		idempotencyKey = fmt.Sprintf("moviepilot:%s:%s:%s", req.JobType, req.TaskContext.Torrent.BindingID, req.TaskContext.MediaItemID)
+	}
+	var existing model.ClusterJob
+	if err := db.GetDb().WithContext(ctx).First(&existing, "idempotency_key = ?", idempotencyKey).Error; err == nil {
+		return &existing, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	if _, ok := dispatchTransport.Session(req.NodeID); !ok {
+		return nil, transport.ErrNotConnected
+	}
+	var node model.ClusterNode
+	if err := db.GetDb().WithContext(ctx).First(&node, "id = ?", req.NodeID).Error; err != nil {
+		return nil, err
+	}
+	if node.Disabled || node.Drain || node.Status == model.ClusterNodeStatusRevoked {
+		return nil, errors.New("target cluster node is disabled, draining, or revoked")
+	}
+	compatible, err := nodeInventorySupports(ctx, req.NodeID, req.TaskContext, req.RequiredCapabilities, req.ExpectedBytes)
+	if err != nil {
+		return nil, err
+	}
+	if !compatible {
+		return nil, errors.New("target cluster node inventory does not satisfy the torrent task requirements")
+	}
+	jobID, attemptID, leaseToken := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	leaseDuration := req.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = mediaJobLeaseDuration
+	}
+	now := time.Now().UTC()
+	leaseUntil := now.Add(leaseDuration)
+	taskContextJSON, _ := json.Marshal(req.TaskContext)
+	requiredJSON, _ := json.Marshal(req.RequiredCapabilities)
+	job := &model.ClusterJob{ID: jobID, ParentJobID: req.TaskContext.ParentBatchID, Type: req.JobType, Status: model.ClusterJobStatusLeased,
+		NotificationStatus: model.ClusterNotificationStatusNotStarted, WorkerCleanupStatus: model.ClusterCleanupStatusPending,
+		ResultDeliveryStatus: model.ClusterResultDeliveryStatusQueued, IdempotencyKey: idempotencyKey, WorkflowVersion: req.TaskContext.WorkflowVersion,
+		Priority: req.Priority, SubscriptionID: req.TaskContext.Subscription.SubscriptionID, SubscriptionItemID: req.TaskContext.Subscription.SubscriptionItemID,
+		MediaItemID: req.TaskContext.MediaItemID, SourceProvider: "qbittorrent", TaskContextJSON: string(taskContextJSON), TaskContextHash: contextHash,
+		RequiredCapabilitiesJSON: string(requiredJSON), ExpectedBytes: req.ExpectedBytes, AssignedNodeID: req.NodeID, CurrentAttemptID: attemptID,
+		CurrentGeneration: 1, AvailableAt: now}
+	attempt := &model.ClusterJobAttempt{ID: attemptID, JobID: jobID, NodeID: req.NodeID, Generation: 1, Status: model.ClusterAttemptStatusOffered,
+		LeaseTokenHash: fmt.Sprintf("%x", sha256.Sum256([]byte(leaseToken))), LeaseUntil: leaseUntil, OfferedAt: now}
+	offer := protocol.JobOffer{AttemptRef: protocol.AttemptRef{JobID: jobID, AttemptID: attemptID, Generation: 1, LeaseToken: leaseToken},
+		IdempotencyKey: idempotencyKey, JobType: req.JobType, LeaseUntil: leaseUntil, RequiredCapabilities: req.RequiredCapabilities,
+		TaskContext: req.TaskContext, TaskContextHash: contextHash}
+	message, err := protocol.NewEnvelope(protocol.MessageJobOffer, offer)
+	if err != nil {
+		return nil, err
+	}
+	message.CorrelationID = jobID
+	outbox := &model.ClusterOutbox{ID: uuid.NewString(), MessageID: message.MessageID, PeerNodeID: req.NodeID, CorrelationID: jobID,
+		MessageType: string(message.Type), PayloadJSON: string(message.Payload), PayloadHash: fmt.Sprintf("%x", sha256.Sum256(message.Payload)),
+		Status: model.ClusterMessageStatusPending, AvailableAt: now}
+	r.outboxMu.Lock()
+	persistErr := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(job).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(attempt).Error; err != nil {
+			return err
+		}
+		var lastSeq uint64
+		if err := tx.Model(&model.ClusterOutbox{}).Where("peer_node_id = ?", req.NodeID).Select("COALESCE(MAX(seq), 0)").Scan(&lastSeq).Error; err != nil {
+			return err
+		}
+		outbox.Seq = lastSeq + 1
+		return tx.Create(outbox).Error
+	})
+	r.outboxMu.Unlock()
+	if persistErr != nil {
+		return job, fmt.Errorf("persist torrent job offer: %w", persistErr)
+	}
+	if err := dispatchTransport.Send(ctx, req.NodeID, *message); err != nil {
+		_ = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			_ = tx.Model(&model.ClusterJobAttempt{}).Where("id = ?", attemptID).Updates(map[string]any{"status": model.ClusterAttemptStatusLost, "finished_at": time.Now().UTC(), "error": err.Error()}).Error
+			_ = tx.Model(&model.ClusterJob{}).Where("id = ?", jobID).Updates(map[string]any{"status": model.ClusterJobStatusQueued, "assigned_node_id": "", "current_attempt_id": "", "last_error": err.Error()}).Error
+			return tx.Model(&model.ClusterOutbox{}).Where("id = ?", outbox.ID).Updates(map[string]any{"status": model.ClusterMessageStatusDeadLetter, "last_error": err.Error()}).Error
+		})
+		return job, err
+	}
+	_ = db.GetDb().WithContext(ctx).Model(&model.ClusterOutbox{}).Where("id = ?", outbox.ID).Updates(map[string]any{"status": model.ClusterMessageStatusSending, "last_sent_at": time.Now().UTC(), "attempt_count": 1}).Error
+	return job, nil
+}
+
 func DispatchMediaBatch(ctx context.Context, req DispatchMediaBatchRequest) (*DispatchMediaBatchResult, error) {
 	return DefaultRuntime.DispatchMediaBatch(ctx, req)
 }
@@ -224,6 +346,7 @@ func (r *Runtime) Start() error {
 			}
 		}
 		service.SetShareInspectConsumer(consumeSubscriptionShareInspect)
+		service.SetTorrentJobDispatcher(r)
 		r.coordinatorService = service
 		r.hub = transport.NewHub(transport.HubOptions{
 			CoordinatorID:       coordinatorID(),
@@ -337,13 +460,17 @@ func (r *Runtime) startWorkerLocked() error {
 			}
 		},
 		OnDisconnect: func(cause error) {
-			// Keep in-flight media moves running across transport loss. Results
-			// are journaled to Redis; leases are renewed after reconnect.
+			// qB-backed jobs are the exception: pause their bound torrents before
+			// the Worker becomes unreachable, while ordinary cloud moves continue
+			// through the durable Redis result queue.
+			if workerService != nil {
+				workerService.PauseMoviePilotTorrents(context.Background())
+			}
 			if cause == nil {
-				log.Warn("cluster worker websocket disconnected; continuing active media transfers offline")
+				log.Warn("cluster worker websocket disconnected; paused active MoviePilot qB torrents")
 				return
 			}
-			log.Warnf("cluster worker websocket disconnected (%v); continuing active media transfers offline", cause)
+			log.Warnf("cluster worker websocket disconnected (%v); paused active MoviePilot qB torrents", cause)
 		},
 	})
 	if err != nil {
@@ -570,6 +697,12 @@ func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coo
 	}
 	if _, err := service.SweepStalledParentJobs(ctx, time.Now().UTC(), 10*time.Minute); err != nil {
 		log.Errorf("sweep stalled cluster parent jobs: %v", err)
+	}
+	if err := service.ReconcileTorrentTransfers(ctx, "", 100); err != nil {
+		log.Errorf("reconcile MoviePilot torrent transfers: %v", err)
+	}
+	if err := service.ReconcileTorrentRetention(ctx, 50); err != nil {
+		log.Errorf("reconcile MoviePilot torrent retention: %v", err)
 	}
 	if _, err := service.SweepExpiredLeases(ctx, time.Now().UTC()); err != nil {
 		log.Errorf("sweep expired cluster leases: %v", err)

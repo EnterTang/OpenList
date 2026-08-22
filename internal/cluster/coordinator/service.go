@@ -28,6 +28,7 @@ type Service struct {
 	inspectMu         sync.RWMutex
 	inspectProcessMu  sync.Mutex
 	inspectConsumer   ShareInspectConsumer
+	torrentDispatcher TorrentJobDispatcher
 }
 
 const (
@@ -985,6 +986,8 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		now = time.Now().UTC()
 	}
 	storedInspect := false
+	storedTorrentObservation := false
+	storedTorrentRetention := false
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		duplicate, err := s.claimInboxTx(tx, peer, message)
 		if err != nil || duplicate {
@@ -994,6 +997,7 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 		if err := tx.First(&job, "id = ?", result.JobID).Error; err != nil {
 			return err
 		}
+		storedTorrentRetention = job.Type == model.ClusterJobTypeTorrentRetention
 		if job.CurrentAttemptID != result.AttemptID || job.CurrentGeneration != result.Generation || job.AssignedNodeID != peer.NodeID() {
 			return errors.New("cluster job result is stale")
 		}
@@ -1029,9 +1033,11 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 					result.ResultHash = payloadHash
 				}
 				storedInspect = true
+			} else if job.Type == model.ClusterJobTypeTorrentObserve {
+				storedTorrentObservation = true
 			}
 			attemptStatus = model.ClusterAttemptStatusSucceeded
-			if job.Type == model.ClusterJobTypeShareInspect {
+			if job.Type == model.ClusterJobTypeShareInspect || job.Type == model.ClusterJobTypeTorrentObserve || job.Type == model.ClusterJobTypeTorrentRetention {
 				jobUpdates["status"] = model.ClusterJobStatusSucceeded
 				jobUpdates["finished_at"] = now
 			} else if directDelivery {
@@ -1069,6 +1075,14 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 					return err
 				}
 				storedInspect = true
+			}
+			if job.Type == model.ClusterJobTypeTorrentObserve && jobUpdates["status"] == model.ClusterJobStatusFailed && job.TaskContextJSON != "" {
+				var task protocol.TaskContext
+				if json.Unmarshal([]byte(job.TaskContextJSON), &task) == nil && task.Torrent != nil {
+					_ = tx.Model(&model.MoviePilotTorrentBinding{}).Where("id = ?", task.Torrent.BindingID).Updates(map[string]any{
+						"status": model.MoviePilotTorrentStatusFailed, "last_error_code": result.ErrorCode, "last_error": result.Error,
+					}).Error
+				}
 			}
 		}
 		updated := tx.Model(&model.ClusterJobAttempt{}).
@@ -1117,6 +1131,17 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 				return err
 			}
 		}
+		if result.Status != "succeeded" && job.Type == model.ClusterJobTypeMediaTransfer {
+			deliveryStatus := model.MoviePilotDeliveryStatusFailed
+			if jobUpdates["status"] == model.ClusterJobStatusQueued {
+				deliveryStatus = model.MoviePilotDeliveryStatusPending
+			}
+			if err := tx.Model(&model.MoviePilotDeliveryFile{}).Where("cluster_job_id = ?", job.ID).Updates(map[string]any{
+				"status": deliveryStatus, "last_error_code": result.ErrorCode, "last_error": result.Error,
+			}).Error; err != nil && !isOptionalMoviePilotTableError(err) {
+				return err
+			}
+		}
 		if job.ParentJobID != "" {
 			if err := reconcileParentJobTx(tx, job.ParentJobID, now); err != nil {
 				return err
@@ -1130,6 +1155,16 @@ func (s *Service) handleJobResult(ctx context.Context, peer transport.Peer, mess
 	}
 	if storedInspect {
 		_, _ = s.ProcessPendingShareInspects(ctx, 1)
+	}
+	if storedTorrentObservation {
+		if err := s.ObserveTorrent(ctx, result.JobID, result.Result); err != nil {
+			log.Warnf("coordinator: persist MoviePilot torrent observation %s: %v", result.JobID, err)
+		}
+	}
+	if storedTorrentRetention {
+		if err := s.completeTorrentRetention(ctx, result.JobID, result); err != nil {
+			log.Warnf("coordinator: finalize MoviePilot torrent retention %s: %v", result.JobID, err)
+		}
 	}
 	return nil
 }

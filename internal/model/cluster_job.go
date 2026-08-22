@@ -3,11 +3,12 @@ package model
 import "time"
 
 const (
-	ClusterJobTypeShareInspect    = "share.inspect"
-	ClusterJobTypeShareBatch      = "share.batch"
-	ClusterJobTypeMediaTransfer   = "media.transfer"
-	ClusterJobTypeTorrentObserve  = "torrent.observe"
-	ClusterJobTypeTorrentTransfer = "torrent.transfer"
+	ClusterJobTypeShareInspect     = "share.inspect"
+	ClusterJobTypeShareBatch       = "share.batch"
+	ClusterJobTypeMediaTransfer    = "media.transfer"
+	ClusterJobTypeTorrentObserve   = "torrent.observe"
+	ClusterJobTypeTorrentTransfer  = "torrent.transfer"
+	ClusterJobTypeTorrentRetention = "torrent.retention"
 
 	ClusterJobStatusQueued          = "queued"
 	ClusterJobStatusPlanning        = "planning"

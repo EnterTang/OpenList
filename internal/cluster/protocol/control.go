@@ -302,6 +302,16 @@ func StorageApplyAAD(nodeID string, apply StorageApply) []byte {
 	}, "\x00"))
 }
 
+func QBSecretApplyAAD(nodeID string, apply ConfigApply, clientID string) []byte {
+	return []byte(strings.Join([]string{
+		"openlist-cluster-qb-v1",
+		strings.TrimSpace(nodeID),
+		fmt.Sprint(apply.Revision),
+		strings.TrimSpace(apply.DesiredHash),
+		strings.TrimSpace(clientID),
+	}, "\x00"))
+}
+
 func validateControlMountPath(value, label string) error {
 	value = strings.TrimSpace(value)
 	if value == "" || value == "/" || !path.IsAbs(value) {

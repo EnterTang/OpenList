@@ -14,6 +14,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/moviepilotbridge"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"gorm.io/gorm"
 )
 
 type MoviePilotBridgeClient interface {
@@ -122,6 +123,9 @@ func BindMoviePilotResource(ctx context.Context, req model.SubscriptionMoviePilo
 	if strings.TrimSpace(req.ResourceRef) == "" {
 		return nil, errors.New("resource_ref is required")
 	}
+	if req.Size < 0 {
+		return nil, errors.New("resource size must not be negative")
+	}
 	sub, err := db.GetSubscriptionByID(req.SubscriptionID)
 	if err != nil {
 		return nil, err
@@ -144,7 +148,7 @@ func BindMoviePilotResource(ctx context.Context, req model.SubscriptionMoviePilo
 	bound := &model.SubscriptionBoundTorrent{
 		BridgeInstanceID: req.BridgeInstanceID, ResourceRef: req.ResourceRef,
 		SelectedFingerprint: strings.TrimSpace(req.SelectedFingerprint), TorrentTitle: strings.TrimSpace(req.TorrentTitle),
-		Site: strings.TrimSpace(req.Site), MediaSource: mediaSource, MediaID: mediaID, MediaType: mediaType,
+		Site: strings.TrimSpace(req.Site), Size: req.Size, MediaSource: mediaSource, MediaID: mediaID, MediaType: mediaType,
 		Season: req.Season, Episode: req.Episode, RetentionPolicy: req.RetentionPolicy, BoundAt: time.Now().UTC(),
 	}
 	sub.BoundTorrent = bound
@@ -170,7 +174,71 @@ func UnbindMoviePilotResource(ctx context.Context, req model.SubscriptionMoviePi
 	return sub, nil
 }
 
+// UpdateMoviePilotRetention changes the durable policy for the bound torrent
+// and all active intent/binding snapshots. A deletion already dispatched to a
+// Worker is intentionally not canceled here; callers must update the policy
+// before the binding enters deleting state when an extension is required.
+func UpdateMoviePilotRetention(ctx context.Context, req model.SubscriptionMoviePilotRetentionUpdateReq) (*model.Subscription, error) {
+	if req.SubscriptionID == 0 {
+		return nil, errors.New("subscription_id is required")
+	}
+	sub, err := db.GetSubscriptionByID(req.SubscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	if sub.BoundTorrent == nil {
+		return nil, errors.New("MoviePilot resource is not bound")
+	}
+	policyRaw, err := json.Marshal(req.RetentionPolicy)
+	if err != nil {
+		return nil, err
+	}
+	policyJSON := string(policyRaw)
+	if err := db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		sub.BoundTorrent.RetentionPolicy = req.RetentionPolicy
+		if err := tx.Save(sub).Error; err != nil {
+			return err
+		}
+		var intents []model.MoviePilotDownloadIntent
+		if err := tx.Where("subscription_id = ? AND status NOT IN ?", sub.ID, []string{model.MoviePilotIntentStatusCancelled}).Find(&intents).Error; err != nil {
+			return err
+		}
+		for _, intent := range intents {
+			if err := tx.Model(&model.MoviePilotDownloadIntent{}).Where("id = ?", intent.ID).Update("retention_policy_json", policyJSON).Error; err != nil {
+				return err
+			}
+			var binding model.MoviePilotTorrentBinding
+			if err := tx.Where("intent_id = ?", intent.ID).First(&binding).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				return err
+			}
+			if binding.Status == model.MoviePilotTorrentStatusDeleting || binding.Status == model.MoviePilotTorrentStatusDeleted {
+				continue
+			}
+			retentionStatus := model.MoviePilotRetentionStatusPending
+			if req.RetentionPolicy.Permanent {
+				retentionStatus = model.MoviePilotRetentionStatusHeld
+			}
+			if err := tx.Model(&model.MoviePilotTorrentBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
+				"retention_policy_json": policyJSON, "retention_status": retentionStatus, "retention_eligible_at": nil,
+			}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return sub, nil
+}
+
 func SubmitMoviePilotIntent(ctx context.Context, sub *model.Subscription) error {
+	return submitMoviePilotIntent(ctx, sub, 0)
+}
+
+func submitMoviePilotIntent(ctx context.Context, sub *model.Subscription, subscriptionItemID uint) error {
 	if sub == nil || sub.BoundTorrent == nil {
 		return errors.New("MoviePilot resource is not bound")
 	}
@@ -190,7 +258,7 @@ func SubmitMoviePilotIntent(ctx context.Context, sub *model.Subscription) error 
 	}
 	intent := &model.MoviePilotDownloadIntent{
 		ID: uuid.NewString(), RequestID: requestID, BridgeInstanceID: bound.BridgeInstanceID,
-		SubscriptionID: sub.ID, MediaSource: bound.MediaSource, MediaID: bound.MediaID,
+		SubscriptionID: sub.ID, SubscriptionItemID: subscriptionItemID, MediaSource: bound.MediaSource, MediaID: bound.MediaID,
 		TorrentFingerprint: bound.SelectedFingerprint, ResourceRef: bound.ResourceRef, RetentionPolicyJSON: string(policyRaw),
 		Status: model.MoviePilotIntentStatusPending,
 	}
@@ -211,7 +279,7 @@ func moviePilotIntentPayload(sub *model.Subscription, bound *model.SubscriptionB
 		},
 		Torrent: moviepilotbridge.TorrentResource{
 			Title: bound.TorrentTitle, ResourceRef: bound.ResourceRef, Site: bound.Site,
-			SelectedFingerprint: bound.SelectedFingerprint,
+			Size: bound.Size, SelectedFingerprint: bound.SelectedFingerprint,
 		},
 		DownloaderPolicy: moviepilotbridge.DownloaderPolicy{Mode: "moviepilot_select"},
 		RetentionPolicy:  policy,
@@ -222,11 +290,6 @@ func runMoviePilot(ctx context.Context, sub *model.Subscription, transfer bool) 
 	if sub == nil || sub.BoundTorrent == nil {
 		return nil, "", 0, 0, 0, errors.New("MoviePilot resource is not bound")
 	}
-	if transfer {
-		if err := SubmitMoviePilotIntent(ctx, sub); err != nil {
-			return nil, sub.LastTreeHash, 0, 0, 0, err
-		}
-	}
 	bound := sub.BoundTorrent
 	now := time.Now().UTC()
 	fileHash := strings.TrimSpace(bound.SelectedFingerprint)
@@ -236,7 +299,7 @@ func runMoviePilot(ctx context.Context, sub *model.Subscription, transfer bool) 
 	item := &model.SubscriptionItem{
 		SubscriptionID: sub.ID, SourceKey: "moviepilot:" + shortHash(bound.ResourceRef+"\x00"+bound.SelectedFingerprint),
 		SourceProvider: firstNonEmpty(bound.Site, model.SubscriptionSourceMoviePilot), SourceURL: bound.ResourceRef,
-		FileName: bound.TorrentTitle, FileHash: fileHash, Season: bound.Season, Episode: bound.Episode,
+		FileName: bound.TorrentTitle, FileHash: fileHash, FileSize: bound.Size, Season: bound.Season, Episode: bound.Episode,
 		Status:     map[bool]string{true: model.SubscriptionItemStatusTransferring, false: model.SubscriptionItemStatusPending}[transfer],
 		LastSeenAt: now, ProviderData: map[string]string{
 			"bridge_instance_id": bound.BridgeInstanceID, "resource_ref": bound.ResourceRef,
@@ -246,6 +309,11 @@ func runMoviePilot(ctx context.Context, sub *model.Subscription, transfer bool) 
 	saved, isNew, err := db.UpsertSubscriptionItem(item)
 	if err != nil {
 		return nil, sub.LastTreeHash, 0, 0, 0, err
+	}
+	if transfer {
+		if err := submitMoviePilotIntent(ctx, sub, saved.ID); err != nil {
+			return nil, sub.LastTreeHash, 0, 0, 0, err
+		}
 	}
 	hash := shortHash(fmt.Sprintf("moviepilot:%d:%s:%s", sub.ID, bound.ResourceRef, bound.SelectedFingerprint))
 	return []model.SubscriptionItem{*saved}, hash, boolToInt(isNew), 0, 0, nil

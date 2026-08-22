@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -117,6 +119,14 @@ func Init(e *gin.Engine) {
 	externalSubscriptions(api.Group("/v1/subscriptions", middlewares.ExternalSubscriptionAuth))
 	moviePilotBridge := newMoviePilotBridgeService()
 	subscription.SetMoviePilotBridgeClient(moviePilotBridge)
+	moviePilotBridge.SetEventHandler(func(ctx context.Context, bridgeID string, event moviepilotbridge.BridgeEvent) error {
+		service := cluster.CoordinatorService()
+		if service == nil {
+			return errors.New("cluster coordinator is not running")
+		}
+		return service.HandleMoviePilotEvent(ctx, bridgeID, event)
+	})
+	moviePilotBridge.StartEventProcessor(context.Background())
 	api.POST("/v1/cluster/moviepilot/events", middlewares.MoviePilotBridgeAuth(moviePilotBridge), handles.ConsumeMoviePilotBridgeEvent(moviePilotBridge))
 	admin(auth.Group("/admin", middlewares.AuthAdmin), moviePilotBridge)
 	if flags.Debug || flags.Dev {
@@ -148,6 +158,7 @@ func admin(g *gin.RouterGroup, moviePilotBridge *moviepilotbridge.Service) {
 	clusterAdmin.POST("/nodes/:id/config", handles.ApplyClusterNodeConfig)
 	clusterAdmin.GET("/results", handles.ListClusterUploadResults)
 	clusterAdmin.GET("/jobs", handles.ListClusterJobs)
+	clusterAdmin.GET("/moviepilot/transfers", handles.ListMoviePilotTransfers)
 	clusterAdmin.POST("/jobs/dispatch", handles.DispatchClusterMediaJob)
 	clusterAdmin.POST("/jobs/dispatch_batch", handles.DispatchClusterMediaBatch)
 	clusterAdmin.POST("/jobs/:id/retry", handles.RetryClusterJob)
@@ -276,6 +287,7 @@ func admin(g *gin.RouterGroup, moviePilotBridge *moviepilotbridge.Service) {
 	subscription.POST("/resource/unbind", handles.UnbindSubscriptionResource)
 	subscription.POST("/resource/bind_moviepilot", handles.BindMoviePilotSubscriptionResource)
 	subscription.POST("/resource/unbind_moviepilot", handles.UnbindMoviePilotSubscriptionResource)
+	subscription.POST("/resource/update_moviepilot_retention", handles.UpdateMoviePilotRetention)
 	subscription.GET("/config", handles.GetSubscriptionConfig)
 	subscription.POST("/config", handles.SaveSubscriptionConfig)
 	subscription.POST("/telegram/status", handles.TelegramSubscriptionStatus)

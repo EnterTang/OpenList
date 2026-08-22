@@ -93,6 +93,7 @@ type MoviePilotTorrentBinding struct {
 	QBClientID           string     `json:"qb_client_id" gorm:"size:128"`
 	TorrentHash          string     `json:"torrent_hash" gorm:"size:64;uniqueIndex:idx_moviepilot_torrent_hash"`
 	ContentPath          string     `json:"content_path" gorm:"type:text"`
+	ObserveJobID         string     `json:"observe_job_id" gorm:"size:64;index"`
 	ObservedContentPath  string     `json:"observed_content_path" gorm:"type:text"`
 	RetentionPolicyJSON  string     `json:"retention_policy_json" gorm:"type:text"`
 	Status               string     `json:"status" gorm:"size:32;index"`
@@ -101,6 +102,7 @@ type MoviePilotTorrentBinding struct {
 	LastQBProgress       float64    `json:"last_qb_progress"`
 	LastQBRatio          float64    `json:"last_qb_ratio"`
 	LastQBSeedingSeconds int64      `json:"last_qb_seeding_seconds"`
+	LastQBHNRPassed      bool       `json:"last_qb_hnr_passed" gorm:"column:last_qb_hnr_passed"`
 	DownloadCompletedAt  *time.Time `json:"download_completed_at,omitempty"`
 	SeedStartedAt        *time.Time `json:"seed_started_at,omitempty"`
 	RetentionEligibleAt  *time.Time `json:"retention_eligible_at,omitempty"`
@@ -111,25 +113,54 @@ type MoviePilotTorrentBinding struct {
 }
 
 type MoviePilotDeliveryFile struct {
-	ID               string     `json:"id" gorm:"primaryKey;size:64"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	TorrentBindingID string     `json:"torrent_binding_id" gorm:"size:64;index;uniqueIndex:idx_moviepilot_delivery_path"`
-	RelativePath     string     `json:"relative_path" gorm:"type:text;uniqueIndex:idx_moviepilot_delivery_path"`
-	FileName         string     `json:"file_name"`
-	SourceSize       int64      `json:"source_size"`
-	MediaSource      string     `json:"media_source" gorm:"size:64"`
-	MediaID          string     `json:"media_id" gorm:"size:128"`
-	Season           int        `json:"season"`
-	Episode          int        `json:"episode"`
-	Required         bool       `json:"required"`
-	Status           string     `json:"status" gorm:"size:32;index"`
-	ClusterJobID     string     `json:"cluster_job_id" gorm:"size:64;index"`
-	ManifestID       string     `json:"manifest_id" gorm:"size:64;index"`
-	UploadProgress   float64    `json:"upload_progress"`
-	LastErrorCode    string     `json:"last_error_code" gorm:"size:128"`
-	LastError        string     `json:"last_error" gorm:"type:text"`
-	FinishedAt       *time.Time `json:"finished_at,omitempty"`
+	ID                 string     `json:"id" gorm:"primaryKey;size:64"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	TorrentBindingID   string     `json:"torrent_binding_id" gorm:"size:64;index;uniqueIndex:idx_moviepilot_delivery_path"`
+	RelativePath       string     `json:"relative_path" gorm:"type:text;uniqueIndex:idx_moviepilot_delivery_path"`
+	FileName           string     `json:"file_name"`
+	SourceSize         int64      `json:"source_size"`
+	SubscriptionItemID uint       `json:"subscription_item_id" gorm:"index"`
+	SourceKey          string     `json:"source_key" gorm:"size:191;index"`
+	MediaSource        string     `json:"media_source" gorm:"size:64"`
+	MediaID            string     `json:"media_id" gorm:"size:128"`
+	Season             int        `json:"season"`
+	Episode            int        `json:"episode"`
+	Required           bool       `json:"required"`
+	Status             string     `json:"status" gorm:"size:32;index"`
+	ClusterJobID       string     `json:"cluster_job_id" gorm:"size:64;index"`
+	ManifestID         string     `json:"manifest_id" gorm:"size:64;index"`
+	UploadProgress     float64    `json:"upload_progress"`
+	LastErrorCode      string     `json:"last_error_code" gorm:"size:128"`
+	LastError          string     `json:"last_error" gorm:"type:text"`
+	FinishedAt         *time.Time `json:"finished_at,omitempty"`
+}
+
+type MoviePilotTransferView struct {
+	DeliveryID         string     `json:"delivery_id"`
+	SubscriptionID     uint       `json:"subscription_id"`
+	TorrentBindingID   string     `json:"torrent_binding_id"`
+	RelativePath       string     `json:"relative_path"`
+	FileName           string     `json:"file_name"`
+	SourceSize         int64      `json:"source_size"`
+	SubscriptionItemID uint       `json:"subscription_item_id"`
+	SourceKey          string     `json:"source_key"`
+	Season             int        `json:"season"`
+	Episode            int        `json:"episode"`
+	Required           bool       `json:"required"`
+	Status             string     `json:"status"`
+	ClusterJobID       string     `json:"cluster_job_id,omitempty"`
+	ManifestID         string     `json:"manifest_id,omitempty"`
+	UploadProgress     float64    `json:"upload_progress"`
+	LastErrorCode      string     `json:"last_error_code,omitempty"`
+	LastError          string     `json:"last_error,omitempty"`
+	FinishedAt         *time.Time `json:"finished_at,omitempty"`
+	WorkerNodeID       string     `json:"worker_node_id"`
+	DownloaderAlias    string     `json:"downloader"`
+	QBClientID         string     `json:"qb_client_id"`
+	TorrentHash        string     `json:"torrent_hash"`
+	TorrentStatus      string     `json:"torrent_status"`
+	RetentionStatus    string     `json:"retention_status"`
 }
 
 type MoviePilotBridgeNonce struct {
@@ -173,6 +204,7 @@ type SubscriptionBoundTorrent struct {
 	SelectedFingerprint string                 `json:"selected_fingerprint,omitempty"`
 	TorrentTitle        string                 `json:"torrent_title,omitempty"`
 	Site                string                 `json:"site,omitempty"`
+	Size                int64                  `json:"size,omitempty"`
 	MediaSource         string                 `json:"media_source,omitempty"`
 	MediaID             string                 `json:"media_id,omitempty"`
 	MediaType           string                 `json:"media_type,omitempty"`

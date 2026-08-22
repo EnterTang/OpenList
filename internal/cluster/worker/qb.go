@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"path"
 	"strings"
 
@@ -19,13 +20,13 @@ var defaultMoviePilotMediaExtensions = map[string]struct{}{
 // QBFile is a qB file plus its resolved Worker-local source path. QBPath is
 // retained for diagnostics and must never be treated as a local path.
 type QBFile struct {
-	Hash         string
-	Name         string
-	QBPath       string
-	WorkerPath   string
-	DownloadRoot string
-	Size         int64
-	Progress     float32
+	Hash         string  `json:"hash"`
+	Name         string  `json:"name"`
+	QBPath       string  `json:"qb_path"`
+	WorkerPath   string  `json:"worker_path"`
+	DownloadRoot string  `json:"download_root"`
+	Size         int64   `json:"size"`
+	Progress     float32 `json:"progress"`
 }
 
 func newWorkerQBClient(config protocol.QBClientConfig) (qbittorrent.Client, error) {
@@ -34,6 +35,28 @@ func newWorkerQBClient(config protocol.QBClientConfig) (qbittorrent.Client, erro
 	// that require WebUI authentication can replace this factory with their
 	// local credential resolver without exposing credentials to Coordinator.
 	return qbittorrent.New(config.WebUIURL)
+}
+
+func newWorkerQBClientWithSecret(config protocol.QBClientConfig, parameters map[string]any) (qbittorrent.Client, error) {
+	username, _ := firstQBSecretString(parameters, "username", "user")
+	password, _ := firstQBSecretString(parameters, "password", "pass")
+	endpoint, err := url.Parse(strings.TrimSpace(config.WebUIURL))
+	if err != nil {
+		return nil, err
+	}
+	endpoint.User = url.UserPassword(username, password)
+	config.WebUIURL = endpoint.String()
+	return qbittorrent.New(config.WebUIURL)
+}
+
+func firstQBSecretString(values map[string]any, keys ...string) (string, bool) {
+	for _, key := range keys {
+		value, ok := values[key].(string)
+		if ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value), true
+		}
+	}
+	return "", false
 }
 
 func (s *Service) discoverTorrentClient(torrent *protocol.TorrentTaskContext) (protocol.QBClientConfig, qbittorrent.Client, protocol.StagingConfig, error) {
@@ -50,8 +73,16 @@ func (s *Service) discoverTorrentClient(torrent *protocol.TorrentTaskContext) (p
 	s.mu.Lock()
 	staging := s.desiredConfig.Staging
 	factory := s.qbClientFactory
+	secret := s.qbSecrets[strings.TrimSpace(clientConfig.ID)]
 	s.mu.Unlock()
 	if factory == nil {
+		if secret != nil {
+			client, err := newWorkerQBClientWithSecret(clientConfig, secret)
+			if err != nil {
+				return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("create qB client %q: %w", clientConfig.ID, err)
+			}
+			return clientConfig, client, staging, nil
+		}
 		factory = newWorkerQBClient
 	}
 	client, err := factory(clientConfig)

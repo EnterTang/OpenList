@@ -6,12 +6,17 @@ import (
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/qbittorrent"
 )
 
 type fakeQBClient struct {
-	info  qbittorrent.TorrentInfo
-	files []qbittorrent.FileInfo
+	info        qbittorrent.TorrentInfo
+	files       []qbittorrent.FileInfo
+	started     []string
+	stopped     []string
+	deleted     []string
+	deleteFiles []bool
 }
 
 func (f *fakeQBClient) AddFromLink(string, string, string) error { return nil }
@@ -25,16 +30,24 @@ func (f *fakeQBClient) GetTorrentByHash(context.Context, string) (qbittorrent.To
 func (f *fakeQBClient) GetFilesByHash(context.Context, string) ([]qbittorrent.FileInfo, error) {
 	return f.files, nil
 }
-func (f *fakeQBClient) StartByHash(context.Context, string) error { return nil }
-func (f *fakeQBClient) StopByHash(context.Context, string) error  { return nil }
-func (f *fakeQBClient) DeleteByHash(context.Context, string, bool) error {
+func (f *fakeQBClient) StartByHash(_ context.Context, hash string) error {
+	f.started = append(f.started, hash)
+	return nil
+}
+func (f *fakeQBClient) StopByHash(_ context.Context, hash string) error {
+	f.stopped = append(f.stopped, hash)
+	return nil
+}
+func (f *fakeQBClient) DeleteByHash(_ context.Context, hash string, deleteFiles bool) error {
+	f.deleted = append(f.deleted, hash)
+	f.deleteFiles = append(f.deleteFiles, deleteFiles)
 	return nil
 }
 func (f *fakeQBClient) Delete(string, bool) error { return nil }
 
 func TestDiscoverTorrentFilesResolvesMultiFileTorrentToWorkerPaths(t *testing.T) {
 	hash := strings.Repeat("a", 40)
-	service := New(nil, nil)
+	service := New(nil, make(channelSender, 10))
 	service.desiredConfig = protocol.WorkerDesiredConfig{
 		QBClients: []protocol.QBClientConfig{{
 			ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a",
@@ -105,5 +118,49 @@ func TestDiscoverTorrentFilesRejectsIncompleteTorrent(t *testing.T) {
 	_, err := service.DiscoverTorrentFiles(context.Background(), &protocol.TorrentTaskContext{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a", TorrentHash: strings.Repeat("c", 40)})
 	if err == nil || !strings.Contains(err.Error(), "is not complete") {
 		t.Fatalf("expected incomplete torrent error, got %v", err)
+	}
+}
+
+func TestExecuteTorrentRetentionDeletesBoundHashAndFiles(t *testing.T) {
+	hash := strings.Repeat("d", 40)
+	client := &fakeQBClient{}
+	service := New(nil, make(channelSender, 10))
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients:        []protocol.QBClientConfig{{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+	}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
+	result, err := service.executeTorrentRetention(context.Background(), protocol.JobOffer{
+		JobType: model.ClusterJobTypeTorrentRetention,
+		TaskContext: protocol.TaskContext{Torrent: &protocol.TorrentTaskContext{
+			BindingID: "binding-1", WorkerNodeID: "worker-1", BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a", TorrentHash: hash, Action: "delete",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("execute retention: %v", err)
+	}
+	if len(client.deleted) != 1 || client.deleted[0] != hash || len(client.deleteFiles) != 1 || !client.deleteFiles[0] {
+		t.Fatalf("delete calls = %#v %#v", client.deleted, client.deleteFiles)
+	}
+	if result["action"] != "delete" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestPauseMoviePilotTorrentsStopsActiveBoundTorrent(t *testing.T) {
+	hash := strings.Repeat("e", 40)
+	client := &fakeQBClient{}
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients:        []protocol.QBClientConfig{{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+	}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
+	service.active["job-1"] = &activeTask{offer: protocol.JobOffer{TaskContext: protocol.TaskContext{Torrent: &protocol.TorrentTaskContext{
+		BindingID: "binding-1", WorkerNodeID: "worker-1", BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a", TorrentHash: hash,
+	}}}}
+	service.PauseMoviePilotTorrents(context.Background())
+	if len(client.stopped) != 1 || client.stopped[0] != hash {
+		t.Fatalf("stop calls = %#v", client.stopped)
 	}
 }

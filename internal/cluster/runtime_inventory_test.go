@@ -123,10 +123,10 @@ func TestTorrentInventoryMatchPinsTaskToBoundWorkerAndRoute(t *testing.T) {
 	if worker, err := ResolveTorrentWorker(task); err != nil || worker != "worker-qb" {
 		t.Fatalf("ResolveTorrentWorker = %q, %v", worker, err)
 	}
-	if _, ok, reason, err := nodeInventoryTorrentMatch("worker-qb", task, capabilities); err != nil || !ok {
+	if _, ok, reason, err := nodeInventoryTorrentMatch("worker-qb", task, capabilities, 0); err != nil || !ok {
 		t.Fatalf("bound worker should match, ok=%v reason=%q err=%v", ok, reason, err)
 	}
-	if _, ok, reason, err := nodeInventoryTorrentMatch("worker-other", task, capabilities); err != nil || ok || !strings.Contains(reason, "bound to worker") {
+	if _, ok, reason, err := nodeInventoryTorrentMatch("worker-other", task, capabilities, 0); err != nil || ok || !strings.Contains(reason, "bound to worker") {
 		t.Fatalf("other worker should be rejected, ok=%v reason=%q err=%v", ok, reason, err)
 	}
 	if got := selectRedispatchNodeID([]string{"worker-other"}, task, 0); got != "" {

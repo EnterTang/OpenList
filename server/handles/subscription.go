@@ -272,6 +272,10 @@ func GetSubscription(c *gin.Context) {
 		return
 	}
 	subscription.HydrateRealtimeStatus(item, items)
+	if err := subscription.HydrateMoviePilotProgress(item); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
 	common.SuccessResp(c, gin.H{"subscription": item, "items": filterDisplayedSubscriptionItems(items)})
 }
 
@@ -613,6 +617,20 @@ func UnbindMoviePilotSubscriptionResource(c *gin.Context) {
 		return
 	}
 	result, err := subscription.UnbindMoviePilotResource(c.Request.Context(), req)
+	if err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, result)
+}
+
+func UpdateMoviePilotRetention(c *gin.Context) {
+	var req model.SubscriptionMoviePilotRetentionUpdateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	result, err := subscription.UpdateMoviePilotRetention(c.Request.Context(), req)
 	if err != nil {
 		common.ErrorResp(c, err, 400)
 		return

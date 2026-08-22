@@ -126,6 +126,23 @@ type SubscriptionProgress struct {
 	FailedEpisodes     int        `json:"failed_episodes,omitempty"`
 	ExpectedEpisodes   int        `json:"expected_episodes,omitempty"`
 	LastEpisodeAddedAt *time.Time `json:"last_episode_added_at,omitempty"`
+	TorrentStatus      string     `json:"torrent_status,omitempty"`
+	DownloadProgress   float64    `json:"download_progress,omitempty"`
+	UploadProgress     float64    `json:"upload_progress,omitempty"`
+	SeedElapsed        int64      `json:"seed_elapsed,omitempty"`
+	RetentionStatus    string     `json:"retention_status,omitempty"`
+	TransferredFiles   int        `json:"transferred_files,omitempty"`
+	ExpectedFiles      int        `json:"expected_files,omitempty"`
+}
+
+type MoviePilotProgressSnapshot struct {
+	TorrentStatus    string
+	DownloadProgress float64
+	UploadProgress   float64
+	SeedElapsed      int64
+	RetentionStatus  string
+	TransferredFiles int
+	ExpectedFiles    int
 }
 
 type SubscriptionItem struct {
@@ -462,6 +479,7 @@ type SubscriptionMoviePilotResourceBindReq struct {
 	SelectedFingerprint string                 `json:"selected_fingerprint,omitempty"`
 	TorrentTitle        string                 `json:"torrent_title,omitempty"`
 	Site                string                 `json:"site,omitempty"`
+	Size                int64                  `json:"size,omitempty"`
 	MediaSource         string                 `json:"media_source,omitempty"`
 	MediaID             string                 `json:"media_id,omitempty"`
 	MediaType           string                 `json:"media_type,omitempty"`
@@ -472,6 +490,11 @@ type SubscriptionMoviePilotResourceBindReq struct {
 
 type SubscriptionMoviePilotResourceUnbindReq struct {
 	SubscriptionID uint `json:"subscription_id" binding:"required"`
+}
+
+type SubscriptionMoviePilotRetentionUpdateReq struct {
+	SubscriptionID  uint                   `json:"subscription_id" binding:"required"`
+	RetentionPolicy TorrentRetentionPolicy `json:"retention_policy"`
 }
 
 type SubscriptionResourceUnbindReq struct {

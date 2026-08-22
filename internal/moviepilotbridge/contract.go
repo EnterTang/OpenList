@@ -90,13 +90,17 @@ type TorrentBoundPayload struct {
 	Downloader  string        `json:"downloader"`
 	TorrentHash string        `json:"torrent_hash"`
 	ContentPath string        `json:"content_path"`
+	Size        int64         `json:"size,omitempty"`
 	Media       MediaIdentity `json:"media,omitempty"`
 }
 
 type TorrentStatePayload struct {
-	State    string  `json:"state"`
-	Progress float64 `json:"progress"`
-	LeftTime int64   `json:"left_time,omitempty"`
+	State          string  `json:"state"`
+	Progress       float64 `json:"progress"`
+	LeftTime       int64   `json:"left_time,omitempty"`
+	Ratio          float64 `json:"ratio,omitempty"`
+	SeedingSeconds int64   `json:"seeding_seconds,omitempty"`
+	HNRPassed      *bool   `json:"hnr_passed,omitempty"`
 }
 
 type TorrentFailure struct {
@@ -128,6 +132,9 @@ func (e BridgeEvent) Validate() error {
 		if contentPath == "." || contentPath == "/" || !path.IsAbs(contentPath) {
 			return errors.New("torrent.bound content path must be an absolute non-root path")
 		}
+		if e.Torrent.Size < 0 {
+			return errors.New("torrent.bound size must not be negative")
+		}
 	case EventTorrentStateChanged:
 		if e.State == nil {
 			return errors.New("torrent.state_changed state is required")
@@ -157,6 +164,9 @@ func (r DownloadIntentRequest) Validate() error {
 	}
 	if strings.TrimSpace(r.Torrent.ResourceRef) == "" && strings.TrimSpace(r.Torrent.Enclosure) == "" {
 		return errors.New("torrent resource_ref or enclosure is required")
+	}
+	if r.Torrent.Size < 0 {
+		return errors.New("torrent size must not be negative")
 	}
 	return nil
 }

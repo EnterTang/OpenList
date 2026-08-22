@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -18,13 +19,63 @@ import (
 )
 
 type SecretResolver func(context.Context, string) ([]byte, error)
+type EventHandler func(context.Context, string, BridgeEvent) error
 
 type Service struct {
-	database     *gorm.DB
-	resolve      SecretResolver
-	httpClient   HTTPDoer
-	now          func() time.Time
-	maxClockSkew time.Duration
+	database      *gorm.DB
+	resolve       SecretResolver
+	httpClient    HTTPDoer
+	now           func() time.Time
+	maxClockSkew  time.Duration
+	handlerMu     sync.RWMutex
+	handler       EventHandler
+	processorOnce sync.Once
+}
+
+// SetEventHandler installs the durable inbox consumer. The handler is invoked
+// only after an event has been committed to the inbox, so a failed consumer
+// can be retried without asking MoviePilot to resend the event.
+func (s *Service) SetEventHandler(handler EventHandler) {
+	if s == nil {
+		return
+	}
+	s.handlerMu.Lock()
+	s.handler = handler
+	s.handlerMu.Unlock()
+}
+
+func (s *Service) eventHandler() EventHandler {
+	if s == nil {
+		return nil
+	}
+	s.handlerMu.RLock()
+	defer s.handlerMu.RUnlock()
+	return s.handler
+}
+
+// StartEventProcessor runs the durable inbox retry loop. It is safe to call
+// more than once; only the first call starts a processor for this service.
+func (s *Service) StartEventProcessor(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.processorOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					_, _ = s.ProcessPendingEvents(ctx, 20)
+				}
+			}
+		}()
+	})
 }
 
 func NewService(database *gorm.DB, resolve SecretResolver, httpClient HTTPDoer) *Service {
@@ -263,6 +314,62 @@ func (s *Service) ConsumeBridgeEvent(ctx context.Context, headers http.Header, m
 		return nil
 	})
 	return result, err
+}
+
+// ProcessPendingEvents drains the signed event inbox in creation order. Event
+// delivery is deliberately at-least-once; the coordinator handlers are
+// idempotent and the inbox row remains available for a later retry.
+func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, error) {
+	if s == nil || s.database == nil {
+		return 0, errors.New("moviepilot bridge database is required")
+	}
+	handler := s.eventHandler()
+	if handler == nil {
+		return 0, errors.New("moviepilot bridge event handler is not configured")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	var inboxes []model.MoviePilotBridgeInbox
+	if err := s.database.WithContext(ctx).
+		Where("status IN ?", []string{"received", "failed"}).
+		Order("created_at ASC, event_id ASC").Limit(limit).Find(&inboxes).Error; err != nil {
+		return 0, err
+	}
+	processed := 0
+	for i := range inboxes {
+		claimed := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).
+			Where("event_id = ? AND status IN ?", inboxes[i].EventID, []string{"received", "failed"}).
+			Updates(map[string]interface{}{"status": "processing", "updated_at": s.now()})
+		if claimed.Error != nil {
+			return processed, claimed.Error
+		}
+		if claimed.RowsAffected == 0 {
+			continue
+		}
+		var event BridgeEvent
+		if err := json.Unmarshal([]byte(inboxes[i].PayloadJSON), &event); err != nil {
+			_ = s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).Where("event_id = ?", inboxes[i].EventID).Updates(map[string]interface{}{
+				"status": "failed", "attempt_count": gorm.Expr("attempt_count + 1"), "last_error": err.Error(), "updated_at": s.now(),
+			}).Error
+			continue
+		}
+		err := handler(ctx, inboxes[i].BridgeID, event)
+		if err != nil {
+			_ = s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).Where("event_id = ?", inboxes[i].EventID).Updates(map[string]interface{}{
+				"status": "failed", "attempt_count": gorm.Expr("attempt_count + 1"), "last_error": err.Error(), "updated_at": s.now(),
+			}).Error
+			continue
+		}
+		now := s.now()
+		if err := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).Where("event_id = ? AND status = ?", inboxes[i].EventID, "processing").Updates(map[string]interface{}{
+			"status": "processed", "processed_at": now, "last_error": "", "updated_at": now,
+		}).Error; err != nil {
+			return processed, err
+		}
+		processed++
+	}
+	return processed, nil
 }
 
 func validateBridgeURL(raw string) (string, error) {
