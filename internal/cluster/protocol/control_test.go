@@ -29,6 +29,24 @@ func TestWorkerDesiredConfigRejectsCaseInsensitiveQBClientAliasCollision(t *test
 	}
 }
 
+func TestWorkerDesiredConfigAcceptsContainerNetworkQBWebUI(t *testing.T) {
+	cfg := WorkerDesiredConfig{QBClients: []QBClientConfig{{
+		ID: "qb-a", WebUIURL: "http://qbittorrent:8080", SecretRef: "secret-a",
+		PathMappings: []QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+	}}}
+	require.NoError(t, cfg.Validate())
+
+	for _, rawURL := range []string{
+		"ftp://qbittorrent:8080",
+		"http://user:password@qbittorrent:8080",
+		"http://qbittorrent:8080?token=secret",
+		"http://qbittorrent:8080/#fragment",
+	} {
+		cfg.QBClients[0].WebUIURL = rawURL
+		require.Error(t, cfg.Validate(), "webui_url=%s", rawURL)
+	}
+}
+
 func TestConfigApplySupportsLegacyConfigJSON(t *testing.T) {
 	desired := WorkerDesiredConfig{
 		ProviderTempRoots:   map[string]string{"aliyundrive": "/ali/temp"},
@@ -61,4 +79,19 @@ func TestStorageApplyAADBindsNodeAndRevision(t *testing.T) {
 func TestWorkerDesiredConfigRejectsUnsafePaths(t *testing.T) {
 	require.Error(t, (WorkerDesiredConfig{ProviderTempRoots: map[string]string{"aliyun": "relative/path"}}).Validate())
 	require.Error(t, (WorkerDesiredConfig{TargetBindings: map[string]TargetBinding{"mobile": {MountPath: "/"}}}).Validate())
+}
+
+func TestWorkerDesiredConfigValidatesMoviePilotStagingWatermarks(t *testing.T) {
+	base := WorkerDesiredConfig{Staging: StagingConfig{Root: "/srv/staging"}}
+	for _, staging := range []StagingConfig{
+		{Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 100},
+		{Root: "/srv/staging", ResumeDownloadHighWatermarkBytes: 200},
+		{Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 200, ResumeDownloadHighWatermarkBytes: 100},
+		{Root: "/srv/staging", SafetyReserveBytes: -1},
+	} {
+		base.Staging = staging
+		require.Error(t, base.Validate(), "staging=%+v", staging)
+	}
+	base.Staging = StagingConfig{Root: "/srv/staging", SafetyReserveBytes: 50, PauseDownloadLowWatermarkBytes: 100, ResumeDownloadHighWatermarkBytes: 200}
+	require.NoError(t, base.Validate())
 }

@@ -63,6 +63,31 @@ func TestMoviePilotBridgeEventHandlerStoresAndDeduplicatesEvent(t *testing.T) {
 	}
 }
 
+func TestMoviePilotBridgeEventHandlerRejectsEventIDPayloadCollision(t *testing.T) {
+	service, bridge, key := newMoviePilotBridgeHandlerService(t)
+	engine := moviePilotBridgeTestEngine(service)
+	firstBody := bridgeEventBody(t, "event-payload-collision")
+	firstHeaders := signBridgeHandlerBody(bridge.ID, "/events", firstBody, key, time.Now().UTC(), "nonce-payload-first")
+	first := httptest.NewRecorder()
+	engine.ServeHTTP(first, newBridgeHandlerRequest(http.MethodPost, "/events", firstBody, firstHeaders))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first event response = %d %s", first.Code, first.Body.String())
+	}
+	changedBody, err := json.Marshal(moviepilotbridge.BridgeEvent{
+		EventID: "event-payload-collision", RequestID: "request-1", Type: moviepilotbridge.EventIntentAccepted,
+		OccurredAt: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedHeaders := signBridgeHandlerBody(bridge.ID, "/events", changedBody, key, time.Now().UTC(), "nonce-payload-changed")
+	changed := httptest.NewRecorder()
+	engine.ServeHTTP(changed, newBridgeHandlerRequest(http.MethodPost, "/events", changedBody, changedHeaders))
+	if changed.Code != http.StatusBadRequest || !strings.Contains(changed.Body.String(), "different Bridge event") {
+		t.Fatalf("event ID collision response = %d %s", changed.Code, changed.Body.String())
+	}
+}
+
 func moviePilotBridgeTestEngine(service *moviepilotbridge.Service) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()

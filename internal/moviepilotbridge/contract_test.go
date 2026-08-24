@@ -24,3 +24,40 @@ func TestTorrentBoundPayloadRequiresResolvedDownloaderAndHash(t *testing.T) {
 		t.Fatalf("empty downloader error = %v", err)
 	}
 }
+
+func TestBridgePayloadRejectsForbiddenSecretAndLocalPathFields(t *testing.T) {
+	for _, body := range [][]byte{
+		[]byte(`{"request_id":"r","site_cookie":"secret"}`),
+		[]byte(`{"nested":{"qb_password":"secret"}}`),
+		[]byte(`{"items":[{"qb_url":"http://qb"}]}`),
+		[]byte(`{"torrent":{"local_path":"/downloads/file.mkv"}}`),
+		[]byte(`{"torrent":{"enclosure":"https://pt.example/download?passkey=secret"}}`),
+	} {
+		if err := validateNoForbiddenBridgeFields(body); err == nil || !strings.Contains(err.Error(), "forbidden") {
+			t.Fatalf("forbidden payload %s error = %v", body, err)
+		}
+	}
+}
+
+func TestDownloadIntentRequiresOpaqueResourceReference(t *testing.T) {
+	request := DownloadIntentRequest{
+		RequestID: "request-opaque", Media: MediaIdentity{MediaSource: "tmdb", MediaID: "123"},
+		Torrent:          TorrentResource{Enclosure: "https://pt.example/download?passkey=secret"},
+		DownloaderPolicy: DownloaderPolicy{Mode: "moviepilot_select"},
+	}
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "resource_ref") {
+		t.Fatalf("enclosure-only intent error = %v", err)
+	}
+}
+
+func TestDownloadIntentRejectsDirectURLDisguisedAsResourceReference(t *testing.T) {
+	request := DownloadIntentRequest{
+		RequestID:        "request-direct-url",
+		Media:            MediaIdentity{MediaSource: "tmdb", MediaID: "123"},
+		Torrent:          TorrentResource{ResourceRef: "https://pt.example/download?id=1&passkey=secret"},
+		DownloaderPolicy: DownloaderPolicy{Mode: "moviepilot_select"},
+	}
+	if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "opaque") {
+		t.Fatalf("direct resource URL error = %v", err)
+	}
+}

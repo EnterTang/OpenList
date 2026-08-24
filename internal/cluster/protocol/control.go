@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"path"
 	"strings"
@@ -50,12 +49,15 @@ type MoviePilotRoute struct {
 }
 
 type StagingConfig struct {
-	Root                 string   `json:"root,omitempty"`
-	MaxUploadConcurrency int      `json:"max_upload_concurrency,omitempty"`
-	MaxFileBytes         int64    `json:"max_file_bytes,omitempty"`
-	ExtensionWhitelist   []string `json:"extension_whitelist,omitempty"`
-	AntiHashEnabled      bool     `json:"antihash_enabled"`
-	ISORenameEnabled     bool     `json:"iso_rename_enabled"`
+	Root                             string   `json:"root,omitempty"`
+	MaxUploadConcurrency             int      `json:"max_upload_concurrency,omitempty"`
+	MaxFileBytes                     int64    `json:"max_file_bytes,omitempty"`
+	SafetyReserveBytes               int64    `json:"safety_reserve_bytes,omitempty"`
+	PauseDownloadLowWatermarkBytes   int64    `json:"pause_download_low_watermark_bytes,omitempty"`
+	ResumeDownloadHighWatermarkBytes int64    `json:"resume_download_high_watermark_bytes,omitempty"`
+	ExtensionWhitelist               []string `json:"extension_whitelist,omitempty"`
+	AntiHashEnabled                  bool     `json:"antihash_enabled"`
+	ISORenameEnabled                 bool     `json:"iso_rename_enabled"`
 }
 
 const maxMoviePilotStagingFileBytes int64 = 150 * 1024 * 1024 * 1024
@@ -124,6 +126,17 @@ func (c WorkerDesiredConfig) Validate() error {
 	}
 	if c.Staging.MaxFileBytes < 0 || c.Staging.MaxFileBytes > maxMoviePilotStagingFileBytes {
 		return fmt.Errorf("MoviePilot staging max file size must not exceed %d bytes", maxMoviePilotStagingFileBytes)
+	}
+	if c.Staging.SafetyReserveBytes < 0 || c.Staging.PauseDownloadLowWatermarkBytes < 0 || c.Staging.ResumeDownloadHighWatermarkBytes < 0 {
+		return errors.New("MoviePilot staging capacity values must not be negative")
+	}
+	low := c.Staging.PauseDownloadLowWatermarkBytes
+	high := c.Staging.ResumeDownloadHighWatermarkBytes
+	if (low == 0) != (high == 0) {
+		return errors.New("MoviePilot staging pause and resume watermarks must be configured together")
+	}
+	if low > 0 && high < low {
+		return errors.New("MoviePilot staging resume watermark must not be below pause watermark")
 	}
 	if root := strings.TrimSpace(c.Staging.Root); root != "" {
 		if err := validateControlMountPath(root, "MoviePilot staging root"); err != nil {
@@ -213,16 +226,8 @@ func (c WorkerDesiredConfig) QBClient(id string) (QBClientConfig, bool) {
 
 func validateQBWebUIURL(raw string) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return errors.New("webui_url must be a local HTTP or HTTPS URL")
-	}
-	host := u.Hostname()
-	if strings.EqualFold(host, "localhost") {
-		return nil
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return errors.New("webui_url must point to a loopback address")
+	if err != nil || u.Opaque != "" || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("webui_url must be an HTTP or HTTPS URL without credentials, query, or fragment")
 	}
 	return nil
 }

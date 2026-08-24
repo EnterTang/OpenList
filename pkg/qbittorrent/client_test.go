@@ -5,10 +5,18 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 func TestGetFilesByHashUsesTheQBTorrentHash(t *testing.T) {
 	hash := strings.Repeat("c", 40)
@@ -137,5 +145,154 @@ func TestQBClientAcceptsContextCancellation(t *testing.T) {
 	_, err = client.GetFilesByHash(ctx, strings.Repeat("f", 40))
 	if err == nil {
 		t.Fatal("expected context cancellation error")
+	}
+}
+
+func TestNewDoesNotExposeCredentialsWhenLoginIsRejected(t *testing.T) {
+	webUIURL, err := url.Parse("https://alice:super-secret@qb.example")
+	if err != nil {
+		t.Fatalf("parse qB URL: %v", err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("create cookie jar: %v", err)
+	}
+	qb := &client{url: webUIURL, client: http.Client{Jar: jar, Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader("Fails.")), Header: make(http.Header)}, nil
+	})}}
+	err = qb.login()
+	if err == nil {
+		t.Fatal("rejected qB login unexpectedly succeeded")
+	}
+	for _, secret := range []string{"alice", "super-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("login error leaked %q: %v", secret, err)
+		}
+	}
+}
+
+func TestHashMethodsRejectQBAllSentinelWithoutSendingControl(t *testing.T) {
+	webUIURL, err := url.Parse("https://qb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	qb := &client{url: webUIURL, client: http.Client{Jar: jar, Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{StatusCode: http.StatusNoContent, Status: "204 No Content", Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})}}
+
+	if err := qb.DeleteByHash(context.Background(), "all", true); err == nil {
+		t.Fatal("qB all sentinel was accepted as an exact torrent hash")
+	}
+	if requests != 0 {
+		t.Fatalf("invalid hash sent %d qB request(s)", requests)
+	}
+}
+
+func TestGetTorrentByHashRejectsMismatchedQBResult(t *testing.T) {
+	requestedHash := strings.Repeat("a", 40)
+	otherHash := strings.Repeat("b", 40)
+	webUIURL, err := url.Parse("https://qb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qb := &client{url: webUIURL, client: http.Client{Jar: jar, Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := "5.2.0"
+		if request.URL.Path == "/api/v2/torrents/info" {
+			body = `[{"hash":"` + otherHash + `"}]`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+
+	if _, err := qb.GetTorrentByHash(context.Background(), requestedHash); err == nil {
+		t.Fatal("mismatched qB torrent result was accepted")
+	}
+}
+
+func TestControlByHashFallsBackToLegacyQBEndpoints(t *testing.T) {
+	webUIURL, err := url.Parse("https://qb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var controls []string
+	qb := &client{url: webUIURL, client: http.Client{Jar: jar, Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		body := "5.0.0"
+		if request.URL.Path != "/api/v2/app/version" {
+			controls = append(controls, request.URL.Path)
+			body = ""
+			if request.URL.Path == "/api/v2/torrents/start" || request.URL.Path == "/api/v2/torrents/stop" {
+				status = http.StatusNotFound
+			}
+		}
+		return &http.Response{StatusCode: status, Status: http.StatusText(status), Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+	hash := strings.Repeat("c", 40)
+
+	if err := qb.StopByHash(context.Background(), hash); err != nil {
+		t.Fatalf("legacy pause fallback: %v", err)
+	}
+	if err := qb.StartByHash(context.Background(), hash); err != nil {
+		t.Fatalf("legacy resume fallback: %v", err)
+	}
+	want := []string{
+		"/api/v2/torrents/stop", "/api/v2/torrents/pause",
+		"/api/v2/torrents/start", "/api/v2/torrents/resume",
+	}
+	if strings.Join(controls, ",") != strings.Join(want, ",") {
+		t.Fatalf("control endpoints = %#v, want %#v", controls, want)
+	}
+}
+
+func TestAddFromLinkAcceptsNoContentAndRejectsHTTPFailure(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		addStatus int
+		wantErr   bool
+	}{
+		{name: "qB 5.2 no-content success", addStatus: http.StatusNoContent},
+		{name: "qB rejects torrent", addStatus: http.StatusBadRequest, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			webUIURL, err := url.Parse("https://qb.example")
+			if err != nil {
+				t.Fatalf("parse qB URL: %v", err)
+			}
+			jar, err := cookiejar.New(nil)
+			if err != nil {
+				t.Fatalf("create cookie jar: %v", err)
+			}
+			qb := &client{url: webUIURL, client: http.Client{Jar: jar, Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				status := http.StatusOK
+				body := "5.2.0"
+				if request.URL.Path == "/api/v2/torrents/add" {
+					status = test.addStatus
+					body = ""
+				}
+				return &http.Response{StatusCode: status, Status: http.StatusText(status), Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			})}}
+
+			err = qb.AddFromLink("magnet:?xt=urn:btih:example", "/downloads", "job-1")
+
+			if test.wantErr && err == nil {
+				t.Fatal("qB add HTTP failure unexpectedly succeeded")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("qB add no-content response failed: %v", err)
+			}
+		})
 	}
 }

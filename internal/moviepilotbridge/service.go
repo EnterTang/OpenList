@@ -53,8 +53,9 @@ func (s *Service) eventHandler() EventHandler {
 	return s.handler
 }
 
-// StartEventProcessor runs the durable inbox retry loop. It is safe to call
-// more than once; only the first call starts a processor for this service.
+// StartEventProcessor runs the durable inbound-event and outbound-intent retry
+// loops. It is safe to call more than once; only the first call starts a
+// processor for this service.
 func (s *Service) StartEventProcessor(ctx context.Context) {
 	if s == nil {
 		return
@@ -66,11 +67,14 @@ func (s *Service) StartEventProcessor(ctx context.Context) {
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
+			_, _ = s.ProcessPendingOutbox(ctx, 20)
+			_, _ = s.ProcessPendingEvents(ctx, 20)
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					_, _ = s.ProcessPendingOutbox(ctx, 20)
 					_, _ = s.ProcessPendingEvents(ctx, 20)
 				}
 			}
@@ -120,6 +124,29 @@ func (s *Service) GetInstance(ctx context.Context, id string) (*model.MoviePilot
 	return &item, nil
 }
 
+func (s *Service) PauseTorrent(ctx context.Context, bridgeID, requestID, downloader, torrentHash, reason string) error {
+	return s.controlTorrent(ctx, bridgeID, requestID, downloader, torrentHash, "pause", reason)
+}
+
+func (s *Service) ResumeTorrent(ctx context.Context, bridgeID, requestID, downloader, torrentHash, reason string) error {
+	return s.controlTorrent(ctx, bridgeID, requestID, downloader, torrentHash, "resume", reason)
+}
+
+func (s *Service) controlTorrent(ctx context.Context, bridgeID, requestID, downloader, torrentHash, action, reason string) error {
+	if s == nil || s.database == nil {
+		return errors.New("moviepilot bridge database is required")
+	}
+	var bridge model.MoviePilotBridgeInstance
+	if err := s.database.WithContext(ctx).First(&bridge, "id = ? AND enabled = ?", strings.TrimSpace(bridgeID), true).Error; err != nil {
+		return err
+	}
+	client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
+	return client.ControlTorrent(ctx, bridge, TorrentControlRequest{
+		RequestID: strings.TrimSpace(requestID), Downloader: strings.TrimSpace(downloader),
+		TorrentHash: strings.ToLower(strings.TrimSpace(torrentHash)), Action: action, Reason: strings.TrimSpace(reason),
+	})
+}
+
 type InstanceUpsertRequest struct {
 	ID                string
 	Name              string
@@ -144,7 +171,7 @@ func (s *Service) UpsertInstance(ctx context.Context, req InstanceUpsertRequest)
 	if id == "" {
 		id = uuid.NewString()
 	}
-	now := time.Now().UTC()
+	now := s.nowUTC()
 	item := &model.MoviePilotBridgeInstance{}
 	err = s.database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing model.MoviePilotBridgeInstance
@@ -235,16 +262,37 @@ func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *mod
 	}
 	var outbox model.MoviePilotBridgeOutbox
 	lookup := s.database.WithContext(ctx).Where("bridge_id = ? AND request_id = ?", bridge.ID, intent.RequestID).Order("created_at DESC").First(&outbox).Error
-	if lookup == nil && outbox.Status == "sent" {
-		return nil
+	if lookup == nil {
+		if outbox.PayloadJSON != string(raw) {
+			return fmt.Errorf("request id %q already belongs to a different payload", intent.RequestID)
+		}
+		if outbox.Status == "sent" || outbox.Status == "sending" {
+			return nil
+		}
 	}
-	now := time.Now().UTC()
 	if lookup != nil && !errors.Is(lookup, gorm.ErrRecordNotFound) {
 		return lookup
 	}
+	now := s.nowUTC()
 	if errors.Is(lookup, gorm.ErrRecordNotFound) {
-		outbox = model.MoviePilotBridgeOutbox{
+		candidate := model.MoviePilotBridgeOutbox{
 			ID: uuid.NewString(), CreatedAt: now, BridgeID: bridge.ID, RequestID: intent.RequestID, EventID: uuid.NewString(),
+			UpdatedAt: now, PayloadJSON: string(raw), Status: "pending", AvailableAt: now,
+		}
+		if err := s.database.WithContext(ctx).Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "bridge_id"}, {Name: "request_id"}},
+			DoNothing: true,
+		}).Create(&candidate).Error; err != nil {
+			return err
+		}
+		if err := s.database.WithContext(ctx).Where("bridge_id = ? AND request_id = ?", bridge.ID, intent.RequestID).First(&outbox).Error; err != nil {
+			return err
+		}
+		if outbox.PayloadJSON != string(raw) {
+			return fmt.Errorf("request id %q already belongs to a different payload", intent.RequestID)
+		}
+		if outbox.Status == "sent" || outbox.Status == "sending" {
+			return nil
 		}
 	}
 	outbox.UpdatedAt = now
@@ -255,12 +303,123 @@ func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *mod
 	if err := s.database.WithContext(ctx).Save(&outbox).Error; err != nil {
 		return err
 	}
-	client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
-	if err := client.SubmitIntent(ctx, bridge, payload); err != nil {
-		_ = s.database.WithContext(ctx).Model(&outbox).Updates(map[string]interface{}{"status": "failed", "last_error": err.Error(), "attempt_count": gorm.Expr("attempt_count + 1")}).Error
+	claimed, err := s.claimOutbox(ctx, &outbox)
+	if err != nil || !claimed {
 		return err
 	}
-	return s.database.WithContext(ctx).Model(&outbox).Updates(map[string]interface{}{"status": "sent", "attempt_count": gorm.Expr("attempt_count + 1")}).Error
+	if err := s.sendOutbox(ctx, bridge, outbox); err != nil {
+		if updateErr := s.markOutboxFailed(ctx, outbox, err); updateErr != nil {
+			return errors.Join(err, updateErr)
+		}
+		return err
+	}
+	return s.markOutboxSent(ctx, outbox)
+}
+
+// ProcessPendingOutbox retries durable download intents in creation order.
+// Transport failures are persisted with exponential backoff and do not stop
+// later rows from being attempted.
+func (s *Service) ProcessPendingOutbox(ctx context.Context, limit int) (int, error) {
+	if s == nil || s.database == nil {
+		return 0, errors.New("moviepilot bridge database is required")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	now := s.nowUTC()
+	if err := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeOutbox{}).
+		Where("status = ? AND updated_at < ?", "sending", now.Add(-5*time.Minute)).
+		Updates(map[string]interface{}{"status": "failed", "last_error": "intent delivery lease expired", "available_at": now, "updated_at": now}).Error; err != nil {
+		return 0, err
+	}
+	var rows []model.MoviePilotBridgeOutbox
+	if err := s.database.WithContext(ctx).
+		Where("status IN ? AND available_at <= ?", []string{"pending", "failed"}, now).
+		Order("created_at ASC, id ASC").Limit(limit).Find(&rows).Error; err != nil {
+		return 0, err
+	}
+	processed := 0
+	for i := range rows {
+		claimed, err := s.claimOutbox(ctx, &rows[i])
+		if err != nil {
+			return processed, err
+		}
+		if !claimed {
+			continue
+		}
+		var bridge model.MoviePilotBridgeInstance
+		if err := s.database.WithContext(ctx).First(&bridge, "id = ? AND enabled = ?", rows[i].BridgeID, true).Error; err != nil {
+			if updateErr := s.markOutboxFailed(ctx, rows[i], err); updateErr != nil {
+				return processed, errors.Join(err, updateErr)
+			}
+			continue
+		}
+		if err := s.sendOutbox(ctx, bridge, rows[i]); err != nil {
+			if updateErr := s.markOutboxFailed(ctx, rows[i], err); updateErr != nil {
+				return processed, errors.Join(err, updateErr)
+			}
+			continue
+		}
+		if err := s.markOutboxSent(ctx, rows[i]); err != nil {
+			return processed, err
+		}
+		processed++
+	}
+	return processed, nil
+}
+
+func (s *Service) claimOutbox(ctx context.Context, outbox *model.MoviePilotBridgeOutbox) (bool, error) {
+	now := s.nowUTC()
+	result := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeOutbox{}).
+		Where("id = ? AND status IN ?", outbox.ID, []string{"pending", "failed"}).
+		Updates(map[string]interface{}{"status": "sending", "updated_at": now})
+	return result.RowsAffected == 1, result.Error
+}
+
+func (s *Service) sendOutbox(ctx context.Context, bridge model.MoviePilotBridgeInstance, outbox model.MoviePilotBridgeOutbox) error {
+	var payload DownloadIntentRequest
+	if err := json.Unmarshal([]byte(outbox.PayloadJSON), &payload); err != nil {
+		return fmt.Errorf("decode bridge intent outbox %s: %w", outbox.ID, err)
+	}
+	client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
+	return client.SubmitIntent(ctx, bridge, payload)
+}
+
+func (s *Service) markOutboxFailed(ctx context.Context, outbox model.MoviePilotBridgeOutbox, deliveryErr error) error {
+	now := s.nowUTC()
+	attempt := outbox.AttemptCount + 1
+	return s.database.WithContext(ctx).Model(&model.MoviePilotBridgeOutbox{}).Where("id = ? AND status = ?", outbox.ID, "sending").Updates(map[string]interface{}{
+		"status": "failed", "last_error": deliveryErr.Error(), "attempt_count": attempt,
+		"available_at": now.Add(moviePilotOutboxRetryDelay(attempt)), "updated_at": now,
+	}).Error
+}
+
+func (s *Service) markOutboxSent(ctx context.Context, outbox model.MoviePilotBridgeOutbox) error {
+	now := s.nowUTC()
+	return s.database.WithContext(ctx).Model(&model.MoviePilotBridgeOutbox{}).Where("id = ? AND status = ?", outbox.ID, "sending").Updates(map[string]interface{}{
+		"status": "sent", "last_error": "", "attempt_count": outbox.AttemptCount + 1, "updated_at": now,
+	}).Error
+}
+
+func moviePilotOutboxRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 7 {
+		attempt = 7
+	}
+	delay := 10 * time.Second * time.Duration(1<<(attempt-1))
+	if delay > 15*time.Minute {
+		return 15 * time.Minute
+	}
+	return delay
+}
+
+func (s *Service) nowUTC() time.Time {
+	if s != nil && s.now != nil {
+		return s.now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 type EventConsumeResult struct {
@@ -271,6 +430,9 @@ type EventConsumeResult struct {
 func (s *Service) ConsumeBridgeEvent(ctx context.Context, headers http.Header, method, path string, body []byte, event BridgeEvent) (EventConsumeResult, error) {
 	if s == nil || s.database == nil {
 		return EventConsumeResult{}, errors.New("moviepilot bridge database is required")
+	}
+	if err := validateNoForbiddenBridgeFields(body); err != nil {
+		return EventConsumeResult{}, err
 	}
 	if err := event.Validate(); err != nil {
 		return EventConsumeResult{}, err
@@ -285,10 +447,14 @@ func (s *Service) ConsumeBridgeEvent(ctx context.Context, headers http.Header, m
 		if err := insertNonce(tx, bridge.ID, signed.Nonce, signed.Timestamp, s.now()); err != nil {
 			return err
 		}
+		raw, marshalErr := json.Marshal(event)
+		if marshalErr != nil {
+			return marshalErr
+		}
 		var existing model.MoviePilotBridgeInbox
 		lookup := tx.First(&existing, "event_id = ?", event.EventID).Error
 		if lookup == nil {
-			if existing.BridgeID != bridge.ID || existing.RequestID != event.RequestID || existing.EventType != event.Type {
+			if existing.BridgeID != bridge.ID || existing.RequestID != event.RequestID || existing.EventType != event.Type || existing.PayloadJSON != string(raw) {
 				return errors.New("event id already belongs to a different Bridge event")
 			}
 			result.Duplicate = true
@@ -296,10 +462,6 @@ func (s *Service) ConsumeBridgeEvent(ctx context.Context, headers http.Header, m
 		}
 		if !errors.Is(lookup, gorm.ErrRecordNotFound) {
 			return lookup
-		}
-		raw, marshalErr := json.Marshal(event)
-		if marshalErr != nil {
-			return marshalErr
 		}
 		now := s.now()
 		inbox := &model.MoviePilotBridgeInbox{
@@ -330,6 +492,13 @@ func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, err
 	if limit <= 0 {
 		limit = 20
 	}
+	now := s.now()
+	processingLease := now.Add(-5 * time.Minute)
+	if err := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).
+		Where("status = ? AND updated_at < ?", "processing", processingLease).
+		Updates(map[string]interface{}{"status": "failed", "last_error": "event processing lease expired", "updated_at": now}).Error; err != nil {
+		return 0, err
+	}
 	var inboxes []model.MoviePilotBridgeInbox
 	if err := s.database.WithContext(ctx).
 		Where("status IN ?", []string{"received", "failed"}).
@@ -340,7 +509,7 @@ func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, err
 	for i := range inboxes {
 		claimed := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).
 			Where("event_id = ? AND status IN ?", inboxes[i].EventID, []string{"received", "failed"}).
-			Updates(map[string]interface{}{"status": "processing", "updated_at": s.now()})
+			Updates(map[string]interface{}{"status": "processing", "attempt_count": gorm.Expr("attempt_count + 1"), "updated_at": s.now()})
 		if claimed.Error != nil {
 			return processed, claimed.Error
 		}
@@ -349,16 +518,20 @@ func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, err
 		}
 		var event BridgeEvent
 		if err := json.Unmarshal([]byte(inboxes[i].PayloadJSON), &event); err != nil {
-			_ = s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).Where("event_id = ?", inboxes[i].EventID).Updates(map[string]interface{}{
-				"status": "failed", "attempt_count": gorm.Expr("attempt_count + 1"), "last_error": err.Error(), "updated_at": s.now(),
-			}).Error
+			if updateErr := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).Where("event_id = ?", inboxes[i].EventID).Updates(map[string]interface{}{
+				"status": "failed", "last_error": err.Error(), "updated_at": s.now(),
+			}).Error; updateErr != nil {
+				return processed, updateErr
+			}
 			continue
 		}
 		err := handler(ctx, inboxes[i].BridgeID, event)
 		if err != nil {
-			_ = s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).Where("event_id = ?", inboxes[i].EventID).Updates(map[string]interface{}{
-				"status": "failed", "attempt_count": gorm.Expr("attempt_count + 1"), "last_error": err.Error(), "updated_at": s.now(),
-			}).Error
+			if updateErr := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).Where("event_id = ?", inboxes[i].EventID).Updates(map[string]interface{}{
+				"status": "failed", "last_error": err.Error(), "updated_at": s.now(),
+			}).Error; updateErr != nil {
+				return processed, updateErr
+			}
 			continue
 		}
 		now := s.now()
@@ -378,7 +551,9 @@ func validateBridgeURL(raw string) (string, error) {
 	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("moviepilot bridge URL must use HTTPS")
 	}
-	u.User = nil
+	if u.User != nil {
+		return "", errors.New("moviepilot bridge URL must not contain userinfo")
+	}
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
@@ -461,6 +636,9 @@ func (v *Verifier) clock() time.Time {
 }
 
 func insertNonce(tx *gorm.DB, bridgeID, nonce string, signedAt, now time.Time) error {
+	if err := tx.Where("used_at < ?", now.Add(-BridgeNonceRetention)).Delete(&model.MoviePilotBridgeNonce{}).Error; err != nil {
+		return fmt.Errorf("prune expired bridge nonces: %w", err)
+	}
 	var existing model.MoviePilotBridgeNonce
 	err := tx.Where("bridge_id = ? AND nonce = ?", bridgeID, nonce).First(&existing).Error
 	if err == nil {

@@ -119,6 +119,9 @@ func Init(e *gin.Engine) {
 	externalSubscriptions(api.Group("/v1/subscriptions", middlewares.ExternalSubscriptionAuth))
 	moviePilotBridge := newMoviePilotBridgeService()
 	subscription.SetMoviePilotBridgeClient(moviePilotBridge)
+	if service := cluster.CoordinatorService(); service != nil {
+		service.SetMoviePilotTorrentController(moviePilotBridge)
+	}
 	moviePilotBridge.SetEventHandler(func(ctx context.Context, bridgeID string, event moviepilotbridge.BridgeEvent) error {
 		service := cluster.CoordinatorService()
 		if service == nil {

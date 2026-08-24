@@ -6,7 +6,22 @@
 
 **Architecture:** MoviePilot Bridge 是独立 MoviePilot V3 插件，负责资源搜索、下载器选择、request_id 到 downloader 到 torrent_hash 的可靠绑定和签名回调。Coordinator 保存 intent、torrent 和文件子任务，按 downloader 严格绑定唯一 Worker；Worker 使用本机 qB WebUI，以 hash 读取并复制文件到 staging，再复用既有 139 上传 manifest 和 ETF materializer。
 
-**Tech Stack:** Go、Gin、GORM、Redis Streams、qBittorrent WebUI API 5.0、MoviePilot V3 Plugin SDK、Python 3.12、pytest、HTTPS、HMAC-SHA256。
+**Tech Stack:** Go、Gin、GORM、Redis Streams、qBittorrent WebUI API 5.0、MoviePilot V3 Plugin SDK、Python 3.12 `unittest`、HTTPS、HMAC-SHA256。
+
+## 当前实施状态（2026-08-24）
+
+下方复选框保留为最初的 test-first 执行记录，不再作为实时完成度判断。当前代码状态如下；协议与部署字段以 [Bridge V1 契约](../../integrations/moviepilot-openlist-bridge-v1.md)、[运行说明](../../operations/moviepilot-qb-pt-transfer.md) 和同目录设计文档为准。
+
+| 范围 | 状态 | 说明 |
+|---|---|---|
+| Task 1～4：契约、持久化、HMAC、订阅搜索与 intent | 已完成 | 已覆盖 opaque resource、payload 幂等、nonce/inbox/outbox 和资源绑定 |
+| Task 5～6：Worker qB 路由、路径映射、staging | 已完成 | 支持容器/私网 WebUI、加密凭据、严格 affinity、150 GiB、并发 2、源文件不变 |
+| Task 7：多集 delivery、进度、manifest、ETF | 已完成 | 每文件 delivery；ETF 仍由 Coordinator 现有 materializer 写入 |
+| Task 8：保种、容量、离线保护 | 已完成 | 时间/分享率/H&R 人工复核/延长/永久保种；Worker 与 Bridge 双层暂停 |
+| Task 9：MoviePilot V3 插件 | 代码与自动测试完成 | 已实现 V3 host、精确 hash、request label 恢复、签名 outbox；仍需目标 MoviePilot 实例实机验收 |
+| Task 10：自动验收与运行手册 | 已完成 | Go/Python 定向、竞态和静态验证覆盖；真实 PT/qB/139 联调属于上线环境验收门禁 |
+
+最初计划中的建议文件拆分在实现时按现有代码边界合并，例如保种编排位于 `internal/cluster/coordinator/torrent_transfer.go`，Worker 离线/容量状态位于现有 service 与 registry 文件。该差异不改变冻结架构。
 
 ## Global Constraints
 
@@ -39,13 +54,11 @@
 | pkg/qbittorrent/client.go | hash 原生 qB 查询、文件、暂停、恢复、删除 |
 | internal/cluster/worker/qb.go | qB 文件发现、路径验证、容量观测 |
 | internal/cluster/worker/qb_staging.go | 原子 staging copy 和清理 |
-| internal/cluster/worker/qb_watchdog.go | Worker lease 失联保护 |
-| internal/cluster/coordinator/torrent_transfer.go | torrent 父子任务与严格派发 |
-| internal/cluster/coordinator/torrent_retention.go | 保种评估与 qB 删除 |
+| internal/cluster/worker/moviepilot_registry.go | Worker 受管 torrent 注册表、离线与容量暂停保护 |
+| internal/cluster/coordinator/torrent_transfer.go | torrent 父子任务、严格派发、保种评估与 qB 删除 |
 | docs/operations/moviepilot-qb-pt-transfer.md | 部署、轮换、容量、恢复与上线检查 |
-| <MoviePilot-Plugins>/plugins.v3/openlistbridge/ | MoviePilot V3 Bridge 源码 |
-| <MoviePilot-Plugins>/tests/v3/openlistbridge/test_plugin.py | Bridge 插件测试 |
-| <MoviePilot-Plugins>/package.v3.json | 插件索引与版本 |
+| plugins.v3/openlistbridge/ | MoviePilot V3 Bridge 源码与部署说明 |
+| plugins.v3/openlistbridge/tests/ | Bridge 插件 `unittest` 测试 |
 
 ## Task 1: 冻结 V1 Bridge 契约
 
@@ -261,7 +274,7 @@ func TestWorkerDesiredConfigRejectsRouteWithoutPathMapping(t *testing.T) {
 
 - [ ] **Step 2: Run go test ./internal/cluster/protocol ./internal/cluster/worker -run TestWorkerDesiredConfigRejectsRouteWithoutPathMapping -count=1. Expected: qB config types do not exist.**
 
-- [ ] **Step 3: Implement config validation.** Require unique IDs, loopback HTTP or HTTPS WebUI URL, local secret reference, absolute non-root Worker paths, longest-prefix mappings, upload concurrency from 1 through 2, and maximum file size at most 150 GiB.
+- [ ] **Step 3: Implement config validation.** Require unique IDs, Worker-reachable HTTP/HTTPS WebUI URL without userinfo/query/fragment, encrypted Worker secret reference, absolute non-root Worker paths, longest-prefix mappings, upload concurrency from 1 through 2, and maximum file size at most 150 GiB.
 
 - [ ] **Step 4: Extend inventory without secrets.** Report bridge/downloader/qB-client tuple, root labels, free and active staging bytes, upload slots, qB health, and qb.copy. Exclude URL, credentials and local filesystem paths.
 

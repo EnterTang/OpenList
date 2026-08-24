@@ -6,7 +6,7 @@ The Bridge plugin is the control-plane adapter between OpenList and MoviePilot. 
 
 ## Intent
 
-Coordinator sends a signed `DownloadIntentRequest` to the plugin. The request must include `request_id`, complete `media_source` plus `media_id`, and `downloader_policy.mode = moviepilot_select`. The torrent may be represented by an opaque `resource_ref`; tracker cookies stay inside MoviePilot.
+Coordinator sends a signed `DownloadIntentRequest` to the plugin. The request must include `request_id`, complete `media_source` plus `media_id`, `downloader_policy.mode = moviepilot_select`, and the opaque `resource_ref` returned by Bridge search. Download enclosures, passkeys, tracker cookies, and direct torrent URLs are forbidden in this contract and stay inside MoviePilot.
 
 ## Events
 
@@ -28,15 +28,25 @@ callbacks must use HTTPS; a trusted reverse proxy may forward
 ## V1 endpoints
 
 Coordinator posts the selected-resource intent to the configured Bridge base
-URL at `/api/v1/openlist/intent`. The Bridge posts events to Coordinator at
+URL at `/api/v1/plugin/OpenListBridge/intent`. The Bridge posts events to Coordinator at
 `/api/v1/cluster/moviepilot/events`. Both sides sign the exact raw JSON body;
 `request_id` is also sent as `X-OpenList-Request-ID` for idempotent retries.
 
 Subscription resource search uses the Bridge base URL at
-`/api/v1/openlist/search`. Search results contain only an opaque
+`/api/v1/plugin/OpenListBridge/search`. Intent status and pre-download
+cancellation use `/api/v1/plugin/OpenListBridge/intent/{request_id}` and
+`/api/v1/plugin/OpenListBridge/intent/{request_id}/cancel`. Exact pause/resume
+control uses `/api/v1/plugin/OpenListBridge/control`; the request must match the
+persisted request ID, downloader, and torrent hash. Search results contain only an opaque
 `resource_ref`, title, site label, size, and seed/leech metadata. Binding a
 result stores that opaque reference in `BoundTorrent`; OpenList does not ask
 MoviePilot to create a subscription.
+
+The Bridge persists intents, exact torrent bindings, replay nonces, and an
+ordered callback outbox in SQLite. Reusing a `request_id` with a different
+payload or changing an established downloader/hash/path binding is rejected.
+Callback retries use bounded exponential backoff and never allow
+`torrent.bound` to overtake `intent.accepted`.
 
 Bridge secrets are stored through the existing encrypted `ClusterSecret`
 store with kind `moviepilot_bridge_hmac`. API responses expose only the
@@ -44,4 +54,4 @@ configured flag and secret fingerprint, never the key.
 
 ## Compatibility
 
-Unknown JSON fields must be ignored for forward compatibility. The plugin must not expose site cookies, qB passwords, qB URLs, or host filesystem paths in search results, events, logs, or UI responses.
+Unknown JSON fields must be ignored for forward compatibility. The plugin must not expose site cookies, qB passwords, qB URLs, download enclosures, or arbitrary host filesystem paths in search results, logs, or UI responses. The sole path exception is the absolute qB `content_path` in `torrent.bound`; it is required to bind the selected qB task and is never returned to an OpenList end user.

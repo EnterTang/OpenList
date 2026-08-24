@@ -481,7 +481,7 @@ func (r *Runtime) startWorkerLocked() error {
 	workerService.ConfigureControlPlane(nodeID, keyPair, nil)
 	r.workerService = workerService
 	clusterworker.SetDefaultService(workerService)
-	r.workerBackground.Add(4)
+	r.workerBackground.Add(5)
 	go func(ctx context.Context, client *transport.WorkerClient) {
 		defer r.workerBackground.Done()
 		if err := client.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -501,6 +501,12 @@ func (r *Runtime) startWorkerLocked() error {
 		runWorkerInventoryRefreshLoop(workerCtx, func(ctx context.Context) error {
 			return reportWorkerInventory(ctx, nodeID, workerService, queue)
 		})
+	}()
+	go func() {
+		defer r.workerBackground.Done()
+		if err := workerService.RunMoviePilotStagingCapacityMonitor(workerCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Errorf("cluster MoviePilot staging capacity monitor stopped: %v", err)
+		}
 	}()
 	return nil
 }
@@ -683,6 +689,9 @@ func (r *Runtime) runManifestProcessor(ctx context.Context) {
 }
 
 func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coordinator.Service) {
+	if _, err := service.ReconcileWorkerOfflineTorrentControl(ctx, 100); err != nil {
+		log.Errorf("reconcile MoviePilot torrents for Worker availability: %v", err)
+	}
 	if _, err := subscription.ReconcileActiveSubscriptionExecutions(ctx, 100); err != nil {
 		log.Errorf("reconcile active subscription executions: %v", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/shirou/gopsutil/v4/disk"
 )
 
@@ -81,14 +82,24 @@ func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory
 	s.mu.Lock()
 	config := cloneDesiredConfig(s.desiredConfig)
 	active := make(map[string]int)
+	activeBytes := make(map[string]int64)
 	for _, task := range s.active {
-		if task == nil || task.offer.TaskContext.Torrent == nil {
+		if task == nil || task.offer.JobType != model.ClusterJobTypeMediaTransfer || task.offer.TaskContext.Torrent == nil {
 			continue
 		}
 		key := strings.TrimSpace(task.offer.TaskContext.Torrent.QBClientID)
 		if key != "" {
 			active[key]++
+			for _, source := range task.offer.TaskContext.SourceObjects {
+				if source.Size > 0 {
+					activeBytes[key] += source.Size
+				}
+			}
 		}
+	}
+	health := make(map[string]string, len(s.qbHealth))
+	for key, value := range s.qbHealth {
+		health[key] = value
 	}
 	s.mu.Unlock()
 
@@ -104,14 +115,15 @@ func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory
 	result := make([]protocol.MoviePilotRouteInventory, 0, len(config.MoviePilotRoutes))
 	for _, route := range config.MoviePilotRoutes {
 		result = append(result, protocol.MoviePilotRouteInventory{
-			BridgeInstanceID:  strings.TrimSpace(route.BridgeInstanceID),
-			Downloader:        strings.TrimSpace(route.Downloader),
-			QBClientID:        strings.TrimSpace(route.QBClientID),
-			StagingRootLabel:  "moviepilot-staging",
-			StagingFreeBytes:  freeBytes,
-			ActiveUploadSlots: active[strings.TrimSpace(route.QBClientID)],
-			UploadConcurrency: moviePilotUploadConcurrency(config.Staging),
-			QBHealth:          "configured",
+			BridgeInstanceID:   strings.TrimSpace(route.BridgeInstanceID),
+			Downloader:         strings.TrimSpace(route.Downloader),
+			QBClientID:         strings.TrimSpace(route.QBClientID),
+			StagingRootLabel:   "moviepilot-staging",
+			StagingFreeBytes:   freeBytes,
+			ActiveStagingBytes: activeBytes[strings.TrimSpace(route.QBClientID)],
+			ActiveUploadSlots:  active[strings.TrimSpace(route.QBClientID)],
+			UploadConcurrency:  moviePilotUploadConcurrency(config.Staging),
+			QBHealth:           firstNonEmpty(health[strings.TrimSpace(route.QBClientID)], "unknown"),
 		})
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -121,6 +133,15 @@ func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory
 		return result[i].Downloader < result[j].Downloader
 	})
 	return result
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func clampUint64ToInt64(value uint64) int64 {

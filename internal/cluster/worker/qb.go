@@ -29,24 +29,26 @@ type QBFile struct {
 	Progress     float32 `json:"progress"`
 }
 
-func newWorkerQBClient(config protocol.QBClientConfig) (qbittorrent.Client, error) {
-	// qB authentication is intentionally kept behind the Worker-local factory.
-	// The control-plane contract carries only a secret reference; deployments
-	// that require WebUI authentication can replace this factory with their
-	// local credential resolver without exposing credentials to Coordinator.
-	return qbittorrent.New(config.WebUIURL)
-}
-
 func newWorkerQBClientWithSecret(config protocol.QBClientConfig, parameters map[string]any) (qbittorrent.Client, error) {
-	username, _ := firstQBSecretString(parameters, "username", "user")
-	password, _ := firstQBSecretString(parameters, "password", "pass")
-	endpoint, err := url.Parse(strings.TrimSpace(config.WebUIURL))
+	webUIURL, err := workerQBWebUIURLWithSecret(config, parameters)
 	if err != nil {
 		return nil, err
 	}
+	return qbittorrent.New(webUIURL)
+}
+
+func workerQBWebUIURLWithSecret(config protocol.QBClientConfig, parameters map[string]any) (string, error) {
+	username, hasUsername := firstQBSecretString(parameters, "username", "user")
+	password, hasPassword := firstQBSecretString(parameters, "password", "pass")
+	if !hasUsername || !hasPassword {
+		return "", errors.New("qB username and password are required")
+	}
+	endpoint, err := url.Parse(strings.TrimSpace(config.WebUIURL))
+	if err != nil {
+		return "", err
+	}
 	endpoint.User = url.UserPassword(username, password)
-	config.WebUIURL = endpoint.String()
-	return qbittorrent.New(config.WebUIURL)
+	return endpoint.String(), nil
 }
 
 func firstQBSecretString(values map[string]any, keys ...string) (string, bool) {
@@ -76,20 +78,68 @@ func (s *Service) discoverTorrentClient(torrent *protocol.TorrentTaskContext) (p
 	secret := s.qbSecrets[strings.TrimSpace(clientConfig.ID)]
 	s.mu.Unlock()
 	if factory == nil {
-		if secret != nil {
-			client, err := newWorkerQBClientWithSecret(clientConfig, secret)
-			if err != nil {
-				return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("create qB client %q: %w", clientConfig.ID, err)
-			}
-			return clientConfig, client, staging, nil
+		if secret == nil {
+			s.recordQBHealth(clientConfig.ID, "unhealthy")
+			return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("qB client %q credentials are unavailable", clientConfig.ID)
 		}
-		factory = newWorkerQBClient
+		client, err := newWorkerQBClientWithSecret(clientConfig, secret)
+		if err != nil {
+			s.recordQBHealth(clientConfig.ID, "unhealthy")
+			return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("create qB client %q: %w", clientConfig.ID, err)
+		}
+		s.recordQBHealth(clientConfig.ID, "healthy")
+		return clientConfig, client, staging, nil
 	}
 	client, err := factory(clientConfig)
 	if err != nil {
+		s.recordQBHealth(clientConfig.ID, "unhealthy")
 		return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("create qB client %q: %w", clientConfig.ID, err)
 	}
+	s.recordQBHealth(clientConfig.ID, "healthy")
 	return clientConfig, client, staging, nil
+}
+
+func (s *Service) recordQBHealth(clientID, health string) {
+	if s == nil || strings.TrimSpace(clientID) == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.qbHealth == nil {
+		s.qbHealth = make(map[string]string)
+	}
+	s.qbHealth[strings.TrimSpace(clientID)] = strings.TrimSpace(health)
+	s.mu.Unlock()
+}
+
+// probeMoviePilotQBClients records actual WebUI authentication/connectivity
+// after desired config and encrypted credentials have been applied.
+func (s *Service) probeMoviePilotQBClients() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	clients := append([]protocol.QBClientConfig(nil), s.desiredConfig.QBClients...)
+	factory := s.qbClientFactory
+	secrets := make(map[string]map[string]any, len(s.qbSecrets))
+	for id, values := range s.qbSecrets {
+		secrets[id] = values
+	}
+	s.mu.Unlock()
+	for _, config := range clients {
+		var err error
+		if factory != nil {
+			_, err = factory(config)
+		} else if secret := secrets[strings.TrimSpace(config.ID)]; secret != nil {
+			_, err = newWorkerQBClientWithSecret(config, secret)
+		} else {
+			err = errors.New("qB credentials are unavailable")
+		}
+		health := "healthy"
+		if err != nil {
+			health = "unhealthy"
+		}
+		s.recordQBHealth(config.ID, health)
+	}
 }
 
 // DiscoverTorrentFiles observes qB by its native torrent hash and resolves

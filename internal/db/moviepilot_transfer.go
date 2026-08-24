@@ -28,7 +28,14 @@ func CreateIntentTx(ctx context.Context, database *gorm.DB, intent *model.MovieP
 		var existing model.MoviePilotDownloadIntent
 		err := tx.Where("request_id = ?", intent.RequestID).First(&existing).Error
 		if err == nil {
-			if existing.BridgeInstanceID != intent.BridgeInstanceID || existing.ResourceRef != intent.ResourceRef || existing.TorrentFingerprint != intent.TorrentFingerprint {
+			if existing.BridgeInstanceID != intent.BridgeInstanceID ||
+				existing.SubscriptionID != intent.SubscriptionID ||
+				existing.SubscriptionItemID != intent.SubscriptionItemID ||
+				existing.MediaSource != intent.MediaSource ||
+				existing.MediaID != intent.MediaID ||
+				existing.ResourceRef != intent.ResourceRef ||
+				existing.TorrentFingerprint != intent.TorrentFingerprint ||
+				existing.RetentionPolicyJSON != intent.RetentionPolicyJSON {
 				return fmt.Errorf("request id %q already belongs to a different intent", intent.RequestID)
 			}
 			intent.ID = existing.ID
@@ -65,11 +72,16 @@ func BindTorrentTx(ctx context.Context, database *gorm.DB, intent *model.MoviePi
 		var existing model.MoviePilotTorrentBinding
 		byIntentErr := tx.Where("intent_id = ?", lockedIntent.ID).First(&existing).Error
 		if byIntentErr == nil {
-			if existing.TorrentHash != torrentHash {
-				return fmt.Errorf("request id %q is already bound to a different torrent hash", lockedIntent.RequestID)
-			}
-			if existing.WorkerNodeID != workerID {
+			if existing.TorrentHash == torrentHash && existing.WorkerNodeID != strings.TrimSpace(workerID) {
 				return fmt.Errorf("torrent hash is already bound to %s", existing.WorkerNodeID)
+			}
+			if existing.BridgeInstanceID != strings.TrimSpace(bridgeID) ||
+				existing.DownloaderAlias != strings.TrimSpace(downloader) ||
+				existing.WorkerNodeID != strings.TrimSpace(workerID) ||
+				existing.QBClientID != strings.TrimSpace(qbClientID) ||
+				existing.TorrentHash != torrentHash ||
+				existing.ContentPath != strings.TrimSpace(contentPath) {
+				return fmt.Errorf("request id %q already has a different immutable torrent binding", lockedIntent.RequestID)
 			}
 			*binding = existing
 			return nil
@@ -78,7 +90,7 @@ func BindTorrentTx(ctx context.Context, database *gorm.DB, intent *model.MoviePi
 			return byIntentErr
 		}
 		var byHash model.MoviePilotTorrentBinding
-		byHashErr := tx.Where("torrent_hash = ?", torrentHash).First(&byHash).Error
+		byHashErr := tx.Where("bridge_instance_id = ? AND torrent_hash = ?", strings.TrimSpace(bridgeID), torrentHash).First(&byHash).Error
 		if byHashErr == nil {
 			return fmt.Errorf("torrent hash is already bound to %s", byHash.WorkerNodeID)
 		}
@@ -110,6 +122,32 @@ func BindTorrentTx(ctx context.Context, database *gorm.DB, intent *model.MoviePi
 		return nil, err
 	}
 	return binding, nil
+}
+
+// NormalizeMoviePilotTorrentBindingIndex removes the pre-release global hash
+// uniqueness constraint. qB torrent hashes are unique within one MoviePilot
+// instance, but the same public torrent may legitimately be present in two
+// independent instances.
+func NormalizeMoviePilotTorrentBindingIndex(database *gorm.DB) error {
+	if database == nil {
+		return errors.New("database is required")
+	}
+	if !database.Migrator().HasTable(&model.MoviePilotTorrentBinding{}) {
+		return nil
+	}
+	const legacyIndex = "idx_moviepilot_torrent_hash"
+	if database.Migrator().HasIndex(&model.MoviePilotTorrentBinding{}, legacyIndex) {
+		if err := database.Migrator().DropIndex(&model.MoviePilotTorrentBinding{}, legacyIndex); err != nil {
+			return fmt.Errorf("drop legacy MoviePilot torrent hash index: %w", err)
+		}
+	}
+	const scopedIndex = "idx_moviepilot_bridge_torrent_hash"
+	if !database.Migrator().HasIndex(&model.MoviePilotTorrentBinding{}, scopedIndex) {
+		if err := database.Migrator().CreateIndex(&model.MoviePilotTorrentBinding{}, scopedIndex); err != nil {
+			return fmt.Errorf("create scoped MoviePilot torrent hash index: %w", err)
+		}
+	}
+	return nil
 }
 
 func ListRetentionCandidates(ctx context.Context, database *gorm.DB, now time.Time, limit int) ([]model.MoviePilotTorrentBinding, error) {
@@ -160,6 +198,7 @@ func ListMoviePilotProgressBySubscriptionIDs(subscriptionIDs []uint) (map[uint]m
 	}
 	bindingIDs := make([]string, 0, len(bindings))
 	seenSubscription := make(map[uint]struct{}, len(bindings))
+	selectedBinding := make(map[uint]string, len(bindings))
 	for _, binding := range bindings {
 		subscriptionID := intentSubscription[binding.IntentID]
 		if subscriptionID == 0 {
@@ -169,6 +208,7 @@ func ListMoviePilotProgressBySubscriptionIDs(subscriptionIDs []uint) (map[uint]m
 			continue
 		}
 		seenSubscription[subscriptionID] = struct{}{}
+		selectedBinding[subscriptionID] = binding.ID
 		result[subscriptionID] = model.MoviePilotProgressSnapshot{TorrentStatus: binding.Status, DownloadProgress: binding.LastQBProgress, SeedElapsed: binding.LastQBSeedingSeconds, RetentionStatus: binding.RetentionStatus}
 		bindingIDs = append(bindingIDs, binding.ID)
 	}
@@ -195,6 +235,9 @@ func ListMoviePilotProgressBySubscriptionIDs(subscriptionIDs []uint) (map[uint]m
 	for _, binding := range bindings {
 		subscriptionID := intentSubscription[binding.IntentID]
 		if subscriptionID == 0 {
+			continue
+		}
+		if selectedBinding[subscriptionID] != binding.ID {
 			continue
 		}
 		current, ok := result[subscriptionID]

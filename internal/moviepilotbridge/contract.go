@@ -2,12 +2,48 @@ package moviepilotbridge
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
 	"strings"
 	"time"
 )
+
+var forbiddenBridgeFieldNames = map[string]struct{}{
+	"site_cookie": {}, "qb_password": {}, "qb_url": {}, "local_path": {}, "enclosure": {},
+}
+
+func validateNoForbiddenBridgeFields(body []byte) error {
+	var payload any
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return fmt.Errorf("decode bridge payload for secret-field validation: %w", err)
+	}
+	var walk func(any) error
+	walk = func(value any) error {
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				if _, forbidden := forbiddenBridgeFieldNames[strings.ToLower(strings.TrimSpace(key))]; forbidden {
+					return fmt.Errorf("bridge payload contains forbidden field %q", key)
+				}
+				if err := walk(child); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				if err := walk(child); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(payload)
+}
 
 const (
 	EventIntentAccepted      = "intent.accepted"
@@ -16,7 +52,8 @@ const (
 	EventTorrentFailed       = "torrent.failed"
 	EventBridgeHealthChanged = "bridge.health_changed"
 
-	BridgeSearchPath = "/api/v1/openlist/search"
+	BridgeSearchPath  = "/api/v1/plugin/OpenListBridge/search"
+	BridgeControlPath = "/api/v1/plugin/OpenListBridge/control"
 )
 
 type ResourceSearchRequest struct {
@@ -73,6 +110,28 @@ type TorrentResource struct {
 type DownloaderPolicy struct {
 	Mode    string   `json:"mode"`
 	Allowed []string `json:"allowed,omitempty"`
+}
+
+type TorrentControlRequest struct {
+	RequestID   string `json:"request_id"`
+	Downloader  string `json:"downloader"`
+	TorrentHash string `json:"torrent_hash"`
+	Action      string `json:"action"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+func (r TorrentControlRequest) Validate() error {
+	if strings.TrimSpace(r.RequestID) == "" || strings.TrimSpace(r.Downloader) == "" {
+		return errors.New("request_id and downloader are required")
+	}
+	if err := validateTorrentHash(r.TorrentHash); err != nil {
+		return fmt.Errorf("torrent_hash: %w", err)
+	}
+	action := strings.ToLower(strings.TrimSpace(r.Action))
+	if action != "pause" && action != "resume" {
+		return errors.New("torrent control action must be pause or resume")
+	}
+	return nil
 }
 
 type BridgeEvent struct {
@@ -162,11 +221,26 @@ func (r DownloadIntentRequest) Validate() error {
 	if strings.TrimSpace(r.DownloaderPolicy.Mode) != "moviepilot_select" {
 		return errors.New("downloader policy mode must be moviepilot_select")
 	}
-	if strings.TrimSpace(r.Torrent.ResourceRef) == "" && strings.TrimSpace(r.Torrent.Enclosure) == "" {
-		return errors.New("torrent resource_ref or enclosure is required")
+	if strings.TrimSpace(r.Torrent.Enclosure) != "" {
+		return errors.New("torrent enclosure is forbidden; use the opaque resource_ref returned by MoviePilot search")
+	}
+	if err := validateOpaqueResourceRef(r.Torrent.ResourceRef); err != nil {
+		return err
 	}
 	if r.Torrent.Size < 0 {
 		return errors.New("torrent size must not be negative")
+	}
+	return nil
+}
+
+func validateOpaqueResourceRef(value string) error {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	if value == "" {
+		return errors.New("torrent resource_ref is required")
+	}
+	if len(value) > 2048 || strings.Contains(value, "://") || strings.HasPrefix(lower, "magnet:") || strings.ContainsAny(value, "\r\n\x00") {
+		return errors.New("torrent resource_ref must be an opaque Bridge reference, not a download URL")
 	}
 	return nil
 }

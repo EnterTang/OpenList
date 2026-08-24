@@ -89,14 +89,15 @@ type NodeCapabilities struct {
 // for a qB client. It deliberately contains no URL, credential reference, or
 // worker-local filesystem path.
 type MoviePilotRouteInventory struct {
-	BridgeInstanceID  string `json:"bridge_instance_id"`
-	Downloader        string `json:"downloader"`
-	QBClientID        string `json:"qb_client_id"`
-	StagingRootLabel  string `json:"staging_root_label,omitempty"`
-	StagingFreeBytes  int64  `json:"staging_free_bytes,omitempty"`
-	ActiveUploadSlots int    `json:"active_upload_slots"`
-	UploadConcurrency int    `json:"upload_concurrency"`
-	QBHealth          string `json:"qb_health"`
+	BridgeInstanceID   string `json:"bridge_instance_id"`
+	Downloader         string `json:"downloader"`
+	QBClientID         string `json:"qb_client_id"`
+	StagingRootLabel   string `json:"staging_root_label,omitempty"`
+	StagingFreeBytes   int64  `json:"staging_free_bytes,omitempty"`
+	ActiveStagingBytes int64  `json:"active_staging_bytes,omitempty"`
+	ActiveUploadSlots  int    `json:"active_upload_slots"`
+	UploadConcurrency  int    `json:"upload_concurrency"`
+	QBHealth           string `json:"qb_health"`
 }
 
 type MountInventory struct {

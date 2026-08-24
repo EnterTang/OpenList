@@ -71,7 +71,7 @@ func TestSubmitIntentPersistsOutboxBeforeSendingSignedBody(t *testing.T) {
 	if outboxCount != 1 {
 		t.Fatalf("outbox count = %d, want one idempotent row", outboxCount)
 	}
-	if got, want := httpClient.request.URL.String(), "https://moviepilot.example/base/api/v1/openlist/intent"; got != want {
+	if got, want := httpClient.request.URL.String(), "https://moviepilot.example/base/api/v1/plugin/OpenListBridge/intent"; got != want {
 		t.Fatalf("bridge URL = %q, want %q", got, want)
 	}
 	if got := httpClient.request.Header.Get("X-OpenList-Request-ID"); got != payload.RequestID {
@@ -97,6 +97,38 @@ func TestSubmitIntentPersistsOutboxBeforeSendingSignedBody(t *testing.T) {
 	}
 }
 
+func TestSubmitIntentRejectsRequestIDReuseWithDifferentPayload(t *testing.T) {
+	database := newBridgeClientDatabase(t)
+	bridge := model.MoviePilotBridgeInstance{
+		ID: "mp-payload-idempotency", Name: "payload", BaseURL: "https://moviepilot.example",
+		SecretRef: "secret", Enabled: true,
+	}
+	if err := database.Create(&bridge).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(database, func(context.Context, string) ([]byte, error) {
+		return []byte("client-signing-key-that-is-long-enough"), nil
+	}, &captureBridgeHTTPClient{})
+	intent := &model.MoviePilotDownloadIntent{
+		ID: "intent-payload-idempotency", RequestID: "request-payload-idempotency",
+		BridgeInstanceID: bridge.ID, MediaSource: "tmdb", MediaID: "123",
+		ResourceRef: "resource-1", TorrentFingerprint: "fingerprint-1",
+	}
+	payload := DownloadIntentRequest{
+		RequestID:        intent.RequestID,
+		Media:            MediaIdentity{MediaSource: "tmdb", MediaID: "123"},
+		Torrent:          TorrentResource{ResourceRef: intent.ResourceRef, SelectedFingerprint: intent.TorrentFingerprint, Title: "first title"},
+		DownloaderPolicy: DownloaderPolicy{Mode: "moviepilot_select"},
+	}
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, payload); err != nil {
+		t.Fatal(err)
+	}
+	payload.Torrent.Title = "different title"
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, payload); err == nil || !strings.Contains(err.Error(), "different payload") {
+		t.Fatalf("request ID payload reuse error = %v", err)
+	}
+}
+
 func TestClientRejectsNonHTTPSBridgeURL(t *testing.T) {
 	client := &Client{HTTPClient: &captureBridgeHTTPClient{}, Resolve: func(context.Context, string) ([]byte, error) {
 		return []byte("key"), nil
@@ -106,6 +138,47 @@ func TestClientRejectsNonHTTPSBridgeURL(t *testing.T) {
 	}, DownloadIntentRequest{RequestID: "request", Media: MediaIdentity{MediaSource: "tmdb", MediaID: "1"}, Torrent: TorrentResource{ResourceRef: "r"}, DownloaderPolicy: DownloaderPolicy{Mode: "moviepilot_select"}})
 	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
 		t.Fatalf("non-HTTPS error = %v", err)
+	}
+}
+
+func TestClientRejectsBridgeURLUserInfo(t *testing.T) {
+	client := &Client{HTTPClient: &captureBridgeHTTPClient{}, Resolve: func(context.Context, string) ([]byte, error) {
+		return []byte("key-that-is-long-enough"), nil
+	}}
+	err := client.ControlTorrent(context.Background(), model.MoviePilotBridgeInstance{
+		ID: "mp", BaseURL: "https://admin:secret@moviepilot.example", SecretRef: "secret",
+	}, TorrentControlRequest{RequestID: "request", Downloader: "qb", TorrentHash: strings.Repeat("a", 40), Action: "pause"})
+	if err == nil || !strings.Contains(err.Error(), "userinfo") {
+		t.Fatalf("bridge URL userinfo error = %v", err)
+	}
+}
+
+func TestClientSendsSignedExactTorrentControl(t *testing.T) {
+	httpClient := &captureBridgeHTTPClient{}
+	key := []byte("client-signing-key-that-is-long-enough")
+	now := time.Unix(1700000000, 0).UTC()
+	client := &Client{
+		HTTPClient: httpClient, Resolve: func(context.Context, string) ([]byte, error) { return key, nil },
+		Now: func() time.Time { return now },
+	}
+	bridge := model.MoviePilotBridgeInstance{ID: "mp-control", BaseURL: "https://moviepilot.example/base", SecretRef: "secret"}
+	payload := TorrentControlRequest{RequestID: "request-control", Downloader: "qb-hk", TorrentHash: strings.Repeat("a", 40), Action: "pause", Reason: "worker_offline"}
+	if err := client.ControlTorrent(context.Background(), bridge, payload); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := httpClient.request.URL.String(), "https://moviepilot.example/base/api/v1/plugin/OpenListBridge/control"; got != want {
+		t.Fatalf("control URL = %q, want %q", got, want)
+	}
+	signed := SignRequest{
+		Version: SignatureVersionV1, InstanceID: bridge.ID, Method: http.MethodPost,
+		Path: BridgeControlPath, Timestamp: now, Nonce: httpClient.request.Header.Get(HeaderNonce), Body: httpClient.body,
+	}
+	wantSignature, err := signed.Signature(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := httpClient.request.Header.Get(HeaderSignature); got != wantSignature {
+		t.Fatalf("control signature = %q, want %q", got, wantSignature)
 	}
 }
 

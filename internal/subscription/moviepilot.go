@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,6 +127,9 @@ func BindMoviePilotResource(ctx context.Context, req model.SubscriptionMoviePilo
 	if req.Size < 0 {
 		return nil, errors.New("resource size must not be negative")
 	}
+	if err := validateMoviePilotRetentionPolicy(req.RetentionPolicy); err != nil {
+		return nil, err
+	}
 	sub, err := db.GetSubscriptionByID(req.SubscriptionID)
 	if err != nil {
 		return nil, err
@@ -168,6 +172,11 @@ func UnbindMoviePilotResource(ctx context.Context, req model.SubscriptionMoviePi
 		return nil, err
 	}
 	sub.BoundTorrent = nil
+	if sub.BoundShare != nil && strings.TrimSpace(sub.BoundShare.SourceType) != "" {
+		sub.SourceType = strings.ToLower(strings.TrimSpace(sub.BoundShare.SourceType))
+	} else if sub.SourceType == model.SubscriptionSourceMoviePilot {
+		sub.SourceType = model.SubscriptionSourceAuto
+	}
 	if err := db.UpdateSubscription(sub); err != nil {
 		return nil, err
 	}
@@ -181,6 +190,9 @@ func UnbindMoviePilotResource(ctx context.Context, req model.SubscriptionMoviePi
 func UpdateMoviePilotRetention(ctx context.Context, req model.SubscriptionMoviePilotRetentionUpdateReq) (*model.Subscription, error) {
 	if req.SubscriptionID == 0 {
 		return nil, errors.New("subscription_id is required")
+	}
+	if err := validateMoviePilotRetentionPolicy(req.RetentionPolicy); err != nil {
+		return nil, err
 	}
 	sub, err := db.GetSubscriptionByID(req.SubscriptionID)
 	if err != nil {
@@ -214,11 +226,14 @@ func UpdateMoviePilotRetention(ctx context.Context, req model.SubscriptionMovieP
 				}
 				return err
 			}
-			if binding.Status == model.MoviePilotTorrentStatusDeleting || binding.Status == model.MoviePilotTorrentStatusDeleted {
+			if binding.Status == model.MoviePilotTorrentStatusDeleting {
+				return fmt.Errorf("torrent %s is already deleting; retention can no longer be extended safely", binding.ID)
+			}
+			if binding.Status == model.MoviePilotTorrentStatusDeleted {
 				continue
 			}
 			retentionStatus := model.MoviePilotRetentionStatusPending
-			if req.RetentionPolicy.Permanent {
+			if req.RetentionPolicy.Permanent || req.RetentionPolicy.ManualHoldUntil != nil && req.RetentionPolicy.ManualHoldUntil.After(time.Now().UTC()) {
 				retentionStatus = model.MoviePilotRetentionStatusHeld
 			}
 			if err := tx.Model(&model.MoviePilotTorrentBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
@@ -232,6 +247,16 @@ func UpdateMoviePilotRetention(ctx context.Context, req model.SubscriptionMovieP
 		return nil, err
 	}
 	return sub, nil
+}
+
+func validateMoviePilotRetentionPolicy(policy model.TorrentRetentionPolicy) error {
+	if policy.MinSeedSeconds < 0 {
+		return errors.New("retention min_seed_seconds must not be negative")
+	}
+	if policy.MinRatio < 0 || math.IsNaN(policy.MinRatio) || math.IsInf(policy.MinRatio, 0) {
+		return errors.New("retention min_ratio must be a finite non-negative number")
+	}
+	return nil
 }
 
 func SubmitMoviePilotIntent(ctx context.Context, sub *model.Subscription) error {

@@ -145,6 +145,19 @@ func (s *Service) ConfigureControlPlane(nodeID string, keys *secure.KeyPair, ope
 				}
 			}
 		}
+		var torrentStates []model.ClusterWorkerObservedState
+		if db.GetDb().Where("resource_type = ?", moviePilotTorrentRegistryType).Find(&torrentStates).Error == nil {
+			if s.moviePilotTorrents == nil {
+				s.moviePilotTorrents = make(map[string]moviePilotTorrentRegistryEntry)
+			}
+			for _, state := range torrentStates {
+				entry, ok := decodeMoviePilotTorrentRegistryEntry(state.PayloadJSON)
+				if !ok {
+					continue
+				}
+				s.moviePilotTorrents[moviePilotTorrentRegistryKey(&entry.Torrent)] = entry
+			}
+		}
 	}
 }
 
@@ -217,8 +230,24 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 		return controlFailure{"stale_revision", "desired config revision is older than the observed revision"}
 	}
 	if apply.Revision == s.configObserved.revision {
+		sameConfig := strings.EqualFold(apply.DesiredHash, s.configObserved.hash)
 		s.mu.Unlock()
-		if strings.EqualFold(apply.DesiredHash, s.configObserved.hash) {
+		if sameConfig {
+			// Desired configuration is persisted across a Worker restart, but qB
+			// credentials are deliberately not. Reapply the encrypted envelopes
+			// even for an unchanged revision before attempting reconnect recovery.
+			qbSecrets, err := s.decodeQBSecretEnvelopes(apply, desired)
+			if err != nil {
+				return err
+			}
+			s.mu.Lock()
+			if qbSecrets != nil {
+				s.qbSecrets = qbSecrets
+			}
+			s.mu.Unlock()
+			s.probeMoviePilotQBClients()
+			s.ResumeMoviePilotTorrents(ctx)
+			s.ReconcileMoviePilotStagingCapacity(ctx)
 			return nil
 		}
 		return controlFailure{"revision_conflict", "desired config revision was already applied with a different hash"}
@@ -239,8 +268,11 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 		}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.applyDesiredConfigMemory(desired, apply.Revision, apply.DesiredHash, qbSecrets)
+	s.mu.Unlock()
+	s.probeMoviePilotQBClients()
+	s.ResumeMoviePilotTorrents(ctx)
+	s.ReconcileMoviePilotStagingCapacity(ctx)
 	return nil
 }
 

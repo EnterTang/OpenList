@@ -83,33 +83,36 @@ type TorrentRetentionPolicy struct {
 }
 
 type MoviePilotTorrentBinding struct {
-	ID                   string     `json:"id" gorm:"primaryKey;size:64"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-	IntentID             string     `json:"intent_id" gorm:"size:64;uniqueIndex"`
-	BridgeInstanceID     string     `json:"bridge_instance_id" gorm:"size:64;index"`
-	DownloaderAlias      string     `json:"downloader_alias" gorm:"size:128;index"`
-	WorkerNodeID         string     `json:"worker_node_id" gorm:"size:64;index"`
-	QBClientID           string     `json:"qb_client_id" gorm:"size:128"`
-	TorrentHash          string     `json:"torrent_hash" gorm:"size:64;uniqueIndex:idx_moviepilot_torrent_hash"`
-	ContentPath          string     `json:"content_path" gorm:"type:text"`
-	ObserveJobID         string     `json:"observe_job_id" gorm:"size:64;index"`
-	ObservedContentPath  string     `json:"observed_content_path" gorm:"type:text"`
-	RetentionPolicyJSON  string     `json:"retention_policy_json" gorm:"type:text"`
-	Status               string     `json:"status" gorm:"size:32;index"`
-	RetentionStatus      string     `json:"retention_status" gorm:"size:32;index"`
-	LastQBState          string     `json:"last_qb_state" gorm:"size:64"`
-	LastQBProgress       float64    `json:"last_qb_progress"`
-	LastQBRatio          float64    `json:"last_qb_ratio"`
-	LastQBSeedingSeconds int64      `json:"last_qb_seeding_seconds"`
-	LastQBHNRPassed      bool       `json:"last_qb_hnr_passed" gorm:"column:last_qb_hnr_passed"`
-	DownloadCompletedAt  *time.Time `json:"download_completed_at,omitempty"`
-	SeedStartedAt        *time.Time `json:"seed_started_at,omitempty"`
-	RetentionEligibleAt  *time.Time `json:"retention_eligible_at,omitempty"`
-	DeletingAt           *time.Time `json:"deleting_at,omitempty"`
-	DeletedAt            *time.Time `json:"deleted_at,omitempty"`
-	LastErrorCode        string     `json:"last_error_code" gorm:"size:128"`
-	LastError            string     `json:"last_error" gorm:"type:text"`
+	ID                     string     `json:"id" gorm:"primaryKey;size:64"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
+	IntentID               string     `json:"intent_id" gorm:"size:64;uniqueIndex"`
+	BridgeInstanceID       string     `json:"bridge_instance_id" gorm:"size:64;index;uniqueIndex:idx_moviepilot_bridge_torrent_hash"`
+	DownloaderAlias        string     `json:"downloader_alias" gorm:"size:128;index"`
+	WorkerNodeID           string     `json:"worker_node_id" gorm:"size:64;index"`
+	QBClientID             string     `json:"qb_client_id" gorm:"size:128"`
+	TorrentHash            string     `json:"torrent_hash" gorm:"size:64;uniqueIndex:idx_moviepilot_bridge_torrent_hash"`
+	ContentPath            string     `json:"content_path" gorm:"type:text"`
+	ObserveJobID           string     `json:"observe_job_id" gorm:"size:64;index"`
+	ObservedContentPath    string     `json:"observed_content_path" gorm:"type:text"`
+	RetentionPolicyJSON    string     `json:"retention_policy_json" gorm:"type:text"`
+	Status                 string     `json:"status" gorm:"size:32;index"`
+	RetentionStatus        string     `json:"retention_status" gorm:"size:32;index"`
+	LastQBState            string     `json:"last_qb_state" gorm:"size:64"`
+	LastQBProgress         float64    `json:"last_qb_progress"`
+	LastQBRatio            float64    `json:"last_qb_ratio"`
+	LastQBSeedingSeconds   int64      `json:"last_qb_seeding_seconds"`
+	LastQBHNRPassed        bool       `json:"last_qb_hnr_passed" gorm:"column:last_qb_hnr_passed"`
+	LastQBHNRKnown         bool       `json:"last_qb_hnr_known" gorm:"column:last_qb_hnr_known"`
+	PausedForWorkerOffline bool       `json:"paused_for_worker_offline" gorm:"index"`
+	WorkerOfflinePausedAt  *time.Time `json:"worker_offline_paused_at,omitempty"`
+	DownloadCompletedAt    *time.Time `json:"download_completed_at,omitempty"`
+	SeedStartedAt          *time.Time `json:"seed_started_at,omitempty"`
+	RetentionEligibleAt    *time.Time `json:"retention_eligible_at,omitempty"`
+	DeletingAt             *time.Time `json:"deleting_at,omitempty"`
+	DeletedAt              *time.Time `json:"deleted_at,omitempty"`
+	LastErrorCode          string     `json:"last_error_code" gorm:"size:128"`
+	LastError              string     `json:"last_error" gorm:"type:text"`
 }
 
 type MoviePilotDeliveryFile struct {
@@ -175,8 +178,8 @@ type MoviePilotBridgeOutbox struct {
 	ID           string    `json:"id" gorm:"primaryKey;size:64"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
-	BridgeID     string    `json:"bridge_id" gorm:"size:64;index"`
-	RequestID    string    `json:"request_id" gorm:"size:64;index"`
+	BridgeID     string    `json:"bridge_id" gorm:"size:64;index;uniqueIndex:idx_moviepilot_bridge_outbox_request"`
+	RequestID    string    `json:"request_id" gorm:"size:64;index;uniqueIndex:idx_moviepilot_bridge_outbox_request"`
 	EventID      string    `json:"event_id" gorm:"size:64;uniqueIndex"`
 	PayloadJSON  string    `json:"payload_json" gorm:"type:text"`
 	Status       string    `json:"status" gorm:"size:32;index"`
@@ -186,16 +189,17 @@ type MoviePilotBridgeOutbox struct {
 }
 
 type MoviePilotBridgeInbox struct {
-	EventID     string     `json:"event_id" gorm:"primaryKey;size:64"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	BridgeID    string     `json:"bridge_id" gorm:"size:64;index"`
-	RequestID   string     `json:"request_id" gorm:"size:64;index"`
-	EventType   string     `json:"event_type" gorm:"size:64;index"`
-	PayloadJSON string     `json:"payload_json" gorm:"type:text"`
-	Status      string     `json:"status" gorm:"size:32;index"`
-	ProcessedAt *time.Time `json:"processed_at,omitempty"`
-	LastError   string     `json:"last_error" gorm:"type:text"`
+	EventID      string     `json:"event_id" gorm:"primaryKey;size:64"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	BridgeID     string     `json:"bridge_id" gorm:"size:64;index"`
+	RequestID    string     `json:"request_id" gorm:"size:64;index"`
+	EventType    string     `json:"event_type" gorm:"size:64;index"`
+	PayloadJSON  string     `json:"payload_json" gorm:"type:text"`
+	Status       string     `json:"status" gorm:"size:32;index"`
+	AttemptCount int        `json:"attempt_count" gorm:"not null;default:0"`
+	ProcessedAt  *time.Time `json:"processed_at,omitempty"`
+	LastError    string     `json:"last_error" gorm:"type:text"`
 }
 
 type SubscriptionBoundTorrent struct {

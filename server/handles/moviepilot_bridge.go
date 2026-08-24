@@ -133,12 +133,12 @@ func ConsumeMoviePilotBridgeEvent(service *moviepilotbridge.Service) gin.Handler
 	return func(c *gin.Context) {
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, 4<<20))
 		if err != nil {
-			common.ErrorResp(c, err, http.StatusBadRequest)
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 			return
 		}
 		var event moviepilotbridge.BridgeEvent
 		if err := json.Unmarshal(body, &event); err != nil {
-			common.ErrorResp(c, err, http.StatusBadRequest)
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 			return
 		}
 		path := c.Request.URL.RequestURI()
@@ -147,7 +147,7 @@ func ConsumeMoviePilotBridgeEvent(service *moviepilotbridge.Service) gin.Handler
 		}
 		result, err := service.ConsumeBridgeEvent(c.Request.Context(), c.Request.Header, c.Request.Method, path, body, event)
 		if err != nil {
-			common.ErrorResp(c, err, http.StatusBadRequest)
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 			return
 		}
 		if _, processErr := service.ProcessPendingEvents(c.Request.Context(), 1); processErr != nil {

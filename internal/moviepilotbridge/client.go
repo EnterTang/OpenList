@@ -14,7 +14,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const BridgeIntentPath = "/api/v1/openlist/intent"
+const BridgeIntentPath = "/api/v1/plugin/OpenListBridge/intent"
 
 type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
@@ -44,7 +44,21 @@ func (c *Client) SearchResources(ctx context.Context, bridge model.MoviePilotBri
 	if err := c.postJSON(ctx, bridge, BridgeSearchPath, payload.RequestID, payload, &response); err != nil {
 		return nil, err
 	}
+	for _, result := range response.Results {
+		if err := validateOpaqueResourceRef(result.ResourceRef); err != nil {
+			return nil, fmt.Errorf("MoviePilot Bridge search returned an invalid resource reference: %w", err)
+		}
+	}
 	return response.Results, nil
+}
+
+func (c *Client) ControlTorrent(ctx context.Context, bridge model.MoviePilotBridgeInstance, payload TorrentControlRequest) error {
+	payload.Action = strings.ToLower(strings.TrimSpace(payload.Action))
+	payload.TorrentHash = strings.ToLower(strings.TrimSpace(payload.TorrentHash))
+	if err := payload.Validate(); err != nil {
+		return err
+	}
+	return c.postJSON(ctx, bridge, BridgeControlPath, payload.RequestID, payload, nil)
 }
 
 func (c *Client) postJSON(ctx context.Context, bridge model.MoviePilotBridgeInstance, endpoint, requestID string, payload any, responsePayload any) error {
@@ -65,6 +79,9 @@ func (c *Client) postJSON(ctx context.Context, bridge model.MoviePilotBridgeInst
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal bridge request: %w", err)
+	}
+	if err := validateNoForbiddenBridgeFields(body); err != nil {
+		return err
 	}
 	now := time.Now().UTC()
 	if c.Now != nil {

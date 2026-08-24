@@ -21,6 +21,9 @@ func Init(d *gorm.DB) {
 	if err != nil {
 		log.Fatalf("failed migrate database: %s", err.Error())
 	}
+	if err := NormalizeMoviePilotTorrentBindingIndex(db); err != nil {
+		log.Fatalf("failed normalize MoviePilot torrent binding index: %s", err.Error())
+	}
 	if err := NormalizeSubscriptionStateVersion(db); err != nil {
 		log.Fatalf("failed normalize migrated subscription state version: %s", err.Error())
 	}

@@ -47,6 +47,20 @@ func TestSearchMoviePilotResourcesDoesNotExposeSiteCookie(t *testing.T) {
 	}
 }
 
+func TestValidateMoviePilotRetentionPolicyRejectsNegativeThresholds(t *testing.T) {
+	for _, policy := range []model.TorrentRetentionPolicy{
+		{MinSeedSeconds: -1},
+		{MinRatio: -0.1},
+	} {
+		if err := validateMoviePilotRetentionPolicy(policy); err == nil {
+			t.Fatalf("policy %#v was accepted", policy)
+		}
+	}
+	if err := validateMoviePilotRetentionPolicy(model.TorrentRetentionPolicy{MinSeedSeconds: 3600, MinRatio: 1.5}); err != nil {
+		t.Fatalf("valid retention policy rejected: %v", err)
+	}
+}
+
 func TestSearchMoviePilotResourcesProjectsOpaqueRefAndMediaIdentity(t *testing.T) {
 	client := &fakeMoviePilotBridgeClient{results: []moviepilotbridge.ResourceSearchResult{{
 		ResourceRef: "resource-1", Title: "Show S01E01", Site: "tracker-a", Size: 1024, Seeders: 8,
@@ -93,6 +107,27 @@ func TestBindMoviePilotResourcePreservesBoundShareWhenUnbound(t *testing.T) {
 		t.Fatalf("unbind MoviePilot resource: %v", err)
 	}
 	if unbound.BoundTorrent != nil || unbound.BoundShare == nil {
+		t.Fatalf("unbound subscription = %#v", unbound)
+	}
+	if unbound.SourceType != model.SubscriptionSourceManual {
+		t.Fatalf("unbound source type = %q, want preserved share source", unbound.SourceType)
+	}
+}
+
+func TestUnbindMoviePilotResourceFallsBackToAutoWithoutBoundShare(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{
+		Name: "MoviePilot Only", TMDBID: 123, MediaType: "tv", SourceType: model.SubscriptionSourceMoviePilot,
+		BoundTorrent: &model.SubscriptionBoundTorrent{BridgeInstanceID: "mp-main", ResourceRef: "resource-1"},
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	unbound, err := UnbindMoviePilotResource(context.Background(), model.SubscriptionMoviePilotResourceUnbindReq{SubscriptionID: sub.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unbound.BoundTorrent != nil || unbound.SourceType != model.SubscriptionSourceAuto {
 		t.Fatalf("unbound subscription = %#v", unbound)
 	}
 }
@@ -149,5 +184,76 @@ func TestUpdateMoviePilotRetentionPropagatesToActiveBinding(t *testing.T) {
 	}
 	if !strings.Contains(gotIntent.RetentionPolicyJSON, "permanent") || gotBinding.RetentionStatus != model.MoviePilotRetentionStatusHeld || !strings.Contains(gotBinding.RetentionPolicyJSON, "permanent") {
 		t.Fatalf("retention snapshots = %#v %#v", gotIntent, gotBinding)
+	}
+}
+
+func TestUpdateMoviePilotRetentionMarksManualExtensionHeld(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "Manual Hold Show", SourceType: model.SubscriptionSourceMoviePilot, MediaType: "tv", BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-hold", RetentionPolicy: model.TorrentRetentionPolicy{MinSeedSeconds: 60}, BoundAt: time.Now().UTC(),
+	}}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	intent := &model.MoviePilotDownloadIntent{ID: "intent-hold", RequestID: "request-hold", BridgeInstanceID: "mp-main", SubscriptionID: sub.ID, Status: model.MoviePilotIntentStatusBound, RetentionPolicyJSON: `{"min_seed_seconds":60}`}
+	eligibleAt := time.Now().UTC().Add(-time.Minute)
+	binding := &model.MoviePilotTorrentBinding{
+		ID: "binding-hold", IntentID: intent.ID, BridgeInstanceID: "mp-main", DownloaderAlias: "qb-a", WorkerNodeID: "worker-1", QBClientID: "qb-a",
+		TorrentHash: strings.Repeat("b", 40), Status: model.MoviePilotTorrentStatusSeeding, RetentionStatus: model.MoviePilotRetentionStatusEligible,
+		RetentionEligibleAt: &eligibleAt, RetentionPolicyJSON: intent.RetentionPolicyJSON,
+	}
+	if err := db.GetDb().Create(intent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().Create(binding).Error; err != nil {
+		t.Fatal(err)
+	}
+	holdUntil := time.Now().UTC().Add(24 * time.Hour)
+	if _, err := UpdateMoviePilotRetention(context.Background(), model.SubscriptionMoviePilotRetentionUpdateReq{
+		SubscriptionID: sub.ID, RetentionPolicy: model.TorrentRetentionPolicy{MinSeedSeconds: 60, ManualHoldUntil: &holdUntil},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var updatedBinding model.MoviePilotTorrentBinding
+	if err := db.GetDb().First(&updatedBinding, "id = ?", binding.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if updatedBinding.RetentionStatus != model.MoviePilotRetentionStatusHeld || updatedBinding.RetentionEligibleAt != nil {
+		t.Fatalf("manual extension binding = %#v", updatedBinding)
+	}
+}
+
+func TestUpdateMoviePilotRetentionRejectsAlreadyDeletingBinding(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "Deleting Show", SourceType: model.SubscriptionSourceMoviePilot, MediaType: "tv", BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-deleting", RetentionPolicy: model.TorrentRetentionPolicy{MinSeedSeconds: 60}, BoundAt: time.Now().UTC(),
+	}}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	intent := &model.MoviePilotDownloadIntent{ID: "intent-deleting", RequestID: "request-deleting", BridgeInstanceID: "mp-main", SubscriptionID: sub.ID, Status: model.MoviePilotIntentStatusBound, RetentionPolicyJSON: `{"min_seed_seconds":60}`}
+	binding := &model.MoviePilotTorrentBinding{
+		ID: "binding-deleting", IntentID: intent.ID, BridgeInstanceID: "mp-main", DownloaderAlias: "qb-a", WorkerNodeID: "worker-1", QBClientID: "qb-a",
+		TorrentHash: strings.Repeat("c", 40), Status: model.MoviePilotTorrentStatusDeleting, RetentionStatus: model.MoviePilotRetentionStatusDeleting,
+		RetentionPolicyJSON: intent.RetentionPolicyJSON,
+	}
+	if err := db.GetDb().Create(intent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDb().Create(binding).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := UpdateMoviePilotRetention(context.Background(), model.SubscriptionMoviePilotRetentionUpdateReq{
+		SubscriptionID: sub.ID, RetentionPolicy: model.TorrentRetentionPolicy{Permanent: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "already deleting") {
+		t.Fatalf("deleting retention update error = %v", err)
+	}
+	reloaded, err := db.GetSubscriptionByID(sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.BoundTorrent == nil || reloaded.BoundTorrent.RetentionPolicy.Permanent {
+		t.Fatalf("failed update changed subscription policy = %#v", reloaded.BoundTorrent)
 	}
 }

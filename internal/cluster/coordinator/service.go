@@ -22,13 +22,15 @@ import (
 )
 
 type Service struct {
-	db                *gorm.DB
-	enrollmentToken   string
-	heartbeatInterval time.Duration
-	inspectMu         sync.RWMutex
-	inspectProcessMu  sync.Mutex
-	inspectConsumer   ShareInspectConsumer
-	torrentDispatcher TorrentJobDispatcher
+	db                     *gorm.DB
+	enrollmentToken        string
+	heartbeatInterval      time.Duration
+	inspectMu              sync.RWMutex
+	inspectProcessMu       sync.Mutex
+	inspectConsumer        ShareInspectConsumer
+	torrentDispatcher      TorrentJobDispatcher
+	moviePilotControllerMu sync.RWMutex
+	moviePilotController   MoviePilotTorrentController
 }
 
 const (
@@ -338,6 +340,13 @@ func (s *Service) OnDisconnect(peer transport.Peer, cause error) {
 	}
 	_ = s.db.Model(&model.ClusterNodeSession{}).Where("id = ?", peer.SessionID()).Updates(updates).Error
 	_ = s.db.Model(&model.ClusterNode{}).Where("id = ? AND last_session_id = ?", peer.NodeID(), peer.SessionID()).Updates(map[string]any{"status": model.ClusterNodeStatusOffline}).Error
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := s.ReconcileWorkerOfflineTorrentControl(ctx, 100); err != nil {
+			log.Warnf("coordinator: pause MoviePilot torrents after Worker disconnect: %v", err)
+		}
+	}()
 }
 
 func (s *Service) ReconcileNodeSessions(ctx context.Context, now time.Time) (int64, error) {
@@ -533,6 +542,12 @@ func (s *Service) HandleMessage(ctx context.Context, peer transport.Peer, messag
 			return err
 		}
 		return s.handleJobReject(ctx, peer, message, payload)
+	case protocol.MessageJobProgress:
+		payload, err := protocol.DecodePayload[protocol.JobProgress](message)
+		if err != nil {
+			return err
+		}
+		return s.handleJobProgress(ctx, peer, message, payload)
 	case protocol.MessageJobResult:
 		payload, err := protocol.DecodePayload[protocol.JobResult](message)
 		if err != nil {
@@ -580,8 +595,109 @@ func (s *Service) HandleMessage(ctx context.Context, peer transport.Peer, messag
 	}
 }
 
+func (s *Service) handleJobProgress(ctx context.Context, peer transport.Peer, message protocol.Envelope, progress protocol.JobProgress) error {
+	if progress.EventSeq == 0 {
+		return errors.New("cluster job progress event_seq is required")
+	}
+	if strings.TrimSpace(progress.Stage) == "" {
+		return errors.New("cluster job progress stage is required")
+	}
+	if progress.CompletedBytes < 0 || progress.TotalBytes < 0 || (progress.TotalBytes > 0 && progress.CompletedBytes > progress.TotalBytes) {
+		return errors.New("cluster job progress byte counts are invalid")
+	}
+	observedAt := progress.ObservedAt.UTC()
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	progress.ObservedAt = observedAt
+	progressJSON, err := json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		duplicate, err := s.claimInboxTx(tx, peer, message)
+		if err != nil || duplicate {
+			return err
+		}
+		var job model.ClusterJob
+		if err := tx.First(&job, "id = ?", progress.JobID).Error; err != nil {
+			return err
+		}
+		if job.CurrentAttemptID != progress.AttemptID || job.CurrentGeneration != progress.Generation || job.AssignedNodeID != peer.NodeID() {
+			return errors.New("cluster job progress is stale")
+		}
+		attempt, err := loadAndValidateAttempt(tx, peer, progress.AttemptRef)
+		if err != nil {
+			return err
+		}
+		if !containsString([]string{model.ClusterAttemptStatusAccepted, model.ClusterAttemptStatusRunning}, attempt.Status) {
+			return fmt.Errorf("cluster job attempt cannot report progress from status %q", attempt.Status)
+		}
+		if progress.EventSeq <= attempt.LastEventSeq {
+			return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
+		}
+
+		now := time.Now().UTC()
+		attemptUpdates := map[string]any{"last_event_seq": progress.EventSeq, "status": model.ClusterAttemptStatusRunning}
+		if attempt.StartedAt == nil {
+			attemptUpdates["started_at"] = now
+		}
+		if err := tx.Model(&model.ClusterJobAttempt{}).Where("id = ? AND last_event_seq < ?", attempt.ID, progress.EventSeq).Updates(attemptUpdates).Error; err != nil {
+			return err
+		}
+		var existingStage model.ClusterJobStage
+		err = tx.Select("status").Where("attempt_id = ? AND name = ?", attempt.ID, progress.Stage).First(&existingStage).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err == nil && containsString([]string{model.ClusterStageStatusSucceeded, model.ClusterStageStatusFailed}, existingStage.Status) {
+			return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
+		}
+		stage := model.ClusterJobStage{
+			ID: uuid.NewString(), JobID: job.ID, AttemptID: attempt.ID, Name: progress.Stage,
+			Status: model.ClusterStageStatusRunning, ProgressJSON: string(progressJSON), StartedAt: &now,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "attempt_id"}, {Name: "name"}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"progress_json": string(progressJSON),
+				"status":        model.ClusterStageStatusRunning,
+				"started_at":    gorm.Expr("COALESCE(started_at, ?)", now),
+			}),
+		}).Create(&stage).Error; err != nil {
+			return err
+		}
+
+		fraction := float64(0)
+		if progress.TotalBytes > 0 {
+			fraction = float64(progress.CompletedBytes) / float64(progress.TotalBytes)
+		}
+		var task protocol.TaskContext
+		if json.Unmarshal([]byte(job.TaskContextJSON), &task) == nil && task.Torrent != nil {
+			switch {
+			case job.Type == model.ClusterJobTypeTorrentObserve:
+				if err := tx.Model(&model.MoviePilotTorrentBinding{}).Where("id = ?", task.Torrent.BindingID).Updates(map[string]any{
+					"last_qb_progress": fraction,
+					"status":           model.MoviePilotTorrentStatusDownloading,
+				}).Error; err != nil && !isOptionalMoviePilotTableError(err) {
+					return err
+				}
+			case job.Type == model.ClusterJobTypeMediaTransfer && progress.Stage == model.ClusterStageUploadingMobile:
+				if err := tx.Model(&model.MoviePilotDeliveryFile{}).Where("cluster_job_id = ?", job.ID).Updates(map[string]any{
+					"upload_progress": fraction,
+					"status":          model.MoviePilotDeliveryStatusUploading,
+				}).Error; err != nil && !isOptionalMoviePilotTableError(err) {
+					return err
+				}
+			}
+		}
+		return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
+	})
+}
+
 func (s *Service) handleStageStatus(ctx context.Context, peer transport.Peer, message protocol.Envelope, update protocol.StageStatusUpdate) error {
-	if update.Stage != model.ClusterStageSavingShare && update.Stage != model.ClusterStageUploadingMobile && update.Stage != model.ClusterStageWorkerMediaCleanup {
+	internalStage := isInternalWorkerStage(update.Stage)
+	if update.Stage != model.ClusterStageSavingShare && update.Stage != model.ClusterStageUploadingMobile && update.Stage != model.ClusterStageWorkerMediaCleanup && !internalStage {
 		return fmt.Errorf("cluster stage %q cannot receive status updates", update.Stage)
 	}
 	if update.Status != model.ClusterStageStatusRunning && update.Status != model.ClusterStageStatusSucceeded && update.Status != model.ClusterStageStatusFailed {
@@ -605,25 +721,25 @@ func (s *Service) handleStageStatus(ctx context.Context, peer transport.Peer, me
 		}
 		var stage model.ClusterJobStage
 		if err := tx.Where("attempt_id = ? AND name = ?", attempt.ID, update.Stage).First(&stage).Error; err != nil {
-			if !errors.Is(err, gorm.ErrRecordNotFound) || update.Stage != model.ClusterStageWorkerMediaCleanup {
+			if !errors.Is(err, gorm.ErrRecordNotFound) || (!internalStage && update.Stage != model.ClusterStageWorkerMediaCleanup) {
 				return err
 			}
 			stage = model.ClusterJobStage{
 				ID: uuid.NewString(), JobID: job.ID, AttemptID: attempt.ID,
-				Name: model.ClusterStageWorkerMediaCleanup, Status: model.ClusterStageStatusPending,
+				Name: update.Stage, Status: model.ClusterStageStatusPending,
 			}
 			if err := tx.Create(&stage).Error; err != nil {
 				return err
 			}
 		}
-		if update.Stage == model.ClusterStageWorkerMediaCleanup {
+		if update.Stage == model.ClusterStageWorkerMediaCleanup || internalStage {
 			switch stage.Status {
 			case model.ClusterStageStatusPending:
 				if update.Status != model.ClusterStageStatusRunning && update.Status != model.ClusterStageStatusSucceeded && update.Status != model.ClusterStageStatusFailed {
 					return fmt.Errorf("cluster cleanup transition %s -> %s is invalid", stage.Status, update.Status)
 				}
 			case model.ClusterStageStatusRunning:
-				if update.Status != model.ClusterStageStatusSucceeded && update.Status != model.ClusterStageStatusFailed {
+				if update.Status != model.ClusterStageStatusRunning && update.Status != model.ClusterStageStatusSucceeded && update.Status != model.ClusterStageStatusFailed {
 					return fmt.Errorf("cluster cleanup transition %s -> %s is invalid", stage.Status, update.Status)
 				}
 			case model.ClusterStageStatusFailed:
@@ -695,6 +811,15 @@ func (s *Service) handleStageStatus(ctx context.Context, peer transport.Peer, me
 		}
 		return s.finishInboxTx(tx, peer, message, model.ClusterMessageStatusProcessed, "")
 	})
+}
+
+func isInternalWorkerStage(stage string) bool {
+	switch stage {
+	case model.ClusterStageQBObserving, model.ClusterStageQBCopying, model.ClusterStageRetentionCheck, model.ClusterStageQBDeleting:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) handleStagePermitRequest(ctx context.Context, peer transport.Peer, message protocol.Envelope, request protocol.StagePermitRequest) error {
@@ -803,7 +928,7 @@ func (s *Service) handleLeaseRenew(ctx context.Context, peer transport.Peer, mes
 		}
 		if err := tx.Model(attempt).Updates(map[string]any{
 			"lease_until":    requestedUntil,
-			"last_event_seq": renewal.LastEventSeq,
+			"last_event_seq": gorm.Expr("CASE WHEN last_event_seq > ? THEN last_event_seq ELSE ? END", renewal.LastEventSeq, renewal.LastEventSeq),
 			"status":         model.ClusterAttemptStatusRunning,
 		}).Error; err != nil {
 			return err

@@ -57,6 +57,41 @@ func TestVerifyRequestRejectsExpiredTimestamp(t *testing.T) {
 	}
 }
 
+func TestVerifyRequestPrunesExpiredNonceRows(t *testing.T) {
+	database, verifier, key, now := newVerifierTest(t)
+	if err := database.Create(&model.MoviePilotBridgeInstance{
+		ID: "mp-main", Name: "main", BaseURL: "https://moviepilot.example", SecretRef: "secret", Enabled: true,
+	}).Error; err != nil {
+		t.Fatalf("create bridge: %v", err)
+	}
+	if err := database.Create(&model.MoviePilotBridgeNonce{
+		ID: "old-nonce", BridgeID: "mp-main", Nonce: "old", CreatedAt: now.Add(-time.Hour), UsedAt: now.Add(-time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("create old nonce: %v", err)
+	}
+	body := []byte(`{"event_id":"e-new"}`)
+	signed := SignRequest{
+		Version: SignatureVersionV1, InstanceID: "mp-main", Method: http.MethodPost,
+		Path: "/api/v1/cluster/moviepilot/events", Timestamp: now, Nonce: "nonce-new", Body: body,
+	}
+	headers, err := signed.Headers(key)
+	if err != nil {
+		t.Fatalf("sign request: %v", err)
+	}
+
+	if err := verifier.Verify(context.Background(), headers, http.MethodPost, signed.Path, body); err != nil {
+		t.Fatalf("verify request: %v", err)
+	}
+
+	var oldCount int64
+	if err := database.Model(&model.MoviePilotBridgeNonce{}).Where("id = ?", "old-nonce").Count(&oldCount).Error; err != nil {
+		t.Fatalf("count old nonce: %v", err)
+	}
+	if oldCount != 0 {
+		t.Fatalf("expired nonce count = %d, want zero", oldCount)
+	}
+}
+
 func TestSignRequestUsesRawBodyHashAndMethod(t *testing.T) {
 	request := SignRequest{
 		Version: SignatureVersionV1, InstanceID: "mp-main", Method: "post",

@@ -21,7 +21,8 @@ const (
 	HeaderNonce      = "X-OpenList-Bridge-Nonce"
 	HeaderSignature  = "X-OpenList-Bridge-Signature"
 
-	DefaultMaxClockSkew = 5 * time.Minute
+	DefaultMaxClockSkew  = 5 * time.Minute
+	BridgeNonceRetention = 2 * DefaultMaxClockSkew
 )
 
 // SignRequest describes the exact HTTP request covered by the Bridge MAC.
