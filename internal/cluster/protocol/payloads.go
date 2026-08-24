@@ -74,14 +74,30 @@ type InventoryReport struct {
 }
 
 type NodeCapabilities struct {
-	DownloadTools        []string `json:"download_tools,omitempty"`
-	SupportedProviders   []string `json:"supported_providers,omitempty"`
-	SupportedOperations  []string `json:"supported_operations,omitempty"`
-	DownloadConcurrency  int      `json:"download_concurrency"`
-	UploadConcurrency    int      `json:"upload_concurrency"`
-	LocalScratchRoot     string   `json:"local_scratch_root,omitempty"`
-	FreeLocalBytes       int64    `json:"free_local_bytes"`
-	RedisDurabilityReady bool     `json:"redis_durability_ready"`
+	DownloadTools        []string                   `json:"download_tools,omitempty"`
+	SupportedProviders   []string                   `json:"supported_providers,omitempty"`
+	SupportedOperations  []string                   `json:"supported_operations,omitempty"`
+	MoviePilotRoutes     []MoviePilotRouteInventory `json:"moviepilot_routes,omitempty"`
+	DownloadConcurrency  int                        `json:"download_concurrency"`
+	UploadConcurrency    int                        `json:"upload_concurrency"`
+	LocalScratchRoot     string                     `json:"local_scratch_root,omitempty"`
+	FreeLocalBytes       int64                      `json:"free_local_bytes"`
+	RedisDurabilityReady bool                       `json:"redis_durability_ready"`
+}
+
+// MoviePilotRouteInventory is the Coordinator-visible, redacted route tuple
+// for a qB client. It deliberately contains no URL, credential reference, or
+// worker-local filesystem path.
+type MoviePilotRouteInventory struct {
+	BridgeInstanceID   string `json:"bridge_instance_id"`
+	Downloader         string `json:"downloader"`
+	QBClientID         string `json:"qb_client_id"`
+	StagingRootLabel   string `json:"staging_root_label,omitempty"`
+	StagingFreeBytes   int64  `json:"staging_free_bytes,omitempty"`
+	ActiveStagingBytes int64  `json:"active_staging_bytes,omitempty"`
+	ActiveUploadSlots  int    `json:"active_upload_slots"`
+	UploadConcurrency  int    `json:"upload_concurrency"`
+	QBHealth           string `json:"qb_health"`
 }
 
 type MountInventory struct {
@@ -131,10 +147,11 @@ type ProviderAccountInventory struct {
 }
 
 type ConfigApply struct {
-	Revision      uint64               `json:"revision"`
-	DesiredHash   string               `json:"desired_hash"`
-	ConfigJSON    string               `json:"config_json,omitempty"`
-	DesiredConfig *WorkerDesiredConfig `json:"desired_config,omitempty"`
+	Revision          uint64               `json:"revision"`
+	DesiredHash       string               `json:"desired_hash"`
+	ConfigJSON        string               `json:"config_json,omitempty"`
+	DesiredConfig     *WorkerDesiredConfig `json:"desired_config,omitempty"`
+	QBSecretEnvelopes map[string]string    `json:"qb_secret_envelopes,omitempty"`
 }
 
 type StorageApply struct {
@@ -279,12 +296,28 @@ type TaskContext struct {
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
 	DeliveryMode          string                    `json:"delivery_mode,omitempty"`
+	Torrent               *TorrentTaskContext       `json:"torrent,omitempty"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
 	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
 	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`
 	StagingTarget         ProviderTargetRequirement `json:"staging_target,omitempty"`
 	DeliveryTarget        ProviderTargetRequirement `json:"delivery_target,omitempty"`
 	TargetProfile         string                    `json:"target_profile"`
+}
+
+// TorrentTaskContext pins a torrent transfer to the Worker and qB client that
+// owns the local files. A torrent cannot be redispatched to another Worker
+// because the qB state and content path are local to this binding.
+type TorrentTaskContext struct {
+	BindingID        string `json:"binding_id"`
+	WorkerNodeID     string `json:"worker_node_id"`
+	BridgeInstanceID string `json:"bridge_instance_id"`
+	Downloader       string `json:"downloader"`
+	QBClientID       string `json:"qb_client_id"`
+	TorrentHash      string `json:"torrent_hash"`
+	RelativePath     string `json:"relative_path"`
+	ContentPath      string `json:"content_path,omitempty"`
+	Action           string `json:"action,omitempty"`
 }
 
 type ShareTaskContext struct {
@@ -347,6 +380,7 @@ type UploadETFManifest struct {
 	Share                 ShareTaskContext          `json:"share"`
 	Media                 MediaTaskContext          `json:"media"`
 	DeliveryMode          string                    `json:"delivery_mode,omitempty"`
+	Torrent               *TorrentTaskContext       `json:"torrent,omitempty"`
 	SourceObjects         []SourceObject            `json:"source_objects"`
 	ShareSaveKey          string                    `json:"share_save_key,omitempty"`
 	ShareSaveObjects      []SourceObject            `json:"share_save_objects,omitempty"`

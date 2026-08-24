@@ -36,6 +36,9 @@ func ListSubscriptionsWithProgress(filter db.SubscriptionFilter, archiveStatus s
 			latestEventBySubscription[event.SubscriptionID] = event
 		}
 	}
+	if err := HydrateMoviePilotProgressForSubscriptions(items); err != nil {
+		return nil, 0, err
+	}
 
 	archiveStatus = strings.ToLower(strings.TrimSpace(archiveStatus))
 	filtered := make([]model.Subscription, 0, len(items))

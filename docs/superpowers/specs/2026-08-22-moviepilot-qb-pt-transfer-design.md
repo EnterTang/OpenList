@@ -17,16 +17,17 @@ MoviePilot 只负责检索、下载器选择和控制面消息中转；OpenList 
 
 - 不使用 MoviePilot 订阅或自动整理。
 - 不修改 qB 下载目录内的文件名、内容或扩展名。
-- 不把 qB 凭据交给 Coordinator，也不让 MoviePilot Bridge 上传网盘文件。
+- 不在 desired config、inventory、任务 payload 或日志中保存/暴露 qB 明文凭据，也不让 MoviePilot Bridge 上传网盘文件；凭据仅以 Coordinator 加密 Secret 保存并为目标 Worker 公钥封装。
 - 不把 qB 来源任务调度给没有本地源文件的其它 Worker。
 - 不将 qB 的最大分享限制当作 PT 最短保种规则的唯一来源。
 
 ## 外部契约依据
 
-- [MoviePilot OpenAPI](https://api.movie-pilot.org/openapi.json) 的下载任务模型包含 `downloader`、`hash`、`content_path`、`season_episode`、`media`、进度和状态；`download/add` 的响应为通用响应，**不承诺**返回可直接关联的下载 ID。
-- [qBittorrent WebUI API 5.0](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-%28qBittorrent-5.0%29) 支持按 hash 查询 torrent、列出文件、暂停/恢复和删除，并返回 `content_path`、`ratio`、`seeding_time` 和状态。
+- [MoviePilot V3 插件开发说明](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/Plugin_Development.md) 定义了 `_PluginBase`、`get_api()` 和插件生命周期；插件只使用 V3 host 提供的 SDK/chain，不启动独立服务。
+- MoviePilot V3 `DownloadChain.download_single(..., return_detail=True)` 返回本次添加操作的 hash；Bridge 用该精确 hash 查询 `list_torrents`，获得 MoviePilot 实际选择的 downloader 和 `content_path`。若添加结果不确定，使用 request 专属 qB label 恢复，禁止用下载列表前后差集猜测。
+- [qBittorrent WebUI API](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-%28qBittorrent-5.0%29) 支持按 hash 查询 torrent、列出文件、暂停/恢复和删除，并返回 `content_path`、`ratio`、`seeding_time` 和状态。控制客户端优先使用 qB 5 的 `start/stop`，404 时兼容 qB 4 的 `resume/pause`。
 
-因此，正式链路不能依赖 MoviePilot 添加下载后的响应猜测任务身份；必须由插件形成请求与 qB hash 的显式绑定。
+因此，正式链路由插件建立 `request_id → downloader → torrent_hash → content_path` 显式绑定，并由 Coordinator 再绑定唯一 Worker。
 
 ## 方案选型
 
@@ -63,7 +64,7 @@ version + "\n" + instance_id + "\n" + HTTP method + "\n" + request path + "\n" +
 ```
 
 - 签名算法：`HMAC-SHA256`，编码为小写十六进制。
-- 必需头：`X-OpenList-Signature-Version`、`X-OpenList-Instance`、`X-OpenList-Timestamp`、`X-OpenList-Nonce`、`X-OpenList-Signature`。
+- 必需头：`X-OpenList-Bridge-Version`、`X-OpenList-Bridge-Instance`、`X-OpenList-Bridge-Timestamp`、`X-OpenList-Bridge-Nonce`、`X-OpenList-Bridge-Signature`。
 - 默认允许 300 秒时钟偏差；接收方为 `(instance_id, nonce)` 持久化去重至少 10 分钟。
 - 所有变更请求必须包含 UUID `request_id` 或 `event_id`；接收方以该键幂等。
 - 密钥仅存于 Coordinator 密钥存储和对应 MoviePilot 插件配置；日志、UI、任务 payload 均不得回显。
@@ -73,9 +74,11 @@ version + "\n" + instance_id + "\n" + HTTP method + "\n" + request path + "\n" +
 Coordinator 调用插件：
 
 ```text
-POST /api/v1/plugin/openlist-bridge/intents
-GET  /api/v1/plugin/openlist-bridge/intents/{request_id}
-POST /api/v1/plugin/openlist-bridge/intents/{request_id}/cancel
+POST /api/v1/plugin/OpenListBridge/search
+POST /api/v1/plugin/OpenListBridge/intent
+GET  /api/v1/plugin/OpenListBridge/intent/{request_id}
+POST /api/v1/plugin/OpenListBridge/intent/{request_id}/cancel
+POST /api/v1/plugin/OpenListBridge/control
 ```
 
 插件向 Coordinator 回调：
@@ -91,13 +94,13 @@ POST /api/v1/cluster/moviepilot/events
   "request_id": "uuid",
   "subscription_id": "string",
   "subscription_item_id": "string",
-  "media": {"tmdb_id": 0, "type": "movie|tv", "season": 0},
-  "torrent": {"title": "string", "enclosure": "url", "site": "string", "size": 0},
+  "media": {"media_source": "tmdb", "media_id": "123", "media_type": "movie|tv", "season": 0},
+  "torrent": {"resource_ref": "opaque-ref-from-search", "title": "string", "site": "string", "size": 0},
   "downloader_policy": {"mode": "moviepilot_select", "allowed": ["optional aliases"]}
 }
 ```
 
-`downloader_policy.mode` 固定为 `moviepilot_select`；Coordinator 不替代 MoviePilot 的选机规则。插件必须最终回传实际 downloader，而不是候选或配置名。
+`downloader_policy.mode` 固定为 `moviepilot_select`；Coordinator 不替代 MoviePilot 的选机规则。`resource_ref` 必须来自 Bridge 搜索，严禁传输 enclosure、passkey、站点 Cookie 或直链。插件必须最终回传实际 downloader，而不是候选或配置名。
 
 事件：
 
@@ -105,11 +108,11 @@ POST /api/v1/cluster/moviepilot/events
 |---|---|---|
 | `intent.accepted` | `event_id`, `request_id` | 插件已接收且开始处理 |
 | `torrent.bound` | 上述字段、`downloader`, `torrent_hash`, `content_path` | MoviePilot/qB 已建立的不可变关联 |
-| `torrent.state_changed` | `torrent_hash`, `state`, `progress` | 快速状态提示，非最终事实来源 |
+| `torrent.state_changed` | `request_id`, `state`, `progress` | 快速状态提示，Worker 的精确 hash 观察为最终事实来源 |
 | `torrent.failed` | `request_id`, `code`, `message` | 创建或调度失败 |
 | `bridge.health_changed` | `instance_id`, `health` | 插件健康变化 |
 
-插件应保存 outbox 并重试未确认事件；Coordinator 为每个事件先持久化 inbox，再驱动状态机。
+插件应保存 outbox 并重试未确认事件；Coordinator 为每个事件先持久化 inbox，再驱动状态机。相同 `request_id` 的不同 payload，以及已经建立后发生变化的 downloader/hash/path 绑定，均作为冲突拒绝。
 
 ## 数据模型
 
@@ -137,32 +140,35 @@ download_root_mapping, retention_policy_snapshot, bound_at
 
 ## Worker 配置与路由
 
-每个 Worker 本地配置 qB 连接和路径映射，凭据只能通过 Worker 本地 secret 引用解析：
+每个 Worker 配置 qB 连接、加密凭据引用和路径映射。Coordinator 只保存并下发由该 Worker 公钥加密的 Secret envelope，Worker 在内存中解密；凭据缺失时 qB 路由不健康，不允许匿名降级：
 
 ```yaml
 qb_clients:
   - id: qb-hk-local
-    webui_url: http://127.0.0.1:8080
-    credential_ref: local-secret://qb-hk
+    webui_url: http://qbittorrent:8080
+    secret_ref: local-secret://qb-hk
     path_mappings:
-      - qb_prefix: /downloads
-        worker_prefix: /mnt/downloads
+      - qb_path: /downloads
+        worker_path: /mnt/downloads
 
 moviepilot_routes:
-  - moviepilot_instance: mp-main
+  - bridge_instance_id: mp-main
     downloader: qb-hk
     qb_client_id: qb-hk-local
 
 staging:
   root: /mnt/staging/openlist
-  max_file_size: 150GiB
+  max_file_bytes: 161061273600
   max_upload_concurrency: 2
-  safety_reserve: 80GiB
-  pause_download_low_watermark: 380GiB
-  resume_download_high_watermark: 430GiB
+  safety_reserve_bytes: 85899345920
+  pause_download_low_watermark_bytes: 408021893120
+  resume_download_high_watermark_bytes: 461708984320
+  extension_whitelist: [.mkv, .mp4, .iso]
+  antihash_enabled: true
+  iso_rename_enabled: true
 ```
 
-`path_mappings` 是必需能力：qB 可能运行在容器内，`content_path` 的容器路径必须映射为 Worker 可访问的宿主机路径。Coordinator 只保存别名、Worker ID 和能力状态；不保存 WebUI 密钥或可访问路径。
+`path_mappings` 是必需能力：qB 可能运行在容器内，`content_path` 的容器路径必须映射为 Worker 可访问的宿主机路径。`webui_url` 可以是 Worker 可达的容器 DNS 或私网地址；HTTP 仅限可信隔离网络，跨主机应使用 HTTPS 和防火墙。Coordinator 的 inventory 只保存别名、Worker ID、容量槽位和健康状态；不回传 WebUI URL、凭据或本地路径。
 
 Worker 在注册与心跳中上报 `(moviepilot_instance, downloader, qb_client_id)`、staging 可用容量、上传槽位和本机 qB 健康度。Coordinator 收到 `torrent.bound` 后用该路由精确选择 Worker；没有唯一可用路由时，将任务置为 `waiting_worker` 并告警。
 
@@ -193,9 +199,9 @@ INTENT_CREATED
 
 1. Worker 通过 qB hash 获取 torrent 信息和文件列表，检查 `content_path` 在已声明路径映射内。
 2. 对单个符合规则的文件做只读复制到 staging；禁止移动、重命名或经本地插件改写 qB 原件。
-3. 在上传 139 的流上启用已有 AntiHash 与 ISO Rename。扩展名白名单由 Worker 配置；最终名称、大小、SHA256 必须以上传后 manifest 为准。
+3. 在上传 139 的 staging 副本上强制启用已有 AntiHash 与 ISO Rename。qB 来源不能通过兼容配置字段关闭这两个转换；扩展名白名单由 Worker 配置，最终名称、大小、SHA256 必须以上传后 manifest 为准。
 4. 上传成功后，Worker 回传既有集群上传 manifest；Coordinator 沿用当前 ETF 根目录、写入路径、通知和幂等逻辑。
-5. 只有上传终态确认后清理 staging 副本。上传或 ETF materialization 可重试时保留副本至重试策略终止。
+5. 上传 manifest 先进入 Worker 持久结果队列；Coordinator 接收并完成既有 ETF materialization 后确认，Worker 再通过清理队列删除 staging 副本。qB 原文件在保种条件满足前保持不变。
 
 staging admission 按下式计算：
 
@@ -227,12 +233,10 @@ MoviePilot 的 `hit_and_run` 只作为“可能存在站点规则”的提示。
 
 ### Worker 离线保护
 
-Coordinator 不能在 Worker 主机断网时远程暂停其 qB。为满足可执行性：
-
-- Worker 本机 lease watchdog 在失去 Coordinator 租约时，仅暂停未完成且由 OpenList 管理的 torrent。
-- 已完成的保种 torrent 默认继续运行，避免短暂控制面故障违反 H&R。
-- 恢复租约后，仅恢复由 watchdog 自身暂停的未完成 torrent。
-- 若要求 Worker 主进程崩溃后也暂停，watchdog 必须是独立 sidecar/supervisor；该要求不由 Coordinator 单独保证。
+- Worker 与 Coordinator 连接断开但进程仍存活时，本机保护逻辑按精确 hash 暂停未完成且由 OpenList 管理的 torrent，并持久化暂停原因；完成保种中的 torrent 不因短暂断线暂停。
+- Worker 进程或整机离线时，Coordinator 通过对应 MoviePilot Bridge 的签名 HTTPS `/control`，使用持久化 request/downloader/hash 精确暂停；恢复时只恢复 `paused_for_worker_offline` 的任务。
+- 容量暂停与离线暂停分别记账。离线原因解除但仍低于高水位时，不恢复下载。
+- 如果 MoviePilot 同时无法访问 qB，则任何远程控制面都无法暂停该 qB；生产部署应让 MoviePilot 到 qB 的控制路径独立于 Worker 主机，或增加同机 supervisor 作为额外保护。
 
 ## 与现有代码的边界
 
@@ -246,7 +250,7 @@ Coordinator 不能在 Worker 主机断网时远程暂停其 qB。为满足可执
 
 | 场景 | 处理 |
 |---|---|
-| Bridge 接收成功但未 bound | 按 request_id 查询和重试；超时后进入人工核对 |
+| Bridge 接收成功但未 bound | 在配置恢复窗口内按 request 专属 qB label 对账；超时发送 `download_binding_timeout` |
 | Bridge 重复回调 | event_id 幂等消费 |
 | downloader 无 Worker 路由 | `waiting_worker`，不创建跨节点搬运任务 |
 | qB hash 不存在或路径越界 | 标记绑定异常，停止自动清理并告警 |
@@ -255,6 +259,7 @@ Coordinator 不能在 Worker 主机断网时远程暂停其 qB。为满足可执
 | 上传完成但 Coordinator 未确认 manifest | outbox 重试；不删除 staging 和 qB 数据 |
 | 文件子任务部分失败 | 父 torrent 保持保种/待处理，不自动删除 |
 | H&R 规则未知 | 不自动删除，进入人工处理 |
+| 同一 request_id payload 变化 | 返回冲突，不覆盖 intent、outbox 或 torrent binding |
 
 ## 验收与测试
 

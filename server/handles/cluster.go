@@ -1,12 +1,14 @@
 package handles
 
 import (
+	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -99,6 +101,20 @@ func ListClusterJobs(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, jobs)
+}
+
+func ListMoviePilotTransfers(c *gin.Context) {
+	subscriptionID, err := requiredUintQuery(c, "subscription_id")
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	items, err := db.ListMoviePilotTransferViews(c.Request.Context(), subscriptionID, c.Query("binding_id"))
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+	common.SuccessResp(c, gin.H{"content": items})
 }
 
 func RetryClusterJob(c *gin.Context) {

@@ -278,6 +278,12 @@ func (s *Service) completeManifestMaterialization(ctx context.Context, manifestI
 		}).Error; err != nil {
 			return err
 		}
+		if err := tx.Model(&model.MoviePilotDeliveryFile{}).Where("cluster_job_id = ?", jobID).Updates(map[string]any{
+			"status": model.MoviePilotDeliveryStatusMaterialized, "manifest_id": manifestID, "upload_progress": 1,
+			"finished_at": now, "last_error_code": "", "last_error": "",
+		}).Error; err != nil && !isOptionalMoviePilotTableError(err) {
+			return err
+		}
 		if err := tx.Select("parent_job_id", "subscription_id", "subscription_item_id").First(&completed, "id = ?", jobID).Error; err != nil {
 			return err
 		}

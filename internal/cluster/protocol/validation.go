@@ -64,7 +64,7 @@ func (c TaskContext) Validate() error {
 	if mode := strings.TrimSpace(c.DeliveryMode); mode != "" && mode != "transfer" && mode != "direct_download" {
 		return fmt.Errorf("unsupported delivery mode %q", mode)
 	}
-	if len(c.SourceObjects) == 0 {
+	if len(c.SourceObjects) == 0 && c.Torrent == nil {
 		return errors.New("at least one source object is required")
 	}
 	for i, object := range c.SourceObjects {
@@ -74,6 +74,22 @@ func (c TaskContext) Validate() error {
 	}
 	if err := validateShareSaveBatch(c); err != nil {
 		return err
+	}
+	if c.Torrent != nil {
+		if strings.TrimSpace(c.Torrent.BindingID) == "" || strings.TrimSpace(c.Torrent.WorkerNodeID) == "" ||
+			strings.TrimSpace(c.Torrent.BridgeInstanceID) == "" || strings.TrimSpace(c.Torrent.Downloader) == "" ||
+			strings.TrimSpace(c.Torrent.QBClientID) == "" {
+			return errors.New("torrent context requires binding, Worker, Bridge, downloader, and qB client identifiers")
+		}
+		if err := validateTorrentHash(c.Torrent.TorrentHash); err != nil {
+			return err
+		}
+		if strings.Contains(c.Torrent.RelativePath, `\\`) || path.IsAbs(c.Torrent.RelativePath) || strings.HasPrefix(path.Clean(c.Torrent.RelativePath), "../") {
+			return errors.New("torrent relative path must stay below the qB content root")
+		}
+		if action := strings.TrimSpace(c.Torrent.Action); action != "" && action != "delete" && action != "pause" && action != "resume" {
+			return fmt.Errorf("unsupported torrent action %q", action)
+		}
 	}
 	return nil
 }
@@ -91,7 +107,7 @@ func (o JobOffer) Validate() error {
 	if o.LeaseUntil.IsZero() {
 		return errors.New("lease_until is required")
 	}
-	if (o.JobType == "media.transfer" || o.JobType == "share.inspect") && o.TaskContext.Share.URL == "" {
+	if (o.JobType == "media.transfer" || o.JobType == "share.inspect") && o.TaskContext.Torrent == nil && o.TaskContext.Share.URL == "" {
 		return errors.New("share url is required")
 	}
 	if o.JobType == "share.inspect" {
@@ -111,7 +127,24 @@ func (o JobOffer) Validate() error {
 			return errors.New("media.transfer requires exactly one source object; split multiple media files into separate child jobs")
 		}
 	}
+	if o.JobType == "torrent.observe" && o.TaskContext.Torrent == nil {
+		return errors.New("torrent.observe requires torrent context")
+	}
 	return validateTaskContextHash(o.TaskContext, o.TaskContextHash)
+}
+
+func validateTorrentHash(value string) error {
+	value = strings.TrimSpace(value)
+	if len(value) != 40 && len(value) != 64 {
+		return errors.New("torrent hash must contain 40 or 64 hexadecimal characters")
+	}
+	if value != strings.ToLower(value) {
+		return errors.New("torrent hash must be lowercase")
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return errors.New("torrent hash must contain hexadecimal characters")
+	}
+	return nil
 }
 
 func (m UploadETFManifest) Validate() error {
@@ -190,6 +223,7 @@ func (m UploadETFManifest) TaskContext() TaskContext {
 		StagingTarget:         m.StagingTarget,
 		DeliveryTarget:        m.DeliveryTarget,
 		TargetProfile:         m.TargetProfile,
+		Torrent:               m.Torrent,
 	}
 }
 

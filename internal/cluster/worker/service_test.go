@@ -76,6 +76,32 @@ func (s channelSender) Send(ctx context.Context, message protocol.Envelope) erro
 	}
 }
 
+func TestSendJobProgressUsesMonotonicAttemptSequence(t *testing.T) {
+	sender := make(channelSender, 2)
+	service := New(&fakeResultQueue{}, sender)
+	offer := protocol.JobOffer{AttemptRef: protocol.AttemptRef{JobID: "job-progress", AttemptID: "attempt-progress", Generation: 1, LeaseToken: "lease"}}
+	service.active[offer.JobID] = &activeTask{attempt: offer.AttemptRef, offer: offer}
+
+	for completed := int64(25); completed <= 50; completed += 25 {
+		if err := service.sendJobProgress(context.Background(), offer, model.ClusterStageUploadingMobile, completed, 100, 10, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for wantSeq := uint64(1); wantSeq <= 2; wantSeq++ {
+		message := <-sender
+		if message.Type != protocol.MessageJobProgress {
+			t.Fatalf("message type = %q", message.Type)
+		}
+		progress, err := protocol.DecodePayload[protocol.JobProgress](message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if progress.EventSeq != wantSeq || progress.TotalBytes != 100 || progress.CompletedBytes != int64(wantSeq)*25 {
+			t.Fatalf("progress = %#v", progress)
+		}
+	}
+}
+
 func (q *fakeResultQueue) EnqueueResultAndCleanupDurably(ctx context.Context, value any, cleanup resultqueue.CleanupRequest) (string, string, error) {
 	q.ctxErr = ctx.Err()
 	q.enqueued = value
@@ -1414,4 +1440,24 @@ func testMediaTransferOfferWithoutBatch(sourceObjects []protocol.SourceObject) p
 
 func testStagedSourcePath(tempRoot string, object protocol.SourceObject) string {
 	return path.Join(tempRoot, path.Base(strings.TrimSpace(object.SourceRelativePath)))
+}
+
+func TestMoviePilotStagingReservationAccountsForConcurrentCopies(t *testing.T) {
+	service := New(nil, nil)
+	service.stagingFreeSpace = func(context.Context, string) (uint64, error) { return 100, nil }
+	stagingRoot := t.TempDir()
+	firstRelease, err := service.reserveMoviePilotStaging(context.Background(), stagingRoot, 60)
+	if err != nil {
+		t.Fatalf("reserve first staging copy: %v", err)
+	}
+	defer firstRelease()
+	if _, err := service.reserveMoviePilotStaging(context.Background(), stagingRoot, 60); err == nil || !errors.Is(err, ErrQBStagingInsufficientSpace) {
+		t.Fatalf("second staging reservation error = %v, want insufficient space", err)
+	}
+	firstRelease()
+	secondRelease, err := service.reserveMoviePilotStaging(context.Background(), stagingRoot, 100)
+	if err != nil {
+		t.Fatalf("reserve staging after release: %v", err)
+	}
+	secondRelease()
 }

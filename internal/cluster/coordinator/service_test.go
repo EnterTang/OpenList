@@ -1013,6 +1013,41 @@ func TestLeaseRenewExtendsCurrentAttempt(t *testing.T) {
 	}
 }
 
+func TestLeaseRenewDoesNotRegressLastEventSequence(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	taskContext := testTaskContext()
+	contextHash, err := protocol.HashTaskContext(taskContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(taskContext, contextHash, model.ClusterAttemptStatusRunning)
+	attempt.LeaseUntil = time.Now().UTC().Add(time.Minute)
+	attempt.LastEventSeq = 5
+	if err := database.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageLeaseRenew, protocol.LeaseRenew{
+		AttemptRef:     attemptRefForTest(attempt),
+		RequestedUntil: time.Now().UTC().Add(10 * time.Minute),
+		LastEventSeq:   3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(database, "token").HandleMessage(context.Background(), &testPeer{}, *message); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.LastEventSeq != 5 {
+		t.Fatalf("last event sequence regressed to %d", attempt.LastEventSeq)
+	}
+}
+
 func TestStagePermitRequiresCurrentLeasedAttempt(t *testing.T) {
 	database := openCoordinatorTestDB(t)
 	taskContext := testTaskContext()
@@ -1580,13 +1615,160 @@ func TestDeleteNodeRejectsOnlineAndDrainingNodes(t *testing.T) {
 	}
 }
 
+func TestJobProgressUpdatesMoviePilotDeliveryAndAttemptSequence(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	task.Torrent = &protocol.TorrentTaskContext{BindingID: "binding-progress", TorrentHash: strings.Repeat("a", 40)}
+	taskRaw, err := json.Marshal(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, "task-hash", model.ClusterAttemptStatusAccepted)
+	job.Type = model.ClusterJobTypeMediaTransfer
+	job.TaskContextJSON = string(taskRaw)
+	binding := model.MoviePilotTorrentBinding{ID: task.Torrent.BindingID, IntentID: "intent-progress", BridgeInstanceID: "bridge-progress", TorrentHash: task.Torrent.TorrentHash}
+	delivery := model.MoviePilotDeliveryFile{ID: "delivery-progress", TorrentBindingID: binding.ID, RelativePath: "Show.S01E01.mkv", ClusterJobID: job.ID, Status: model.MoviePilotDeliveryStatusPending}
+	for _, value := range []any{&job, &attempt, &binding, &delivery} {
+		if err := database.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	progress := protocol.JobProgress{
+		AttemptRef:     attemptRefForTest(attempt),
+		Stage:          model.ClusterStageUploadingMobile,
+		EventSeq:       1,
+		CompletedBytes: 40,
+		TotalBytes:     100,
+		ObservedAt:     time.Now().UTC(),
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageJobProgress, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *message); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.LastEventSeq != 1 || attempt.Status != model.ClusterAttemptStatusRunning {
+		t.Fatalf("attempt after progress = %#v", attempt)
+	}
+	if err := database.First(&delivery, "id = ?", delivery.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Status != model.MoviePilotDeliveryStatusUploading || delivery.UploadProgress != 0.4 {
+		t.Fatalf("delivery after progress = %#v", delivery)
+	}
+	var stage model.ClusterJobStage
+	if err := database.First(&stage, "attempt_id = ? AND name = ?", attempt.ID, model.ClusterStageUploadingMobile).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusRunning || !strings.Contains(stage.ProgressJSON, `"completed_bytes":40`) {
+		t.Fatalf("stage after progress = %#v", stage)
+	}
+}
+
+func TestJobProgressDoesNotRegressTerminalStageOrDelivery(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	task.Torrent = &protocol.TorrentTaskContext{BindingID: "binding-terminal-progress", TorrentHash: strings.Repeat("c", 40)}
+	taskRaw, err := json.Marshal(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, attempt := testJobAndAttempt(task, "task-hash", model.ClusterAttemptStatusRunning)
+	job.Type = model.ClusterJobTypeMediaTransfer
+	job.TaskContextJSON = string(taskRaw)
+	attempt.LastEventSeq = 1
+	now := time.Now().UTC()
+	binding := model.MoviePilotTorrentBinding{ID: task.Torrent.BindingID, IntentID: "intent-terminal-progress", BridgeInstanceID: "bridge-terminal-progress", TorrentHash: task.Torrent.TorrentHash}
+	delivery := model.MoviePilotDeliveryFile{
+		ID: "delivery-terminal-progress", TorrentBindingID: binding.ID, RelativePath: "Show.S01E01.mkv",
+		ClusterJobID: job.ID, Status: model.MoviePilotDeliveryStatusMaterialized, UploadProgress: 1,
+	}
+	stage := model.ClusterJobStage{
+		ID: "stage-terminal-progress", JobID: job.ID, AttemptID: attempt.ID,
+		Name: model.ClusterStageUploadingMobile, Status: model.ClusterStageStatusSucceeded,
+		StartedAt: &now, FinishedAt: &now, ProgressJSON: `{"completed_bytes":100,"total_bytes":100}`,
+	}
+	for _, value := range []any{&job, &attempt, &binding, &delivery, &stage} {
+		if err := database.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	progress := protocol.JobProgress{
+		AttemptRef: attemptRefForTest(attempt), Stage: model.ClusterStageUploadingMobile, EventSeq: 2,
+		CompletedBytes: 50, TotalBytes: 100, ObservedAt: now.Add(time.Second),
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageJobProgress, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *message); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.First(&stage, "id = ?", stage.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusSucceeded || !strings.Contains(stage.ProgressJSON, `"completed_bytes":100`) {
+		t.Fatalf("terminal stage regressed = %#v", stage)
+	}
+	if err := database.First(&delivery, "id = ?", delivery.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Status != model.MoviePilotDeliveryStatusMaterialized || delivery.UploadProgress != 1 {
+		t.Fatalf("materialized delivery regressed = %#v", delivery)
+	}
+	if err := database.First(&attempt, "id = ?", attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.LastEventSeq != 2 {
+		t.Fatalf("attempt sequence was not acknowledged: %d", attempt.LastEventSeq)
+	}
+}
+
+func TestQBStageStatusCreatesCoordinatorOwnedInternalStage(t *testing.T) {
+	database := openCoordinatorTestDB(t)
+	task := testTaskContext()
+	task.Torrent = &protocol.TorrentTaskContext{BindingID: "binding-stage", TorrentHash: strings.Repeat("b", 40)}
+	job, attempt := testJobAndAttempt(task, "task-hash", model.ClusterAttemptStatusAccepted)
+	job.Type = model.ClusterJobTypeTorrentObserve
+	for _, value := range []any{&job, &attempt} {
+		if err := database.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	update := protocol.StageStatusUpdate{
+		AttemptRef: attemptRefForTest(attempt), Stage: model.ClusterStageQBObserving, Status: model.ClusterStageStatusRunning,
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageStageStatus, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(database, "").HandleMessage(context.Background(), &testPeer{}, *message); err != nil {
+		t.Fatal(err)
+	}
+	var stage model.ClusterJobStage
+	if err := database.First(&stage, "attempt_id = ? AND name = ?", attempt.ID, model.ClusterStageQBObserving).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stage.Status != model.ClusterStageStatusRunning || stage.StartedAt == nil {
+		t.Fatalf("qB stage = %#v", stage)
+	}
+}
+
 func openCoordinatorTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	database, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.AutoMigrate(&model.ClusterNode{}, &model.ClusterNodeSession{}, &model.ClusterNodeInventory{}, &model.ClusterNodeDesiredConfig{}, &model.ClusterStorageProfile{}, &model.ClusterJob{}, &model.ClusterJobAttempt{}, &model.ClusterJobStage{}, &model.ClusterUploadManifest{}, &model.ClusterShareInspectManifest{}, &model.ClusterInbox{}, &model.ClusterOutbox{}); err != nil {
+	if err := database.AutoMigrate(&model.ClusterNode{}, &model.ClusterNodeSession{}, &model.ClusterNodeInventory{}, &model.ClusterNodeDesiredConfig{}, &model.ClusterStorageProfile{}, &model.ClusterJob{}, &model.ClusterJobAttempt{}, &model.ClusterJobStage{}, &model.ClusterUploadManifest{}, &model.ClusterShareInspectManifest{}, &model.ClusterInbox{}, &model.ClusterOutbox{}, &model.MoviePilotTorrentBinding{}, &model.MoviePilotDeliveryFile{}); err != nil {
 		t.Fatal(err)
 	}
 	return database

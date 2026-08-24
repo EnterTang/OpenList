@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/secure"
+	internaldb "github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/qbittorrent"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 type fakeStorageOperator struct {
@@ -62,6 +67,97 @@ func TestConfigApplyUpdatesObservedStateAndBindings(t *testing.T) {
 	require.Equal(t, "mobile_primary", name)
 	_, revision := service.ControlIdentity()
 	require.Equal(t, uint64(7), revision)
+}
+
+func TestConfigApplyDecryptsQBSecretWithoutPersistingPlaintext(t *testing.T) {
+	keys, err := secure.GenerateKeyPair()
+	require.NoError(t, err)
+	sender := make(channelSender, 1)
+	service := New(&fakeResultQueue{}, sender)
+	service.ConfigureControlPlane("worker-qb", keys, nil)
+	desired := protocol.WorkerDesiredConfig{QBClients: []protocol.QBClientConfig{{
+		ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-qb-a",
+		PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+	}}}
+	hash, err := protocol.HashWorkerDesiredConfig(desired)
+	require.NoError(t, err)
+	apply := protocol.ConfigApply{Revision: 8, DesiredHash: hash, DesiredConfig: &desired}
+	apply.QBSecretEnvelopes = map[string]string{"qb-a": ""}
+	apply.QBSecretEnvelopes["qb-a"], err = secure.SealJSON(keys.PublicKey(), map[string]any{"username": "qb-user", "password": "qb-password"}, protocol.QBSecretApplyAAD("worker-qb", apply, "qb-a"))
+	require.NoError(t, err)
+	message, err := protocol.NewEnvelope(protocol.MessageConfigApply, apply)
+	require.NoError(t, err)
+	require.NoError(t, service.HandleMessage(context.Background(), nil, *message))
+	response := <-sender
+	observed, err := protocol.DecodePayload[protocol.ConfigObserved](response)
+	require.NoError(t, err)
+	require.Equal(t, "applied", observed.Status)
+	service.mu.Lock()
+	secret := service.qbSecrets["qb-a"]
+	service.mu.Unlock()
+	require.Equal(t, "qb-user", secret["username"])
+	require.NotContains(t, string(response.Payload), "qb-password")
+}
+
+func TestConfigApplyResumesDisconnectPausedMoviePilotTorrent(t *testing.T) {
+	keys, err := secure.GenerateKeyPair()
+	require.NoError(t, err)
+	sender := make(channelSender, 1)
+	service := New(&fakeResultQueue{}, sender)
+	service.ConfigureControlPlane("worker-qb", keys, nil)
+	hash := strings.Repeat("b", 40)
+	client := &fakeQBClient{info: qbittorrent.TorrentInfo{Hash: hash, Progress: .5, AmountLeft: 100}}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
+	torrent := protocol.TorrentTaskContext{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a", TorrentHash: hash}
+	service.moviePilotTorrents[moviePilotTorrentRegistryKey(&torrent)] = moviePilotTorrentRegistryEntry{Torrent: torrent, PausedByDisconnect: true}
+	desired := protocol.WorkerDesiredConfig{
+		QBClients: []protocol.QBClientConfig{{
+			ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-qb-a",
+			PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+		}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+	}
+	desiredHash, err := protocol.HashWorkerDesiredConfig(desired)
+	require.NoError(t, err)
+	apply := protocol.ConfigApply{Revision: 9, DesiredHash: desiredHash, DesiredConfig: &desired}
+	apply.QBSecretEnvelopes = map[string]string{"qb-a": ""}
+	apply.QBSecretEnvelopes["qb-a"], err = secure.SealJSON(keys.PublicKey(), map[string]any{"username": "qb-user", "password": "qb-password"}, protocol.QBSecretApplyAAD("worker-qb", apply, "qb-a"))
+	require.NoError(t, err)
+	message, err := protocol.NewEnvelope(protocol.MessageConfigApply, apply)
+	require.NoError(t, err)
+	require.NoError(t, service.HandleMessage(context.Background(), nil, *message))
+	<-sender
+	require.Equal(t, []string{hash}, client.started)
+}
+
+func TestConfigureControlPlaneRestoresMoviePilotTorrentRegistry(t *testing.T) {
+	database, err := gorm.Open(sqlite.Open("file:worker_moviepilot_registry_restore?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.ClusterWorkerObservedState{}))
+	previous := internaldb.GetDb()
+	internaldb.UseConnection(database)
+	t.Cleanup(func() {
+		internaldb.UseConnection(previous)
+		sqlDB, dbErr := database.DB()
+		if dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	torrent := protocol.TorrentTaskContext{BridgeInstanceID: "mp-main", QBClientID: "qb-a", TorrentHash: strings.Repeat("a", 40)}
+	raw, err := json.Marshal(moviePilotTorrentRegistryEntry{Torrent: torrent, PausedByDisconnect: true})
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.ClusterWorkerObservedState{
+		ID: moviePilotTorrentRegistryID(&torrent), ResourceType: moviePilotTorrentRegistryType,
+		ResourceKey: moviePilotTorrentRegistryKey(&torrent), Hash: torrent.TorrentHash, PayloadJSON: string(raw),
+	}).Error)
+
+	service := New(nil, nil)
+	service.ConfigureControlPlane("worker-1", nil, nil)
+	service.mu.Lock()
+	restoredEntry, restored := service.moviePilotTorrents[moviePilotTorrentRegistryKey(&torrent)]
+	service.mu.Unlock()
+	require.True(t, restored)
+	require.True(t, restoredEntry.PausedByDisconnect)
 }
 
 func TestStorageApplyDecryptsCredentialsWithoutEchoingThem(t *testing.T) {

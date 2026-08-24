@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -81,6 +83,7 @@ type CleanupRequest struct {
 type CleanupTarget struct {
 	OpenListPath     string `json:"openlist_path"`
 	StorageMountPath string `json:"storage_mount_path"`
+	LocalPath        string `json:"local_path,omitempty"`
 	OwnedRootPath    string `json:"owned_root_path,omitempty"`
 	RemoteFileID     string `json:"remote_file_id,omitempty"`
 	Name             string `json:"name"`
@@ -113,6 +116,21 @@ func (r CleanupRequest) Validate() error {
 }
 
 func validateCleanupTarget(target CleanupTarget) error {
+	if localPath := strings.TrimSpace(target.LocalPath); localPath != "" {
+		cleanPath := filepath.Clean(localPath)
+		ownedRoot := filepath.Clean(strings.TrimSpace(target.OwnedRootPath))
+		if !filepath.IsAbs(cleanPath) || cleanPath == string(filepath.Separator) || !filepath.IsAbs(ownedRoot) || ownedRoot == string(filepath.Separator) {
+			return errors.New("local cleanup paths must be absolute non-root paths")
+		}
+		relative, err := filepath.Rel(ownedRoot, cleanPath)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) || filepath.Dir(cleanPath) != ownedRoot {
+			return errors.New("local cleanup path must remain inside its owned root")
+		}
+		if target.Name == "" || filepath.Base(cleanPath) != target.Name || target.RemoteFileID != "" || target.EmptyRecycleBin {
+			return errors.New("local cleanup target does not match its exact file")
+		}
+		return nil
+	}
 	cleanPath := path.Clean(strings.TrimSpace(target.OpenListPath))
 	mountPath := path.Clean(strings.TrimSpace(target.StorageMountPath))
 	if !strings.HasPrefix(cleanPath, "/") || mountPath == "." || !strings.HasPrefix(mountPath, "/") {
@@ -139,6 +157,35 @@ func validateCleanupTarget(target CleanupTarget) error {
 			return errors.New("exact cleanup request must target a direct file in its owned root")
 		}
 		return nil
+	}
+	return nil
+}
+
+// ExecuteLocalCleanupTarget removes a Worker-local staging file after its
+// durable result has been queued. It is exported for the Worker cleanup loop;
+// validation still enforces the exact owned-root boundary.
+func ExecuteLocalCleanupTarget(ctx context.Context, target CleanupTarget) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localPath := filepath.Clean(strings.TrimSpace(target.LocalPath))
+	ownedRoot := filepath.Clean(strings.TrimSpace(target.OwnedRootPath))
+	relative, err := filepath.Rel(ownedRoot, localPath)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.Dir(localPath) != ownedRoot {
+		return errors.New("local cleanup path escaped its owned root")
+	}
+	info, err := os.Lstat(localPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("local cleanup target is not a regular file")
+	}
+	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }

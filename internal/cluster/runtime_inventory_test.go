@@ -104,6 +104,39 @@ func TestNodeInventorySupportsHonorsProviderAccountUploadLimit(t *testing.T) {
 	}
 }
 
+func TestTorrentInventoryMatchPinsTaskToBoundWorkerAndRoute(t *testing.T) {
+	task := protocol.TaskContext{Torrent: &protocol.TorrentTaskContext{
+		WorkerNodeID:     "worker-qb",
+		BridgeInstanceID: "mp-main",
+		Downloader:       "qb-a",
+		QBClientID:       "qb-a",
+		TorrentHash:      strings.Repeat("a", 40),
+	}}
+	capabilities := protocol.NodeCapabilities{
+		SupportedOperations: []string{"qb.copy"},
+		MoviePilotRoutes: []protocol.MoviePilotRouteInventory{{
+			BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a",
+			UploadConcurrency: 2, QBHealth: "configured",
+		}},
+	}
+
+	if worker, err := ResolveTorrentWorker(task); err != nil || worker != "worker-qb" {
+		t.Fatalf("ResolveTorrentWorker = %q, %v", worker, err)
+	}
+	if _, ok, reason, err := nodeInventoryTorrentMatch("worker-qb", task, capabilities, 0); err != nil || !ok {
+		t.Fatalf("bound worker should match, ok=%v reason=%q err=%v", ok, reason, err)
+	}
+	if _, ok, reason, err := nodeInventoryTorrentMatch("worker-other", task, capabilities, 0); err != nil || ok || !strings.Contains(reason, "bound to worker") {
+		t.Fatalf("other worker should be rejected, ok=%v reason=%q err=%v", ok, reason, err)
+	}
+	if got := selectRedispatchNodeID([]string{"worker-other"}, task, 0); got != "" {
+		t.Fatalf("offline bound worker must not fall back to %q", got)
+	}
+	if got := selectRedispatchNodeID([]string{"worker-other", "worker-qb"}, task, 0); got != "worker-qb" {
+		t.Fatalf("bound worker selection = %q, want worker-qb", got)
+	}
+}
+
 func TestNodeInventorySupportsRequiresSourceProviderCapability(t *testing.T) {
 	database := openClusterRuntimeTestDB(t)
 	oldConf := conf.Conf

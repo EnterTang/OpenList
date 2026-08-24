@@ -3,6 +3,7 @@ package subscription
 import (
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
@@ -86,6 +87,53 @@ func CalculateSubscriptionProgress(sub *model.Subscription, items []model.Subscr
 		}
 	}
 	return archiveStalledProgress(sub, now, progress)
+}
+
+// HydrateMoviePilotProgress adds the torrent/download/upload projection to a
+// subscription detail or list card. Completion remains derived from
+// SubscriptionItem.Status, which is only changed after ETF materialization.
+func HydrateMoviePilotProgress(sub *model.Subscription) error {
+	if sub == nil || sub.SourceType != model.SubscriptionSourceMoviePilot {
+		return nil
+	}
+	snapshots, err := db.ListMoviePilotProgressBySubscriptionIDs([]uint{sub.ID})
+	if err != nil {
+		return err
+	}
+	applyMoviePilotProgress(&sub.Progress, snapshots[sub.ID])
+	return nil
+}
+
+func HydrateMoviePilotProgressForSubscriptions(subscriptions []model.Subscription) error {
+	ids := make([]uint, 0, len(subscriptions))
+	for _, sub := range subscriptions {
+		if sub.SourceType == model.SubscriptionSourceMoviePilot {
+			ids = append(ids, sub.ID)
+		}
+	}
+	snapshots, err := db.ListMoviePilotProgressBySubscriptionIDs(ids)
+	if err != nil {
+		return err
+	}
+	for i := range subscriptions {
+		if snapshot, ok := snapshots[subscriptions[i].ID]; ok {
+			applyMoviePilotProgress(&subscriptions[i].Progress, snapshot)
+		}
+	}
+	return nil
+}
+
+func applyMoviePilotProgress(progress *model.SubscriptionProgress, snapshot model.MoviePilotProgressSnapshot) {
+	if progress == nil {
+		return
+	}
+	progress.TorrentStatus = snapshot.TorrentStatus
+	progress.DownloadProgress = snapshot.DownloadProgress
+	progress.UploadProgress = snapshot.UploadProgress
+	progress.SeedElapsed = snapshot.SeedElapsed
+	progress.RetentionStatus = snapshot.RetentionStatus
+	progress.TransferredFiles = snapshot.TransferredFiles
+	progress.ExpectedFiles = snapshot.ExpectedFiles
 }
 
 func hasSeasonEpisodeCounts(sub *model.Subscription) bool {

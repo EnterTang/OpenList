@@ -366,6 +366,8 @@ func runBySource(ctx context.Context, sub *model.Subscription, transfer bool) ([
 		return runPanSou(ctx, sub, transfer)
 	case model.SubscriptionSourceHDHive, model.SubscriptionSourceAuto:
 		return runHDHive(ctx, sub, transfer)
+	case model.SubscriptionSourceMoviePilot:
+		return runMoviePilot(ctx, sub, transfer)
 	default:
 		return nil, sub.LastTreeHash, 0, 0, 0, fmt.Errorf("unsupported subscription source type: %s", sub.SourceType)
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -133,6 +135,30 @@ func TestCleanupRequestAllowsOwnedSourceAndMobileTargets(t *testing.T) {
 	require.NoError(t, request.Validate())
 	request.AdditionalTargets[0].RemoteFileID = ""
 	require.Error(t, request.Validate())
+}
+
+func TestCleanupRequestAllowsWorkerLocalStagingTarget(t *testing.T) {
+	root := t.TempDir()
+	request := CleanupRequest{
+		Version: "v1", JobID: "job-1", MediaItemID: "media-1",
+		OpenListPath: "/mobile/.openlist-cluster/job-1/media-1/episode.mkv", StorageMountPath: "/mobile",
+		RemoteFileID: "mobile-file", Name: "episode.mkv",
+		AdditionalTargets: []CleanupTarget{{
+			LocalPath: filepath.Join(root, "episode.mkv"), OwnedRootPath: root, Name: "episode.mkv",
+		}},
+	}
+	require.NoError(t, request.Validate())
+}
+
+func TestExecuteLocalCleanupTargetRemovesOnlyOwnedRegularFile(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "episode.mkv")
+	require.NoError(t, os.WriteFile(filePath, []byte("staged"), 0o600))
+	target := CleanupTarget{LocalPath: filePath, OwnedRootPath: root, Name: "episode.mkv"}
+	require.NoError(t, validateCleanupTarget(target))
+	require.NoError(t, ExecuteLocalCleanupTarget(context.Background(), target))
+	_, err := os.Stat(filePath)
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestCleanupRequestRejectsFlatExactTargetOutsideOwnedRoot(t *testing.T) {

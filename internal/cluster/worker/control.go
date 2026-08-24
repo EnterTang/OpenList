@@ -145,6 +145,19 @@ func (s *Service) ConfigureControlPlane(nodeID string, keys *secure.KeyPair, ope
 				}
 			}
 		}
+		var torrentStates []model.ClusterWorkerObservedState
+		if db.GetDb().Where("resource_type = ?", moviePilotTorrentRegistryType).Find(&torrentStates).Error == nil {
+			if s.moviePilotTorrents == nil {
+				s.moviePilotTorrents = make(map[string]moviePilotTorrentRegistryEntry)
+			}
+			for _, state := range torrentStates {
+				entry, ok := decodeMoviePilotTorrentRegistryEntry(state.PayloadJSON)
+				if !ok {
+					continue
+				}
+				s.moviePilotTorrents[moviePilotTorrentRegistryKey(&entry.Torrent)] = entry
+			}
+		}
 	}
 }
 
@@ -163,6 +176,13 @@ func (s *Service) DecorateInventory(report *protocol.InventoryReport) {
 		return
 	}
 	report.KeyAgreement, report.ObservedRevision = s.ControlIdentity()
+	report.Capabilities.MoviePilotRoutes = s.moviePilotRouteInventory()
+	if len(report.Capabilities.MoviePilotRoutes) > 0 && !containsInventoryOperation(report.Capabilities.SupportedOperations, "qb.copy") {
+		report.Capabilities.SupportedOperations = append(report.Capabilities.SupportedOperations, "qb.copy")
+	}
+	if len(report.Capabilities.MoviePilotRoutes) > 0 && !containsInventoryOperation(report.Capabilities.SupportedOperations, "qb.control") {
+		report.Capabilities.SupportedOperations = append(report.Capabilities.SupportedOperations, "qb.control")
+	}
 	s.mu.Lock()
 	report.Capabilities.DownloadConcurrency = effectiveConcurrency(s.desiredConfig.DownloadConcurrency)
 	report.Capabilities.UploadConcurrency = effectiveConcurrency(s.desiredConfig.UploadConcurrency)
@@ -210,13 +230,33 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 		return controlFailure{"stale_revision", "desired config revision is older than the observed revision"}
 	}
 	if apply.Revision == s.configObserved.revision {
+		sameConfig := strings.EqualFold(apply.DesiredHash, s.configObserved.hash)
 		s.mu.Unlock()
-		if strings.EqualFold(apply.DesiredHash, s.configObserved.hash) {
+		if sameConfig {
+			// Desired configuration is persisted across a Worker restart, but qB
+			// credentials are deliberately not. Reapply the encrypted envelopes
+			// even for an unchanged revision before attempting reconnect recovery.
+			qbSecrets, err := s.decodeQBSecretEnvelopes(apply, desired)
+			if err != nil {
+				return err
+			}
+			s.mu.Lock()
+			if qbSecrets != nil {
+				s.qbSecrets = qbSecrets
+			}
+			s.mu.Unlock()
+			s.probeMoviePilotQBClients()
+			s.ResumeMoviePilotTorrents(ctx)
+			s.ReconcileMoviePilotStagingCapacity(ctx)
 			return nil
 		}
 		return controlFailure{"revision_conflict", "desired config revision was already applied with a different hash"}
 	}
 	s.mu.Unlock()
+	qbSecrets, err := s.decodeQBSecretEnvelopes(apply, desired)
+	if err != nil {
+		return err
+	}
 	raw, err := json.Marshal(desired)
 	if err != nil {
 		return controlFailure{"invalid_config", "desired config could not be persisted"}
@@ -228,19 +268,28 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 		}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.applyDesiredConfigMemory(desired, apply.Revision, apply.DesiredHash)
+	s.applyDesiredConfigMemory(desired, apply.Revision, apply.DesiredHash, qbSecrets)
+	s.mu.Unlock()
+	s.probeMoviePilotQBClients()
+	s.ResumeMoviePilotTorrents(ctx)
+	s.ReconcileMoviePilotStagingCapacity(ctx)
 	return nil
 }
 
-func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig, revision uint64, hash string) {
+func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig, revision uint64, hash string, qbSecrets ...map[string]map[string]any) {
 	s.desiredConfig = cloneDesiredConfig(desired)
+	if len(qbSecrets) > 0 && qbSecrets[0] != nil {
+		s.qbSecrets = qbSecrets[0]
+	}
 	s.configObserved = observedState{revision: revision, hash: hash}
 	if revision > s.observedRevision {
 		s.observedRevision = revision
 	}
 	s.downloadGate.SetLimit(effectiveConcurrency(desired.DownloadConcurrency))
 	s.uploadGate.SetLimit(effectiveConcurrency(desired.UploadConcurrency))
+	if s.moviePilotUploadGate != nil {
+		s.moviePilotUploadGate.SetLimit(moviePilotUploadConcurrency(desired.Staging))
+	}
 	for name, binding := range desired.TargetBindings {
 		gate := s.targetGates[name]
 		if gate == nil {
@@ -250,6 +299,38 @@ func (s *Service) applyDesiredConfigMemory(desired protocol.WorkerDesiredConfig,
 			gate.SetLimit(defaultTargetConcurrency(binding.MaxConcurrency))
 		}
 	}
+}
+
+func (s *Service) decodeQBSecretEnvelopes(apply protocol.ConfigApply, desired protocol.WorkerDesiredConfig) (map[string]map[string]any, error) {
+	if len(desired.QBClients) == 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	keys := s.controlKeys
+	nodeID := s.controlNodeID
+	s.mu.Unlock()
+	if keys == nil || strings.TrimSpace(nodeID) == "" {
+		return nil, controlFailure{"control_unavailable", "worker qB secure control is not configured"}
+	}
+	secrets := make(map[string]map[string]any, len(desired.QBClients))
+	for _, client := range desired.QBClients {
+		envelope := strings.TrimSpace(apply.QBSecretEnvelopes[strings.TrimSpace(client.ID)])
+		if envelope == "" {
+			return nil, controlFailure{"qb_secret_missing", "qB client credentials were not delivered securely"}
+		}
+		parameters := make(map[string]any)
+		if err := keys.OpenJSON(envelope, protocol.QBSecretApplyAAD(nodeID, apply, client.ID), &parameters); err != nil {
+			return nil, controlFailure{"qb_secret_decryption_failed", "qB client credentials could not be authenticated for this worker"}
+		}
+		if _, ok := firstQBSecretString(parameters, "username", "user"); !ok {
+			return nil, controlFailure{"qb_secret_invalid", "qB client username is missing"}
+		}
+		if _, ok := firstQBSecretString(parameters, "password", "pass"); !ok {
+			return nil, controlFailure{"qb_secret_invalid", "qB client password is missing"}
+		}
+		secrets[strings.TrimSpace(client.ID)] = parameters
+	}
+	return secrets, nil
 }
 
 func effectiveConcurrency(configured int) int {
@@ -457,6 +538,33 @@ func cloneDesiredConfig(config protocol.WorkerDesiredConfig) protocol.WorkerDesi
 		value.MountPath = path.Clean(value.MountPath)
 		cloned.TargetBindings[normalizeControlKey(key)] = value
 	}
+	cloned.QBClients = make([]protocol.QBClientConfig, 0, len(config.QBClients))
+	for _, client := range config.QBClients {
+		client.ID = strings.TrimSpace(client.ID)
+		client.WebUIURL = strings.TrimSpace(client.WebUIURL)
+		client.SecretRef = strings.TrimSpace(client.SecretRef)
+		client.PathMappings = append([]protocol.QBPathMapping(nil), client.PathMappings...)
+		for i := range client.PathMappings {
+			client.PathMappings[i].QBPath = path.Clean(strings.TrimSpace(client.PathMappings[i].QBPath))
+			client.PathMappings[i].WorkerPath = path.Clean(strings.TrimSpace(client.PathMappings[i].WorkerPath))
+		}
+		cloned.QBClients = append(cloned.QBClients, client)
+	}
+	cloned.MoviePilotRoutes = make([]protocol.MoviePilotRoute, 0, len(config.MoviePilotRoutes))
+	for _, route := range config.MoviePilotRoutes {
+		route.BridgeInstanceID = strings.TrimSpace(route.BridgeInstanceID)
+		route.Downloader = strings.TrimSpace(route.Downloader)
+		route.QBClientID = strings.TrimSpace(route.QBClientID)
+		cloned.MoviePilotRoutes = append(cloned.MoviePilotRoutes, route)
+	}
+	cloned.Staging.Root = strings.TrimSpace(config.Staging.Root)
+	if cloned.Staging.Root != "" {
+		cloned.Staging.Root = path.Clean(cloned.Staging.Root)
+	}
+	cloned.Staging.ExtensionWhitelist = append([]string(nil), config.Staging.ExtensionWhitelist...)
+	for i := range cloned.Staging.ExtensionWhitelist {
+		cloned.Staging.ExtensionWhitelist[i] = strings.ToLower(strings.TrimSpace(cloned.Staging.ExtensionWhitelist[i]))
+	}
 	return cloned
 }
 
@@ -496,6 +604,13 @@ func (s *Service) acquireDownloadCapacity(ctx context.Context) (func(), error) {
 func (s *Service) tryAcquireMediaCapacity() (func(), bool) {
 	s.refreshDefaultMediaConcurrency()
 	return s.downloadGate.TryAcquire()
+}
+
+func (s *Service) tryAcquireMoviePilotUploadCapacity() (func(), bool) {
+	if s.moviePilotUploadGate == nil {
+		return func() {}, true
+	}
+	return s.moviePilotUploadGate.TryAcquire()
 }
 
 func (s *Service) acquireUploadCapacity(ctx context.Context) (func(), error) {

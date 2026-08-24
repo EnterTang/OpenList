@@ -1,12 +1,16 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/message"
+	"github.com/OpenListTeam/OpenList/v4/internal/moviepilotbridge"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/OpenListTeam/OpenList/v4/server/handles"
@@ -113,7 +117,21 @@ func Init(e *gin.Engine) {
 	_sharing(auth.Group("/share", middlewares.AuthNotGuest))
 	externalSubscriptions(api.Group("/subscriptions", middlewares.ExternalSubscriptionAuth))
 	externalSubscriptions(api.Group("/v1/subscriptions", middlewares.ExternalSubscriptionAuth))
-	admin(auth.Group("/admin", middlewares.AuthAdmin))
+	moviePilotBridge := newMoviePilotBridgeService()
+	subscription.SetMoviePilotBridgeClient(moviePilotBridge)
+	if service := cluster.CoordinatorService(); service != nil {
+		service.SetMoviePilotTorrentController(moviePilotBridge)
+	}
+	moviePilotBridge.SetEventHandler(func(ctx context.Context, bridgeID string, event moviepilotbridge.BridgeEvent) error {
+		service := cluster.CoordinatorService()
+		if service == nil {
+			return errors.New("cluster coordinator is not running")
+		}
+		return service.HandleMoviePilotEvent(ctx, bridgeID, event)
+	})
+	moviePilotBridge.StartEventProcessor(context.Background())
+	api.POST("/v1/cluster/moviepilot/events", middlewares.MoviePilotBridgeAuth(moviePilotBridge), handles.ConsumeMoviePilotBridgeEvent(moviePilotBridge))
+	admin(auth.Group("/admin", middlewares.AuthAdmin), moviePilotBridge)
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
 	}
@@ -132,7 +150,7 @@ func externalSubscriptions(g *gin.RouterGroup) {
 	g.POST("/:id/update", handles.ExternalUpdateSubscription)
 }
 
-func admin(g *gin.RouterGroup) {
+func admin(g *gin.RouterGroup, moviePilotBridge *moviepilotbridge.Service) {
 	clusterAdmin := g.Group("/cluster")
 	clusterAdmin.GET("/config", handles.GetClusterConfig)
 	clusterAdmin.POST("/config", handles.SaveClusterConfig)
@@ -143,6 +161,7 @@ func admin(g *gin.RouterGroup) {
 	clusterAdmin.POST("/nodes/:id/config", handles.ApplyClusterNodeConfig)
 	clusterAdmin.GET("/results", handles.ListClusterUploadResults)
 	clusterAdmin.GET("/jobs", handles.ListClusterJobs)
+	clusterAdmin.GET("/moviepilot/transfers", handles.ListMoviePilotTransfers)
 	clusterAdmin.POST("/jobs/dispatch", handles.DispatchClusterMediaJob)
 	clusterAdmin.POST("/jobs/dispatch_batch", handles.DispatchClusterMediaBatch)
 	clusterAdmin.POST("/jobs/:id/retry", handles.RetryClusterJob)
@@ -155,6 +174,11 @@ func admin(g *gin.RouterGroup) {
 	clusterAdmin.GET("/storage-profiles", handles.ListClusterStorageProfiles)
 	clusterAdmin.POST("/storage-profiles", handles.ApplyClusterStorageProfile)
 	clusterAdmin.GET("/audit", handles.ListClusterControlAudit)
+
+	bridgeAdmin := g.Group("/moviepilot_bridge")
+	bridgeAdmin.GET("", handles.ListMoviePilotBridges(moviePilotBridge))
+	bridgeAdmin.POST("", handles.UpsertMoviePilotBridge(moviePilotBridge))
+	bridgeAdmin.POST("/:id/disable", handles.DisableMoviePilotBridge(moviePilotBridge))
 
 	meta := g.Group("/meta")
 	meta.GET("/list", handles.ListMetas)
@@ -264,6 +288,9 @@ func admin(g *gin.RouterGroup) {
 	subscription.POST("/resource/unlock", handles.UnlockSubscriptionResource)
 	subscription.POST("/resource/bind", handles.BindSubscriptionResource)
 	subscription.POST("/resource/unbind", handles.UnbindSubscriptionResource)
+	subscription.POST("/resource/bind_moviepilot", handles.BindMoviePilotSubscriptionResource)
+	subscription.POST("/resource/unbind_moviepilot", handles.UnbindMoviePilotSubscriptionResource)
+	subscription.POST("/resource/update_moviepilot_retention", handles.UpdateMoviePilotRetention)
 	subscription.GET("/config", handles.GetSubscriptionConfig)
 	subscription.POST("/config", handles.SaveSubscriptionConfig)
 	subscription.POST("/telegram/status", handles.TelegramSubscriptionStatus)

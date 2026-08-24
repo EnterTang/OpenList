@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,11 +27,14 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/internal/subscription"
 	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
+	"github.com/OpenListTeam/OpenList/v4/pkg/qbittorrent"
 	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/tache"
+	"github.com/shirou/gopsutil/v4/disk"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -65,6 +70,8 @@ var cleanupLookupDelay = 2 * time.Second
 
 const sourceCleanupLookupAttempts = 3
 
+const moviePilotStagingCapacityCheckInterval = time.Minute
+
 const shareSaveBatchCollisionKeyPrefix = "share-save-batch-collision:"
 
 var (
@@ -91,6 +98,7 @@ func getFreshCleanupObject(ctx context.Context, storage driver.Driver, actualPat
 type activeTask struct {
 	attempt         protocol.AttemptRef
 	offer           protocol.JobOffer
+	eventSeq        uint64
 	ctx             context.Context
 	cancel          context.CancelCauseFunc
 	stagingMount    string
@@ -121,10 +129,18 @@ type Service struct {
 	desiredConfig         protocol.WorkerDesiredConfig
 	configObserved        observedState
 	storageObserved       map[string]observedState
+	qbSecrets             map[string]map[string]any
+	qbHealth              map[string]string
 	observedRevision      uint64
 	downloadGate          *limitGate
 	uploadGate            *limitGate
+	moviePilotUploadGate  *limitGate
 	targetGates           map[string]*limitGate
+	qbClientFactory       func(protocol.QBClientConfig) (qbittorrent.Client, error)
+	stagingFreeSpace      func(context.Context, string) (uint64, error)
+	stagingReservationMu  sync.Mutex
+	stagingReservations   map[string]int64
+	moviePilotTorrents    map[string]moviePilotTorrentRegistryEntry
 	mediaTransferBoundary func(context.Context, protocol.JobOffer, resolvedMediaTransferTargets) error
 	shareSaveSaver        func(context.Context, string, string, string, []string) ([]string, error)
 	shareSaveBatchSaver   func(context.Context, string, string, string, []string) ([]string, error)
@@ -147,9 +163,78 @@ func New(queue resultQueue, sender Sender) *Service {
 		queue: queue, sender: sender,
 		pending: make(map[string]resultqueue.Result), active: make(map[string]*activeTask), control: make(map[string]chan error), permits: make(map[string]chan protocol.StagePermit),
 		storageOperator: openListStorageOperator{}, storageObserved: make(map[string]observedState),
-		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), targetGates: make(map[string]*limitGate),
-		shareSaveSaver: subscription.SaveClusterShareSelection, shareSaveBatchSaver: subscription.SaveClusterShareSelectionBatch, stagedSourceFinder: findExistingStagedSource,
+		qbSecrets: make(map[string]map[string]any), qbHealth: make(map[string]string),
+		downloadGate: newLimitGate(concurrency), uploadGate: newLimitGate(concurrency), moviePilotUploadGate: newLimitGate(moviePilotDefaultUploadConcurrency), targetGates: make(map[string]*limitGate),
+		// Leave the factory unset so discoverTorrentClient can select the
+		// Worker-local credential-aware constructor. Tests and deployments that
+		// need a custom qB client may still inject an explicit factory.
+		qbClientFactory: nil,
+		shareSaveSaver:  subscription.SaveClusterShareSelection, shareSaveBatchSaver: subscription.SaveClusterShareSelectionBatch, stagedSourceFinder: findExistingStagedSource,
+		stagingFreeSpace: func(ctx context.Context, root string) (uint64, error) {
+			usage, err := disk.UsageWithContext(ctx, root)
+			if err != nil {
+				return 0, err
+			}
+			return usage.Free, nil
+		},
+		stagingReservations: make(map[string]int64),
+		moviePilotTorrents:  make(map[string]moviePilotTorrentRegistryEntry),
 	}
+}
+
+// reserveMoviePilotStaging reserves only the bytes needed by an in-flight
+// qB-to-staging copy. The reservation is released immediately after the copy
+// finishes because the actual staged file then accounts for its own disk
+// usage. Keeping the reservation while copying closes the race between two
+// upload workers that both observe the same free-space value.
+func (s *Service) reserveMoviePilotStaging(ctx context.Context, stagingRoot string, bytes int64) (func(), error) {
+	if bytes <= 0 {
+		return func() {}, nil
+	}
+	root := filepath.Clean(strings.TrimSpace(stagingRoot))
+	if root == "." || root == "" {
+		return nil, errors.New("qB staging root is required")
+	}
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		return nil, fmt.Errorf("create qB staging root: %w", err)
+	}
+	usage := s.stagingFreeSpace
+	s.mu.Lock()
+	safetyReserve := s.desiredConfig.Staging.SafetyReserveBytes
+	s.mu.Unlock()
+	if usage == nil {
+		usage = func(ctx context.Context, root string) (uint64, error) {
+			value, err := disk.UsageWithContext(ctx, root)
+			if err != nil {
+				return 0, err
+			}
+			return value.Free, nil
+		}
+	}
+	s.stagingReservationMu.Lock()
+	defer s.stagingReservationMu.Unlock()
+	free, err := usage(ctx, root)
+	if err != nil {
+		return nil, fmt.Errorf("inspect qB staging free space: %w", err)
+	}
+	reserved := s.stagingReservations[root]
+	if safetyReserve < 0 || reserved < 0 || uint64(bytes) > free || uint64(reserved) > free-uint64(bytes) || uint64(safetyReserve) > free-uint64(bytes)-uint64(reserved) {
+		return nil, fmt.Errorf("%w: free=%d reserved=%d required=%d safety_reserve=%d", ErrQBStagingInsufficientSpace, free, reserved, bytes, safetyReserve)
+	}
+	s.stagingReservations[root] = reserved + bytes
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.stagingReservationMu.Lock()
+			defer s.stagingReservationMu.Unlock()
+			remaining := s.stagingReservations[root] - bytes
+			if remaining <= 0 {
+				delete(s.stagingReservations, root)
+			} else {
+				s.stagingReservations[root] = remaining
+			}
+		})
+	}, nil
 }
 
 func effectiveMediaConcurrency() int {
@@ -282,6 +367,9 @@ func executeCleanup(ctx context.Context, request resultqueue.CleanupRequest) err
 }
 
 func executeCleanupTarget(ctx context.Context, target resultqueue.CleanupTarget) error {
+	if strings.TrimSpace(target.LocalPath) != "" {
+		return resultqueue.ExecuteLocalCleanupTarget(ctx, target)
+	}
 	storage, actualPath, err := getCleanupStorageAndActualPath(target.OpenListPath)
 	if err != nil {
 		return fmt.Errorf("resolve cleanup storage: %w", err)
@@ -551,6 +639,12 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		// coordinator will retry the offer or recover it after the lease ends.
 		return fmt.Errorf("cluster attempt %s is already claimed without an active execution", offer.AttemptRef.AttemptID)
 	}
+	if offer.TaskContext.Torrent != nil {
+		if err := s.rememberMoviePilotTorrent(ctx, offer.TaskContext.Torrent); err != nil {
+			_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
+			return s.sendJobReject(ctx, offer, "worker_torrent_registry_unavailable", err.Error(), true)
+		}
+	}
 	// Detach execution from the websocket session context so transport loss
 	// cannot cancel an in-flight share-save / move. Explicit job.cancel and
 	// generation supersession still cancel via cancelCause.
@@ -578,13 +672,22 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 	s.mu.Unlock()
 
 	if offer.JobType == model.ClusterJobTypeMediaTransfer {
-		release, ok := s.tryAcquireMediaCapacity()
+		acquire := s.tryAcquireMediaCapacity
+		capacityName := "worker media"
+		if offer.TaskContext.Torrent != nil {
+			acquire = s.tryAcquireMoviePilotUploadCapacity
+			capacityName = "MoviePilot qB upload"
+		}
+		release, ok := acquire()
 		if !ok {
 			active, limit := s.downloadGate.Snapshot()
-			log.Warnf("cluster job %s admission rejected attempt=%s generation=%d code=worker_capacity_unavailable active=%d limit=%d", offer.JobID, offer.AttemptID, offer.Generation, active, limit)
+			if offer.TaskContext.Torrent != nil && s.moviePilotUploadGate != nil {
+				active, limit = s.moviePilotUploadGate.Snapshot()
+			}
+			log.Warnf("cluster job %s admission rejected attempt=%s generation=%d code=worker_capacity_unavailable capacity=%s active=%d limit=%d", offer.JobID, offer.AttemptID, offer.Generation, capacityName, active, limit)
 			cancelCause(nil)
 			_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
-			return s.sendJobReject(ctx, offer, "worker_capacity_unavailable", "worker media concurrency limit is full", true)
+			return s.sendJobReject(ctx, offer, "worker_capacity_unavailable", capacityName+" concurrency limit is full", true)
 		}
 		var releaseOnce sync.Once
 		current.capacityRelease = func() { releaseOnce.Do(release) }
@@ -628,6 +731,10 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		var err error
 		if offer.JobType == "share.inspect" {
 			result, err = s.executeShareInspect(jobCtx, offer)
+		} else if offer.JobType == model.ClusterJobTypeTorrentObserve {
+			result, err = s.executeTorrentObserve(jobCtx, offer)
+		} else if offer.JobType == model.ClusterJobTypeTorrentRetention {
+			result, err = s.executeTorrentRetention(jobCtx, offer)
 		} else if offer.JobType == "media.transfer" && offer.TaskContext.DeliveryMode == model.SubscriptionDeliveryModeDirectDownload {
 			result, err = s.executeMediaDirectFirst(jobCtx, offer)
 		} else {
@@ -643,6 +750,155 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		}
 	}()
 	return nil
+}
+
+func (s *Service) executeTorrentObserve(ctx context.Context, offer protocol.JobOffer) (map[string]any, error) {
+	if offer.JobType != model.ClusterJobTypeTorrentObserve || offer.TaskContext.Torrent == nil {
+		return nil, fmt.Errorf("unsupported torrent observation offer")
+	}
+	s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusRunning, "")
+	_, client, _, err := s.discoverTorrentClient(offer.TaskContext.Torrent)
+	if err != nil {
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusFailed, err.Error())
+		return nil, err
+	}
+	for {
+		info, queryErr := client.GetTorrentByHash(ctx, offer.TaskContext.Torrent.TorrentHash)
+		if queryErr != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusFailed, queryErr.Error())
+			return nil, fmt.Errorf("query qB torrent %q: %w", offer.TaskContext.Torrent.TorrentHash, queryErr)
+		}
+		completedBytes, totalBytes := torrentProgressBytes(info)
+		if progressErr := s.sendJobProgress(ctx, offer, model.ClusterStageQBObserving, completedBytes, totalBytes, int64(info.Dlspeed), string(info.State)); progressErr != nil {
+			log.Warnf("cluster job %s qB progress notify failed: %v", offer.JobID, progressErr)
+		}
+		if info.Progress >= 0.999999 && info.AmountLeft <= 0 {
+			files, discoverErr := s.DiscoverTorrentFiles(ctx, offer.TaskContext.Torrent)
+			if discoverErr != nil {
+				s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusFailed, discoverErr.Error())
+				return nil, discoverErr
+			}
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusSucceeded, "")
+			return map[string]any{
+				"files":           files,
+				"torrent_hash":    offer.TaskContext.Torrent.TorrentHash,
+				"content_path":    info.ContentPath,
+				"qb_state":        string(info.State),
+				"progress":        info.Progress,
+				"ratio":           info.Ratio,
+				"seeding_seconds": int64(info.SeedingTime),
+				"observed_at":     time.Now().UTC(),
+			}, nil
+		}
+		timer := time.NewTimer(10 * time.Second)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func torrentProgressBytes(info qbittorrent.TorrentInfo) (int64, int64) {
+	total := info.TotalSize
+	if total <= 0 {
+		total = info.Size
+	}
+	if total <= 0 && info.Completed > 0 {
+		total = info.Completed + max(info.AmountLeft, 0)
+	}
+	completed := info.Completed
+	if completed <= 0 && total > 0 {
+		completed = total - max(info.AmountLeft, 0)
+	}
+	if completed < 0 {
+		completed = 0
+	}
+	if total > 0 && completed > total {
+		completed = total
+	}
+	return completed, total
+}
+
+func (s *Service) executeTorrentRetention(ctx context.Context, offer protocol.JobOffer) (map[string]any, error) {
+	if offer.JobType != model.ClusterJobTypeTorrentRetention || offer.TaskContext.Torrent == nil {
+		return nil, fmt.Errorf("unsupported torrent retention offer")
+	}
+	torrent := offer.TaskContext.Torrent
+	_, client, _, err := s.discoverTorrentClient(torrent)
+	if err != nil {
+		return nil, err
+	}
+	action := strings.ToLower(strings.TrimSpace(torrent.Action))
+	if action == "" {
+		action = "delete"
+	}
+	if action == "delete" {
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusRunning, "")
+		_, queryErr := client.GetTorrentByHash(ctx, torrent.TorrentHash)
+		if isQBTorrentMissing(queryErr) {
+			s.forgetMoviePilotTorrent(ctx, torrent)
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusSucceeded, "")
+			return map[string]any{"action": action, "torrent_hash": torrent.TorrentHash, "completed_at": time.Now().UTC()}, nil
+		}
+		if queryErr != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusFailed, queryErr.Error())
+			return nil, fmt.Errorf("query qB torrent before deletion: %w", queryErr)
+		}
+		if err = client.StopByHash(ctx, torrent.TorrentHash); err != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusFailed, err.Error())
+			return nil, fmt.Errorf("stop qB torrent before deletion: %w", err)
+		}
+		err = client.DeleteByHash(ctx, torrent.TorrentHash, true)
+		if err != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusFailed, err.Error())
+			return nil, err
+		}
+		_, queryErr = client.GetTorrentByHash(ctx, torrent.TorrentHash)
+		if queryErr == nil {
+			err = fmt.Errorf("qB torrent %q still exists after deletion", torrent.TorrentHash)
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusFailed, err.Error())
+			return nil, err
+		}
+		if !isQBTorrentMissing(queryErr) {
+			err = fmt.Errorf("confirm qB torrent deletion: %w", queryErr)
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusFailed, err.Error())
+			return nil, err
+		}
+		s.forgetMoviePilotTorrent(ctx, torrent)
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBDeleting, model.ClusterStageStatusSucceeded, "")
+	} else if action == "inspect" {
+		s.reportStageStatus(ctx, offer, model.ClusterStageRetentionCheck, model.ClusterStageStatusRunning, "")
+		info, queryErr := client.GetTorrentByHash(ctx, torrent.TorrentHash)
+		if queryErr != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageRetentionCheck, model.ClusterStageStatusFailed, queryErr.Error())
+			return nil, fmt.Errorf("inspect qB torrent retention state: %w", queryErr)
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageRetentionCheck, model.ClusterStageStatusSucceeded, "")
+		return map[string]any{
+			"action": action, "torrent_hash": torrent.TorrentHash, "qb_state": string(info.State),
+			"progress": info.Progress, "ratio": info.Ratio, "seeding_seconds": int64(info.SeedingTime),
+			"observed_at": time.Now().UTC(),
+		}, nil
+	} else if action == "pause" {
+		err = client.StopByHash(ctx, torrent.TorrentHash)
+	} else if action == "resume" {
+		err = client.StartByHash(ctx, torrent.TorrentHash)
+	} else {
+		return nil, fmt.Errorf("unsupported torrent retention action %q", action)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"action": action, "torrent_hash": torrent.TorrentHash, "completed_at": time.Now().UTC()}, nil
+}
+
+func isQBTorrentMissing(err error) bool {
+	var notFound qbittorrent.InfoNotFoundError
+	return errors.As(err, &notFound)
 }
 
 func (s *Service) maintainLease(ctx context.Context, cancel context.CancelCauseFunc, offer protocol.JobOffer) {
@@ -699,6 +955,7 @@ func (s *Service) sendLeaseRenew(ctx context.Context, offer protocol.JobOffer, r
 	message, err := protocol.NewEnvelope(protocol.MessageLeaseRenew, protocol.LeaseRenew{
 		AttemptRef:     offer.AttemptRef,
 		RequestedUntil: requestedUntil,
+		LastEventSeq:   s.currentJobEventSeq(offer.JobID),
 	})
 	if err != nil {
 		return err
@@ -726,6 +983,57 @@ func (s *Service) sendLeaseRenew(ctx context.Context, offer protocol.JobOffer, r
 	}
 }
 
+func (s *Service) sendJobProgress(ctx context.Context, offer protocol.JobOffer, stage string, completedBytes, totalBytes, bytesPerSecond int64, progressMessage string) error {
+	if s.sender == nil {
+		return errors.New("cluster sender is unavailable")
+	}
+	if strings.TrimSpace(stage) == "" {
+		return errors.New("cluster progress stage is required")
+	}
+	if completedBytes < 0 || totalBytes < 0 || (totalBytes > 0 && completedBytes > totalBytes) {
+		return errors.New("cluster progress byte counts are invalid")
+	}
+	eventSeq, ok := s.nextJobEventSeq(offer.JobID)
+	if !ok {
+		return fmt.Errorf("cluster job %s is not active", offer.JobID)
+	}
+	payload := protocol.JobProgress{
+		AttemptRef:     offer.AttemptRef,
+		Stage:          strings.TrimSpace(stage),
+		EventSeq:       eventSeq,
+		CompletedBytes: completedBytes,
+		TotalBytes:     totalBytes,
+		BytesPerSecond: bytesPerSecond,
+		ObservedAt:     time.Now().UTC(),
+		Message:        strings.TrimSpace(progressMessage),
+	}
+	message, err := protocol.NewEnvelope(protocol.MessageJobProgress, payload)
+	if err != nil {
+		return err
+	}
+	return s.sender.Send(ctx, *message)
+}
+
+func (s *Service) nextJobEventSeq(jobID string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active, ok := s.active[jobID]
+	if !ok || active == nil {
+		return 0, false
+	}
+	active.eventSeq++
+	return active.eventSeq, true
+}
+
+func (s *Service) currentJobEventSeq(jobID string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if active := s.active[jobID]; active != nil {
+		return active.eventSeq
+	}
+	return 0
+}
+
 func executionAttemptKey(ref protocol.AttemptRef) string {
 	return fmt.Sprintf("%s:%s:%d", safeClusterPathSegment(ref.JobID), safeClusterPathSegment(ref.AttemptID), ref.Generation)
 }
@@ -751,6 +1059,8 @@ func (s *Service) CancelActive(cause error) {
 // OnTransportReconnected renews leases for jobs that kept running while the
 // websocket was down so the coordinator does not sweep them as lease_expired.
 func (s *Service) OnTransportReconnected(ctx context.Context) {
+	s.ResumeMoviePilotTorrents(ctx)
+	s.ReconcileMoviePilotStagingCapacity(ctx)
 	s.mu.Lock()
 	tasks := make([]*activeTask, 0, len(s.active))
 	for _, task := range s.active {
@@ -771,6 +1081,241 @@ func (s *Service) OnTransportReconnected(ctx context.Context) {
 			log.Warnf("cluster job %s post-reconnect lease renew failed: %v", task.offer.JobID, err)
 		}
 	}
+}
+
+// PauseMoviePilotTorrents stops qB torrents referenced by active cluster jobs
+// before the Worker goes offline. The qB files remain untouched; the
+// Coordinator can safely redispatch the transfer after reconnection.
+func (s *Service) PauseMoviePilotTorrents(ctx context.Context) {
+	s.mu.Lock()
+	torrents := make(map[string]protocol.TorrentTaskContext, len(s.moviePilotTorrents)+len(s.active))
+	for key, entry := range s.moviePilotTorrents {
+		torrents[key] = entry.Torrent
+	}
+	for _, task := range s.active {
+		if task == nil || task.offer.TaskContext.Torrent == nil {
+			continue
+		}
+		torrent := *task.offer.TaskContext.Torrent
+		torrents[moviePilotTorrentRegistryKey(&torrent)] = torrent
+	}
+	s.mu.Unlock()
+	for _, torrentValue := range torrents {
+		torrent := torrentValue
+		_, client, _, err := s.discoverTorrentClient(&torrent)
+		if err != nil {
+			log.Warnf("pause MoviePilot qB torrent %s on disconnect: %v", torrent.TorrentHash, err)
+			continue
+		}
+		pauseCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		info, infoErr := client.GetTorrentByHash(pauseCtx, torrent.TorrentHash)
+		if infoErr != nil {
+			if isMoviePilotTorrentMissing(infoErr) {
+				s.forgetMoviePilotTorrent(ctx, &torrent)
+			}
+			log.Warnf("inspect MoviePilot qB torrent %s on disconnect: %v", torrent.TorrentHash, infoErr)
+			cancel()
+			continue
+		}
+		if info.Progress >= 0.999999 && info.AmountLeft <= 0 {
+			cancel()
+			continue
+		}
+		if err := client.StopByHash(pauseCtx, torrent.TorrentHash); err != nil {
+			log.Warnf("pause MoviePilot qB torrent %s on disconnect: %v", torrent.TorrentHash, err)
+		} else if err := s.setMoviePilotTorrentDisconnectPaused(ctx, &torrent, true); err != nil {
+			log.Warnf("persist MoviePilot qB torrent %s disconnect pause: %v", torrent.TorrentHash, err)
+		}
+		cancel()
+	}
+}
+
+// ResumeMoviePilotTorrents resumes only torrents paused by the disconnect
+// safeguard. Capacity and retention pauses are intentionally left untouched.
+func (s *Service) ResumeMoviePilotTorrents(ctx context.Context) {
+	s.mu.Lock()
+	torrents := make([]protocol.TorrentTaskContext, 0, len(s.moviePilotTorrents))
+	for _, entry := range s.moviePilotTorrents {
+		if entry.PausedByDisconnect {
+			torrents = append(torrents, entry.Torrent)
+		}
+	}
+	s.mu.Unlock()
+	for i := range torrents {
+		torrent := &torrents[i]
+		_, client, _, err := s.discoverTorrentClient(torrent)
+		if err != nil {
+			log.Warnf("resume MoviePilot qB torrent %s after reconnect: %v", torrent.TorrentHash, err)
+			continue
+		}
+		resumeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		info, infoErr := client.GetTorrentByHash(resumeCtx, torrent.TorrentHash)
+		if infoErr != nil {
+			if isMoviePilotTorrentMissing(infoErr) {
+				s.forgetMoviePilotTorrent(ctx, torrent)
+			}
+			log.Warnf("inspect MoviePilot qB torrent %s before reconnect resume: %v", torrent.TorrentHash, infoErr)
+			cancel()
+			continue
+		}
+		if info.Progress >= 0.999999 && info.AmountLeft <= 0 {
+			if err := s.setMoviePilotTorrentDisconnectPaused(ctx, torrent, false); err != nil {
+				log.Warnf("clear completed MoviePilot qB torrent %s disconnect pause: %v", torrent.TorrentHash, err)
+			}
+			cancel()
+			continue
+		}
+		s.mu.Lock()
+		pausedByCapacity := s.moviePilotTorrents[moviePilotTorrentRegistryKey(torrent)].PausedByCapacity
+		s.mu.Unlock()
+		if pausedByCapacity {
+			if err := s.setMoviePilotTorrentDisconnectPaused(ctx, torrent, false); err != nil {
+				log.Warnf("clear MoviePilot qB torrent %s disconnect pause: %v", torrent.TorrentHash, err)
+			}
+			cancel()
+			continue
+		}
+		if err := client.StartByHash(resumeCtx, torrent.TorrentHash); err != nil {
+			log.Warnf("resume MoviePilot qB torrent %s after reconnect: %v", torrent.TorrentHash, err)
+		} else if err := s.setMoviePilotTorrentDisconnectPaused(ctx, torrent, false); err != nil {
+			log.Warnf("clear MoviePilot qB torrent %s disconnect pause: %v", torrent.TorrentHash, err)
+		}
+		cancel()
+	}
+}
+
+// ReconcileMoviePilotStagingCapacity applies the configured low/high
+// watermarks to known incomplete MoviePilot torrents. It records capacity as a
+// distinct pause cause so reconnect recovery never restarts a torrent before
+// staging space has recovered past the high watermark.
+func (s *Service) ReconcileMoviePilotStagingCapacity(ctx context.Context) {
+	s.mu.Lock()
+	staging := s.desiredConfig.Staging
+	entries := make([]moviePilotTorrentRegistryEntry, 0, len(s.moviePilotTorrents))
+	for _, entry := range s.moviePilotTorrents {
+		entries = append(entries, entry)
+	}
+	s.mu.Unlock()
+	root := strings.TrimSpace(staging.Root)
+	low, high := staging.PauseDownloadLowWatermarkBytes, staging.ResumeDownloadHighWatermarkBytes
+	if root == "" || low <= 0 || high <= 0 {
+		return
+	}
+	usage := s.stagingFreeSpace
+	if usage == nil {
+		usage = func(ctx context.Context, root string) (uint64, error) {
+			value, err := disk.UsageWithContext(ctx, root)
+			if err != nil {
+				return 0, err
+			}
+			return value.Free, nil
+		}
+	}
+	free, err := usage(ctx, root)
+	if err != nil {
+		log.Warnf("inspect MoviePilot staging capacity: %v", err)
+		return
+	}
+	if free <= uint64(low) {
+		for i := range entries {
+			entry := entries[i]
+			if entry.PausedByCapacity {
+				continue
+			}
+			s.pauseMoviePilotTorrentForCapacity(ctx, &entry.Torrent)
+		}
+		return
+	}
+	if free < uint64(high) {
+		return
+	}
+	for i := range entries {
+		entry := entries[i]
+		if !entry.PausedByCapacity || entry.PausedByDisconnect {
+			continue
+		}
+		s.resumeMoviePilotTorrentForCapacity(ctx, &entry.Torrent)
+	}
+}
+
+// RunMoviePilotStagingCapacityMonitor keeps the low/high watermark policy
+// effective when free space changes outside an upload attempt, such as after
+// an operator frees disk space or a cleanup job completes.
+func (s *Service) RunMoviePilotStagingCapacityMonitor(ctx context.Context) error {
+	for {
+		s.ReconcileMoviePilotStagingCapacity(ctx)
+		timer := time.NewTimer(moviePilotStagingCapacityCheckInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Service) pauseMoviePilotTorrentForCapacity(ctx context.Context, torrent *protocol.TorrentTaskContext) {
+	_, client, _, err := s.discoverTorrentClient(torrent)
+	if err != nil {
+		log.Warnf("resolve MoviePilot qB torrent %s for capacity pause: %v", torrent.TorrentHash, err)
+		return
+	}
+	pauseCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	info, err := client.GetTorrentByHash(pauseCtx, torrent.TorrentHash)
+	if err != nil {
+		if isMoviePilotTorrentMissing(err) {
+			s.forgetMoviePilotTorrent(ctx, torrent)
+		}
+		log.Warnf("inspect MoviePilot qB torrent %s for capacity pause: %v", torrent.TorrentHash, err)
+		return
+	}
+	if info.Progress >= 0.999999 && info.AmountLeft <= 0 {
+		return
+	}
+	if err := client.StopByHash(pauseCtx, torrent.TorrentHash); err != nil {
+		log.Warnf("pause MoviePilot qB torrent %s for staging capacity: %v", torrent.TorrentHash, err)
+		return
+	}
+	if err := s.setMoviePilotTorrentCapacityPaused(ctx, torrent, true); err != nil {
+		log.Warnf("persist MoviePilot qB torrent %s capacity pause: %v", torrent.TorrentHash, err)
+	}
+}
+
+func (s *Service) resumeMoviePilotTorrentForCapacity(ctx context.Context, torrent *protocol.TorrentTaskContext) {
+	_, client, _, err := s.discoverTorrentClient(torrent)
+	if err != nil {
+		log.Warnf("resolve MoviePilot qB torrent %s for capacity resume: %v", torrent.TorrentHash, err)
+		return
+	}
+	resumeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	info, err := client.GetTorrentByHash(resumeCtx, torrent.TorrentHash)
+	if err != nil {
+		if isMoviePilotTorrentMissing(err) {
+			s.forgetMoviePilotTorrent(ctx, torrent)
+		}
+		log.Warnf("inspect MoviePilot qB torrent %s for capacity resume: %v", torrent.TorrentHash, err)
+		return
+	}
+	if info.Progress >= 0.999999 && info.AmountLeft <= 0 {
+		if err := s.setMoviePilotTorrentCapacityPaused(ctx, torrent, false); err != nil {
+			log.Warnf("clear completed MoviePilot qB torrent %s capacity pause: %v", torrent.TorrentHash, err)
+		}
+		return
+	}
+	if err := client.StartByHash(resumeCtx, torrent.TorrentHash); err != nil {
+		log.Warnf("resume MoviePilot qB torrent %s after staging capacity recovery: %v", torrent.TorrentHash, err)
+		return
+	}
+	if err := s.setMoviePilotTorrentCapacityPaused(ctx, torrent, false); err != nil {
+		log.Warnf("clear MoviePilot qB torrent %s capacity pause: %v", torrent.TorrentHash, err)
+	}
+}
+
+func isMoviePilotTorrentMissing(err error) bool {
+	var missing qbittorrent.InfoNotFoundError
+	return errors.As(err, &missing)
 }
 
 func (s *Service) cancelAttempt(attempt protocol.AttemptRef, cause error) {
@@ -871,6 +1416,17 @@ func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFMani
 		return resultqueue.CleanupTarget{}, err
 	}
 	return target, nil
+}
+
+func NewLocalSourceCleanupTarget(ownedRoot, sourcePath string) (resultqueue.CleanupTarget, error) {
+	ownedRoot = path.Clean(strings.TrimSpace(ownedRoot))
+	sourcePath = path.Clean(strings.TrimSpace(sourcePath))
+	if !path.IsAbs(ownedRoot) || ownedRoot == "/" || !path.IsAbs(sourcePath) || path.Dir(sourcePath) != ownedRoot {
+		return resultqueue.CleanupTarget{}, errors.New("local cluster source cleanup must target a direct file in a non-root staging directory")
+	}
+	return resultqueue.CleanupTarget{
+		LocalPath: sourcePath, OwnedRootPath: ownedRoot, Name: path.Base(sourcePath), ExactFile: true,
+	}, nil
 }
 
 func getSourceCleanupObjectWithRetry(ctx context.Context, storage driver.Driver, actualPath string) (model.Obj, error) {
@@ -1055,37 +1611,112 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	isQBTransfer := offer.TaskContext.Torrent != nil
 	primary := primarySourceObject(offer.TaskContext.SourceObjects)
-	if primary.SourceFileID == "" {
-		return errors.New("cluster media task has no source object")
+	var stagedSource string
+	var reused bool
+	var stagingTempRoot string
+	var qbStagingConfig protocol.StagingConfig
+	var qbClient qbittorrent.Client
+	if isQBTransfer {
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusRunning, "")
+		files, discoverErr := s.DiscoverTorrentFiles(ctx, offer.TaskContext.Torrent)
+		if discoverErr != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusFailed, discoverErr.Error())
+			return discoverErr
+		}
+		if len(files) != 1 {
+			err = fmt.Errorf("torrent transfer requires one selected media file, found %d", len(files))
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusFailed, err.Error())
+			return err
+		}
+		file := files[0]
+		primary = protocol.SourceObject{
+			Provider: "qbittorrent", SourceFileID: "torrent:" + file.Hash + ":" + file.Name,
+			SourceRelativePath: file.Name, Size: file.Size,
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusSucceeded, "")
+		s.mu.Lock()
+		stagingConfig := s.desiredConfig.Staging
+		s.mu.Unlock()
+		qbStagingConfig = stagingConfig
+		stagingTempRoot = strings.TrimSpace(stagingConfig.Root)
+		if stagingTempRoot == "" {
+			return errors.New("MoviePilot qB staging root is not configured")
+		}
+		_, qbClient, _, err = s.discoverTorrentClient(offer.TaskContext.Torrent)
+		if err != nil {
+			return fmt.Errorf("resolve qB control client: %w", err)
+		}
+		releaseStagingReservation, admissionErr := s.reserveMoviePilotStaging(ctx, stagingTempRoot, file.Size)
+		if admissionErr != nil {
+			if errors.Is(admissionErr, ErrQBStagingInsufficientSpace) && qbClient != nil {
+				if pauseErr := qbClient.StopByHash(ctx, offer.TaskContext.Torrent.TorrentHash); pauseErr != nil {
+					log.Warnf("pause MoviePilot qB torrent %s after staging space reservation failure: %v", offer.TaskContext.Torrent.TorrentHash, pauseErr)
+				} else if pauseErr := s.setMoviePilotTorrentCapacityPaused(ctx, offer.TaskContext.Torrent, true); pauseErr != nil {
+					log.Warnf("persist MoviePilot qB torrent %s staging capacity pause: %v", offer.TaskContext.Torrent.TorrentHash, pauseErr)
+				}
+				s.ReconcileMoviePilotStagingCapacity(ctx)
+			}
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBCopying, model.ClusterStageStatusFailed, admissionErr.Error())
+			return admissionErr
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBCopying, model.ClusterStageStatusRunning, "")
+		stagedSource, err = CopyQBFileToStaging(ctx, QBSource{
+			WorkerPath: file.WorkerPath, DownloadRoot: file.DownloadRoot, Name: file.Name, Size: file.Size,
+		}, QBStagingAdmission{
+			StagingRoot: stagingTempRoot, DownloadRoot: file.DownloadRoot,
+			MaxFileBytes: stagingConfig.MaxFileBytes, ExtensionWhitelist: stagingConfig.ExtensionWhitelist,
+		})
+		releaseStagingReservation()
+		if err != nil {
+			if errors.Is(err, ErrQBStagingInsufficientSpace) && qbClient != nil {
+				if pauseErr := qbClient.StopByHash(ctx, offer.TaskContext.Torrent.TorrentHash); pauseErr != nil {
+					log.Warnf("pause MoviePilot qB torrent %s after staging space failure: %v", offer.TaskContext.Torrent.TorrentHash, pauseErr)
+				} else if pauseErr := s.setMoviePilotTorrentCapacityPaused(ctx, offer.TaskContext.Torrent, true); pauseErr != nil {
+					log.Warnf("persist MoviePilot qB torrent %s staging capacity pause: %v", offer.TaskContext.Torrent.TorrentHash, pauseErr)
+				}
+				s.ReconcileMoviePilotStagingCapacity(ctx)
+			}
+			s.reportStageStatus(ctx, offer, model.ClusterStageQBCopying, model.ClusterStageStatusFailed, err.Error())
+			return err
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageQBCopying, model.ClusterStageStatusSucceeded, "")
+	} else {
+		if primary.SourceFileID == "" {
+			return errors.New("cluster media task has no source object")
+		}
+		if _, err := s.requestStagePermitWithRetry(ctx, offer, model.ClusterStageSavingShare); err != nil {
+			return err
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusRunning, "")
+		requestedTempRoot, resolveErr := s.resolveStagingTempRoot(ctx, offer.TaskContext)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve cluster staging temp root: %w", resolveErr)
+		}
+		stagingTempRoot = mediaTransferShareSaveTempRoot(offer.TaskContext, requestedTempRoot)
 	}
-	if _, err := s.requestStagePermitWithRetry(ctx, offer, model.ClusterStageSavingShare); err != nil {
-		return err
-	}
-	s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusRunning, "")
-	requestedTempRoot, err := s.resolveStagingTempRoot(ctx, offer.TaskContext)
-	if err != nil {
-		return fmt.Errorf("resolve cluster staging temp root: %w", err)
-	}
-	stagingTempRoot := mediaTransferShareSaveTempRoot(offer.TaskContext, requestedTempRoot)
 	if s.mediaTransferBoundary != nil {
 		return s.mediaTransferBoundary(ctx, offer, resolvedMediaTransferTargets{
 			StagingRoot: stagingTempRoot, DeliveryRoot: targetRootBase, DeliveryMount: targetBindingMount,
 		})
 	}
-	stagingStorage, _, err := op.GetStorageAndActualPath(stagingTempRoot)
-	if err != nil {
-		return fmt.Errorf("resolve cluster staging account: %w", err)
-	}
-	s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
-	stagedSource, reused, err := s.prepareMediaTransferShareSave(ctx, offer, stagingTempRoot)
-	if err != nil {
-		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
-		return err
-	}
-	s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, "")
-	if reused {
-		log.Infof("cluster job %s continuing with existing staged source %s", offer.JobID, stagedSource)
+	var stagingStorage driver.Driver
+	if !isQBTransfer {
+		stagingStorage, _, err = op.GetStorageAndActualPath(stagingTempRoot)
+		if err != nil {
+			return fmt.Errorf("resolve cluster staging account: %w", err)
+		}
+		s.recordActiveAccountBindings(offer.JobID, stagingStorage.GetStorage().MountPath, targetBindingMount)
+		stagedSource, reused, err = s.prepareMediaTransferShareSave(ctx, offer, stagingTempRoot)
+		if err != nil {
+			s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusFailed, err.Error())
+			return err
+		}
+		s.reportStageStatus(ctx, offer, model.ClusterStageSavingShare, model.ClusterStageStatusSucceeded, "")
+		if reused {
+			log.Infof("cluster job %s continuing with existing staged source %s", offer.JobID, stagedSource)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1141,12 +1772,18 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		Share:                 offer.TaskContext.Share,
 		Media:                 offer.TaskContext.Media,
 		DeliveryMode:          offer.TaskContext.DeliveryMode,
+		Torrent:               offer.TaskContext.Torrent,
 		SourceObjects:         offer.TaskContext.SourceObjects,
 		ShareSaveKey:          offer.TaskContext.ShareSaveKey,
 		ShareSaveObjects:      offer.TaskContext.ShareSaveObjects,
 		MobileAccountBinding:  targetStorage.GetStorage().MountPath,
 	}
-	sourceCleanup, err := NewSourceCleanupTarget(ctx, manifest, stagingTempRoot, stagedSource)
+	var sourceCleanup resultqueue.CleanupTarget
+	if isQBTransfer {
+		sourceCleanup, err = NewLocalSourceCleanupTarget(stagingTempRoot, stagedSource)
+	} else {
+		sourceCleanup, err = NewSourceCleanupTarget(ctx, manifest, stagingTempRoot, stagedSource)
+	}
 	if err != nil {
 		return fmt.Errorf("build cluster source cleanup request: %w", err)
 	}
@@ -1154,6 +1791,19 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		AntiHash:  setting.GetBool(conf.PluginAntiHashEnabled),
 		ISORename: setting.GetBool(conf.PluginISORenameEnabled),
 		Whitelist: setting.GetStr(conf.PluginExtensionWhitelist),
+	}
+	if isQBTransfer {
+		// qB source files must remain byte-identical for seeding. The Worker
+		// always applies both transformations to the staging copy only.
+		pluginOpts.AntiHash = true
+		pluginOpts.ISORename = true
+		if len(qbStagingConfig.ExtensionWhitelist) > 0 {
+			whitelist := make([]string, 0, len(qbStagingConfig.ExtensionWhitelist))
+			for _, extension := range qbStagingConfig.ExtensionWhitelist {
+				whitelist = append(whitelist, strings.TrimPrefix(strings.TrimSpace(extension), "."))
+			}
+			pluginOpts.Whitelist = strings.Join(whitelist, ",")
+		}
 	}
 	expectedName := plugin.ApplyUploadName(targetName, pluginOpts)
 	expectedSize := plugin.ExpectedUploadSize(primary.Size, targetName, pluginOpts)
@@ -1215,6 +1865,76 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		UploadManifest: &manifest, AdditionalCleanupTargets: []resultqueue.CleanupTarget{sourceCleanup}, FinalizePayload: &finalizePayload,
 	}
 	creator, err := op.GetAdmin()
+	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
+	if isQBTransfer {
+		if err != nil {
+			return fmt.Errorf("resolve cluster qB upload task creator: %w", err)
+		}
+		if creator == nil {
+			return errors.New("resolve cluster qB upload task creator: admin user is unavailable")
+		}
+		sourceFile, openErr := os.Open(stagedSource)
+		if openErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, openErr.Error())
+			return fmt.Errorf("open staged qB file: %w", openErr)
+		}
+		localFile := &stream.FileStream{
+			Ctx: ctx, Obj: &model.Object{Name: targetName, Size: primary.Size}, Reader: sourceFile,
+			Mimetype: utils.GetMimeType(targetName), Closers: utils.NewClosers(sourceFile),
+		}
+		processedFile, processErr := plugin.ProcessStreamer(localFile, pluginOpts)
+		if processErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, processErr.Error())
+			return fmt.Errorf("process staged qB file for upload: %w", processErr)
+		}
+		uploadTotal := processedFile.GetSize()
+		if progressErr := s.sendJobProgress(ctx, offer, model.ClusterStageUploadingMobile, 0, uploadTotal, 0, "uploading"); progressErr != nil {
+			log.Warnf("cluster job %s upload progress notify failed: %v", offer.JobID, progressErr)
+		}
+		processedFile = newProgressFileStreamer(processedFile, func(completed, total int64) {
+			if progressErr := s.sendJobProgress(ctx, offer, model.ClusterStageUploadingMobile, completed, total, 0, "uploading"); progressErr != nil {
+				log.Warnf("cluster job %s upload progress notify failed: %v", offer.JobID, progressErr)
+			}
+		})
+		putCtx := context.WithValue(clusterMoveContext(ctx, binding, creator), conf.SkipPluginKey, struct{}{})
+		if putErr := fs.PutDirectly(putCtx, targetRoot, processedFile, true); putErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, putErr.Error())
+			return fmt.Errorf("upload staged qB file: %w", putErr)
+		}
+		if progressErr := s.sendJobProgress(ctx, offer, model.ClusterStageUploadingMobile, uploadTotal, uploadTotal, 0, "uploaded"); progressErr != nil {
+			log.Warnf("cluster job %s final upload progress notify failed: %v", offer.JobID, progressErr)
+		}
+		remote, getRemoteErr := fs.Get(ctx, expectedPath, &fs.GetArgs{NoLog: true})
+		if getRemoteErr != nil || remote == nil || remote.IsDir() {
+			if getRemoteErr == nil {
+				getRemoteErr = errors.New("uploaded qB object is missing or is a directory")
+			}
+			finishUploadStage(model.ClusterStageStatusFailed, getRemoteErr.Error())
+			return fmt.Errorf("inspect uploaded qB object: %w", getRemoteErr)
+		}
+		manifest.Name = remote.GetName()
+		manifest.Size = remote.GetSize()
+		manifest.SHA256 = strings.ToUpper(strings.TrimSpace(remote.GetHash().GetHash(utils.SHA256)))
+		if manifest.SHA256 == "" {
+			finishUploadStage(model.ClusterStageStatusFailed, "uploaded qB object has no SHA256 metadata")
+			return errors.New("uploaded qB object has no SHA256 metadata")
+		}
+		manifest.HashSource = "remote_object_metadata"
+		manifest.RemoteFileID = remote.GetID()
+		manifest.RemotePath = expectedPath
+		manifest.UploadReceipt = remote.GetID()
+		cleanup, cleanupErr := NewCleanupRequest(manifest, targetStorage.GetStorage().MountPath, sourceCleanup)
+		if cleanupErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, cleanupErr.Error())
+			return cleanupErr
+		}
+		if _, enqueueErr := s.EnqueueThenCleanup(ctx, manifest, cleanup); enqueueErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, enqueueErr.Error())
+			return fmt.Errorf("persist qB upload result: %w", enqueueErr)
+		}
+		finishUploadStage(model.ClusterStageStatusSucceeded, "")
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("resolve cluster move task creator: %w", err)
 	}
@@ -1222,7 +1942,6 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		return errors.New("resolve cluster move task creator: admin user is unavailable")
 	}
 	taskCtx := clusterMoveContext(ctx, binding, creator)
-	s.reportStageStatus(ctx, offer, model.ClusterStageUploadingMobile, model.ClusterStageStatusRunning, "")
 	transferTask, err := fs.Move(taskCtx, stagedSource, targetRoot, true)
 	if err != nil {
 		finishUploadStage(model.ClusterStageStatusFailed, err.Error())

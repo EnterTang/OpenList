@@ -52,6 +52,8 @@ func SearchResources(ctx context.Context, req model.SubscriptionResourceSearchRe
 			results, searchErr = searchPanSouResources(ctx, query, limit, cfg.PanSou)
 		case model.SubscriptionSourceHDHive:
 			results, searchErr = searchHDHiveResources(ctx, req, query, limit, cfg.Telegram.HDHive)
+		case model.SubscriptionSourceMoviePilot:
+			results, searchErr = SearchMoviePilotResources(ctx, req)
 		default:
 			searchErr = fmt.Errorf("unsupported resource search source: %s", source)
 		}
@@ -114,7 +116,19 @@ func ResourceSearchSourceCapabilities(cfg model.SubscriptionConfig) map[string]m
 			Available:         hdhiveConfigured,
 			UnavailableReason: hdhiveReason,
 		},
+		model.SubscriptionSourceMoviePilot: {
+			Configured:        moviePilotBridgeAvailable(),
+			Available:         moviePilotBridgeAvailable(),
+			UnavailableReason: moviePilotSearchUnavailableReason(),
+		},
 	}
+}
+
+func moviePilotSearchUnavailableReason() string {
+	if !moviePilotBridgeAvailable() {
+		return "bridge_not_configured"
+	}
+	return ""
 }
 
 func normalizeResourceSearchSources(values []string) []string {
@@ -129,7 +143,7 @@ func normalizeResourceSearchSources(values []string) []string {
 			return []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou}
 		}
 		if value == "all" {
-			return []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive}
+			return []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive, model.SubscriptionSourceMoviePilot}
 		}
 		if _, ok := seen[value]; ok {
 			continue

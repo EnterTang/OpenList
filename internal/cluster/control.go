@@ -66,6 +66,21 @@ func ListSecrets(ctx context.Context) ([]model.ClusterSecret, error) {
 	return secrets, err
 }
 
+// ResolveSecret returns the decrypted JSON payload for an active Coordinator
+// secret. Callers must keep the returned bytes in memory only for the
+// operation that needs them.
+func ResolveSecret(ctx context.Context, id string) ([]byte, string, error) {
+	var secret model.ClusterSecret
+	if err := db.GetDb().WithContext(ctx).First(&secret, "id = ? AND revoked_at IS NULL", strings.TrimSpace(id)).Error; err != nil {
+		return nil, "", err
+	}
+	plaintext, err := decryptCoordinatorSecret(secret)
+	if err != nil {
+		return nil, "", err
+	}
+	return plaintext, secret.Fingerprint, nil
+}
+
 func WriteSecret(ctx context.Context, req SecretWriteRequest, actor ControlActor) (*model.ClusterSecret, error) {
 	if strings.TrimSpace(req.Alias) == "" || strings.TrimSpace(req.Kind) == "" || len(req.Value) == 0 {
 		return nil, errors.New("secret alias, kind, and non-empty value are required")
@@ -145,6 +160,37 @@ func (r *Runtime) ApplyNodeConfig(ctx context.Context, nodeID string, desired pr
 		return nil, err
 	}
 	payload := protocol.ConfigApply{Revision: revision, DesiredHash: hash, ConfigJSON: string(raw), DesiredConfig: &desired}
+	if len(desired.QBClients) > 0 {
+		var node model.ClusterNode
+		if err := db.GetDb().WithContext(ctx).First(&node, "id = ?", nodeID).Error; err != nil {
+			return nil, err
+		}
+		if node.Disabled || node.Status == model.ClusterNodeStatusRevoked || strings.TrimSpace(node.KeyPublic) == "" {
+			return nil, errors.New("cluster node is disabled, revoked, or has no pinned public key")
+		}
+		payload.QBSecretEnvelopes = make(map[string]string, len(desired.QBClients))
+		for _, client := range desired.QBClients {
+			secret, _, secretErr := ResolveSecret(ctx, client.SecretRef)
+			if secretErr != nil {
+				return nil, fmt.Errorf("resolve qB client %q secret: %w", client.ID, secretErr)
+			}
+			var parameters map[string]any
+			if err := json.Unmarshal(secret, &parameters); err != nil || parameters == nil {
+				return nil, fmt.Errorf("qB client %q secret payload is invalid", client.ID)
+			}
+			if _, ok := firstSecretString(parameters, "username", "user"); !ok {
+				return nil, fmt.Errorf("qB client %q secret username is required", client.ID)
+			}
+			if _, ok := firstSecretString(parameters, "password", "pass"); !ok {
+				return nil, fmt.Errorf("qB client %q secret password is required", client.ID)
+			}
+			envelope, sealErr := secure.SealJSON(node.KeyPublic, parameters, protocol.QBSecretApplyAAD(nodeID, payload, client.ID))
+			if sealErr != nil {
+				return nil, fmt.Errorf("seal qB client %q secret: %w", client.ID, sealErr)
+			}
+			payload.QBSecretEnvelopes[strings.TrimSpace(client.ID)] = envelope
+		}
+	}
 	state := &model.ClusterNodeDesiredConfig{
 		NodeID: nodeID, Revision: revision, DesiredHash: hash, ConfigJSON: string(raw), Status: model.ClusterDesiredStatusPending,
 	}
@@ -162,6 +208,16 @@ func (r *Runtime) ApplyNodeConfig(ctx context.Context, nodeID string, desired pr
 		return state, err
 	}
 	return state, nil
+}
+
+func firstSecretString(values map[string]any, keys ...string) (string, bool) {
+	for _, key := range keys {
+		value, ok := values[key].(string)
+		if ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value), true
+		}
+	}
+	return "", false
 }
 
 func (r *Runtime) ApplyStorageProfile(ctx context.Context, req StorageProfileWriteRequest, actor ControlActor) (*model.ClusterStorageProfile, error) {
