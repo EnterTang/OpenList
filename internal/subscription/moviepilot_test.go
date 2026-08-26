@@ -64,6 +64,8 @@ func TestValidateMoviePilotRetentionPolicyRejectsNegativeThresholds(t *testing.T
 func TestSearchMoviePilotResourcesProjectsOpaqueRefAndMediaIdentity(t *testing.T) {
 	client := &fakeMoviePilotBridgeClient{results: []moviepilotbridge.ResourceSearchResult{{
 		ResourceRef: "resource-1", Title: "Show S01E01", Site: "tracker-a", Size: 1024, Seeders: 8,
+		Leechers: 2, Grabs: 11, SeasonEpisode: "S01 E01-E24", EpisodeCount: 24,
+		Promotion: "免费", HitAndRun: true, Labels: []string{"WEB-DL", "1080p"},
 		SelectedFingerprint: "fingerprint-1",
 	}}}
 	SetMoviePilotBridgeClient(client)
@@ -76,6 +78,12 @@ func TestSearchMoviePilotResourcesProjectsOpaqueRefAndMediaIdentity(t *testing.T
 	}
 	if len(results) != 1 || results[0].ExternalRef != "resource-1" || results[0].BridgeInstanceID != "mp-main" {
 		t.Fatalf("projected results = %#v", results)
+	}
+	if results[0].SeasonEpisode != "S01 E01-E24" || results[0].EpisodeCount != 24 || results[0].Promotion != "免费" || !results[0].HitAndRun {
+		t.Fatalf("projected resource metadata = %#v", results[0])
+	}
+	if len(results[0].Labels) != 2 || results[0].Labels[0] != "WEB-DL" || results[0].Grabs != 11 {
+		t.Fatalf("projected resource labels/heat = %#v", results[0])
 	}
 	if len(client.searches) != 1 || client.searches[0].MediaSource != "tmdb" || client.searches[0].MediaID != "123" {
 		t.Fatalf("search requests = %#v", client.searches)

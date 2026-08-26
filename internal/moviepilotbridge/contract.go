@@ -67,13 +67,22 @@ type ResourceSearchRequest struct {
 }
 
 type ResourceSearchResult struct {
-	ResourceRef         string `json:"resource_ref"`
-	Title               string `json:"title"`
-	Site                string `json:"site,omitempty"`
-	Size                int64  `json:"size,omitempty"`
-	Seeders             int    `json:"seeders,omitempty"`
-	Leechers            int    `json:"leechers,omitempty"`
-	SelectedFingerprint string `json:"selected_fingerprint,omitempty"`
+	ResourceRef         string   `json:"resource_ref"`
+	Title               string   `json:"title"`
+	Description         string   `json:"description,omitempty"`
+	Site                string   `json:"site,omitempty"`
+	Size                int64    `json:"size,omitempty"`
+	Seeders             int      `json:"seeders,omitempty"`
+	Leechers            int      `json:"leechers,omitempty"`
+	Grabs               int      `json:"grabs,omitempty"`
+	SeasonEpisode       string   `json:"season_episode,omitempty"`
+	EpisodeCount        int      `json:"episode_count,omitempty"`
+	Promotion           string   `json:"promotion,omitempty"`
+	FreeRemaining       string   `json:"free_remaining,omitempty"`
+	HitAndRun           bool     `json:"hit_and_run,omitempty"`
+	Labels              []string `json:"labels,omitempty"`
+	PublishedAt         string   `json:"published_at,omitempty"`
+	SelectedFingerprint string   `json:"selected_fingerprint,omitempty"`
 }
 
 type ResourceSearchResponse struct {

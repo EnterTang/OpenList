@@ -429,6 +429,7 @@ type SubscriptionResourceSearchResult struct {
 	Provider           string                           `json:"provider,omitempty"`
 	Title              string                           `json:"title"`
 	Content            string                           `json:"content,omitempty"`
+	Description        string                           `json:"description,omitempty"`
 	Channel            string                           `json:"channel,omitempty"`
 	MessageURL         string                           `json:"message_url,omitempty"`
 	Date               string                           `json:"date,omitempty"`
@@ -438,6 +439,14 @@ type SubscriptionResourceSearchResult struct {
 	Size               int64                            `json:"size,omitempty"`
 	Seeders            int                              `json:"seeders,omitempty"`
 	Leechers           int                              `json:"leechers,omitempty"`
+	Grabs              int                              `json:"grabs,omitempty"`
+	SeasonEpisode      string                           `json:"season_episode,omitempty"`
+	EpisodeCount       int                              `json:"episode_count,omitempty"`
+	Promotion          string                           `json:"promotion,omitempty"`
+	FreeRemaining      string                           `json:"free_remaining,omitempty"`
+	HitAndRun          bool                             `json:"hit_and_run,omitempty"`
+	Labels             []string                         `json:"labels,omitempty"`
+	PublishedAt        string                           `json:"published_at,omitempty"`
 	Links              []SubscriptionResourceSearchLink `json:"links,omitempty"`
 }
 

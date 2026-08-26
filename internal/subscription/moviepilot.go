@@ -78,8 +78,12 @@ func SearchMoviePilotResources(ctx context.Context, req model.SubscriptionResour
 			break
 		}
 		projected := projectMoviePilotResult(bridgeID, bridgeSearchResult{
-			ResourceRef: item.ResourceRef, Title: item.Title, Site: item.Site, Size: item.Size,
-			Seeders: item.Seeders, Leechers: item.Leechers, SelectedFingerprint: item.SelectedFingerprint,
+			ResourceRef: item.ResourceRef, Title: item.Title, Description: item.Description, Site: item.Site, Size: item.Size,
+			Seeders: item.Seeders, Leechers: item.Leechers, Grabs: item.Grabs,
+			SeasonEpisode: item.SeasonEpisode, EpisodeCount: item.EpisodeCount,
+			Promotion: item.Promotion, FreeRemaining: item.FreeRemaining,
+			HitAndRun: item.HitAndRun, Labels: item.Labels, PublishedAt: item.PublishedAt,
+			SelectedFingerprint: item.SelectedFingerprint,
 		})
 		if strings.TrimSpace(projected.ExternalRef) == "" || strings.TrimSpace(projected.Title) == "" {
 			continue
@@ -96,20 +100,32 @@ func projectMoviePilotResult(bridgeID string, item bridgeSearchResult) model.Sub
 	}
 	return model.SubscriptionResourceSearchResult{
 		SourceType: model.SubscriptionSourceMoviePilot, Provider: strings.TrimSpace(item.Site),
-		Title: strings.TrimSpace(item.Title), Content: content,
+		Title: strings.TrimSpace(item.Title), Content: content, Description: strings.TrimSpace(item.Description),
 		ExternalRef: strings.TrimSpace(item.ResourceRef), BridgeInstanceID: strings.TrimSpace(bridgeID),
 		TorrentFingerprint: strings.TrimSpace(item.SelectedFingerprint), Size: item.Size,
-		Seeders: item.Seeders, Leechers: item.Leechers,
+		Seeders: item.Seeders, Leechers: item.Leechers, Grabs: item.Grabs,
+		SeasonEpisode: strings.TrimSpace(item.SeasonEpisode), EpisodeCount: item.EpisodeCount,
+		Promotion: strings.TrimSpace(item.Promotion), FreeRemaining: strings.TrimSpace(item.FreeRemaining),
+		HitAndRun: item.HitAndRun, Labels: append([]string(nil), item.Labels...), PublishedAt: strings.TrimSpace(item.PublishedAt),
 	}
 }
 
 type bridgeSearchResult struct {
 	ResourceRef         string
 	Title               string
+	Description         string
 	Site                string
 	Size                int64
 	Seeders             int
 	Leechers            int
+	Grabs               int
+	SeasonEpisode       string
+	EpisodeCount        int
+	Promotion           string
+	FreeRemaining       string
+	HitAndRun           bool
+	Labels              []string
+	PublishedAt         string
 	SelectedFingerprint string
 	SiteCookie          string
 }
