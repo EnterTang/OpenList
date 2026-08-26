@@ -139,6 +139,7 @@ type Cluster struct {
 	CoordinatorURL            string       `json:"coordinator_url" env:"COORDINATOR_URL"`
 	EnrollmentToken           string       `json:"enrollment_token" env:"ENROLLMENT_TOKEN"`
 	SecretMasterKey           string       `json:"-" env:"SECRET_MASTER_KEY"`
+	SecretMasterKeyPrevious   string       `json:"-" env:"SECRET_MASTER_KEY_PREVIOUS"`
 	WorkerKeyFile             string       `json:"worker_key_file" env:"WORKER_KEY_FILE"`
 	WebSocketPath             string       `json:"websocket_path" env:"WEBSOCKET_PATH"`
 	HeartbeatIntervalSecond   int          `json:"heartbeat_interval_seconds" env:"HEARTBEAT_INTERVAL_SECONDS"`

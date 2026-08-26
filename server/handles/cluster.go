@@ -1,6 +1,7 @@
 package handles
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func clusterControlActor(c *gin.Context) cluster.ControlActor {
@@ -29,6 +31,19 @@ func GetClusterConfig(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, cfg)
+}
+
+func GetClusterNodeConfig(c *gin.Context) {
+	view, err := cluster.GetNodeConfig(c.Request.Context(), c.Param("id"))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		common.ErrorResp(c, err, http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+	common.SuccessResp(c, view)
 }
 
 func SaveClusterConfig(c *gin.Context) {
@@ -257,6 +272,15 @@ func RevokeClusterSecret(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, gin.H{"revoked": true})
+}
+
+func MigrateClusterSecrets(c *gin.Context) {
+	result, err := cluster.MigrateSecrets(c.Request.Context(), clusterControlActor(c))
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	common.SuccessResp(c, result)
 }
 
 func ApplyClusterNodeConfig(c *gin.Context) {

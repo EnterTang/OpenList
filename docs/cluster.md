@@ -24,8 +24,34 @@ control plane.
 ```
 
 Set `CLUSTER_SECRET_MASTER_KEY` to a random 32-byte value encoded as hex or
-base64. It is environment-only and encrypts storage credentials at rest;
-losing it makes stored credentials unrecoverable.
+base64 (or `OPENLIST_CLUSTER_SECRET_MASTER_KEY` when the default environment
+prefix is enabled). It is environment-only and encrypts storage credentials at
+rest; losing it makes stored credentials unrecoverable. Use the same prefix
+for `CLUSTER_SECRET_MASTER_KEY_PREVIOUS`.
+
+To rotate it without re-entering qB, MoviePilot Bridge, and storage
+credentials, deploy the new value as `CLUSTER_SECRET_MASTER_KEY` and keep the
+old value temporarily as `CLUSTER_SECRET_MASTER_KEY_PREVIOUS`. Restart all
+Coordinator replicas with the same pair, verify that existing secrets can be
+resolved, then call `POST /api/admin/cluster/secrets/migrate`. The migration
+is transactional: it re-encrypts every secret that still uses the previous
+key, always writes with the current key, and aborts without partial changes if
+any row cannot be decrypted. After a successful response, remove
+`CLUSTER_SECRET_MASTER_KEY_PREVIOUS` and restart the Coordinator. The Worker
+enrollment token, pinned X25519 key, and active Worker connections are not
+changed by this rotation.
+
+Generate a new current value with `openssl rand -hex 32`. If an existing
+deployment has a 32-character hexadecimal value, that is only 16 bytes: it
+must not remain in the current slot. Move it to the previous slot only when
+the legacy AES-GCM compatibility described below applies, and use a newly
+generated 64-character hexadecimal value as the current key.
+
+The current key must always be a 32-byte hex/base64 key. For compatibility
+with historical deployments that accepted AES-128 keys, the *previous* key
+slot also accepts a 16-byte hex/base64 value when the old ciphertext uses the
+same AES-GCM envelope; use this only during migration and remove it immediately
+after the migration succeeds.
 
 The public Worker URL must use `wss://` unless the Coordinator is reached via
 `localhost`, `127.0.0.1`, or `::1`. Run TLS on OpenList or terminate TLS at a
@@ -124,6 +150,8 @@ All endpoints are under `/api/admin/cluster` and require administrator auth.
 - `GET /results`
 - `GET /result_queue/stats`
 - `GET|POST /secrets`
+- `POST /secrets/migrate` (requires `CLUSTER_SECRET_MASTER_KEY_PREVIOUS`; the
+  operation is all-or-nothing and never returns plaintext)
 - `POST /secrets/:id/revoke`
 - `GET|POST /storage-profiles`
 - `GET /audit`

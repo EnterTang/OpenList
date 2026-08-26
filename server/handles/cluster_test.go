@@ -1,7 +1,9 @@
 package handles
 
 import (
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,5 +84,85 @@ func TestDeleteClusterNodeRemovesOfflineNode(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("node count = %d", count)
+	}
+}
+
+func TestGetClusterNodeConfigReturnsSafeDesiredConfig(t *testing.T) {
+	database := setupClusterHandleRuntime(t)
+	desired := map[string]any{
+		"qb_clients": []map[string]any{{
+			"id": "qb-main", "webui_url": "http://qb:8080", "secret_ref": "secret-qb",
+			"path_mappings": []map[string]string{{"qb_path": "/downloads", "worker_path": "/srv/downloads"}},
+		}},
+		"moviepilot_routes": []map[string]string{{"bridge_instance_id": "mp-main", "downloader": "qb-main", "qb_client_id": "qb-main"}},
+		"staging":           map[string]any{"root": "/srv/staging", "max_upload_concurrency": 2},
+	}
+	raw, err := json.Marshal(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNode{ID: "worker-config", Status: model.ClusterNodeStatusOnline}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.ClusterNodeDesiredConfig{
+		NodeID: "worker-config", Revision: 3, DesiredHash: "hash-3", ConfigJSON: string(raw),
+		Status: model.ClusterDesiredStatusApplied, ObservedRevision: 3, ObservedHash: "hash-3",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	c, recorder := newSubscriptionHandleContext(t, http.MethodGet, "/admin/cluster/nodes/worker-config/config")
+	c.Params = gin.Params{{Key: "id", Value: "worker-config"}}
+	GetClusterNodeConfig(c)
+	resp := decodeHandleResp[map[string]any](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200: %s", resp.Code, recorder.Body.String())
+	}
+	config, ok := resp.Data["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("response config = %#v", resp.Data["config"])
+	}
+	if config["qb_clients"] == nil || config["moviepilot_routes"] == nil || config["staging"] == nil {
+		t.Fatalf("response omitted MoviePilot/qB config: %#v", config)
+	}
+	if resp.Data["revision"] != float64(3) || resp.Data["status"] != model.ClusterDesiredStatusApplied {
+		t.Fatalf("response metadata = %#v", resp.Data)
+	}
+}
+
+func TestMigrateClusterSecretsDoesNotExposePlaintext(t *testing.T) {
+	setupClusterHandleRuntime(t)
+	oldKey := strings.Repeat("11", 32)
+	newKey := strings.Repeat("22", 32)
+	conf.Conf.Cluster.SecretMasterKey = oldKey
+	secret, err := cluster.WriteSecret(t.Context(), cluster.SecretWriteRequest{
+		Alias: "bridge-migration", Kind: "moviepilot_bridge_hmac",
+		Value: map[string]any{"hmac_key": "bridge-plaintext-secret"},
+	}, cluster.ControlActor{Name: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf.Conf.Cluster.SecretMasterKey = newKey
+	conf.Conf.Cluster.SecretMasterKeyPrevious = oldKey
+
+	c, recorder := newSubscriptionHandleContext(t, http.MethodPost, "/admin/cluster/secrets/migrate")
+	MigrateClusterSecrets(c)
+	resp := decodeHandleResp[cluster.SecretMigrationResult](t, recorder)
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200: %s", resp.Code, recorder.Body.String())
+	}
+	if resp.Data.Total != 1 || resp.Data.Migrated != 1 || resp.Data.Skipped != 0 {
+		t.Fatalf("migration result = %+v", resp.Data)
+	}
+	if strings.Contains(recorder.Body.String(), "bridge-plaintext-secret") {
+		t.Fatalf("migration response leaked plaintext: %s", recorder.Body.String())
+	}
+
+	conf.Conf.Cluster.SecretMasterKeyPrevious = ""
+	recovered, _, err := cluster.ResolveSecret(t.Context(), secret.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(recovered), "bridge-plaintext-secret") {
+		t.Fatalf("migrated secret was not recoverable: %s", recovered)
 	}
 }

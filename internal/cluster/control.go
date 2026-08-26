@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -38,6 +39,14 @@ type SecretWriteRequest struct {
 	Value map[string]any `json:"value"`
 }
 
+// SecretMigrationResult describes an all-or-nothing encryption-key rotation.
+// A row is skipped when it already authenticates with the current key.
+type SecretMigrationResult struct {
+	Total    int `json:"total"`
+	Migrated int `json:"migrated"`
+	Skipped  int `json:"skipped"`
+}
+
 type StorageProfileWriteRequest struct {
 	ID            string         `json:"id,omitempty"`
 	NodeID        string         `json:"node_id"`
@@ -52,6 +61,46 @@ type StorageProfileWriteRequest struct {
 	Disabled      bool           `json:"disabled,omitempty"`
 }
 
+// NodeConfigView is the Coordinator-owned, non-secret desired configuration
+// that can be safely shown to an administrator. qB credentials are never
+// included; QBClientConfig only contains the local secret reference.
+type NodeConfigView struct {
+	NodeID           string                       `json:"node_id"`
+	Revision         uint64                       `json:"revision"`
+	DesiredHash      string                       `json:"desired_hash"`
+	Config           protocol.WorkerDesiredConfig `json:"config"`
+	Status           string                       `json:"status"`
+	ObservedRevision uint64                       `json:"observed_revision"`
+	ObservedHash     string                       `json:"observed_hash"`
+	ObservedAt       *time.Time                   `json:"observed_at,omitempty"`
+	LastError        string                       `json:"last_error,omitempty"`
+}
+
+// GetNodeConfig returns the last Coordinator-owned desired config for one
+// Worker. The response intentionally contains only secret references, never
+// decrypted qB usernames or passwords.
+func GetNodeConfig(ctx context.Context, nodeID string) (*NodeConfigView, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return nil, errors.New("cluster node id is required")
+	}
+	var state model.ClusterNodeDesiredConfig
+	if err := db.GetDb().WithContext(ctx).First(&state, "node_id = ?", nodeID).Error; err != nil {
+		return nil, err
+	}
+	var config protocol.WorkerDesiredConfig
+	if strings.TrimSpace(state.ConfigJSON) != "" {
+		if err := json.Unmarshal([]byte(state.ConfigJSON), &config); err != nil {
+			return nil, fmt.Errorf("decode desired worker config: %w", err)
+		}
+	}
+	return &NodeConfigView{
+		NodeID: state.NodeID, Revision: state.Revision, DesiredHash: state.DesiredHash,
+		Config: config, Status: state.Status, ObservedRevision: state.ObservedRevision,
+		ObservedHash: state.ObservedHash, ObservedAt: state.ObservedAt, LastError: state.LastError,
+	}, nil
+}
+
 func ApplyNodeConfig(ctx context.Context, nodeID string, desired protocol.WorkerDesiredConfig, actor ControlActor) (*model.ClusterNodeDesiredConfig, error) {
 	return DefaultRuntime.ApplyNodeConfig(ctx, nodeID, desired, actor)
 }
@@ -64,6 +113,56 @@ func ListSecrets(ctx context.Context) ([]model.ClusterSecret, error) {
 	var secrets []model.ClusterSecret
 	err := db.GetDb().WithContext(ctx).Order("alias ASC").Find(&secrets).Error
 	return secrets, err
+}
+
+// MigrateSecrets re-encrypts every ClusterSecret that still uses the previous
+// Coordinator master key. The transaction is deliberately all-or-nothing:
+// one undecryptable row prevents a partial rotation and leaves the operator
+// an actionable error before the previous key is removed.
+func MigrateSecrets(ctx context.Context, actor ControlActor) (*SecretMigrationResult, error) {
+	keys, err := coordinatorMasterKeys()
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) < 2 || bytes.Equal(keys[0], keys[1]) {
+		return nil, errors.New("previous cluster secret master key is required for migration")
+	}
+
+	result := &SecretMigrationResult{}
+	err = db.GetDb().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var secrets []model.ClusterSecret
+		if err := tx.Order("id ASC").Find(&secrets).Error; err != nil {
+			return err
+		}
+		result.Total = len(secrets)
+		for _, secret := range secrets {
+			plaintext, keyIndex, err := decryptCoordinatorSecretWithKeys(secret, keys)
+			if err != nil {
+				return fmt.Errorf("migrate secret %q: %w", secret.ID, err)
+			}
+			if keyIndex == 0 {
+				result.Skipped++
+				continue
+			}
+			ciphertext, nonce, fingerprint, err := encryptCoordinatorSecretWithKey(plaintext, keys[0])
+			if err != nil {
+				return fmt.Errorf("re-encrypt secret %q: %w", secret.ID, err)
+			}
+			updatedAt := time.Now().UTC()
+			if err := tx.Model(&model.ClusterSecret{}).Where("id = ?", secret.ID).Updates(map[string]any{
+				"updated_at": updatedAt, "ciphertext": ciphertext, "nonce": nonce,
+				"fingerprint": fingerprint, "version": secret.Version + 1, "rotated_at": updatedAt,
+			}).Error; err != nil {
+				return err
+			}
+			result.Migrated++
+		}
+		return createControlAudit(tx, actor, "secret.migrate", "secret", "all", uint64(result.Migrated), "succeeded", "re-encrypted with current master key")
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ResolveSecret returns the decrypted JSON payload for an active Coordinator
@@ -377,6 +476,10 @@ func encryptCoordinatorSecret(plaintext []byte) (string, string, string, error) 
 	if err != nil {
 		return "", "", "", err
 	}
+	return encryptCoordinatorSecretWithKey(plaintext, key)
+}
+
+func encryptCoordinatorSecretWithKey(plaintext, key []byte) (string, string, string, error) {
 	aead, err := coordinatorAEAD(key)
 	if err != nil {
 		return "", "", "", err
@@ -391,27 +494,57 @@ func encryptCoordinatorSecret(plaintext []byte) (string, string, string, error) 
 }
 
 func decryptCoordinatorSecret(secret model.ClusterSecret) ([]byte, error) {
-	key, err := coordinatorMasterKey()
+	keys, err := coordinatorMasterKeys()
 	if err != nil {
 		return nil, err
 	}
-	aead, err := coordinatorAEAD(key)
-	if err != nil {
-		return nil, err
+	plaintext, _, err := decryptCoordinatorSecretWithKeys(secret, keys)
+	return plaintext, err
+}
+
+func decryptCoordinatorSecretWithKeys(secret model.ClusterSecret, keys [][]byte) ([]byte, int, error) {
+	if len(keys) == 0 {
+		return nil, -1, errors.New("cluster secret master key is not configured")
 	}
 	nonce, err := base64.RawStdEncoding.DecodeString(secret.Nonce)
-	if err != nil || len(nonce) != aead.NonceSize() {
-		return nil, errors.New("stored secret nonce is invalid")
+	if err != nil {
+		return nil, -1, errors.New("stored secret nonce is invalid")
 	}
 	ciphertext, err := base64.RawStdEncoding.DecodeString(secret.Ciphertext)
 	if err != nil {
-		return nil, errors.New("stored secret ciphertext is invalid")
+		return nil, -1, errors.New("stored secret ciphertext is invalid")
 	}
-	plaintext, err := aead.Open(nil, nonce, ciphertext, []byte("openlist-cluster-secret-v1"))
+	for index, key := range keys {
+		aead, err := coordinatorAEAD(key)
+		if err != nil {
+			continue
+		}
+		if len(nonce) != aead.NonceSize() {
+			return nil, -1, errors.New("stored secret nonce is invalid")
+		}
+		plaintext, err := aead.Open(nil, nonce, ciphertext, []byte("openlist-cluster-secret-v1"))
+		if err == nil {
+			return plaintext, index, nil
+		}
+	}
+	return nil, -1, errors.New("stored secret authentication failed")
+}
+
+func coordinatorMasterKeys() ([][]byte, error) {
+	current, err := coordinatorMasterKey()
 	if err != nil {
-		return nil, errors.New("stored secret authentication failed")
+		return nil, err
 	}
-	return plaintext, nil
+	keys := [][]byte{current}
+	previousValue := strings.TrimSpace(conf.Conf.Cluster.SecretMasterKeyPrevious)
+	if previousValue == "" {
+		return keys, nil
+	}
+	previous, err := decodeCoordinatorMasterKey(previousValue, true)
+	if err != nil {
+		return nil, errors.New("previous cluster secret master key must be 32 bytes encoded as hex or base64 (16-byte legacy keys are also accepted)")
+	}
+	return append(keys, previous), nil
 }
 
 func coordinatorMasterKey() ([]byte, error) {
@@ -419,16 +552,30 @@ func coordinatorMasterKey() ([]byte, error) {
 	if value == "" {
 		return nil, errors.New("cluster secret master key is not configured")
 	}
-	if raw, err := hex.DecodeString(value); err == nil && len(raw) == 32 {
-		return raw, nil
+	key, err := decodeCoordinatorMasterKey(value, false)
+	if err != nil {
+		return nil, errors.New("cluster secret master key must be 32 bytes encoded as hex or base64")
 	}
-	if raw, err := base64.RawStdEncoding.DecodeString(value); err == nil && len(raw) == 32 {
-		return raw, nil
+	return key, nil
+}
+
+func decodeCoordinatorMasterKey(value string, allowLegacy bool) ([]byte, error) {
+	decode := func(raw []byte) ([]byte, error) {
+		if len(raw) == 32 || (allowLegacy && len(raw) == 16) {
+			return raw, nil
+		}
+		return nil, errors.New("invalid key length")
 	}
-	if raw, err := base64.StdEncoding.DecodeString(value); err == nil && len(raw) == 32 {
-		return raw, nil
+	if raw, err := hex.DecodeString(value); err == nil {
+		return decode(raw)
 	}
-	return nil, errors.New("cluster secret master key must be 32 bytes encoded as hex or base64")
+	if raw, err := base64.RawStdEncoding.DecodeString(value); err == nil {
+		return decode(raw)
+	}
+	if raw, err := base64.StdEncoding.DecodeString(value); err == nil {
+		return decode(raw)
+	}
+	return nil, errors.New("invalid key encoding")
 }
 
 func coordinatorAEAD(key []byte) (cipher.AEAD, error) {
