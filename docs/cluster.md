@@ -101,6 +101,11 @@ Keep `worker_key_file` on persistent storage. It is created with mode `0600`
 beneath a `0700` directory. The Coordinator pins its X25519 public key on first
 enrollment and rejects later connections that replace the key.
 
+When the Worker key field is left empty, the admin API displays the stable
+default path that OpenList will use. Save that displayed path (or configure an
+absolute path yourself) when running a Windows executable, especially if the
+executable may be launched from different working directories after a restart.
+
 ## Windows embedded Redis
 
 Local Windows AMD64 artifacts built by `scripts/build-release-local.sh` with
@@ -128,11 +133,19 @@ notices. For production or other high-assurance deployments, prefer an
 external Redis on Linux or a vendor-supported platform. Windows ARM64,
 32-bit, and legacy Windows support are not promised.
 
+For a standalone Windows executable using the embedded Redis, set the address
+to `127.0.0.1:6379` (or `localhost:6379`) and leave the username blank. The
+Docker-only hostname `redis:6379` is not a loopback address, so OpenList will
+correctly treat it as an external Redis service and will not start the embedded
+Redis for that setting.
+
 ## Admin APIs
 
 All endpoints are under `/api/admin/cluster` and require administrator auth.
 
-- `GET /config` (secrets are returned only as `*_configured` flags)
+- `GET /config` (the enrollment token is returned in plaintext for copying to
+  other OpenList panels; other secrets are returned only as `*_configured`
+  flags)
 - `POST /config` (persists runtime configuration and returns
   `restart_required: true`; empty secret fields preserve their current values,
   while `clear_enrollment_token`, `clear_target_api_token`, and Redis
@@ -161,6 +174,11 @@ notification settings does not hot-switch the running process. Restart the
 OpenList process or container after saving. Environment variables still take
 precedence over `config.json`, so a value supplied with `OPENLIST_CLUSTER_*`
 must be changed at the deployment layer rather than in the admin UI.
+
+The cluster settings page also reports the current Worker runtime status and
+the latest connection or startup error. The HTTP page can remain available
+when cluster startup fails, so an accessible admin page alone does not prove
+that the Worker runtime is connected.
 
 Uncertain target notifications can be inspected through
 `GET /api/admin/etf_auto/jobs?status=unknown` and explicitly retried with

@@ -23,6 +23,10 @@ type MoviePilotBridgeClient interface {
 	SubmitIntent(context.Context, string, *model.MoviePilotDownloadIntent, moviepilotbridge.DownloadIntentRequest) error
 }
 
+type moviePilotBridgeCatalog interface {
+	ListEnabledInstanceIDs(context.Context) ([]string, error)
+}
+
 var moviePilotBridgeRegistry struct {
 	sync.RWMutex
 	client MoviePilotBridgeClient
@@ -45,6 +49,10 @@ func moviePilotBridgeAvailable() bool {
 }
 
 func SearchMoviePilotResources(ctx context.Context, req model.SubscriptionResourceSearchReq) ([]model.SubscriptionResourceSearchResult, error) {
+	return searchMoviePilotResources(ctx, req)
+}
+
+func searchMoviePilotResources(ctx context.Context, req model.SubscriptionResourceSearchReq) ([]model.SubscriptionResourceSearchResult, error) {
 	query := strings.TrimSpace(req.Query)
 	if query == "" {
 		return nil, errors.New("query is required")
@@ -67,7 +75,7 @@ func SearchMoviePilotResources(ctx context.Context, req model.SubscriptionResour
 	remote, err := client.SearchResources(ctx, bridgeID, moviepilotbridge.ResourceSearchRequest{
 		RequestID: shortHash(fmt.Sprintf("search:%s:%d:%s", bridgeID, req.TMDBID, query)),
 		Query:     query, MediaSource: "tmdb", MediaID: strconv.FormatInt(req.TMDBID, 10),
-		MediaType: strings.TrimSpace(req.MediaType),
+		MediaType: strings.TrimSpace(req.MediaType), Season: req.Season, Episode: req.Episode,
 	})
 	if err != nil {
 		return nil, err
@@ -91,6 +99,77 @@ func SearchMoviePilotResources(ctx context.Context, req model.SubscriptionResour
 		results = append(results, projected)
 	}
 	return results, nil
+}
+
+// ensureMoviePilotResourceBound makes MoviePilot subscriptions behave like
+// other source-driven subscriptions. MoviePilot's result order is already
+// its source-selection policy, so the first valid result is persisted with
+// its opaque reference and fingerprint before any download intent is sent.
+func ensureMoviePilotResourceBound(ctx context.Context, sub *model.Subscription) error {
+	if sub == nil {
+		return errors.New("subscription is required")
+	}
+	if sub.BoundTorrent != nil {
+		return nil
+	}
+	client := currentMoviePilotBridgeClient()
+	if client == nil {
+		return errors.New("MoviePilot Bridge is unavailable")
+	}
+	catalog, ok := client.(moviePilotBridgeCatalog)
+	if !ok {
+		return errors.New("MoviePilot Bridge catalog is unavailable")
+	}
+	if sub.TMDBID <= 0 {
+		return errors.New("TMDB ID is required for automatic MoviePilot search")
+	}
+	query := strings.TrimSpace(sub.TMDBName)
+	if query == "" {
+		query = strings.TrimSpace(sub.Name)
+	}
+	if query == "" {
+		return errors.New("subscription name is required for automatic MoviePilot search")
+	}
+	bridgeIDs, err := catalog.ListEnabledInstanceIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("list enabled MoviePilot Bridges: %w", err)
+	}
+	if len(bridgeIDs) == 0 {
+		return errors.New("no enabled MoviePilot Bridge is configured")
+	}
+
+	var searchErrors []string
+	for _, bridgeID := range bridgeIDs {
+		results, searchErr := searchMoviePilotResources(ctx, model.SubscriptionResourceSearchReq{
+			Query: query, BridgeInstanceID: bridgeID, TMDBID: sub.TMDBID,
+			MediaType: sub.MediaType, Season: sub.Season, Limit: defaultResourceSearchLimit,
+		})
+		if searchErr != nil {
+			searchErrors = append(searchErrors, fmt.Sprintf("%s: %v", bridgeID, searchErr))
+			continue
+		}
+		if len(results) == 0 {
+			continue
+		}
+		selected := results[0]
+		bound, bindErr := BindMoviePilotResource(ctx, model.SubscriptionMoviePilotResourceBindReq{
+			SubscriptionID: sub.ID, BridgeInstanceID: selected.BridgeInstanceID,
+			ResourceRef: selected.ExternalRef, SelectedFingerprint: selected.TorrentFingerprint,
+			TorrentTitle: selected.Title, Site: selected.Provider, Size: selected.Size,
+			MediaSource: "tmdb", MediaID: strconv.FormatInt(sub.TMDBID, 10),
+			MediaType: sub.MediaType, Season: sub.Season,
+		})
+		if bindErr != nil {
+			return fmt.Errorf("bind automatically selected MoviePilot resource: %w", bindErr)
+		}
+		sub.BoundTorrent = bound.BoundTorrent
+		sub.SourceType = bound.SourceType
+		return nil
+	}
+	if len(searchErrors) > 0 {
+		return fmt.Errorf("automatic MoviePilot search failed: %s", strings.Join(searchErrors, "; "))
+	}
+	return errors.New("automatic MoviePilot search returned no resources")
 }
 
 func projectMoviePilotResult(bridgeID string, item bridgeSearchResult) model.SubscriptionResourceSearchResult {
@@ -328,8 +407,11 @@ func moviePilotIntentPayload(sub *model.Subscription, bound *model.SubscriptionB
 }
 
 func runMoviePilot(ctx context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
-	if sub == nil || sub.BoundTorrent == nil {
-		return nil, "", 0, 0, 0, errors.New("MoviePilot resource is not bound")
+	if sub == nil {
+		return nil, "", 0, 0, 0, errors.New("subscription is required")
+	}
+	if err := ensureMoviePilotResourceBound(ctx, sub); err != nil {
+		return nil, "", 0, 0, 0, err
 	}
 	bound := sub.BoundTorrent
 	now := time.Now().UTC()

@@ -1,4 +1,10 @@
 set -e
+
+# Keep local builds independent from a user's persistent `go env` overrides
+# while still allowing explicit environment values to win.
+export GOTOOLCHAIN="${GOTOOLCHAIN:-auto}"
+export GOSUMDB="${GOSUMDB:-sum.golang.org}"
+
 appName="openlist"
 builtAt="$(date +'%F %T %z')"
 gitAuthor="The OpenList Projects Contributors <noreply@openlist.team>"
@@ -108,8 +114,10 @@ ldflags="\
 GenerateWindowsResource() {
   if [ ! -f resource/windows.syso ]; then
     echo "generating Windows resource (.syso) with manifest and version info"
-    if ! command -v rsrc >/dev/null 2>&1; then
-      go install github.com/akavel/rsrc@latest >/dev/null 2>&1
+    rsrc_bin="$(command -v rsrc || true)"
+    if [ -z "$rsrc_bin" ]; then
+      echo "Warning: rsrc not found; building without optional Windows resource metadata" >&2
+      return 0
     fi
     # Parse version (e.g. v3.25.0 → 3,25,0,0) for Windows VS_VERSION_INFO
     ver_major=$(echo "$version" | sed 's/^v//' | cut -d. -f1)
@@ -145,7 +153,7 @@ GenerateWindowsResource() {
   "ManifestPath": "resource/app.manifest"
 }
 EOF
-    rsrc -manifest resource/app.manifest -json resource/versioninfo.json -arch amd64 -o resource/windows.syso || {
+    "$rsrc_bin" -manifest resource/app.manifest -json resource/versioninfo.json -arch amd64 -o resource/windows.syso || {
       echo "Warning: rsrc failed, building without Windows resource" >&2
       rm -f resource/versioninfo.json
       return 0

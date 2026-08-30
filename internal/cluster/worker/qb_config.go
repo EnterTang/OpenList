@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -33,18 +34,20 @@ func (s *Service) ResolveMoviePilotRoute(bridgeInstanceID, downloader string) (p
 }
 
 // ResolveQBPath maps a path reported by qB to the corresponding path on this
-// Worker. The most specific mapping wins, which allows a general download
-// root plus a narrower override for one qB category.
-func ResolveQBPath(client protocol.QBClientConfig, qbPath string) (string, error) {
-	qbPath = path.Clean(strings.TrimSpace(qbPath))
-	if qbPath == "." || !path.IsAbs(qbPath) {
+// Worker. qB paths use slash semantics, while Worker paths use the local OS
+// semantics so native Windows qB paths such as C:\\Downloads are supported.
+// The most specific mapping wins, which allows a general download root plus a
+// narrower override for one qB category.
+func ResolveQBPath(client protocol.QBClientConfig, rawQBPath string) (string, error) {
+	qbPath := normalizeQBPath(rawQBPath)
+	if qbPath == "." || !isAbsoluteQBPath(qbPath) {
 		return "", errors.New("qB content path must be absolute")
 	}
 	best := -1
 	var selected protocol.QBPathMapping
 	for _, mapping := range client.PathMappings {
-		source := path.Clean(strings.TrimSpace(mapping.QBPath))
-		if source == "." || !path.IsAbs(source) {
+		source := normalizeQBPath(mapping.QBPath)
+		if source == "." || !isAbsoluteQBPath(source) {
 			continue
 		}
 		if qbPath != source && !strings.HasPrefix(qbPath, source+"/") {
@@ -58,17 +61,43 @@ func ResolveQBPath(client protocol.QBClientConfig, qbPath string) (string, error
 	if best < 0 {
 		return "", fmt.Errorf("qB path %q does not match any configured path mapping", qbPath)
 	}
-	workerRoot := path.Clean(strings.TrimSpace(selected.WorkerPath))
-	if workerRoot == "." || !path.IsAbs(workerRoot) {
+	workerRoot := filepath.Clean(strings.TrimSpace(selected.WorkerPath))
+	if workerRoot == "." || !filepath.IsAbs(workerRoot) {
 		return "", errors.New("qB worker path mapping must be absolute")
 	}
-	source := path.Clean(strings.TrimSpace(selected.QBPath))
+	source := normalizeQBPath(selected.QBPath)
 	suffix := strings.TrimPrefix(qbPath, source)
-	resolved := path.Clean(path.Join(workerRoot, suffix))
-	if resolved != workerRoot && !strings.HasPrefix(resolved, workerRoot+"/") {
+	suffix = strings.TrimLeft(suffix, "/")
+	resolved := workerRoot
+	if suffix != "" {
+		resolved = filepath.Join(workerRoot, filepath.FromSlash(suffix))
+	}
+	if !pathWithin(workerRoot, resolved) {
 		return "", fmt.Errorf("qB path %q escapes worker mapping", qbPath)
 	}
 	return resolved, nil
+}
+
+// normalizeQBPath canonicalizes paths reported by qB without applying the
+// Worker OS's path rules. qB's API may return either POSIX paths or native
+// Windows paths depending on where qBittorrent is running.
+func normalizeQBPath(raw string) string {
+	value := strings.ReplaceAll(strings.TrimSpace(raw), `\`, "/")
+	cleaned := path.Clean(value)
+	if isWindowsDriveAbsolute(value) && len(cleaned) == 2 && cleaned[1] == ':' {
+		return cleaned + "/"
+	}
+	return cleaned
+}
+
+func isAbsoluteQBPath(value string) bool {
+	return path.IsAbs(value) || isWindowsDriveAbsolute(value)
+}
+
+func isWindowsDriveAbsolute(value string) bool {
+	return len(value) >= 3 &&
+		((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z')) &&
+		value[1] == ':' && value[2] == '/'
 }
 
 func moviePilotUploadConcurrency(config protocol.StagingConfig) int {

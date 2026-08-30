@@ -139,7 +139,7 @@ func (c WorkerDesiredConfig) Validate() error {
 		return errors.New("MoviePilot staging resume watermark must not be below pause watermark")
 	}
 	if root := strings.TrimSpace(c.Staging.Root); root != "" {
-		if err := validateControlMountPath(root, "MoviePilot staging root"); err != nil {
+		if err := validateWorkerLocalPath(root, "MoviePilot staging root"); err != nil {
 			return err
 		}
 	}
@@ -171,13 +171,13 @@ func (c WorkerDesiredConfig) Validate() error {
 		}
 		seenQBPaths := make(map[string]struct{}, len(client.PathMappings))
 		for _, mapping := range client.PathMappings {
-			if err := validateControlMountPath(mapping.QBPath, "qB path mapping source"); err != nil {
+			if err := validateQBPath(mapping.QBPath, "qB path mapping source"); err != nil {
 				return fmt.Errorf("qB client %q: %w", id, err)
 			}
-			if err := validateControlMountPath(mapping.WorkerPath, "qB path mapping worker path"); err != nil {
+			if err := validateWorkerLocalPath(mapping.WorkerPath, "qB path mapping worker path"); err != nil {
 				return fmt.Errorf("qB client %q: %w", id, err)
 			}
-			qbPath := path.Clean(strings.TrimSpace(mapping.QBPath))
+			qbPath := normalizePortablePath(mapping.QBPath)
 			if _, exists := seenQBPaths[qbPath]; exists {
 				return fmt.Errorf("qB client %q path mapping %q is duplicated", id, qbPath)
 			}
@@ -327,4 +327,50 @@ func validateControlMountPath(value, label string) error {
 		return fmt.Errorf("%s is invalid", label)
 	}
 	return nil
+}
+
+// validateQBPath validates a path reported by qB. qB may run on Windows or
+// Unix, so its path syntax must be accepted independently of the Coordinator's
+// operating system.
+func validateQBPath(value, label string) error {
+	return validatePortableAbsolutePath(value, label)
+}
+
+// validateWorkerLocalPath validates a path consumed by the selected Worker.
+// The Coordinator can run on a different OS, so this accepts both POSIX paths
+// and native Windows drive/UNC paths.
+func validateWorkerLocalPath(value, label string) error {
+	return validatePortableAbsolutePath(value, label)
+}
+
+func validatePortableAbsolutePath(value, label string) error {
+	value = strings.TrimSpace(value)
+	normalized := normalizePortablePath(value)
+	if value == "" || !isPortableAbsolutePath(normalized) || isPortableRoot(normalized) {
+		return fmt.Errorf("%s must be an absolute non-root path", label)
+	}
+	return nil
+}
+
+func normalizePortablePath(value string) string {
+	return path.Clean(strings.ReplaceAll(strings.TrimSpace(value), `\`, "/"))
+}
+
+func isPortableAbsolutePath(value string) bool {
+	return path.IsAbs(value) || isWindowsDriveAbsolutePath(value)
+}
+
+func isWindowsDriveAbsolutePath(value string) bool {
+	return len(value) >= 3 &&
+		((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z')) &&
+		value[1] == ':' && value[2] == '/'
+}
+
+func isPortableRoot(value string) bool {
+	if value == "/" {
+		return true
+	}
+	return len(value) == 2 &&
+		((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z')) &&
+		value[1] == ':'
 }

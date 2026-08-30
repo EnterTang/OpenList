@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
@@ -167,11 +168,11 @@ func (s *Service) DiscoverTorrentFiles(ctx context.Context, torrent *protocol.To
 	if err != nil {
 		return nil, fmt.Errorf("query qB torrent files %q: %w", torrent.TorrentHash, err)
 	}
-	contentPath := path.Clean(strings.TrimSpace(info.ContentPath))
+	contentPath := normalizeQBPath(info.ContentPath)
 	if contentPath == "." {
-		contentPath = path.Clean(strings.TrimSpace(torrent.ContentPath))
+		contentPath = normalizeQBPath(torrent.ContentPath)
 	}
-	if contentPath == "." || !path.IsAbs(contentPath) {
+	if contentPath == "." || !isAbsoluteQBPath(contentPath) {
 		return nil, errors.New("qB torrent content path must be absolute")
 	}
 	workerContentRoot, err := ResolveQBPath(clientConfig, contentPath)
@@ -201,7 +202,7 @@ func (s *Service) DiscoverTorrentFiles(ctx context.Context, torrent *protocol.To
 			continue
 		}
 		qbPath := path.Join(contentPath, relative)
-		workerPath := path.Join(workerContentRoot, relative)
+		workerPath := filepath.Join(workerContentRoot, filepath.FromSlash(relative))
 		if len(files) == 1 && path.Base(contentPath) == path.Base(relative) {
 			qbPath = contentPath
 			workerPath, err = ResolveQBPath(clientConfig, qbPath)

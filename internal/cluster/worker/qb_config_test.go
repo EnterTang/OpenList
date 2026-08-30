@@ -27,6 +27,24 @@ func TestResolveQBPathUsesLongestPrefix(t *testing.T) {
 	}
 }
 
+func TestResolveQBPathAcceptsNativeWindowsQBPath(t *testing.T) {
+	client := protocol.QBClientConfig{
+		ID: "qb-windows",
+		PathMappings: []protocol.QBPathMapping{{
+			QBPath:     `C:\Downloads`,
+			WorkerPath: "/srv/downloads",
+		}},
+	}
+
+	got, err := ResolveQBPath(client, `C:\Downloads\Movies\film.mkv`)
+	if err != nil {
+		t.Fatalf("resolve Windows qB path: %v", err)
+	}
+	if got != "/srv/downloads/Movies/film.mkv" {
+		t.Fatalf("resolved path = %q, want %q", got, "/srv/downloads/Movies/film.mkv")
+	}
+}
+
 func TestResolveQBPathRejectsUnmappedPath(t *testing.T) {
 	_, err := ResolveQBPath(protocol.QBClientConfig{
 		PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},

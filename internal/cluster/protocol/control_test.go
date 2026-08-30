@@ -81,6 +81,17 @@ func TestWorkerDesiredConfigRejectsUnsafePaths(t *testing.T) {
 	require.Error(t, (WorkerDesiredConfig{TargetBindings: map[string]TargetBinding{"mobile": {MountPath: "/"}}}).Validate())
 }
 
+func TestWorkerDesiredConfigAcceptsWindowsWorkerPaths(t *testing.T) {
+	cfg := WorkerDesiredConfig{
+		QBClients: []QBClientConfig{{
+			ID: "qb-win", WebUIURL: "http://127.0.0.1:8383", SecretRef: "secret-qb-win",
+			PathMappings: []QBPathMapping{{QBPath: `C:\Downloads`, WorkerPath: `F:\downloads`}},
+		}},
+		Staging: StagingConfig{Root: `F:\downloads\staging`},
+	}
+	require.NoError(t, cfg.Validate())
+}
+
 func TestWorkerDesiredConfigValidatesMoviePilotStagingWatermarks(t *testing.T) {
 	base := WorkerDesiredConfig{Staging: StagingConfig{Root: "/srv/staging"}}
 	for _, staging := range []StagingConfig{

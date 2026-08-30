@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -545,8 +546,8 @@ func cloneDesiredConfig(config protocol.WorkerDesiredConfig) protocol.WorkerDesi
 		client.SecretRef = strings.TrimSpace(client.SecretRef)
 		client.PathMappings = append([]protocol.QBPathMapping(nil), client.PathMappings...)
 		for i := range client.PathMappings {
-			client.PathMappings[i].QBPath = path.Clean(strings.TrimSpace(client.PathMappings[i].QBPath))
-			client.PathMappings[i].WorkerPath = path.Clean(strings.TrimSpace(client.PathMappings[i].WorkerPath))
+			client.PathMappings[i].QBPath = normalizeQBPath(client.PathMappings[i].QBPath)
+			client.PathMappings[i].WorkerPath = filepath.Clean(strings.TrimSpace(client.PathMappings[i].WorkerPath))
 		}
 		cloned.QBClients = append(cloned.QBClients, client)
 	}
@@ -559,7 +560,7 @@ func cloneDesiredConfig(config protocol.WorkerDesiredConfig) protocol.WorkerDesi
 	}
 	cloned.Staging.Root = strings.TrimSpace(config.Staging.Root)
 	if cloned.Staging.Root != "" {
-		cloned.Staging.Root = path.Clean(cloned.Staging.Root)
+		cloned.Staging.Root = filepath.Clean(cloned.Staging.Root)
 	}
 	cloned.Staging.ExtensionWhitelist = append([]string(nil), config.Staging.ExtensionWhitelist...)
 	for i := range cloned.Staging.ExtensionWhitelist {

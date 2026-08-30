@@ -154,6 +154,34 @@ func TestHandlerErrorReturnsNackWithoutClosingSession(t *testing.T) {
 	require.ErrorIs(t, receive(t, clientDone), context.Canceled)
 }
 
+func TestWorkerClientReportsPreConnectionErrors(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	serverURL := websocketURL(server.URL)
+	server.Close()
+
+	connectionErrors := make(chan error, 1)
+	client, err := NewWorkerClient(WorkerClientOptions{
+		URL:               serverURL,
+		NodeID:            "worker-error",
+		HandshakeTimeout:  time.Second,
+		OnConnectionError: func(cause error) { connectionErrors <- cause },
+	})
+	require.NoError(t, err)
+
+	got := client.RunOnce(context.Background())
+	require.Error(t, got)
+	select {
+	case reported := <-connectionErrors:
+		require.ErrorIs(t, reported, got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for pre-connection error")
+	}
+}
+
 func TestNewWorkerSessionSupersedesPreviousEpoch(t *testing.T) {
 	t.Parallel()
 

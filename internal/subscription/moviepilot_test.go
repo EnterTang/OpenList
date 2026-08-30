@@ -16,6 +16,7 @@ type fakeMoviePilotBridgeClient struct {
 	searches []moviepilotbridge.ResourceSearchRequest
 	intents  []moviepilotbridge.DownloadIntentRequest
 	results  []moviepilotbridge.ResourceSearchResult
+	bridges  []string
 }
 
 func (f *fakeMoviePilotBridgeClient) SearchResources(_ context.Context, _ string, request moviepilotbridge.ResourceSearchRequest) ([]moviepilotbridge.ResourceSearchResult, error) {
@@ -26,6 +27,10 @@ func (f *fakeMoviePilotBridgeClient) SearchResources(_ context.Context, _ string
 func (f *fakeMoviePilotBridgeClient) SubmitIntent(_ context.Context, _ string, _ *model.MoviePilotDownloadIntent, request moviepilotbridge.DownloadIntentRequest) error {
 	f.intents = append(f.intents, request)
 	return nil
+}
+
+func (f *fakeMoviePilotBridgeClient) ListEnabledInstanceIDs(_ context.Context) ([]string, error) {
+	return append([]string(nil), f.bridges...), nil
 }
 
 func TestSearchMoviePilotResourcesDoesNotExposeSiteCookie(t *testing.T) {
@@ -71,7 +76,7 @@ func TestSearchMoviePilotResourcesProjectsOpaqueRefAndMediaIdentity(t *testing.T
 	SetMoviePilotBridgeClient(client)
 	t.Cleanup(func() { SetMoviePilotBridgeClient(nil) })
 	results, err := SearchMoviePilotResources(context.Background(), model.SubscriptionResourceSearchReq{
-		Query: "Show", BridgeInstanceID: "mp-main", TMDBID: 123, MediaType: "tv", Limit: 10,
+		Query: "Show", BridgeInstanceID: "mp-main", TMDBID: 123, MediaType: "tv", Season: 2, Episode: 3, Limit: 10,
 	})
 	if err != nil {
 		t.Fatalf("search MoviePilot resources: %v", err)
@@ -85,8 +90,52 @@ func TestSearchMoviePilotResourcesProjectsOpaqueRefAndMediaIdentity(t *testing.T
 	if len(results[0].Labels) != 2 || results[0].Labels[0] != "WEB-DL" || results[0].Grabs != 11 {
 		t.Fatalf("projected resource labels/heat = %#v", results[0])
 	}
-	if len(client.searches) != 1 || client.searches[0].MediaSource != "tmdb" || client.searches[0].MediaID != "123" {
+	if len(client.searches) != 1 || client.searches[0].MediaSource != "tmdb" || client.searches[0].MediaID != "123" || client.searches[0].Season != 2 || client.searches[0].Episode != 3 {
 		t.Fatalf("search requests = %#v", client.searches)
+	}
+}
+
+func TestRunMoviePilotAutomaticallyBindsFirstBridgeResult(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	client := &fakeMoviePilotBridgeClient{
+		bridges: []string{"mp-main"},
+		results: []moviepilotbridge.ResourceSearchResult{{
+			ResourceRef: "resource-1", Title: "Auto Movie 1080p", Site: "tracker-a", Size: 1024,
+			SelectedFingerprint: "fingerprint-1",
+		}},
+	}
+	SetMoviePilotBridgeClient(client)
+	t.Cleanup(func() { SetMoviePilotBridgeClient(nil) })
+	sub := &model.Subscription{
+		Name: "Auto Movie", TMDBName: "Auto Movie", TMDBID: 123, MediaType: "movie",
+		SourceType: model.SubscriptionSourceMoviePilot,
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	items, _, _, _, _, err := runMoviePilot(context.Background(), sub, true)
+	if err != nil {
+		t.Fatalf("run MoviePilot subscription: %v", err)
+	}
+	if len(items) != 1 || len(client.intents) != 1 {
+		t.Fatalf("automatic MoviePilot run items/intents = %d/%d", len(items), len(client.intents))
+	}
+	if sub.BoundTorrent == nil || sub.BoundTorrent.ResourceRef != "resource-1" {
+		t.Fatalf("bound subscription = %#v", sub.BoundTorrent)
+	}
+	if client.intents[0].Torrent.ResourceRef != "resource-1" {
+		t.Fatalf("submitted intent = %#v", client.intents[0])
+	}
+	if len(client.searches) != 1 || client.searches[0].MediaID != "123" || client.searches[0].MediaType != "movie" {
+		t.Fatalf("automatic search requests = %#v", client.searches)
+	}
+	reloaded, err := db.GetSubscriptionByID(sub.ID)
+	if err != nil {
+		t.Fatalf("reload subscription: %v", err)
+	}
+	if reloaded.BoundTorrent == nil || reloaded.BoundTorrent.SelectedFingerprint != "fingerprint-1" {
+		t.Fatalf("persisted binding = %#v", reloaded.BoundTorrent)
 	}
 }
 

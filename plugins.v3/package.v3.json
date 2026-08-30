@@ -1,0 +1,15 @@
+{
+  "OpenListBridge": {
+    "name": "OpenList Bridge",
+    "description": "OpenList PT 资源搜索、qB 选择与状态中转。",
+    "labels": "OpenList,MoviePilot,qBittorrent,PT",
+    "version": "1.0.0",
+    "icon": "OpenList.png",
+    "author": "OpenListTeam",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首个 MoviePilot V3 版本：提供 OpenList 资源搜索、下载意图和精确 qB 状态回传。"
+    }
+  }
+}

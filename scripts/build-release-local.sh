@@ -24,7 +24,8 @@ Options:
                           Defaults to windows-amd64.
   --lite                  Build lite frontend/backend artifacts.
   --skip-frontend-build   Reuse existing frontend dist/ without rebuilding.
-  --skip-i18n             Skip Crowdin i18n download (default for local builds).
+  --skip-i18n             Skip Crowdin download and merge local i18n overrides
+                          during the frontend prebuild (default for local builds).
   --with-crowdin-i18n     Run Crowdin i18n:release (needs CROWDIN_PROJECT_ID and token).
   --no-install            Skip pnpm install before frontend build.
   -h, --help              Show this help.
@@ -374,7 +375,7 @@ if [ "$SKIP_FRONTEND_BUILD" != "true" ]; then
     frontend_build_cmd=(pnpm build)
   fi
   if [ "$SKIP_I18N" = "true" ]; then
-    echo "==> Skipping Crowdin i18n (using committed src/lang files)"
+    echo "==> Skipping Crowdin i18n download (merging local language overrides)"
     if [ "$RUN_PNPM_INSTALL" = "false" ]; then
       (cd "$FRONTEND_DIR" && "${frontend_build_cmd[@]}")
     else

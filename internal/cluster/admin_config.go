@@ -18,6 +18,7 @@ type AdminConfig struct {
 	ActiveRole                string           `json:"active_role"`
 	NodeID                    string           `json:"node_id"`
 	CoordinatorURL            string           `json:"coordinator_url"`
+	EnrollmentToken           string           `json:"enrollment_token"`
 	EnrollmentTokenConfigured bool             `json:"enrollment_token_configured"`
 	WorkerKeyFile             string           `json:"worker_key_file"`
 	WebSocketPath             string           `json:"websocket_path"`
@@ -26,6 +27,7 @@ type AdminConfig struct {
 	TargetAPITokenConfigured  bool             `json:"target_api_token_configured"`
 	TargetSupportsIdempotency bool             `json:"target_supports_idempotency"`
 	Redis                     AdminRedisConfig `json:"redis"`
+	Runtime                   RuntimeStatus    `json:"runtime"`
 	RestartRequired           bool             `json:"restart_required"`
 }
 
@@ -209,13 +211,22 @@ func normalizeWebSocketPath(value string) string {
 }
 
 func publicAdminConfig(cfg conf.Cluster, restartRequired bool) AdminConfig {
+	workerKeyFile := strings.TrimSpace(cfg.WorkerKeyFile)
+	if ParseRole(cfg.Role).RunsWorker() {
+		if workerKeyFile == "" {
+			workerKeyFile = defaultWorkerKeyFile(cfg.NodeID)
+		} else {
+			workerKeyFile = resolveWorkerKeyFile(workerKeyFile)
+		}
+	}
 	return AdminConfig{
 		Role:                      string(ParseRole(cfg.Role)),
 		ActiveRole:                string(ParseRole(conf.Conf.Cluster.Role)),
 		NodeID:                    cfg.NodeID,
 		CoordinatorURL:            cfg.CoordinatorURL,
+		EnrollmentToken:           cfg.EnrollmentToken,
 		EnrollmentTokenConfigured: cfg.EnrollmentToken != "",
-		WorkerKeyFile:             cfg.WorkerKeyFile,
+		WorkerKeyFile:             workerKeyFile,
 		WebSocketPath:             cfg.WebSocketPath,
 		ETFRootPath:               cfg.ETFRootPath,
 		TargetBaseURL:             cfg.TargetBaseURL,
@@ -228,6 +239,7 @@ func publicAdminConfig(cfg conf.Cluster, restartRequired bool) AdminConfig {
 			DB:                 cfg.Redis.DB,
 			RequireAOF:         cfg.Redis.RequireAOF,
 		},
+		Runtime:         DefaultRuntime.Status(),
 		RestartRequired: restartRequired,
 	}
 }

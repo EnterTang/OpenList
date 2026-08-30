@@ -4,7 +4,14 @@ OpenList Bridge 是 MoviePilot V3 控制面插件。它只负责资源搜索、�
 
 ## 安装与入口
 
-将整个 `openlistbridge` 目录安装到 MoviePilot V3 插件目录，并确保 MoviePilot 能导入根目录 `__init__.py` 中的 `OpenListBridge(_PluginBase)`。插件通过 MoviePilot V3 的 `get_api()` 注册以下入口，实际前缀由 MoviePilot 固定为 `/api/v1/plugin/OpenListBridge`：
+如果通过 `PLUGIN_LOCAL_REPO_PATHS` 使用本地插件仓库，路径必须指向包含
+`package.v3.json` 的仓库根目录（本仓库中的 `plugins.v3`），不能指向
+`plugins.v3/openlistbridge` 子目录。安装时由 MoviePilot 将
+`plugins.v3/openlistbridge` 同步到插件目录，并确保能导入其中的
+`__init__.py` 和 `OpenListBridge(_PluginBase)`。如果只手工安装单个插件目录，
+则不应把该目录同时配置为本地插件仓库路径。
+
+插件通过 MoviePilot V3 的 `get_api()` 注册以下入口，实际前缀由 MoviePilot 固定为 `/api/v1/plugin/OpenListBridge`：
 
 - `POST /api/v1/plugin/OpenListBridge/search`
 - `POST /api/v1/plugin/OpenListBridge/intent`

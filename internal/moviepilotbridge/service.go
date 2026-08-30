@@ -113,6 +113,23 @@ func (s *Service) ListInstances(ctx context.Context) ([]model.MoviePilotBridgeIn
 	return items, err
 }
 
+// ListEnabledInstanceIDs returns the deterministic Bridge order used by
+// automatic MoviePilot subscription searches. The secret itself is resolved
+// only when a search request is sent.
+func (s *Service) ListEnabledInstanceIDs(ctx context.Context) ([]string, error) {
+	items, err := s.ListInstances(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Enabled && strings.TrimSpace(item.ID) != "" {
+			ids = append(ids, strings.TrimSpace(item.ID))
+		}
+	}
+	return ids, nil
+}
+
 func (s *Service) GetInstance(ctx context.Context, id string) (*model.MoviePilotBridgeInstance, error) {
 	if s == nil || s.database == nil {
 		return nil, errors.New("moviepilot bridge database is required")

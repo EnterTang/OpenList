@@ -36,6 +36,10 @@ type WorkerClientOptions struct {
 	LastReceivedSeq   uint64
 	HelloControlState func() (*clusterprotocol.NodeKeyAgreement, uint64)
 	OnConnect         func(Peer, Welcome)
+	// OnConnectionError reports failures that happen before a WebSocket session
+	// is established, such as DNS/TLS errors or a rejected hello. Run retries
+	// these failures automatically, so callers need a separate diagnostic hook.
+	OnConnectionError func(error)
 	OnDisconnect      func(error)
 }
 
@@ -102,7 +106,14 @@ func (c *WorkerClient) Run(ctx context.Context) error {
 	}
 }
 
-func (c *WorkerClient) RunOnce(ctx context.Context) error {
+func (c *WorkerClient) RunOnce(ctx context.Context) (err error) {
+	connected := false
+	defer func() {
+		if err != nil && !connected && c.opts.OnConnectionError != nil {
+			c.opts.OnConnectionError(err)
+		}
+	}()
+
 	dialer := c.opts.Dialer
 	if dialer == nil {
 		dialer = websocket.DefaultDialer
@@ -188,7 +199,10 @@ func (c *WorkerClient) RunOnce(ctx context.Context) error {
 	runDone := make(chan error, 1)
 	go func() { runDone <- conn.run(welcomeMessage.Seq, hello.Seq) }()
 	if c.opts.OnConnect != nil {
+		connected = true
 		c.opts.OnConnect(conn, welcome)
+	} else {
+		connected = true
 	}
 	runErr := <-runDone
 	if c.opts.OnDisconnect != nil {

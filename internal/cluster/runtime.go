@@ -57,10 +57,22 @@ type Runtime struct {
 	coordinatorLeaseMu   sync.Mutex
 
 	mu         sync.RWMutex
+	statusMu   sync.RWMutex
 	controlMu  sync.Mutex
 	outboxMu   sync.Mutex
 	generation uint64
 	started    bool
+	lastError  string
+}
+
+// RuntimeStatus describes the local cluster process, including failures that
+// occur after the HTTP server has started. The server intentionally stays
+// available when cluster startup fails so an administrator can correct the
+// configuration, therefore the admin API must expose this state explicitly.
+type RuntimeStatus struct {
+	Started         bool   `json:"started"`
+	WorkerConnected bool   `json:"worker_connected"`
+	LastError       string `json:"last_error,omitempty"`
 }
 
 const (
@@ -306,6 +318,7 @@ func (r *Runtime) Start() error {
 	if r.started {
 		return nil
 	}
+	r.setLastError(nil)
 	r.role = ParseRole(conf.Conf.Cluster.Role)
 	if r.role == RoleStandalone {
 		r.started = true
@@ -316,29 +329,25 @@ func (r *Runtime) Start() error {
 	generation := r.generation
 	if r.role.RunsCoordinator() {
 		if strings.TrimSpace(conf.Conf.Cluster.EnrollmentToken) == "" {
-			r.stopLocked()
-			return errors.New("cluster.enrollment_token is required for coordinator and hybrid roles")
+			return r.failStartLocked(errors.New("cluster.enrollment_token is required for coordinator and hybrid roles"))
 		}
 		leaseOwner := coordinatorID() + ":" + uuid.NewString()
 		r.leaseOwner = leaseOwner
 		leaseAcquiredAt := time.Now().UTC()
 		if err := r.acquireCoordinatorLease(r.ctx, leaseAcquiredAt); err != nil {
-			r.stopLocked()
-			return err
+			return r.failStartLocked(err)
 		}
 		runtimeCtx := r.ctx
 		service := coordinator.New(db.GetDb(), conf.Conf.Cluster.EnrollmentToken)
 		service.SetHeartbeatInterval(heartbeatInterval())
 		if _, err := service.ReconcileNodeSessions(runtimeCtx, time.Now().UTC()); err != nil {
-			r.stopLocked()
-			return fmt.Errorf("reconcile stale cluster sessions: %w", err)
+			return r.failStartLocked(fmt.Errorf("reconcile stale cluster sessions: %w", err))
 		}
 		if r.role.RunsWorker() {
 			if nodeID := strings.TrimSpace(conf.Conf.Cluster.NodeID); nodeID != "" {
 				requeued, err := service.RequeueNodeAttempts(runtimeCtx, nodeID, time.Now().UTC())
 				if err != nil {
-					r.stopLocked()
-					return fmt.Errorf("requeue restarted worker attempts: %w", err)
+					return r.failStartLocked(fmt.Errorf("requeue restarted worker attempts: %w", err))
 				}
 				if requeued > 0 {
 					log.Warnf("requeued %d cluster attempt(s) left by restarted worker %s", requeued, nodeID)
@@ -353,7 +362,9 @@ func (r *Runtime) Start() error {
 			Authenticate:        service.Authenticate,
 			Handler:             service,
 			CheckOrigin:         clusterCheckOrigin,
-			RejectDuplicateNode: true,
+			// A restarted Worker may reconnect before the Coordinator has observed
+			// the old TCP session closing. Let the Hub replace that stale session
+			// immediately instead of making the Worker wait for the read timeout.
 			OnConnect: func(peer transport.Peer) {
 				service.OnConnect(peer)
 				if err := service.ReplayOutbox(runtimeCtx, peer); err != nil {
@@ -372,13 +383,44 @@ func (r *Runtime) Start() error {
 	}
 	if r.role.RunsWorker() {
 		if err := r.startWorkerLocked(); err != nil {
-			r.stopLocked()
-			return err
+			return r.failStartLocked(err)
 		}
 	}
 	r.started = true
 	log.Infof("cluster runtime started with role %s", r.role)
 	return nil
+}
+
+func (r *Runtime) failStartLocked(err error) error {
+	r.setLastError(err)
+	r.stopLocked()
+	return err
+}
+
+// Status returns a point-in-time view of the local cluster runtime.
+func (r *Runtime) Status() RuntimeStatus {
+	r.mu.RLock()
+	started := r.started
+	workerClient := r.workerClient
+	r.mu.RUnlock()
+	workerConnected := false
+	if workerClient != nil {
+		_, workerConnected = workerClient.Peer()
+	}
+	r.statusMu.RLock()
+	lastError := r.lastError
+	r.statusMu.RUnlock()
+	return RuntimeStatus{Started: started, WorkerConnected: workerConnected, LastError: lastError}
+}
+
+func (r *Runtime) setLastError(err error) {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	if err == nil {
+		r.lastError = ""
+		return
+	}
+	r.lastError = err.Error()
 }
 
 func (r *Runtime) startWorkerLocked() error {
@@ -407,12 +449,9 @@ func (r *Runtime) startWorkerLocked() error {
 	})
 	keyFile := strings.TrimSpace(conf.Conf.Cluster.WorkerKeyFile)
 	if keyFile == "" {
-		base := filepath.Dir(conf.Conf.Database.DBFile)
-		if base == "" || base == "." {
-			base = "data"
-		}
-		nodeKeyName := fmt.Sprintf("%x", sha256.Sum256([]byte(nodeID)))[:24]
-		keyFile = filepath.Join(base, "cluster", nodeKeyName+".x25519.key")
+		keyFile = defaultWorkerKeyFile(nodeID)
+	} else {
+		keyFile = resolveWorkerKeyFile(keyFile)
 	}
 	keyPair, err := secure.LoadOrCreateKeyPair(keyFile)
 	if err != nil {
@@ -452,6 +491,7 @@ func (r *Runtime) startWorkerLocked() error {
 			return &protocol.NodeKeyAgreement{Algorithm: protocol.KeyAgreementX25519, KeyID: keyPair.KeyID(), PublicKey: keyPair.PublicKey()}, 0
 		},
 		OnConnect: func(_ transport.Peer, _ protocol.Welcome) {
+			r.setLastError(nil)
 			if workerService != nil {
 				workerService.OnTransportReconnected(workerCtx)
 			}
@@ -459,7 +499,14 @@ func (r *Runtime) startWorkerLocked() error {
 				log.Errorf("report cluster worker inventory: %v", err)
 			}
 		},
+		OnConnectionError: func(cause error) {
+			r.setLastError(cause)
+			log.Warnf("cluster worker websocket connection failed: %v", cause)
+		},
 		OnDisconnect: func(cause error) {
+			if cause != nil {
+				r.setLastError(cause)
+			}
 			// qB-backed jobs are the exception: pause their bound torrents before
 			// the Worker becomes unreachable, while ordinary cloud moves continue
 			// through the durable Redis result queue.
@@ -519,6 +566,26 @@ func nodeLocalCleanupQueueNames(baseStream, nodeID string) (string, string, stri
 	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.TrimSpace(nodeID))))[:16]
 	stream := baseStream + ":" + digest
 	return stream, "cluster-local-cleaners-v1:" + digest, stream + ":dlq"
+}
+
+func defaultWorkerKeyFile(nodeID string) string {
+	base := filepath.Dir(conf.Conf.Database.DBFile)
+	if base == "" || base == "." {
+		base = "data"
+	}
+	nodeKeyName := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.TrimSpace(nodeID))))[:24]
+	return filepath.Join(base, "cluster", nodeKeyName+".x25519.key")
+}
+
+func resolveWorkerKeyFile(filename string) string {
+	filename = strings.TrimSpace(filename)
+	if filename == "" || filepath.IsAbs(filename) {
+		return filename
+	}
+	if strings.TrimSpace(conf.ConfigPath) != "" {
+		return filepath.Join(filepath.Dir(conf.ConfigPath), filename)
+	}
+	return filename
 }
 
 func reportWorkerInventory(ctx context.Context, nodeID string, workerService *clusterworker.Service, queue *resultqueue.Queue) error {
@@ -1125,6 +1192,7 @@ func (r *Runtime) Stop() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stopLocked()
+	r.setLastError(nil)
 }
 
 func (r *Runtime) stopLocked() {

@@ -1794,9 +1794,9 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	}
 	if isQBTransfer {
 		// qB source files must remain byte-identical for seeding. The Worker
-		// always applies both transformations to the staging copy only.
-		pluginOpts.AntiHash = true
-		pluginOpts.ISORename = true
+		// applies the configured transformations to the staging copy only.
+		pluginOpts.AntiHash = qbStagingConfig.AntiHashEnabled
+		pluginOpts.ISORename = qbStagingConfig.ISORenameEnabled
 		if len(qbStagingConfig.ExtensionWhitelist) > 0 {
 			whitelist := make([]string, 0, len(qbStagingConfig.ExtensionWhitelist))
 			for _, extension := range qbStagingConfig.ExtensionWhitelist {

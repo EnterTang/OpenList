@@ -33,7 +33,7 @@ func setupAdminConfigTest(t *testing.T, clusterConfig conf.Cluster) string {
 	return conf.ConfigPath
 }
 
-func TestGetAdminConfigRedactsSecrets(t *testing.T) {
+func TestGetAdminConfigExposesEnrollmentTokenOnly(t *testing.T) {
 	cfg := conf.DefaultConfig(t.TempDir()).Cluster
 	cfg.EnrollmentToken = "enrollment-secret"
 	cfg.TargetAPIToken = "target-secret"
@@ -44,17 +44,37 @@ func TestGetAdminConfigRedactsSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.EnrollmentTokenConfigured || !got.TargetAPITokenConfigured || !got.Redis.PasswordConfigured {
+	if got.EnrollmentToken != cfg.EnrollmentToken || !got.EnrollmentTokenConfigured || !got.TargetAPITokenConfigured || !got.Redis.PasswordConfigured {
 		t.Fatalf("secret configured flags were not returned: %+v", got)
 	}
 	body, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"enrollment-secret", "target-secret", "redis-secret"} {
+	for _, secret := range []string{"target-secret", "redis-secret"} {
 		if string(body) == secret || containsJSONText(body, secret) {
 			t.Fatalf("admin config leaked secret %q: %s", secret, body)
 		}
+	}
+}
+
+func TestPublicAdminConfigShowsPersistentWorkerKeyPath(t *testing.T) {
+	cfg := conf.DefaultConfig(t.TempDir()).Cluster
+	cfg.Role = string(RoleWorker)
+	cfg.NodeID = "worker-1"
+	setupAdminConfigTest(t, cfg)
+
+	got := publicAdminConfig(cfg, false)
+	baseDir := filepath.Dir(conf.Conf.Database.DBFile)
+	if got.WorkerKeyFile == "" || filepath.Dir(filepath.Dir(got.WorkerKeyFile)) != baseDir {
+		t.Fatalf("worker key path = %q, want it beneath %q", got.WorkerKeyFile, baseDir)
+	}
+
+	cfg.WorkerKeyFile = "cluster/custom-worker.key"
+	got = publicAdminConfig(cfg, false)
+	want := filepath.Join(baseDir, "cluster/custom-worker.key")
+	if got.WorkerKeyFile != want {
+		t.Fatalf("relative worker key path = %q, want %q", got.WorkerKeyFile, want)
 	}
 }
 

@@ -391,6 +391,8 @@ type SubscriptionResourceSearchReq struct {
 	Limit            int      `json:"limit" form:"limit"`
 	TMDBID           int64    `json:"tmdb_id" form:"tmdb_id"`
 	MediaType        string   `json:"media_type" form:"media_type"`
+	Season           int      `json:"season,omitempty" form:"season"`
+	Episode          int      `json:"episode,omitempty" form:"episode"`
 	CloudType        string   `json:"cloud_type" form:"cloud_type"`
 	BridgeInstanceID string   `json:"bridge_instance_id,omitempty" form:"bridge_instance_id"`
 }
