@@ -163,6 +163,7 @@ func admin(g *gin.RouterGroup, moviePilotBridge *moviepilotbridge.Service) {
 	clusterAdmin.GET("/results", handles.ListClusterUploadResults)
 	clusterAdmin.GET("/jobs", handles.ListClusterJobs)
 	clusterAdmin.GET("/moviepilot/transfers", handles.ListMoviePilotTransfers)
+	clusterAdmin.POST("/moviepilot/manual_qb", handles.AdoptCompletedQBTorrent)
 	clusterAdmin.POST("/jobs/dispatch", handles.DispatchClusterMediaJob)
 	clusterAdmin.POST("/jobs/dispatch_batch", handles.DispatchClusterMediaBatch)
 	clusterAdmin.POST("/jobs/:id/retry", handles.RetryClusterJob)

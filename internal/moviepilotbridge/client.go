@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 )
 
 const BridgeIntentPath = "/api/v1/plugin/OpenListBridge/intent"
+
+const BridgeIntentReconcilePath = "/api/v1/plugin/OpenListBridge/intent/%s/reconcile"
 
 type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
@@ -34,6 +37,18 @@ func (c *Client) SubmitIntent(ctx context.Context, bridge model.MoviePilotBridge
 		return errors.New("moviepilot bridge secret resolver is not configured")
 	}
 	return c.postJSON(ctx, bridge, BridgeIntentPath, payload.RequestID, payload, nil)
+}
+
+// ReconcileIntent asks the Bridge to replay the exact persisted torrent
+// binding. It is used when Coordinator has durably sent an intent but lost
+// the bound event before creating its own binding.
+func (c *Client) ReconcileIntent(ctx context.Context, bridge model.MoviePilotBridgeInstance, requestID string) error {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return errors.New("moviepilot bridge request id is required")
+	}
+	endpoint := fmt.Sprintf(BridgeIntentReconcilePath, url.PathEscape(requestID))
+	return c.postJSON(ctx, bridge, endpoint, requestID, map[string]any{}, nil)
 }
 
 func (c *Client) SearchResources(ctx context.Context, bridge model.MoviePilotBridgeInstance, payload ResourceSearchRequest) ([]ResourceSearchResult, error) {

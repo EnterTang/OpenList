@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
+	"github.com/OpenListTeam/OpenList/v4/internal/cluster/coordinator"
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -130,6 +131,27 @@ func ListMoviePilotTransfers(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, gin.H{"content": items})
+}
+
+// AdoptCompletedQBTorrent starts the normal Worker observation/upload
+// workflow for a torrent that was already completed outside MoviePilot.
+func AdoptCompletedQBTorrent(c *gin.Context) {
+	service := cluster.CoordinatorService()
+	if service == nil {
+		common.ErrorStrResp(c, "cluster coordinator is disabled", http.StatusBadRequest)
+		return
+	}
+	var req coordinator.ManualQBTorrentAdoptionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	result, err := service.AdoptCompletedQBTorrent(c.Request.Context(), req)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusBadRequest)
+		return
+	}
+	common.SuccessResp(c, result)
 }
 
 func RetryClusterJob(c *gin.Context) {

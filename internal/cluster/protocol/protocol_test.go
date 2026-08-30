@@ -198,6 +198,23 @@ func TestTaskContextValidate_RejectsDuplicateShareSaveObjectIdentity(t *testing.
 	}
 }
 
+func TestTaskContextValidate_AllowsManualQBTorrentWithoutMoviePilotRoute(t *testing.T) {
+	context := testTaskContext()
+	context.Share = ShareTaskContext{}
+	context.ShareSaveKey = ""
+	context.ShareSaveObjects = nil
+	context.SourceObjects = []SourceObject{{
+		Provider: "qbittorrent", SourceFileID: "torrent:manual:video.mkv", SourceRelativePath: "video.mkv", Size: 100,
+	}}
+	context.Torrent = &TorrentTaskContext{
+		BindingID: "manual-binding", WorkerNodeID: "worker-1", QBClientID: "qb-win",
+		TorrentHash: strings.Repeat("a", 40), Manual: true,
+	}
+	if err := context.Validate(); err != nil {
+		t.Fatalf("manual qB task context: %v", err)
+	}
+}
+
 func TestUploadETFManifestCarriesAndValidatesCoordinatorContext(t *testing.T) {
 	context := testTaskContext()
 	context.ShareSaveKey = "share-save-batch:abc123"

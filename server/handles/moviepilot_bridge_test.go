@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -63,6 +64,28 @@ func TestMoviePilotBridgeEventHandlerStoresAndDeduplicatesEvent(t *testing.T) {
 	}
 }
 
+func TestMoviePilotBridgeEventHandlerReturnsRetryableStatusOnProcessingFailure(t *testing.T) {
+	service, bridge, key := newMoviePilotBridgeHandlerService(t)
+	engine := moviePilotBridgeTestEngine(service)
+	wantErr := errors.New("worker route is temporarily unavailable")
+	service.SetEventHandler(func(context.Context, string, moviepilotbridge.BridgeEvent) error { return wantErr })
+	body := bridgeEventBody(t, "event-processing-failure")
+	firstHeaders := signBridgeHandlerBody(bridge.ID, "/events", body, key, time.Now().UTC(), "nonce-processing-failure-first")
+	first := httptest.NewRecorder()
+	engine.ServeHTTP(first, newBridgeHandlerRequest(http.MethodPost, "/events", body, firstHeaders))
+	if first.Code != http.StatusServiceUnavailable || !strings.Contains(first.Body.String(), "processing_error") {
+		t.Fatalf("processing failure response = %d %s", first.Code, first.Body.String())
+	}
+
+	service.SetEventHandler(func(context.Context, string, moviepilotbridge.BridgeEvent) error { return nil })
+	secondHeaders := signBridgeHandlerBody(bridge.ID, "/events", body, key, time.Now().UTC(), "nonce-processing-failure-retry")
+	second := httptest.NewRecorder()
+	engine.ServeHTTP(second, newBridgeHandlerRequest(http.MethodPost, "/events", body, secondHeaders))
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"duplicate":true`) {
+		t.Fatalf("retry response = %d %s", second.Code, second.Body.String())
+	}
+}
+
 func TestMoviePilotBridgeEventHandlerRejectsEventIDPayloadCollision(t *testing.T) {
 	service, bridge, key := newMoviePilotBridgeHandlerService(t)
 	engine := moviePilotBridgeTestEngine(service)
@@ -115,6 +138,7 @@ func newMoviePilotBridgeHandlerService(t *testing.T) (*moviepilotbridge.Service,
 		t.Fatalf("create bridge: %v", err)
 	}
 	service := moviepilotbridge.NewService(database, func(context.Context, string) ([]byte, error) { return key, nil }, http.DefaultClient)
+	service.SetEventHandler(func(context.Context, string, moviepilotbridge.BridgeEvent) error { return nil })
 	return service, bridge, key
 }
 

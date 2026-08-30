@@ -54,6 +54,13 @@ func TestSubmitIntentPersistsOutboxBeforeSendingSignedBody(t *testing.T) {
 	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, payload); err != nil {
 		t.Fatalf("submit intent: %v", err)
 	}
+	if err := database.Create(&model.MoviePilotTorrentBinding{
+		ID: "binding-client", IntentID: intent.ID, BridgeInstanceID: bridge.ID,
+		DownloaderAlias: "qb-hk", WorkerNodeID: "worker-1", QBClientID: "qb-client",
+		TorrentHash: strings.Repeat("a", 40), ContentPath: "/downloads/Show", Status: model.MoviePilotTorrentStatusBound,
+	}).Error; err != nil {
+		t.Fatalf("create binding: %v", err)
+	}
 	if err := service.SubmitIntent(context.Background(), bridge.ID, &model.MoviePilotDownloadIntent{
 		ID: "intent-client-retry", RequestID: intent.RequestID, BridgeInstanceID: bridge.ID,
 		MediaSource: intent.MediaSource, MediaID: intent.MediaID, ResourceRef: intent.ResourceRef,
@@ -94,6 +101,41 @@ func TestSubmitIntentPersistsOutboxBeforeSendingSignedBody(t *testing.T) {
 	}
 	if outbox.Status != "sent" || outbox.PayloadJSON == "" {
 		t.Fatalf("outbox = %+v", outbox)
+	}
+}
+
+func TestSubmitIntentReconcilesSentOrphanIntent(t *testing.T) {
+	database := newBridgeClientDatabase(t)
+	key := []byte("client-signing-key-that-is-long-enough")
+	bridge := model.MoviePilotBridgeInstance{
+		ID: "mp-reconcile", Name: "reconcile", BaseURL: "https://moviepilot.example", SecretRef: "secret", Enabled: true,
+	}
+	if err := database.Create(&bridge).Error; err != nil {
+		t.Fatalf("create bridge: %v", err)
+	}
+	httpClient := &captureBridgeHTTPClient{}
+	service := NewService(database, func(context.Context, string) ([]byte, error) { return key, nil }, httpClient)
+	intent := &model.MoviePilotDownloadIntent{
+		ID: "intent-reconcile", RequestID: "request-reconcile", BridgeInstanceID: bridge.ID,
+		MediaSource: "tmdb", MediaID: "123", ResourceRef: "resource-reconcile", TorrentFingerprint: "fingerprint-reconcile",
+	}
+	payload := DownloadIntentRequest{
+		RequestID:        intent.RequestID,
+		Media:            MediaIdentity{MediaSource: "tmdb", MediaID: "123"},
+		Torrent:          TorrentResource{ResourceRef: intent.ResourceRef, SelectedFingerprint: intent.TorrentFingerprint},
+		DownloaderPolicy: DownloaderPolicy{Mode: "moviepilot_select"},
+	}
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, payload); err != nil {
+		t.Fatalf("initial submit: %v", err)
+	}
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, payload); err != nil {
+		t.Fatalf("orphan reconcile: %v", err)
+	}
+	if got, want := httpClient.request.URL.Path, "/api/v1/plugin/OpenListBridge/intent/request-reconcile/reconcile"; got != want {
+		t.Fatalf("reconcile path = %q, want %q", got, want)
+	}
+	if got, want := string(httpClient.body), "{}"; got != want {
+		t.Fatalf("reconcile body = %q, want %q", got, want)
 	}
 }
 
@@ -193,7 +235,7 @@ func newBridgeClientDatabase(t *testing.T) *gorm.DB {
 		t.Fatalf("get sqlite db: %v", err)
 	}
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := database.AutoMigrate(&model.MoviePilotBridgeInstance{}, &model.MoviePilotDownloadIntent{}, &model.MoviePilotBridgeOutbox{}); err != nil {
+	if err := database.AutoMigrate(&model.MoviePilotBridgeInstance{}, &model.MoviePilotDownloadIntent{}, &model.MoviePilotTorrentBinding{}, &model.MoviePilotBridgeOutbox{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return database

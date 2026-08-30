@@ -137,6 +137,7 @@ type Service struct {
 	moviePilotUploadGate  *limitGate
 	targetGates           map[string]*limitGate
 	qbClientFactory       func(protocol.QBClientConfig) (qbittorrent.Client, error)
+	inventoryRefresh      func(context.Context) error
 	stagingFreeSpace      func(context.Context, string) (uint64, error)
 	stagingReservationMu  sync.Mutex
 	stagingReservations   map[string]int64
@@ -149,6 +150,27 @@ type Service struct {
 	shareSaveFlightMu     sync.Mutex
 	shareSaveFlightCalls  map[string]int
 	shareSaveFlightJoined func(string)
+}
+
+// SetInventoryRefresh installs the runtime callback used to publish an
+// immediate capability snapshot after a control-plane config apply. This is
+// needed because qB health is discovered from credentials held only in memory.
+func (s *Service) SetInventoryRefresh(refresh func(context.Context) error) {
+	s.mu.Lock()
+	s.inventoryRefresh = refresh
+	s.mu.Unlock()
+}
+
+func (s *Service) refreshInventory(ctx context.Context) {
+	s.mu.Lock()
+	refresh := s.inventoryRefresh
+	s.mu.Unlock()
+	if refresh == nil {
+		return
+	}
+	if err := refresh(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, transport.ErrNotConnected) {
+		log.Warnf("cluster worker inventory refresh after config apply failed: %v", err)
+	}
 }
 
 type resolvedMediaTransferTargets struct {

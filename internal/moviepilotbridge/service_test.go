@@ -108,7 +108,7 @@ func TestProcessPendingEventsMarksHandlerFailureForRetry(t *testing.T) {
 	wantErr := errors.New("coordinator temporarily unavailable")
 	service := NewService(database, nil, nil)
 	service.SetEventHandler(func(context.Context, string, BridgeEvent) error { return wantErr })
-	if processed, err := service.ProcessPendingEvents(context.Background(), 10); err != nil || processed != 0 {
+	if processed, err := service.ProcessPendingEvents(context.Background(), 10); !errors.Is(err, wantErr) || processed != 0 {
 		t.Fatalf("process pending = processed %d err %v", processed, err)
 	}
 	var inbox model.MoviePilotBridgeInbox

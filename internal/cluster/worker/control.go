@@ -220,6 +220,7 @@ func (s *Service) handleConfigApply(ctx context.Context, message protocol.Envelo
 	} else {
 		observed.Status = "applied"
 		observed.ObservedHash = apply.DesiredHash
+		s.refreshInventory(ctx)
 	}
 	return s.sendControlResult(ctx, message.MessageID, protocol.MessageConfigObserved, observed)
 }

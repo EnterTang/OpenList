@@ -66,12 +66,24 @@ func (s *Service) discoverTorrentClient(torrent *protocol.TorrentTaskContext) (p
 	if torrent == nil {
 		return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, errors.New("torrent context is required")
 	}
-	route, clientConfig, err := s.ResolveMoviePilotRoute(torrent.BridgeInstanceID, torrent.Downloader)
-	if err != nil {
-		return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, err
-	}
-	if requested := strings.TrimSpace(torrent.QBClientID); requested != "" && !strings.EqualFold(requested, route.QBClientID) {
-		return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("torrent qB client %q does not match configured route qB client %q", requested, route.QBClientID)
+	var clientConfig protocol.QBClientConfig
+	if torrent.Manual {
+		var ok bool
+		s.mu.Lock()
+		clientConfig, ok = s.desiredConfig.QBClient(torrent.QBClientID)
+		s.mu.Unlock()
+		if !ok {
+			return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("manual torrent references unknown qB client %q", strings.TrimSpace(torrent.QBClientID))
+		}
+	} else {
+		route, resolvedClient, err := s.ResolveMoviePilotRoute(torrent.BridgeInstanceID, torrent.Downloader)
+		if err != nil {
+			return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, err
+		}
+		if requested := strings.TrimSpace(torrent.QBClientID); requested != "" && !strings.EqualFold(requested, route.QBClientID) {
+			return protocol.QBClientConfig{}, nil, protocol.StagingConfig{}, fmt.Errorf("torrent qB client %q does not match configured route qB client %q", requested, route.QBClientID)
+		}
+		clientConfig = resolvedClient
 	}
 	s.mu.Lock()
 	staging := s.desiredConfig.Staging

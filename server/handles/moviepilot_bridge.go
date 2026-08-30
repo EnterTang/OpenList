@@ -151,9 +151,9 @@ func ConsumeMoviePilotBridgeEvent(service *moviepilotbridge.Service) gin.Handler
 			return
 		}
 		if _, processErr := service.ProcessPendingEvents(c.Request.Context(), 1); processErr != nil {
-			// The inbox is already durable. Return acceptance while leaving the
-			// event marked failed for a duplicate delivery or later retry.
-			common.SuccessResp(c, gin.H{"accepted": true, "duplicate": result.Duplicate, "stored": result.Stored, "processing": "queued", "processing_error": processErr.Error()})
+			// The inbox is already durable. A non-2xx response is required so the
+			// Bridge keeps its outbox event and retries after the route recovers.
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"accepted": false, "duplicate": result.Duplicate, "stored": result.Stored, "processing": "failed", "processing_error": processErr.Error()})
 			return
 		}
 		common.SuccessResp(c, gin.H{"accepted": true, "duplicate": result.Duplicate, "stored": result.Stored})

@@ -115,6 +115,61 @@ func TestResolveMoviePilotWorkerRouteRejectsOfflineWorkerInventory(t *testing.T)
 	}
 }
 
+func TestAdoptCompletedQBTorrentUsesManualWorkerTransferWorkflow(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	sub := model.Subscription{
+		ID: 31, Name: "Manual movie", SourceType: model.SubscriptionSourceManual, MediaType: "movie",
+		TMDBID: 10220, TMDBName: "Rounders", TMDBYear: 1998, TargetRoot: "/media",
+		DeliveryTarget: model.SubscriptionStorageTarget{Provider: "yidong139", Folder: "movies"},
+	}
+	node := model.ClusterNode{ID: "worker-win", Status: model.ClusterNodeStatusOnline}
+	for _, value := range []any{&sub, &node} {
+		if err := database.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorder := &torrentDispatchRecorder{}
+	service := New(database, "")
+	service.SetTorrentJobDispatcher(recorder)
+	hash := strings.Repeat("a", 40)
+	result, err := service.AdoptCompletedQBTorrent(context.Background(), ManualQBTorrentAdoptionRequest{
+		SubscriptionID: sub.ID, WorkerNodeID: node.ID, QBClientID: "qb-win", TorrentHash: hash,
+		Title: "Rounders.1998.mkv", ContentPath: `F:\downloads\Rounders`, Size: 100,
+	})
+	if err != nil {
+		t.Fatalf("adopt completed qB torrent: %v", err)
+	}
+	if result.BindingID == "" || result.ObserveJobID == "" || result.SubscriptionItemID == 0 {
+		t.Fatalf("manual adoption result = %#v", result)
+	}
+	if len(recorder.requests) != 1 || recorder.requests[0].JobType != model.ClusterJobTypeTorrentObserve || !recorder.requests[0].TaskContext.Torrent.Manual {
+		t.Fatalf("manual observation request = %#v", recorder.requests)
+	}
+	var binding model.MoviePilotTorrentBinding
+	if err := database.First(&binding, "id = ?", result.BindingID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !isManualQBBinding(&binding) || binding.WorkerNodeID != node.ID || binding.QBClientID != "qb-win" || binding.RetentionStatus != model.MoviePilotRetentionStatusHeld {
+		t.Fatalf("manual binding = %#v", binding)
+	}
+	if err := service.ObserveTorrent(context.Background(), result.ObserveJobID, map[string]any{
+		"content_path": `F:\downloads\Rounders`, "qb_state": "stalledUP", "progress": 1.0,
+		"files": []map[string]any{{"name": "Rounders.1998.mkv", "size": int64(100)}},
+	}); err != nil {
+		t.Fatalf("observe manual qB torrent: %v", err)
+	}
+	if len(recorder.requests) != 2 || recorder.requests[1].JobType != model.ClusterJobTypeMediaTransfer || !recorder.requests[1].TaskContext.Torrent.Manual {
+		t.Fatalf("manual delivery request = %#v", recorder.requests)
+	}
+	var delivery model.MoviePilotDeliveryFile
+	if err := database.First(&delivery, "torrent_binding_id = ?", binding.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !delivery.Required || delivery.Status != model.MoviePilotDeliveryStatusUploading || delivery.SourceKey == "" {
+		t.Fatalf("manual delivery = %#v", delivery)
+	}
+}
+
 func TestReconcileWorkerOfflineTorrentControlPausesAndResumesExactBinding(t *testing.T) {
 	database := openTorrentTransferTestDB(t)
 	intent := model.MoviePilotDownloadIntent{ID: "intent-offline-control", RequestID: "request-offline-control", BridgeInstanceID: "bridge-1"}

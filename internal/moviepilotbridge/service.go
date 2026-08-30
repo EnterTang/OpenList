@@ -283,8 +283,23 @@ func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *mod
 		if outbox.PayloadJSON != string(raw) {
 			return fmt.Errorf("request id %q already belongs to a different payload", intent.RequestID)
 		}
-		if outbox.Status == "sent" || outbox.Status == "sending" {
+		if outbox.Status == "sending" {
 			return nil
+		}
+		if outbox.Status == "sent" {
+			var binding model.MoviePilotTorrentBinding
+			bindingErr := s.database.WithContext(ctx).Where("intent_id = ?", intent.ID).First(&binding).Error
+			if bindingErr == nil {
+				return nil
+			}
+			if !errors.Is(bindingErr, gorm.ErrRecordNotFound) {
+				return bindingErr
+			}
+			// The Bridge may have accepted the download while Coordinator's
+			// bound-event handler was unavailable. Ask it to replay the exact
+			// persisted binding instead of creating another qB download.
+			client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
+			return client.ReconcileIntent(ctx, bridge, intent.RequestID)
 		}
 	}
 	if lookup != nil && !errors.Is(lookup, gorm.ErrRecordNotFound) {
@@ -308,8 +323,20 @@ func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *mod
 		if outbox.PayloadJSON != string(raw) {
 			return fmt.Errorf("request id %q already belongs to a different payload", intent.RequestID)
 		}
-		if outbox.Status == "sent" || outbox.Status == "sending" {
+		if outbox.Status == "sending" {
 			return nil
+		}
+		if outbox.Status == "sent" {
+			var binding model.MoviePilotTorrentBinding
+			bindingErr := s.database.WithContext(ctx).Where("intent_id = ?", intent.ID).First(&binding).Error
+			if bindingErr == nil {
+				return nil
+			}
+			if !errors.Is(bindingErr, gorm.ErrRecordNotFound) {
+				return bindingErr
+			}
+			client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
+			return client.ReconcileIntent(ctx, bridge, intent.RequestID)
 		}
 	}
 	outbox.UpdatedAt = now
@@ -523,6 +550,7 @@ func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, err
 		return 0, err
 	}
 	processed := 0
+	var firstHandlerErr error
 	for i := range inboxes {
 		claimed := s.database.WithContext(ctx).Model(&model.MoviePilotBridgeInbox{}).
 			Where("event_id = ? AND status IN ?", inboxes[i].EventID, []string{"received", "failed"}).
@@ -540,6 +568,9 @@ func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, err
 			}).Error; updateErr != nil {
 				return processed, updateErr
 			}
+			if firstHandlerErr == nil {
+				firstHandlerErr = err
+			}
 			continue
 		}
 		err := handler(ctx, inboxes[i].BridgeID, event)
@@ -548,6 +579,9 @@ func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, err
 				"status": "failed", "last_error": err.Error(), "updated_at": s.now(),
 			}).Error; updateErr != nil {
 				return processed, updateErr
+			}
+			if firstHandlerErr == nil {
+				firstHandlerErr = err
 			}
 			continue
 		}
@@ -559,7 +593,7 @@ func (s *Service) ProcessPendingEvents(ctx context.Context, limit int) (int, err
 		}
 		processed++
 	}
-	return processed, nil
+	return processed, firstHandlerErr
 }
 
 func validateBridgeURL(raw string) (string, error) {

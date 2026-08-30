@@ -259,36 +259,8 @@ func (r *Runtime) ApplyNodeConfig(ctx context.Context, nodeID string, desired pr
 		return nil, err
 	}
 	payload := protocol.ConfigApply{Revision: revision, DesiredHash: hash, ConfigJSON: string(raw), DesiredConfig: &desired}
-	if len(desired.QBClients) > 0 {
-		var node model.ClusterNode
-		if err := db.GetDb().WithContext(ctx).First(&node, "id = ?", nodeID).Error; err != nil {
-			return nil, err
-		}
-		if node.Disabled || node.Status == model.ClusterNodeStatusRevoked || strings.TrimSpace(node.KeyPublic) == "" {
-			return nil, errors.New("cluster node is disabled, revoked, or has no pinned public key")
-		}
-		payload.QBSecretEnvelopes = make(map[string]string, len(desired.QBClients))
-		for _, client := range desired.QBClients {
-			secret, _, secretErr := ResolveSecret(ctx, client.SecretRef)
-			if secretErr != nil {
-				return nil, fmt.Errorf("resolve qB client %q secret: %w", client.ID, secretErr)
-			}
-			var parameters map[string]any
-			if err := json.Unmarshal(secret, &parameters); err != nil || parameters == nil {
-				return nil, fmt.Errorf("qB client %q secret payload is invalid", client.ID)
-			}
-			if _, ok := firstSecretString(parameters, "username", "user"); !ok {
-				return nil, fmt.Errorf("qB client %q secret username is required", client.ID)
-			}
-			if _, ok := firstSecretString(parameters, "password", "pass"); !ok {
-				return nil, fmt.Errorf("qB client %q secret password is required", client.ID)
-			}
-			envelope, sealErr := secure.SealJSON(node.KeyPublic, parameters, protocol.QBSecretApplyAAD(nodeID, payload, client.ID))
-			if sealErr != nil {
-				return nil, fmt.Errorf("seal qB client %q secret: %w", client.ID, sealErr)
-			}
-			payload.QBSecretEnvelopes[strings.TrimSpace(client.ID)] = envelope
-		}
+	if err := sealNodeConfigQBSecrets(ctx, nodeID, &payload, desired); err != nil {
+		return nil, err
 	}
 	state := &model.ClusterNodeDesiredConfig{
 		NodeID: nodeID, Revision: revision, DesiredHash: hash, ConfigJSON: string(raw), Status: model.ClusterDesiredStatusPending,
@@ -307,6 +279,100 @@ func (r *Runtime) ApplyNodeConfig(ctx context.Context, nodeID string, desired pr
 		return state, err
 	}
 	return state, nil
+}
+
+// ReplayNodeConfig re-sends the current desired configuration without
+// advancing its revision. Workers intentionally keep qB credentials only in
+// memory, so a process restart needs a fresh node-specific envelope even when
+// the desired configuration itself has not changed.
+func (r *Runtime) ReplayNodeConfig(ctx context.Context, nodeID string) error {
+	r.controlMu.Lock()
+	defer r.controlMu.Unlock()
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return errors.New("cluster node id is required")
+	}
+	var state model.ClusterNodeDesiredConfig
+	if err := db.GetDb().WithContext(ctx).First(&state, "node_id = ?", nodeID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return err
+	}
+	apply, err := buildNodeConfigApply(ctx, nodeID, state)
+	if err != nil {
+		return err
+	}
+	return r.sendDurableControl(ctx, nodeID, protocol.MessageConfigApply, nodeID, apply, func(tx *gorm.DB) error {
+		if err := ensureControlNode(tx, nodeID); err != nil {
+			return err
+		}
+		return createControlAudit(tx, ControlActor{Name: "system"}, "config.replay", "node_config", nodeID, state.Revision, "queued", "replayed desired config after Worker reconnect")
+	})
+}
+
+func buildNodeConfigApply(ctx context.Context, nodeID string, state model.ClusterNodeDesiredConfig) (protocol.ConfigApply, error) {
+	if state.Revision == 0 || strings.TrimSpace(state.DesiredHash) == "" || strings.TrimSpace(state.ConfigJSON) == "" {
+		return protocol.ConfigApply{}, errors.New("stored Worker desired configuration is incomplete")
+	}
+	var desired protocol.WorkerDesiredConfig
+	if err := json.Unmarshal([]byte(state.ConfigJSON), &desired); err != nil {
+		return protocol.ConfigApply{}, fmt.Errorf("decode desired worker config: %w", err)
+	}
+	if err := desired.Validate(); err != nil {
+		return protocol.ConfigApply{}, err
+	}
+	hash, err := protocol.HashWorkerDesiredConfig(desired)
+	if err != nil {
+		return protocol.ConfigApply{}, err
+	}
+	if !strings.EqualFold(hash, state.DesiredHash) {
+		return protocol.ConfigApply{}, errors.New("stored Worker desired configuration hash mismatch")
+	}
+	apply := protocol.ConfigApply{
+		Revision: state.Revision, DesiredHash: state.DesiredHash,
+		ConfigJSON: state.ConfigJSON, DesiredConfig: &desired,
+	}
+	if err := sealNodeConfigQBSecrets(ctx, nodeID, &apply, desired); err != nil {
+		return protocol.ConfigApply{}, err
+	}
+	return apply, nil
+}
+
+func sealNodeConfigQBSecrets(ctx context.Context, nodeID string, apply *protocol.ConfigApply, desired protocol.WorkerDesiredConfig) error {
+	if len(desired.QBClients) == 0 {
+		return nil
+	}
+	var node model.ClusterNode
+	if err := db.GetDb().WithContext(ctx).First(&node, "id = ?", nodeID).Error; err != nil {
+		return err
+	}
+	if node.Disabled || node.Status == model.ClusterNodeStatusRevoked || strings.TrimSpace(node.KeyPublic) == "" {
+		return errors.New("cluster node is disabled, revoked, or has no pinned public key")
+	}
+	apply.QBSecretEnvelopes = make(map[string]string, len(desired.QBClients))
+	for _, client := range desired.QBClients {
+		secret, _, secretErr := ResolveSecret(ctx, client.SecretRef)
+		if secretErr != nil {
+			return fmt.Errorf("resolve qB client %q secret: %w", client.ID, secretErr)
+		}
+		var parameters map[string]any
+		if err := json.Unmarshal(secret, &parameters); err != nil || parameters == nil {
+			return fmt.Errorf("qB client %q secret payload is invalid", client.ID)
+		}
+		if _, ok := firstSecretString(parameters, "username", "user"); !ok {
+			return fmt.Errorf("qB client %q secret username is required", client.ID)
+		}
+		if _, ok := firstSecretString(parameters, "password", "pass"); !ok {
+			return fmt.Errorf("qB client %q secret password is required", client.ID)
+		}
+		envelope, sealErr := secure.SealJSON(node.KeyPublic, parameters, protocol.QBSecretApplyAAD(nodeID, *apply, client.ID))
+		if sealErr != nil {
+			return fmt.Errorf("seal qB client %q secret: %w", client.ID, sealErr)
+		}
+		apply.QBSecretEnvelopes[strings.TrimSpace(client.ID)] = envelope
+	}
+	return nil
 }
 
 func firstSecretString(values map[string]any, keys ...string) (string, bool) {

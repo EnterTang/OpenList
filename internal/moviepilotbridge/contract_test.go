@@ -25,6 +25,22 @@ func TestTorrentBoundPayloadRequiresResolvedDownloaderAndHash(t *testing.T) {
 	}
 }
 
+func TestTorrentBoundPayloadAcceptsWindowsContentPath(t *testing.T) {
+	event := BridgeEvent{
+		EventID:   "ae13a7ac-99bc-4fa3-8417-3c9f466af1cf",
+		Type:      EventTorrentBound,
+		RequestID: "83264f37-1cd6-4c49-9d6e-456f5e463d0c",
+		Torrent: &TorrentBoundPayload{
+			Downloader:  "qb-win",
+			TorrentHash: strings.Repeat("a", 40),
+			ContentPath: `F:\downloads\Rounders`,
+		},
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatalf("Windows torrent.bound content path: %v", err)
+	}
+}
+
 func TestBridgePayloadRejectsForbiddenSecretAndLocalPathFields(t *testing.T) {
 	for _, body := range [][]byte{
 		[]byte(`{"request_id":"r","site_cookie":"secret"}`),

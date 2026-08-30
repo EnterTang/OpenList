@@ -83,6 +83,34 @@ func TestDiscoverTorrentFilesResolvesMultiFileTorrentToWorkerPaths(t *testing.T)
 	}
 }
 
+func TestDiscoverManualTorrentFilesUsesConfiguredQBClientWithoutMoviePilotRoute(t *testing.T) {
+	hash := strings.Repeat("b", 40)
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients: []protocol.QBClientConfig{{
+			ID: "qb-manual", WebUIURL: "http://127.0.0.1:8383", SecretRef: "secret-qb-manual",
+			PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+		}},
+		Staging: protocol.StagingConfig{ExtensionWhitelist: []string{".mkv"}},
+	}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) {
+		return &fakeQBClient{
+			info:  qbittorrent.TorrentInfo{Hash: hash, Progress: 1, AmountLeft: 0, ContentPath: "/downloads/Rounders"},
+			files: []qbittorrent.FileInfo{{Name: "Rounders.1998.mkv", Size: 100, Progress: 1}},
+		}, nil
+	}
+
+	files, err := service.DiscoverTorrentFiles(context.Background(), &protocol.TorrentTaskContext{
+		BindingID: "manual-binding", WorkerNodeID: "worker-1", QBClientID: "qb-manual", TorrentHash: hash, Manual: true,
+	})
+	if err != nil {
+		t.Fatalf("discover manual qB torrent files: %v", err)
+	}
+	if len(files) != 1 || files[0].WorkerPath != "/srv/downloads/Rounders/Rounders.1998.mkv" {
+		t.Fatalf("manual qB files = %#v", files)
+	}
+}
+
 func TestNewWorkerUsesStoredQBSecretByDefault(t *testing.T) {
 	service := New(nil, nil)
 	if service.qbClientFactory != nil {

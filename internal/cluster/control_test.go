@@ -9,12 +9,15 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
+	"github.com/OpenListTeam/OpenList/v4/internal/cluster/secure"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	clusterdb "github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -96,6 +99,64 @@ func TestCoordinatorSecretRejectsLegacyAES128CurrentKey(t *testing.T) {
 
 	_, _, _, err := encryptCoordinatorSecret([]byte(`{"secret":"value"}`))
 	require.EqualError(t, err, "cluster secret master key must be 32 bytes encoded as hex or base64")
+}
+
+func TestBuildNodeConfigApplyReencryptsStoredQBSecret(t *testing.T) {
+	originalConf := conf.Conf
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	conf.Conf.Cluster.SecretMasterKey = strings.Repeat("42", 32)
+	t.Cleanup(func() { conf.Conf = originalConf })
+
+	database, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:cluster_config_replay_%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.ClusterNode{}, &model.ClusterSecret{}, &model.ClusterNodeDesiredConfig{}))
+	originalDB := clusterdb.GetDb()
+	clusterdb.UseConnection(database)
+	t.Cleanup(func() {
+		clusterdb.UseConnection(originalDB)
+		sqlDB, dbErr := database.DB()
+		if dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	keys, err := secure.GenerateKeyPair()
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	secretValue := []byte(`{"username":"qb-user","password":"qb-password"}`)
+	ciphertext, nonce, fingerprint, err := encryptCoordinatorSecret(secretValue)
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.ClusterSecret{
+		ID: "secret-qb", CreatedAt: now, UpdatedAt: now, Alias: "qb", Kind: "qbittorrent",
+		Ciphertext: ciphertext, Nonce: nonce, Fingerprint: fingerprint, Version: 1, RotatedAt: now,
+	}).Error)
+	require.NoError(t, database.Create(&model.ClusterNode{
+		ID: "worker-qb", CreatedAt: now, UpdatedAt: now, Name: "worker-qb", Role: model.ClusterRoleWorker,
+		Status: model.ClusterNodeStatusOnline, KeyAlgorithm: protocol.KeyAgreementX25519, KeyID: keys.KeyID(), KeyPublic: keys.PublicKey(),
+	}).Error)
+	desired := protocol.WorkerDesiredConfig{QBClients: []protocol.QBClientConfig{{
+		ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-qb",
+		PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+	}}}
+	raw, err := json.Marshal(desired)
+	require.NoError(t, err)
+	hash, err := protocol.HashWorkerDesiredConfig(desired)
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.ClusterNodeDesiredConfig{
+		NodeID: "worker-qb", Revision: 8, DesiredHash: hash, ConfigJSON: string(raw), Status: model.ClusterDesiredStatusApplied,
+	}).Error)
+
+	apply, err := buildNodeConfigApply(context.Background(), "worker-qb", model.ClusterNodeDesiredConfig{
+		NodeID: "worker-qb", Revision: 8, DesiredHash: hash, ConfigJSON: string(raw),
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(8), apply.Revision)
+	require.Len(t, apply.QBSecretEnvelopes, 1)
+	require.NotContains(t, apply.QBSecretEnvelopes["qb-a"], "qb-password")
+	var recovered map[string]any
+	require.NoError(t, keys.OpenJSON(apply.QBSecretEnvelopes["qb-a"], protocol.QBSecretApplyAAD("worker-qb", apply, "qb-a"), &recovered))
+	require.Equal(t, "qb-user", recovered["username"])
+	require.Equal(t, "qb-password", recovered["password"])
 }
 
 func TestCoordinatorSecretMigrationReencryptsPreviousKeyRowsAtomically(t *testing.T) {

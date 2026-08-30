@@ -358,15 +358,18 @@ func (r *Runtime) Start() error {
 		service.SetTorrentJobDispatcher(r)
 		r.coordinatorService = service
 		r.hub = transport.NewHub(transport.HubOptions{
-			CoordinatorID:       coordinatorID(),
-			Authenticate:        service.Authenticate,
-			Handler:             service,
-			CheckOrigin:         clusterCheckOrigin,
+			CoordinatorID: coordinatorID(),
+			Authenticate:  service.Authenticate,
+			Handler:       service,
+			CheckOrigin:   clusterCheckOrigin,
 			// A restarted Worker may reconnect before the Coordinator has observed
 			// the old TCP session closing. Let the Hub replace that stale session
 			// immediately instead of making the Worker wait for the read timeout.
 			OnConnect: func(peer transport.Peer) {
 				service.OnConnect(peer)
+				if err := r.ReplayNodeConfig(runtimeCtx, peer.NodeID()); err != nil {
+					log.Errorf("replay desired config for node %s: %v", peer.NodeID(), err)
+				}
 				if err := service.ReplayOutbox(runtimeCtx, peer); err != nil {
 					log.Errorf("replay cluster outbox for node %s: %v", peer.NodeID(), err)
 				}
@@ -526,6 +529,9 @@ func (r *Runtime) startWorkerLocked() error {
 	r.workerClient = workerClient
 	workerService = clusterworker.New(queue, workerClient)
 	workerService.ConfigureControlPlane(nodeID, keyPair, nil)
+	workerService.SetInventoryRefresh(func(ctx context.Context) error {
+		return reportWorkerInventory(ctx, nodeID, workerService, queue)
+	})
 	r.workerService = workerService
 	clusterworker.SetDefaultService(workerService)
 	r.workerBackground.Add(5)

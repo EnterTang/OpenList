@@ -186,6 +186,13 @@ func nodeInventoryTorrentMatch(nodeID string, taskContext protocol.TaskContext, 
 	if !containsFold(capabilities.SupportedOperations, operation) {
 		return nodeProviderAccountMatch{}, false, fmt.Sprintf("missing operation %q", operation), nil
 	}
+	if torrent.Manual {
+		// A manually selected qB torrent has no MoviePilot downloader alias to
+		// match against inventory. The Worker resolves the configured qB client
+		// locally and performs the authoritative completion/path checks before
+		// any staging copy. Capacity remains enforced there as well.
+		return nodeProviderAccountMatch{}, true, "", nil
+	}
 	for _, route := range capabilities.MoviePilotRoutes {
 		if !strings.EqualFold(strings.TrimSpace(route.BridgeInstanceID), strings.TrimSpace(torrent.BridgeInstanceID)) ||
 			!strings.EqualFold(strings.TrimSpace(route.Downloader), strings.TrimSpace(torrent.Downloader)) ||

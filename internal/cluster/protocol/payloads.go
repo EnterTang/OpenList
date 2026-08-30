@@ -318,6 +318,10 @@ type TorrentTaskContext struct {
 	RelativePath     string `json:"relative_path"`
 	ContentPath      string `json:"content_path,omitempty"`
 	Action           string `json:"action,omitempty"`
+	// Manual marks a completed torrent that an administrator selected directly
+	// from a Worker's qB client. It has no MoviePilot Bridge callback, but is
+	// still pinned to the Worker and qB client that own the source files.
+	Manual bool `json:"manual,omitempty"`
 }
 
 type ShareTaskContext struct {

@@ -5,6 +5,46 @@ set -e
 export GOTOOLCHAIN="${GOTOOLCHAIN:-auto}"
 export GOSUMDB="${GOSUMDB:-sum.golang.org}"
 
+repositoryDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+embeddedRedisHelper="$repositoryDir/scripts/prepare-embedded-redis.sh"
+embeddedRedisOutput="${EMBEDDED_REDIS_OUTPUT:-$repositoryDir/internal/embeddedredis/assets/generated/redis-windows.zip}"
+case "$embeddedRedisOutput" in
+  /*) ;;
+  *) embeddedRedisOutput="$repositoryDir/$embeddedRedisOutput" ;;
+esac
+embeddedRedisCacheDir="${EMBEDDED_REDIS_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-$repositoryDir}/.cache}/openlist/embedded-redis}"
+export EMBEDDED_REDIS_CACHE_DIR="$embeddedRedisCacheDir"
+embeddedRedisPreparedByBuild=false
+
+EnsureEmbeddedRedisPayload() {
+  if [ -f "$embeddedRedisOutput" ] && [ ! -L "$embeddedRedisOutput" ]; then
+    return 0
+  fi
+  if [ -L "$embeddedRedisOutput" ]; then
+    echo "Error: embedded Redis payload must be a regular file: $embeddedRedisOutput" >&2
+    return 1
+  fi
+  if [ ! -f "$embeddedRedisHelper" ]; then
+    echo "Error: embedded Redis preparation helper not found: $embeddedRedisHelper" >&2
+    return 1
+  fi
+
+  echo "==> Preparing pinned embedded Redis payload"
+  EMBEDDED_REDIS_OUTPUT="$embeddedRedisOutput" bash "$embeddedRedisHelper" prepare
+  embeddedRedisPreparedByBuild=true
+}
+
+CleanupEmbeddedRedisPayload() {
+  if [ "$embeddedRedisPreparedByBuild" != true ]; then
+    return 0
+  fi
+  if ! EMBEDDED_REDIS_OUTPUT="$embeddedRedisOutput" bash "$embeddedRedisHelper" clean; then
+    echo "Warning: failed to clean generated embedded Redis payload: $embeddedRedisOutput" >&2
+  fi
+}
+
+trap CleanupEmbeddedRedisPayload EXIT
+
 appName="openlist"
 builtAt="$(date +'%F %T %z')"
 gitAuthor="The OpenList Projects Contributors <noreply@openlist.team>"
@@ -312,6 +352,7 @@ BuildWinArm64() {
 }
 
 BuildWin7() {
+  EnsureEmbeddedRedisPayload
   GenerateWindowsResource
   # Setup Win7 Go compiler (patched version that supports Windows 7)
   go_version=$(go version | grep -o 'go[0-9]\+\.[0-9]\+\.[0-9]\+' | sed 's/go//')
@@ -353,6 +394,7 @@ BuildWin7() {
 }
 
 BuildDev() {
+  EnsureEmbeddedRedisPayload
   mkdir -p "dist"
   muslflags="$(GetMuslStaticLdflags)"
   BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
@@ -443,6 +485,7 @@ BuildDockerMultiplatform() {
 }
 
 BuildRelease() {
+  EnsureEmbeddedRedisPayload
   mkdir -p "build"
   BuildWinArm64 ./build/"$appName"-windows-arm64.exe
   BuildWin7 ./build/"$appName"-windows7
@@ -503,6 +546,7 @@ BuildReleaseLinuxAmd64Musl() {
 BuildReleaseWindowsAmd64() {
   mkdir -p build
   echo building for windows-amd64
+  EnsureEmbeddedRedisPayload
   GenerateWindowsResource
   if UseXgoDocker; then
     xgo -targets=windows/amd64 -out "$appName" -ldflags="$ldflags" -tags=jsoniter .

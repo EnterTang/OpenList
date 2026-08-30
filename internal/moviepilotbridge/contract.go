@@ -196,8 +196,7 @@ func (e BridgeEvent) Validate() error {
 		if err := validateTorrentHash(e.Torrent.TorrentHash); err != nil {
 			return fmt.Errorf("torrent.bound torrent hash: %w", err)
 		}
-		contentPath := path.Clean(strings.TrimSpace(e.Torrent.ContentPath))
-		if contentPath == "." || contentPath == "/" || !path.IsAbs(contentPath) {
+		if !isPortableNonRootContentPath(e.Torrent.ContentPath) {
 			return errors.New("torrent.bound content path must be an absolute non-root path")
 		}
 		if e.Torrent.Size < 0 {
@@ -218,6 +217,24 @@ func (e BridgeEvent) Validate() error {
 		return fmt.Errorf("unsupported bridge event type %q", e.Type)
 	}
 	return nil
+}
+
+// isPortableNonRootContentPath validates the qB path reported by the Bridge,
+// not a path local to the Coordinator. The two hosts can run different
+// operating systems, so filepath.IsAbs would reject a valid Windows path
+// when the Coordinator runs on Linux or macOS.
+func isPortableNonRootContentPath(value string) bool {
+	normalized := path.Clean(strings.ReplaceAll(strings.TrimSpace(value), `\`, "/"))
+	if normalized == "." || normalized == "/" {
+		return false
+	}
+	return path.IsAbs(normalized) || isWindowsDriveAbsoluteContentPath(normalized)
+}
+
+func isWindowsDriveAbsoluteContentPath(value string) bool {
+	return len(value) >= 3 &&
+		((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z')) &&
+		value[1] == ':' && value[2] == '/'
 }
 
 func (r DownloadIntentRequest) Validate() error {

@@ -76,10 +76,11 @@ func (c TaskContext) Validate() error {
 		return err
 	}
 	if c.Torrent != nil {
-		if strings.TrimSpace(c.Torrent.BindingID) == "" || strings.TrimSpace(c.Torrent.WorkerNodeID) == "" ||
-			strings.TrimSpace(c.Torrent.BridgeInstanceID) == "" || strings.TrimSpace(c.Torrent.Downloader) == "" ||
-			strings.TrimSpace(c.Torrent.QBClientID) == "" {
-			return errors.New("torrent context requires binding, Worker, Bridge, downloader, and qB client identifiers")
+		if strings.TrimSpace(c.Torrent.BindingID) == "" || strings.TrimSpace(c.Torrent.WorkerNodeID) == "" || strings.TrimSpace(c.Torrent.QBClientID) == "" {
+			return errors.New("torrent context requires binding, Worker, and qB client identifiers")
+		}
+		if !c.Torrent.Manual && (strings.TrimSpace(c.Torrent.BridgeInstanceID) == "" || strings.TrimSpace(c.Torrent.Downloader) == "") {
+			return errors.New("MoviePilot torrent context requires Bridge and downloader identifiers")
 		}
 		if err := validateTorrentHash(c.Torrent.TorrentHash); err != nil {
 			return err

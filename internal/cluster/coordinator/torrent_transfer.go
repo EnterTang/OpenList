@@ -30,6 +30,7 @@ const (
 	moviePilotTorrentParentPrefix   = "moviepilot-torrent-parent:"
 	moviePilotTorrentObservePrefix  = "moviepilot-torrent-observe:"
 	moviePilotTorrentDeliveryPrefix = "moviepilot-torrent-delivery:"
+	manualQBTorrentBridgePrefix     = "manual-qb:"
 )
 
 var torrentEpisodePattern = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{1,3})e(\d{1,4})(?:[^a-z0-9]|$)`)
@@ -50,6 +51,26 @@ type TorrentJobDispatchRequest struct {
 
 type TorrentJobDispatcher interface {
 	DispatchTorrentJob(context.Context, TorrentJobDispatchRequest) (*model.ClusterJob, error)
+}
+
+// ManualQBTorrentAdoptionRequest adopts a completed torrent that already
+// exists in a Worker's qBittorrent client. It is intentionally tied to an
+// existing subscription so that the normal target naming, upload receipt,
+// retry, and progress views remain authoritative.
+type ManualQBTorrentAdoptionRequest struct {
+	SubscriptionID uint   `json:"subscription_id"`
+	WorkerNodeID   string `json:"worker_node_id"`
+	QBClientID     string `json:"qb_client_id"`
+	TorrentHash    string `json:"torrent_hash"`
+	Title          string `json:"title,omitempty"`
+	ContentPath    string `json:"content_path,omitempty"`
+	Size           int64  `json:"size,omitempty"`
+}
+
+type ManualQBTorrentAdoptionResult struct {
+	BindingID          string `json:"binding_id"`
+	ObserveJobID       string `json:"observe_job_id"`
+	SubscriptionItemID uint   `json:"subscription_item_id"`
 }
 
 type MoviePilotTorrentController interface {
@@ -97,6 +118,9 @@ func (s *Service) ReconcileWorkerOfflineTorrentControl(ctx context.Context, limi
 	var firstErr error
 	for i := range bindings {
 		binding := &bindings[i]
+		if isManualQBBinding(binding) {
+			continue
+		}
 		var intent model.MoviePilotDownloadIntent
 		if err := s.db.WithContext(ctx).First(&intent, "id = ?", binding.IntentID).Error; err != nil {
 			continue
@@ -142,6 +166,173 @@ func (s *Service) SetTorrentJobDispatcher(dispatcher TorrentJobDispatcher) {
 	if s != nil {
 		s.torrentDispatcher = dispatcher
 	}
+}
+
+// AdoptCompletedQBTorrent creates the same durable observation and delivery
+// workflow used by MoviePilot callbacks, without asking MoviePilot to create
+// a new download. The source is read-only: the Worker stages a copy and the
+// permanent retention policy guarantees this manual action never deletes the
+// original qB torrent or its seeding files.
+func (s *Service) AdoptCompletedQBTorrent(ctx context.Context, req ManualQBTorrentAdoptionRequest) (*ManualQBTorrentAdoptionResult, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("cluster database is unavailable")
+	}
+	if s.torrentDispatcher == nil {
+		return nil, errors.New("torrent job dispatcher is not configured")
+	}
+	req.WorkerNodeID = strings.TrimSpace(req.WorkerNodeID)
+	req.QBClientID = strings.TrimSpace(req.QBClientID)
+	req.TorrentHash = strings.ToLower(strings.TrimSpace(req.TorrentHash))
+	if req.SubscriptionID == 0 || req.WorkerNodeID == "" || req.QBClientID == "" {
+		return nil, errors.New("subscription, Worker, and qB client are required")
+	}
+	if err := validateManualQBTorrentHash(req.TorrentHash); err != nil {
+		return nil, err
+	}
+	if req.Size < 0 {
+		return nil, errors.New("torrent size must not be negative")
+	}
+	var sub model.Subscription
+	if err := s.db.WithContext(ctx).First(&sub, "id = ?", req.SubscriptionID).Error; err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(sub.DeliveryTarget.Provider) == "" || strings.TrimSpace(sub.DeliveryTarget.Folder) == "" {
+		return nil, errors.New("subscription delivery target is not configured")
+	}
+	var node model.ClusterNode
+	if err := s.db.WithContext(ctx).First(&node, "id = ?", req.WorkerNodeID).Error; err != nil {
+		return nil, err
+	}
+	if node.Disabled || node.Drain || node.Status != model.ClusterNodeStatusOnline {
+		return nil, errors.New("selected Worker is not online and available")
+	}
+
+	requestID := manualQBTorrentRequestID(req.SubscriptionID, req.WorkerNodeID, req.QBClientID, req.TorrentHash)
+	bridgeID := manualQBTorrentBridgeID(req.WorkerNodeID, req.QBClientID)
+	item, err := s.ensureManualQBTorrentItem(ctx, &sub, requestID, req)
+	if err != nil {
+		return nil, err
+	}
+	policyJSON := `{"permanent":true}`
+	intent := &model.MoviePilotDownloadIntent{
+		ID:                  uuid.NewString(),
+		RequestID:           requestID,
+		BridgeInstanceID:    bridgeID,
+		SubscriptionID:      sub.ID,
+		SubscriptionItemID:  item.ID,
+		MediaSource:         "manual_qb",
+		MediaID:             fmt.Sprint(sub.TMDBID),
+		TorrentFingerprint:  req.TorrentHash,
+		ResourceRef:         "manual-qb:" + req.TorrentHash,
+		RetentionPolicyJSON: policyJSON,
+		Status:              model.MoviePilotIntentStatusBound,
+	}
+	if err := db.CreateIntentTx(ctx, s.db, intent); err != nil {
+		return nil, err
+	}
+	if intent.SubscriptionItemID != item.ID {
+		if err := s.db.WithContext(ctx).First(item, "id = ? AND subscription_id = ?", intent.SubscriptionItemID, sub.ID).Error; err != nil {
+			return nil, fmt.Errorf("load existing manual qB subscription item: %w", err)
+		}
+	}
+	binding, err := db.BindTorrentTx(ctx, s.db, intent, bridgeID, "manual", req.WorkerNodeID, req.QBClientID, req.TorrentHash, strings.TrimSpace(req.ContentPath))
+	if err != nil {
+		return nil, err
+	}
+	task := moviePilotTorrentTaskContext(&sub, item, binding, binding.ID, moviepilotbridge.MediaIdentity{
+		MediaSource: intent.MediaSource,
+		MediaID:     intent.MediaID,
+		MediaType:   sub.MediaType,
+		Season:      sub.Season,
+	})
+	parent, err := s.ensureTorrentParent(ctx, binding, task)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.db.WithContext(ctx).Model(&model.MoviePilotTorrentBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
+		"observe_job_id":   parent.ID,
+		"status":           advanceMoviePilotTorrentStatus(binding.Status, model.MoviePilotTorrentStatusBound),
+		"retention_status": model.MoviePilotRetentionStatusHeld,
+		"last_error_code":  "",
+		"last_error":       "",
+	}).Error; err != nil {
+		return nil, err
+	}
+	task.ParentBatchID = parent.ID
+	if err := s.dispatchTorrentJob(ctx, TorrentJobDispatchRequest{
+		JobType: model.ClusterJobTypeTorrentObserve, NodeID: req.WorkerNodeID,
+		IdempotencyKey: manualQBTorrentObservePrefix(binding.ID), ExpectedBytes: req.Size, TaskContext: task,
+		RequiredCapabilities: []string{"qb.copy", "result.report"},
+	}); err != nil {
+		return nil, err
+	}
+	return &ManualQBTorrentAdoptionResult{BindingID: binding.ID, ObserveJobID: parent.ID, SubscriptionItemID: item.ID}, nil
+}
+
+func validateManualQBTorrentHash(value string) error {
+	if len(value) != 40 && len(value) != 64 {
+		return errors.New("torrent hash must contain 40 or 64 hexadecimal characters")
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return errors.New("torrent hash must contain lowercase hexadecimal characters")
+		}
+	}
+	return nil
+}
+
+func manualQBTorrentRequestID(subscriptionID uint, workerNodeID, qbClientID, torrentHash string) string {
+	return manualQBTorrentBridgePrefix + uuid.NewSHA1(uuid.NameSpaceURL, []byte(fmt.Sprintf("subscription:%d|worker:%s|qb:%s|torrent:%s", subscriptionID, workerNodeID, qbClientID, torrentHash))).String()
+}
+
+func manualQBTorrentBridgeID(workerNodeID, qbClientID string) string {
+	return manualQBTorrentBridgePrefix + uuid.NewSHA1(uuid.NameSpaceURL, []byte("worker:"+workerNodeID+"|qb:"+qbClientID)).String()
+}
+
+func manualQBTorrentObservePrefix(bindingID string) string {
+	return "manual-qb-observe:" + strings.TrimSpace(bindingID)
+}
+
+func isManualQBBinding(binding *model.MoviePilotTorrentBinding) bool {
+	return binding != nil && strings.HasPrefix(strings.ToLower(strings.TrimSpace(binding.BridgeInstanceID)), manualQBTorrentBridgePrefix)
+}
+
+func (s *Service) ensureManualQBTorrentItem(ctx context.Context, sub *model.Subscription, requestID string, req ManualQBTorrentAdoptionRequest) (*model.SubscriptionItem, error) {
+	if sub == nil {
+		return nil, errors.New("subscription is required")
+	}
+	var item model.SubscriptionItem
+	lookup := s.db.WithContext(ctx).Where("subscription_id = ? AND source_key = ?", sub.ID, requestID).First(&item).Error
+	if lookup == nil {
+		return &item, nil
+	}
+	if !errors.Is(lookup, gorm.ErrRecordNotFound) {
+		return nil, lookup
+	}
+	name := path.Base(strings.ReplaceAll(strings.TrimSpace(req.Title), `\`, "/"))
+	if name == "." || name == "/" || name == "" {
+		name = "manual-qb-" + req.TorrentHash[:min(12, len(req.TorrentHash))]
+	}
+	if path.Ext(name) == "" {
+		name += ".mkv"
+	}
+	planned := subscription.PlanTarget(subscription.PlanInput{
+		TargetRoot: sub.TargetRoot, TMDBID: sub.TMDBID, TMDBName: sub.TMDBName, TMDBYear: sub.TMDBYear,
+		MediaType: sub.MediaType, Category: sub.Category, Season: sub.Season, Seasons: sub.Seasons,
+	}, name, "")
+	item = model.SubscriptionItem{
+		SubscriptionID: sub.ID, SourceKey: requestID, SourceProvider: model.SubscriptionSourceManual,
+		SourceURL: "qb:" + req.TorrentHash, SourcePath: strings.TrimSpace(req.ContentPath),
+		FileName: name, FileHash: req.TorrentHash, FileSize: req.Size,
+		Season: planned.Season, Episode: planned.Episode, TargetDir: planned.TargetDir,
+		TargetName: planned.TargetName, TargetPath: planned.TargetPath,
+		Status: model.SubscriptionItemStatusTransferring, LastSeenAt: time.Now().UTC(),
+		ProviderData: map[string]string{"origin": "manual_qb", "worker_node_id": req.WorkerNodeID, "qb_client_id": req.QBClientID, "torrent_hash": req.TorrentHash},
+	}
+	if err := s.db.WithContext(ctx).Create(&item).Error; err != nil {
+		return nil, err
+	}
+	return &item, nil
 }
 
 // HandleMoviePilotEvent is the durable bridge-to-coordinator handoff. The
@@ -603,7 +794,8 @@ func moviePilotTorrentTaskContext(sub *model.Subscription, item *model.Subscript
 		StagingTarget:  protocol.ProviderTargetRequirement{Provider: "moviepilot-qb", RequiredBytes: item.FileSize},
 		DeliveryTarget: protocol.ProviderTargetRequirement{Provider: deliveryProvider, Folder: deliveryFolder, NeedUpload: true, RequiredBytes: item.FileSize},
 		Torrent: &protocol.TorrentTaskContext{BindingID: binding.ID, WorkerNodeID: binding.WorkerNodeID, BridgeInstanceID: binding.BridgeInstanceID,
-			Downloader: binding.DownloaderAlias, QBClientID: binding.QBClientID, TorrentHash: binding.TorrentHash, ContentPath: binding.ContentPath},
+			Downloader: binding.DownloaderAlias, QBClientID: binding.QBClientID, TorrentHash: binding.TorrentHash, ContentPath: binding.ContentPath,
+			Manual: isManualQBBinding(binding)},
 	}
 }
 
@@ -669,6 +861,7 @@ func (s *Service) ObserveTorrent(ctx context.Context, jobID string, result map[s
 		return err
 	}
 	requiredCount := 0
+	manualAnchorUsed := false
 	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.First(&binding, "id = ?", task.Torrent.BindingID).Error; err != nil {
 			return err
@@ -708,7 +901,16 @@ func (s *Service) ObserveTorrent(ctx context.Context, jobID string, result map[s
 			season, episode, matched := torrentFileEpisode(relative)
 			var item model.SubscriptionItem
 			itemFound := false
-			if matched {
+			if isManualQBBinding(&binding) {
+				var itemErr error
+				item, itemErr = manualQBTorrentDeliveryItem(tx, &sub, &intent, &binding, *file, relative, !manualAnchorUsed)
+				if itemErr != nil {
+					return itemErr
+				}
+				manualAnchorUsed = true
+				itemFound = true
+				season, episode = item.Season, item.Episode
+			} else if matched {
 				lookupErr := tx.Where("subscription_id = ? AND season = ? AND episode = ? AND status <> ?", intent.SubscriptionID, season, episode, model.SubscriptionItemStatusSkipped).Order("created_at ASC, id ASC").First(&item).Error
 				if lookupErr == nil {
 					itemFound = true
@@ -816,6 +1018,58 @@ func (s *Service) ObserveTorrent(ctx context.Context, jobID string, result map[s
 		return err
 	}
 	return s.ReconcileTorrentTransfers(ctx, task.Torrent.BindingID, 100)
+}
+
+func manualQBTorrentDeliveryItem(tx *gorm.DB, sub *model.Subscription, intent *model.MoviePilotDownloadIntent, binding *model.MoviePilotTorrentBinding, file observedTorrentFile, relative string, useAnchor bool) (model.SubscriptionItem, error) {
+	if tx == nil || sub == nil || intent == nil || binding == nil {
+		return model.SubscriptionItem{}, errors.New("manual qB delivery item context is required")
+	}
+	var item model.SubscriptionItem
+	if useAnchor {
+		if err := tx.First(&item, "id = ? AND subscription_id = ?", intent.SubscriptionItemID, intent.SubscriptionID).Error; err != nil {
+			return model.SubscriptionItem{}, fmt.Errorf("load manual qB anchor item: %w", err)
+		}
+	} else {
+		sourceKey := manualQBTorrentDeliverySourceKey(binding.ID, relative)
+		lookup := tx.Where("subscription_id = ? AND source_key = ?", intent.SubscriptionID, sourceKey).First(&item).Error
+		if errors.Is(lookup, gorm.ErrRecordNotFound) {
+			item = model.SubscriptionItem{SubscriptionID: intent.SubscriptionID, SourceKey: sourceKey, Status: model.SubscriptionItemStatusPending}
+			if err := tx.Create(&item).Error; err != nil {
+				return model.SubscriptionItem{}, err
+			}
+		} else if lookup != nil {
+			return model.SubscriptionItem{}, lookup
+		}
+	}
+	planned := subscription.PlanTarget(subscription.PlanInput{
+		TargetRoot: sub.TargetRoot, TMDBID: sub.TMDBID, TMDBName: sub.TMDBName, TMDBYear: sub.TMDBYear,
+		MediaType: sub.MediaType, Category: sub.Category, Season: sub.Season, Seasons: sub.Seasons,
+	}, path.Base(relative), path.Dir(relative))
+	updates := map[string]any{
+		"source_provider": model.SubscriptionSourceManual,
+		"source_url":      "qb:" + binding.TorrentHash,
+		"source_path":     relative,
+		"file_name":       path.Base(relative),
+		"file_size":       file.Size,
+		"file_hash":       file.Hash,
+		"season":          planned.Season,
+		"episode":         planned.Episode,
+		"target_dir":      planned.TargetDir,
+		"target_name":     planned.TargetName,
+		"target_path":     planned.TargetPath,
+		"last_seen_at":    time.Now().UTC(),
+	}
+	if err := tx.Model(&item).Updates(updates).Error; err != nil {
+		return model.SubscriptionItem{}, err
+	}
+	if err := tx.First(&item, "id = ?", item.ID).Error; err != nil {
+		return model.SubscriptionItem{}, err
+	}
+	return item, nil
+}
+
+func manualQBTorrentDeliverySourceKey(bindingID, relative string) string {
+	return manualQBTorrentBridgePrefix + uuid.NewSHA1(uuid.NameSpaceURL, []byte("binding:"+bindingID+"|file:"+relative)).String()
 }
 
 func resultString(value any) string {
