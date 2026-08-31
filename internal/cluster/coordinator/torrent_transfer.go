@@ -799,6 +799,61 @@ func moviePilotTorrentTaskContext(sub *model.Subscription, item *model.Subscript
 	}
 }
 
+// applyObservedTorrentItemMetadata makes the qB file discovered by the Worker
+// authoritative for the subscription item's source name and target extension.
+// MoviePilot events often contain only a release title, which is not a file
+// name and can omit the media suffix entirely.
+func applyObservedTorrentItemMetadata(item *model.SubscriptionItem, sub *model.Subscription, relative string, size int64, hash string) (map[string]any, bool) {
+	if item == nil || sub == nil {
+		return nil, false
+	}
+	fileName := path.Base(relative)
+	planned := subscription.PlanTarget(subscription.PlanInput{
+		TargetRoot: sub.TargetRoot, TMDBID: sub.TMDBID, TMDBName: sub.TMDBName,
+		TMDBYear: sub.TMDBYear, MediaType: sub.MediaType, Category: sub.Category,
+		Season: sub.Season, Seasons: sub.Seasons,
+	}, fileName, path.Dir(relative))
+	updates := map[string]any{
+		"file_name": fileName,
+	}
+	changed := item.FileName != fileName
+	item.FileName = fileName
+	// Keep a previously planned/custom target intact when it already names a
+	// file. Repair only legacy rows whose target is missing or has no suffix.
+	existingTargetPath := strings.TrimSpace(item.TargetPath)
+	targetReady := existingTargetPath != "" && existingTargetPath != "." && existingTargetPath != "/" && path.Ext(path.Base(existingTargetPath)) != ""
+	if !targetReady {
+		updates["season"] = planned.Season
+		updates["episode"] = planned.Episode
+		updates["target_dir"] = planned.TargetDir
+		updates["target_name"] = planned.TargetName
+		updates["target_path"] = planned.TargetPath
+		if item.Season != planned.Season || item.Episode != planned.Episode || item.TargetDir != planned.TargetDir || item.TargetName != planned.TargetName || item.TargetPath != planned.TargetPath {
+			changed = true
+		}
+		item.Season = planned.Season
+		item.Episode = planned.Episode
+		item.TargetDir = planned.TargetDir
+		item.TargetName = planned.TargetName
+		item.TargetPath = planned.TargetPath
+	}
+	if size > 0 {
+		updates["file_size"] = size
+		if item.FileSize != size {
+			changed = true
+		}
+		item.FileSize = size
+	}
+	if strings.TrimSpace(hash) != "" {
+		updates["file_hash"] = hash
+		if item.FileHash != hash {
+			changed = true
+		}
+		item.FileHash = hash
+	}
+	return updates, changed
+}
+
 func parentIDForBinding(binding *model.MoviePilotTorrentBinding) string {
 	if binding == nil {
 		return ""
@@ -937,6 +992,14 @@ func (s *Service) ObserveTorrent(ctx context.Context, jobID string, result map[s
 				}
 			} else if strings.EqualFold(sub.MediaType, "movie") || len(files) == 1 {
 				itemFound = tx.Where("id = ? AND subscription_id = ?", intent.SubscriptionItemID, intent.SubscriptionID).First(&item).Error == nil
+			}
+			if itemFound {
+				itemUpdates, itemChanged := applyObservedTorrentItemMetadata(&item, &sub, relative, file.Size, file.Hash)
+				if itemChanged {
+					if err := tx.Model(&item).Updates(itemUpdates).Error; err != nil {
+						return err
+					}
+				}
 			}
 			required := itemFound
 			if !matched && itemFound {
@@ -1168,6 +1231,11 @@ func (s *Service) dispatchDeliveryFile(ctx context.Context, delivery *model.Movi
 	var sub model.Subscription
 	if err := s.db.WithContext(ctx).First(&sub, "id = ?", intent.SubscriptionID).Error; err != nil {
 		return err
+	}
+	if itemUpdates, itemChanged := applyObservedTorrentItemMetadata(&item, &sub, delivery.RelativePath, delivery.SourceSize, ""); itemChanged {
+		if err := s.db.WithContext(ctx).Model(&item).Updates(itemUpdates).Error; err != nil {
+			return err
+		}
 	}
 	task := moviePilotTorrentTaskContext(&sub, &item, &binding, parentIDForBinding(&binding), moviepilotbridge.MediaIdentity{MediaSource: intent.MediaSource, MediaID: intent.MediaID, MediaType: sub.MediaType, Season: delivery.Season, Episode: delivery.Episode})
 	task.MediaItemID = "moviepilot-delivery:" + delivery.ID

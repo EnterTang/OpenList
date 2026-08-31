@@ -46,6 +46,34 @@ type clusterErrorCoder interface {
 	ClusterErrorCode() string
 }
 
+// postPluginHashFileStreamer preserves the content hash computed from the
+// exact bytes that will be uploaded. Some upload drivers compute a hash
+// internally but expose only an error from Put, so that value cannot be
+// recovered from the upload call itself.
+type postPluginHashFileStreamer struct {
+	model.FileStreamer
+	hashInfo utils.HashInfo
+}
+
+func (s *postPluginHashFileStreamer) GetHash() utils.HashInfo {
+	return s.hashInfo
+}
+
+func annotatePostPluginSHA256(file model.FileStreamer) (model.FileStreamer, string, error) {
+	_, hash, err := stream.CacheFullAndHash(file, nil, utils.SHA256)
+	if err != nil {
+		return file, "", err
+	}
+	hash = strings.ToUpper(strings.TrimSpace(hash))
+	if hash == "" {
+		return file, "", errors.New("processed qB file has no SHA256")
+	}
+	return &postPluginHashFileStreamer{
+		FileStreamer: file,
+		hashInfo:     utils.NewHashInfo(utils.SHA256, hash),
+	}, hash, nil
+}
+
 type resultQueue interface {
 	ValidateDurability(context.Context) error
 	EnqueueDurably(context.Context, any) (string, error)
@@ -1459,13 +1487,13 @@ func NewSourceCleanupTarget(ctx context.Context, manifest protocol.UploadETFMani
 }
 
 func NewLocalSourceCleanupTarget(ownedRoot, sourcePath string) (resultqueue.CleanupTarget, error) {
-	ownedRoot = path.Clean(strings.TrimSpace(ownedRoot))
-	sourcePath = path.Clean(strings.TrimSpace(sourcePath))
-	if !path.IsAbs(ownedRoot) || ownedRoot == "/" || !path.IsAbs(sourcePath) || path.Dir(sourcePath) != ownedRoot {
+	ownedRoot = filepath.Clean(strings.TrimSpace(ownedRoot))
+	sourcePath = filepath.Clean(strings.TrimSpace(sourcePath))
+	if !filepath.IsAbs(ownedRoot) || ownedRoot == string(filepath.Separator) || !filepath.IsAbs(sourcePath) || filepath.Dir(sourcePath) != ownedRoot {
 		return resultqueue.CleanupTarget{}, errors.New("local cluster source cleanup must target a direct file in a non-root staging directory")
 	}
 	return resultqueue.CleanupTarget{
-		LocalPath: sourcePath, OwnedRootPath: ownedRoot, Name: path.Base(sourcePath), ExactFile: true,
+		LocalPath: sourcePath, OwnedRootPath: ownedRoot, Name: filepath.Base(sourcePath), ExactFile: true,
 	}, nil
 }
 
@@ -1901,6 +1929,11 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		SourceKey: offer.TaskContext.Subscription.SourceKey, FileHash: primary.Hash,
 		TargetDir: targetRoot, FileName: path.Base(stagedSource), TargetName: expectedName,
 	}
+	if isQBTransfer {
+		// stagedSource is a Worker-local filesystem path. filepath.Base is
+		// required here because path.Base does not recognize Windows '\\'.
+		finalizePayload.FileName = filepath.Base(stagedSource)
+	}
 	binding := task_group.ClusterTransferBinding{
 		UploadManifest: &manifest, AdditionalCleanupTargets: []resultqueue.CleanupTarget{sourceCleanup}, FinalizePayload: &finalizePayload,
 	}
@@ -1926,6 +1959,11 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		if processErr != nil {
 			finishUploadStage(model.ClusterStageStatusFailed, processErr.Error())
 			return fmt.Errorf("process staged qB file for upload: %w", processErr)
+		}
+		processedFile, postPluginSHA256, hashErr := annotatePostPluginSHA256(processedFile)
+		if hashErr != nil {
+			finishUploadStage(model.ClusterStageStatusFailed, hashErr.Error())
+			return fmt.Errorf("hash processed staged qB file: %w", hashErr)
 		}
 		uploadTotal := processedFile.GetSize()
 		if progressErr := s.sendJobProgress(ctx, offer, model.ClusterStageUploadingMobile, 0, uploadTotal, 0, "uploading"); progressErr != nil {
@@ -1954,12 +1992,18 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		}
 		manifest.Name = remote.GetName()
 		manifest.Size = remote.GetSize()
-		manifest.SHA256 = strings.ToUpper(strings.TrimSpace(remote.GetHash().GetHash(utils.SHA256)))
-		if manifest.SHA256 == "" {
-			finishUploadStage(model.ClusterStageStatusFailed, "uploaded qB object has no SHA256 metadata")
-			return errors.New("uploaded qB object has no SHA256 metadata")
+		remoteSHA256 := strings.ToUpper(strings.TrimSpace(remote.GetHash().GetHash(utils.SHA256)))
+		if remoteSHA256 != "" && !strings.EqualFold(remoteSHA256, postPluginSHA256) {
+			message := fmt.Sprintf("uploaded qB object SHA256 mismatch: worker=%s remote=%s", postPluginSHA256, remoteSHA256)
+			finishUploadStage(model.ClusterStageStatusFailed, message)
+			return errors.New(message)
 		}
-		manifest.HashSource = "remote_object_metadata"
+		manifest.SHA256 = postPluginSHA256
+		if remoteSHA256 != "" {
+			manifest.HashSource = "remote_object_metadata"
+		} else {
+			manifest.HashSource = "worker_post_plugin"
+		}
 		manifest.RemoteFileID = remote.GetID()
 		manifest.RemotePath = expectedPath
 		manifest.UploadReceipt = remote.GetID()

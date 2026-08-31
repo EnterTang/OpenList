@@ -254,6 +254,13 @@ func TestObserveTorrentCreatesOneDeliveryPerFileAndDispatchesRecognizedEpisodes(
 	if err := service.ObserveTorrent(context.Background(), observe.ID, result); err != nil {
 		t.Fatal(err)
 	}
+	var preservedItem model.SubscriptionItem
+	if err := database.First(&preservedItem, "id = ?", items[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if preservedItem.TargetPath != items[0].TargetPath {
+		t.Fatalf("existing valid target was rewritten: got=%q want=%q", preservedItem.TargetPath, items[0].TargetPath)
+	}
 	var deliveries []model.MoviePilotDeliveryFile
 	if err := database.Order("relative_path ASC").Find(&deliveries).Error; err != nil {
 		t.Fatal(err)
@@ -277,6 +284,81 @@ func TestObserveTorrentCreatesOneDeliveryPerFileAndDispatchesRecognizedEpisodes(
 	}
 	if updatedBinding.Status != model.MoviePilotTorrentStatusTransferring || updatedBinding.LastQBState != "uploading" || updatedBinding.LastQBProgress != 1 || updatedBinding.LastQBRatio != 1.25 || updatedBinding.LastQBSeedingSeconds != 7200 {
 		t.Fatalf("binding qB observation = %#v", updatedBinding)
+	}
+}
+
+func TestApplyObservedTorrentItemMetadataRestoresActualMediaExtension(t *testing.T) {
+	subscription := model.Subscription{
+		ID: 29, Name: "赌王之王", SourceType: model.SubscriptionSourceMoviePilot, MediaType: "movie",
+		TMDBID: 10220, TMDBName: "赌王之王", TMDBYear: 1998, TargetRoot: "/media", Category: "犯罪片",
+	}
+	item := model.SubscriptionItem{
+		ID: 30, SubscriptionID: subscription.ID, FileName: "Rounders 1998 BluRay 1080p x265 10bit DDP5.1 MNHD-FRDS",
+		TargetName: "", TargetPath: "", Status: model.SubscriptionItemStatusTransferring,
+	}
+	updates, changed := applyObservedTorrentItemMetadata(&item, &subscription,
+		"Rounders 1998 BluRay 1080p x265 10bit DDP5.1 MNHD-FRDS/Rounders 1998 BluRay 1080p x265 10bit DDP5.1 MNHD-FRDS.mkv",
+		6381644170, "")
+	if !changed {
+		t.Fatal("observed qB metadata was not marked changed")
+	}
+	if item.FileName != "Rounders 1998 BluRay 1080p x265 10bit DDP5.1 MNHD-FRDS.mkv" {
+		t.Fatalf("item filename = %q", item.FileName)
+	}
+	if !strings.HasSuffix(item.TargetName, ".mkv") || !strings.HasSuffix(item.TargetPath, ".mkv") {
+		t.Fatalf("planned target lost media extension: name=%q path=%q", item.TargetName, item.TargetPath)
+	}
+	if updates["file_name"] != item.FileName || updates["target_name"] != item.TargetName || updates["target_path"] != item.TargetPath {
+		t.Fatalf("metadata updates = %#v, item = %#v", updates, item)
+	}
+}
+
+func TestDispatchDeliveryFileRepairsLegacyItemWithoutExtension(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	subscription := model.Subscription{
+		ID: 32, Name: "赌王之王", SourceType: model.SubscriptionSourceMoviePilot, MediaType: "movie",
+		TMDBID: 10220, TMDBName: "赌王之王", TMDBYear: 1998, TargetRoot: "/media", Category: "犯罪片",
+	}
+	item := model.SubscriptionItem{
+		ID: 33, SubscriptionID: subscription.ID, SourceKey: "moviepilot:resource", SourceProvider: model.SubscriptionSourceMoviePilot,
+		FileName: "Rounders 1998 BluRay 1080p x265 10bit DDP5.1 MNHD-FRDS", Status: model.SubscriptionItemStatusPending,
+	}
+	intent := model.MoviePilotDownloadIntent{
+		ID: "intent-legacy-extension", RequestID: "request-legacy-extension", BridgeInstanceID: "bridge-1",
+		SubscriptionID: subscription.ID, SubscriptionItemID: item.ID, MediaSource: "tmdb", MediaID: "10220",
+		Status: model.MoviePilotIntentStatusBound,
+	}
+	binding := model.MoviePilotTorrentBinding{
+		ID: "binding-legacy-extension", IntentID: intent.ID, BridgeInstanceID: intent.BridgeInstanceID,
+		DownloaderAlias: "qb-main", WorkerNodeID: "worker-1", QBClientID: "qb-1", TorrentHash: strings.Repeat("d", 40),
+		Status: model.MoviePilotTorrentStatusBound,
+	}
+	delivery := model.MoviePilotDeliveryFile{
+		ID: "delivery-legacy-extension", TorrentBindingID: binding.ID,
+		SubscriptionItemID: item.ID,
+		RelativePath:       "Rounders 1998 BluRay 1080p x265 10bit DDP5.1 MNHD-FRDS/Rounders 1998 BluRay 1080p x265 10bit DDP5.1 MNHD-FRDS.mkv",
+		SourceSize:         6381644170, Required: true, Status: model.MoviePilotDeliveryStatusPending,
+	}
+	for _, value := range []any{&subscription, &item, &intent, &binding, &delivery} {
+		if err := database.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorder := &torrentDispatchRecorder{}
+	service := New(database, "")
+	service.SetTorrentJobDispatcher(recorder)
+	if err := service.dispatchDeliveryFile(context.Background(), &delivery); err != nil {
+		t.Fatalf("dispatch legacy delivery: %v", err)
+	}
+	if len(recorder.requests) != 1 || !strings.HasSuffix(recorder.requests[0].TaskContext.Media.LogicalTargetPath, ".mkv") {
+		t.Fatalf("dispatch target = %#v", recorder.requests)
+	}
+	var repaired model.SubscriptionItem
+	if err := database.First(&repaired, "id = ?", item.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(repaired.TargetPath, ".mkv") || !strings.HasSuffix(repaired.TargetName, ".mkv") {
+		t.Fatalf("repaired item target = %#v", repaired)
 	}
 }
 

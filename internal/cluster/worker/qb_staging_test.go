@@ -31,6 +31,9 @@ func TestCopyQBFileToStagingKeepsSourceUnchangedAndCleansByCaller(t *testing.T) 
 	if string(staged) != string(original) {
 		t.Fatalf("staged content = %q, want %q", staged, original)
 	}
+	if filepath.Base(stagedPath) != "Show.S01E01.mkv" {
+		t.Fatalf("staged filename = %q, want original qB filename", filepath.Base(stagedPath))
+	}
 	unchanged, err := os.ReadFile(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -97,6 +100,9 @@ func TestCopyQBFileToStagingCreatesUniqueFilesForConcurrentCopies(t *testing.T) 
 	}
 	if len(copied) != 2 || copied[0] == copied[1] {
 		t.Fatalf("concurrent staging paths = %#v", copied)
+	}
+	if filepath.Base(copied[0]) != "episode.mkv" && filepath.Base(copied[1]) != "episode.mkv" {
+		t.Fatalf("concurrent staging did not retain the original filename: %#v", copied)
 	}
 	for _, staged := range copied {
 		_ = os.Remove(staged)

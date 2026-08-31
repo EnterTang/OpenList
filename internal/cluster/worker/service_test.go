@@ -1,8 +1,12 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"path"
 	"strings"
 	"sync"
@@ -17,7 +21,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/internal/task_group"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/tache"
 	"github.com/stretchr/testify/require"
 )
@@ -240,6 +246,24 @@ func TestTrustedSourceSHA256DoesNotTreatIdentityHashAsContent(t *testing.T) {
 	got, ok := trustedSourceSHA256(content)
 	require.True(t, ok)
 	require.Equal(t, strings.Repeat("A", 64), got)
+}
+
+func TestAnnotatePostPluginSHA256UsesProcessedBytesAndKeepsStreamReadable(t *testing.T) {
+	content := []byte("post-plugin-content")
+	wantSum := sha256.Sum256(content)
+	wantHash := strings.ToUpper(hex.EncodeToString(wantSum[:]))
+	input := &stream.FileStream{
+		Obj:    &model.Object{Name: "movie.mkv", Size: int64(len(content))},
+		Reader: bytes.NewReader(content),
+	}
+
+	annotated, gotHash, err := annotatePostPluginSHA256(input)
+	require.NoError(t, err)
+	require.Equal(t, wantHash, gotHash)
+	require.Equal(t, wantHash, annotated.GetHash().GetHash(utils.SHA256))
+	gotContent, err := io.ReadAll(annotated)
+	require.NoError(t, err)
+	require.Equal(t, content, gotContent)
 }
 
 func TestResolveClusterAdoptPathPrefersPostPluginName(t *testing.T) {

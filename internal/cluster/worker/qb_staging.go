@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/shirou/gopsutil/v4/disk"
@@ -98,12 +99,24 @@ func CopyQBFileToStaging(ctx context.Context, source QBSource, admission QBStagi
 	if source.Size > 0 && info.Size() != source.Size {
 		return "", fmt.Errorf("qB source size changed: qB=%d local=%d", source.Size, info.Size())
 	}
-	extension := filepath.Ext(sourceName(source))
-	temp, err := os.CreateTemp(stagingRoot, ".openlist-qb-*"+extension)
+	name := sourceName(source)
+	if name == "" || name == "." || name == ".." {
+		return "", errors.New("qB source file name must be a regular file name")
+	}
+	// Keep the qB basename as the normal staging filename so downstream
+	// processing sees the same media name and extension. A unique fallback is
+	// only needed when concurrent copies use the same basename.
+	tempPath := filepath.Join(stagingRoot, name)
+	temp, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
+	if errors.Is(err, os.ErrExist) {
+		extension := filepath.Ext(name)
+		stem := strings.TrimSuffix(name, extension)
+		temp, err = os.CreateTemp(stagingRoot, "."+stem+".openlist-*"+extension)
+	}
 	if err != nil {
 		return "", fmt.Errorf("create qB staging file: %w", err)
 	}
-	tempPath := temp.Name()
+	tempPath = temp.Name()
 	defer func() {
 		_ = temp.Close()
 		if err != nil {
@@ -136,7 +149,7 @@ func CopyQBFileToStaging(ctx context.Context, source QBSource, admission QBStagi
 
 func sourceName(source QBSource) string {
 	if name := strings.TrimSpace(source.Name); name != "" {
-		return filepath.Base(name)
+		return filepath.Base(filepath.FromSlash(name))
 	}
 	return filepath.Base(source.WorkerPath)
 }
@@ -188,6 +201,13 @@ func copyContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, erro
 }
 
 func syncDirectory(root string) error {
+	// Windows does not support syncing a directory handle and returns
+	// ERROR_ACCESS_DENIED. The staged file has already been flushed with
+	// temp.Sync() before this point, so there is no directory metadata sync
+	// equivalent to perform on Windows.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	directory, err := os.Open(root)
 	if err != nil {
 		return fmt.Errorf("open qB staging directory for sync: %w", err)
