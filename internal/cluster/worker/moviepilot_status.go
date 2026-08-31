@@ -27,22 +27,17 @@ func (s *Service) ListMoviePilotTaskStatuses() []model.MoviePilotTaskStatus {
 		}
 		torrent := task.offer.TaskContext.Torrent
 		activeBindings[moviePilotStatusBindingKey(torrent)] = struct{}{}
-		phase := "worker_running"
-		torrentStatus := firstWorkerStatusValue(task.progressMessage, "worker_running")
-		switch task.stage {
-		case model.ClusterStageQBObserving:
-			phase = "qb_observing"
-		case model.ClusterStageQBCopying:
-			phase = "qb_copying"
-		case model.ClusterStageUploadingMobile:
-			phase = "uploading_mobile"
+		phase := workerMoviePilotTaskPhase(task.stage, task.stageStatus, task.completedBytes, task.totalBytes, task.progressMessage)
+		torrentStatus := "worker_running"
+		if task.stage == model.ClusterStageQBObserving {
+			torrentStatus = firstWorkerStatusValue(task.progressMessage, torrentStatus)
 		}
 		status := model.MoviePilotTaskStatus{
 			SubscriptionID:     task.offer.TaskContext.Subscription.SubscriptionID,
 			SubscriptionItemID: task.offer.TaskContext.Subscription.SubscriptionItemID,
 			SubscriptionName:   task.offer.TaskContext.Subscription.SubscriptionName,
 			ItemName:           task.offer.TaskContext.Media.LogicalTargetPath,
-			Phase:              phase, IntentStatus: "bound",
+			Phase:              phase, IntentStatus: model.MoviePilotIntentStatusBound,
 			TorrentStatus: torrentStatus, BindingID: torrent.BindingID,
 			BridgeInstanceID: torrent.BridgeInstanceID, WorkerNodeID: firstWorkerStatusValue(s.controlNodeID, torrent.WorkerNodeID),
 			Downloader: torrent.Downloader, QBClientID: torrent.QBClientID, TorrentHash: torrent.TorrentHash,
@@ -69,11 +64,19 @@ func (s *Service) ListMoviePilotTaskStatuses() []model.MoviePilotTaskStatus {
 			SubscriptionID:     entry.Subscription.SubscriptionID,
 			SubscriptionItemID: entry.Subscription.SubscriptionItemID,
 			SubscriptionName:   entry.Subscription.SubscriptionName,
-			Phase:              "registered", IntentStatus: "bound", TorrentStatus: "registered",
-			BindingID: torrent.BindingID, BridgeInstanceID: torrent.BridgeInstanceID,
+			ItemName:           firstWorkerStatusValue(entry.Torrent.RelativePath, entry.Torrent.ContentPath),
+			Phase:              firstWorkerStatusValue(entry.Phase, model.MoviePilotTaskPhaseBound),
+			IntentStatus:       firstWorkerStatusValue(entry.IntentStatus, model.MoviePilotIntentStatusBound),
+			TorrentStatus:      firstWorkerStatusValue(entry.TorrentStatus, "registered"),
+			DownloadProgress:   clampWorkerStatusProgress(entry.DownloadProgress),
+			UploadProgress:     clampWorkerStatusProgress(entry.UploadProgress),
+			BindingID:          torrent.BindingID, BridgeInstanceID: torrent.BridgeInstanceID,
 			WorkerNodeID: firstWorkerStatusValue(s.controlNodeID, torrent.WorkerNodeID),
 			Downloader:   torrent.Downloader, QBClientID: torrent.QBClientID, TorrentHash: torrent.TorrentHash,
-			UpdatedAt: now,
+			ClusterJobID: entry.ClusterJobID, ClusterJobStatus: entry.ClusterJobStatus,
+			ClusterJobStage: entry.ClusterJobStage, ClusterJobStageStatus: entry.ClusterStageStatus,
+			ErrorCode: entry.ErrorCode, Error: entry.Error,
+			UpdatedAt: firstWorkerStatusTime(entry.UpdatedAt, now),
 		})
 	}
 	return result

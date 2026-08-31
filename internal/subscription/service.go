@@ -21,6 +21,14 @@ import (
 
 var subscriptionRunLocks sync.Map // subscriptionID -> *sync.Mutex
 
+// Auto subscriptions use MoviePilot as the first candidate source. The
+// function variables keep the ordering testable without making external
+// MoviePilot or HDHive calls in unit tests.
+var (
+	runMoviePilotForAuto = runMoviePilot
+	runHDHiveForAuto     = runHDHive
+)
+
 func lockSubscriptionRun(subscriptionID uint) func() {
 	value, _ := subscriptionRunLocks.LoadOrStore(subscriptionID, &sync.Mutex{})
 	mu := value.(*sync.Mutex)
@@ -364,13 +372,42 @@ func runBySource(ctx context.Context, sub *model.Subscription, transfer bool) ([
 		return runTelegram(ctx, sub, transfer)
 	case model.SubscriptionSourcePanSou:
 		return runPanSou(ctx, sub, transfer)
-	case model.SubscriptionSourceHDHive, model.SubscriptionSourceAuto:
+	case model.SubscriptionSourceHDHive:
 		return runHDHive(ctx, sub, transfer)
+	case model.SubscriptionSourceAuto:
+		return runAuto(ctx, sub, transfer)
 	case model.SubscriptionSourceMoviePilot:
 		return runMoviePilot(ctx, sub, transfer)
 	default:
 		return nil, sub.LastTreeHash, 0, 0, 0, fmt.Errorf("unsupported subscription source type: %s", sub.SourceType)
 	}
+}
+
+func runAuto(ctx context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+	if sub == nil {
+		return nil, "", 0, 0, 0, errors.New("subscription is required")
+	}
+	moviePilotSub := *sub
+	moviePilotSub.SourceType = model.SubscriptionSourceMoviePilot
+	items, hash, added, changed, transferred, moviePilotErr := runMoviePilotForAuto(ctx, &moviePilotSub, transfer)
+	if moviePilotErr == nil && len(items) > 0 {
+		// BindMoviePilotResource persists the selected resource and changes the
+		// subscription source to MoviePilot. Copy the selected runtime state back
+		// so the current run and subsequent runs use the same bound resource.
+		*sub = moviePilotSub
+		return items, hash, added, changed, transferred, nil
+	}
+	if moviePilotSub.BoundTorrent != nil {
+		// A resource was selected and persisted, so a submit failure must be
+		// surfaced instead of silently switching this run to another source.
+		return items, hash, added, changed, transferred, moviePilotErr
+	}
+
+	items, hash, added, changed, transferred, fallbackErr := runHDHiveForAuto(ctx, sub, transfer)
+	if fallbackErr != nil && moviePilotErr != nil {
+		return items, hash, added, changed, transferred, fmt.Errorf("MoviePilot priority search failed: %v; fallback source search failed: %w", moviePilotErr, fallbackErr)
+	}
+	return items, hash, added, changed, transferred, fallbackErr
 }
 
 func runManual(ctx context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {

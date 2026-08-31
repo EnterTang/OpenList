@@ -139,6 +139,44 @@ func TestRunMoviePilotAutomaticallyBindsFirstBridgeResult(t *testing.T) {
 	}
 }
 
+func TestRunAutoPrefersMoviePilotBeforeFallbackSources(t *testing.T) {
+	oldMoviePilot := runMoviePilotForAuto
+	oldHDHive := runHDHiveForAuto
+	t.Cleanup(func() {
+		runMoviePilotForAuto = oldMoviePilot
+		runHDHiveForAuto = oldHDHive
+	})
+	calledFallback := false
+	runMoviePilotForAuto = func(_ context.Context, sub *model.Subscription, transfer bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+		if !transfer || sub.SourceType != model.SubscriptionSourceMoviePilot {
+			t.Fatalf("MoviePilot auto request = source %q transfer %v", sub.SourceType, transfer)
+		}
+		return []model.SubscriptionItem{{SourcePath: "/staging/auto.mkv", Status: model.SubscriptionItemStatusPending}}, "moviepilot-hash", 1, 0, 0, nil
+	}
+	runHDHiveForAuto = func(context.Context, *model.Subscription, bool) ([]model.SubscriptionItem, string, int, int, int, error) {
+		calledFallback = true
+		return nil, "", 0, 0, 0, nil
+	}
+
+	sub := &model.Subscription{SourceType: model.SubscriptionSourceAuto}
+	items, hash, added, _, _, err := runAuto(context.Background(), sub, true)
+	if err != nil {
+		t.Fatalf("run auto: %v", err)
+	}
+	if calledFallback || len(items) != 1 || hash != "moviepilot-hash" || added != 1 {
+		t.Fatalf("auto result = items=%#v hash=%q added=%d fallback=%v", items, hash, added, calledFallback)
+	}
+
+	clusterSub := &model.Subscription{SourceType: model.SubscriptionSourceAuto}
+	clusterItems, clusterHash, clusterAdded, _, _, err := runAutoCluster(context.Background(), clusterSub)
+	if err != nil {
+		t.Fatalf("run clustered auto: %v", err)
+	}
+	if calledFallback || len(clusterItems) != 1 || clusterHash != "moviepilot-hash" || clusterAdded != 1 {
+		t.Fatalf("cluster auto result = items=%#v hash=%q added=%d fallback=%v", clusterItems, clusterHash, clusterAdded, calledFallback)
+	}
+}
+
 func TestBindMoviePilotResourcePreservesBoundShareWhenUnbound(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	sub := &model.Subscription{

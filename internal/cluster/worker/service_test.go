@@ -348,6 +348,29 @@ func TestNewCleanupRequestIncludesStagedSourceCleanupByDefault(t *testing.T) {
 	require.Equal(t, source, request.AdditionalTargets[0])
 }
 
+func TestGetFreshUploadedObjectUsesFreshProviderLookup(t *testing.T) {
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/139"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	getCleanupStorageAndActualPath = func(sourcePath string) (driver.Driver, string, error) {
+		require.Equal(t, "/139/upload/Episode.mkv", sourcePath)
+		return d, "/upload/Episode.mkv", nil
+	}
+	getCleanupObject = func(_ context.Context, storage driver.Driver, actualPath string, _ ...bool) (model.Obj, error) {
+		require.Same(t, d, storage)
+		require.Equal(t, "/upload/Episode.mkv", actualPath)
+		return &model.Object{ID: "remote-file", Name: "Episode.mkv"}, nil
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+	})
+
+	object, err := getFreshUploadedObject(context.Background(), "/139/upload/Episode.mkv")
+	require.NoError(t, err)
+	require.Equal(t, "remote-file", object.GetID())
+}
+
 func TestNewSourceCleanupTargetRequiresExactRemoteID(t *testing.T) {
 	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/123"}}
 	originalStorage := getCleanupStorageAndActualPath

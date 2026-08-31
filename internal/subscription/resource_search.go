@@ -143,7 +143,10 @@ func normalizeResourceSearchSources(values []string) []string {
 			return []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou}
 		}
 		if value == "all" {
-			return []string{model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive, model.SubscriptionSourceMoviePilot}
+			return []string{model.SubscriptionSourceMoviePilot, model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive}
+		}
+		if value == model.SubscriptionSourceAuto {
+			return []string{model.SubscriptionSourceMoviePilot, model.SubscriptionSourceTelegram, model.SubscriptionSourcePanSou, model.SubscriptionSourceHDHive}
 		}
 		if _, ok := seen[value]; ok {
 			continue

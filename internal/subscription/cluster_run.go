@@ -10,6 +10,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -21,13 +22,37 @@ func runClusterBySource(ctx context.Context, sub *model.Subscription) ([]model.S
 		return runManualCluster(ctx, sub)
 	case model.SubscriptionSourcePanSou:
 		return runPanSouCluster(ctx, sub)
-	case model.SubscriptionSourceHDHive, model.SubscriptionSourceAuto:
+	case model.SubscriptionSourceHDHive:
 		return runHDHiveCluster(ctx, sub)
+	case model.SubscriptionSourceAuto:
+		return runAutoCluster(ctx, sub)
 	case model.SubscriptionSourceMoviePilot:
 		return runMoviePilot(ctx, sub, true)
 	default:
 		return nil, sub.LastTreeHash, 0, 0, 0, fmt.Errorf("unsupported subscription source type: %s", sub.SourceType)
 	}
+}
+
+func runAutoCluster(ctx context.Context, sub *model.Subscription) ([]model.SubscriptionItem, string, int, int, int, error) {
+	if sub == nil {
+		return nil, "", 0, 0, 0, errors.New("subscription is required")
+	}
+	moviePilotSub := *sub
+	moviePilotSub.SourceType = model.SubscriptionSourceMoviePilot
+	items, hash, added, changed, dispatched, moviePilotErr := runMoviePilotForAuto(ctx, &moviePilotSub, true)
+	if moviePilotErr == nil && len(items) > 0 {
+		*sub = moviePilotSub
+		return items, hash, added, changed, dispatched, nil
+	}
+	if moviePilotSub.BoundTorrent != nil {
+		return items, hash, added, changed, dispatched, moviePilotErr
+	}
+
+	items, hash, added, changed, dispatched, fallbackErr := runHDHiveForAuto(ctx, sub, true)
+	if fallbackErr != nil && moviePilotErr != nil {
+		return items, hash, added, changed, dispatched, fmt.Errorf("MoviePilot priority search failed: %v; fallback source search failed: %w", moviePilotErr, fallbackErr)
+	}
+	return items, hash, added, changed, dispatched, fallbackErr
 }
 
 func runTelegramCluster(ctx context.Context, sub *model.Subscription) ([]model.SubscriptionItem, string, int, int, int, error) {

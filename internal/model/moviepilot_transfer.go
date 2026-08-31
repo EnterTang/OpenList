@@ -3,6 +3,21 @@ package model
 import "time"
 
 const (
+	// MoviePilot task phases are user-facing lifecycle states shared by the
+	// Coordinator API, Worker API, and the MoviePilot Bridge UI. Technical
+	// cluster stages remain available in ClusterJobStage for diagnostics.
+	MoviePilotTaskPhasePending          = "pending"
+	MoviePilotTaskPhaseAccepted         = "accepted"
+	MoviePilotTaskPhaseWaitingBinding   = "waiting_binding"
+	MoviePilotTaskPhaseBound            = "bound"
+	MoviePilotTaskPhaseDownloading      = "downloading"
+	MoviePilotTaskPhaseDownloadComplete = "download_completed"
+	MoviePilotTaskPhaseStaging          = "staging"
+	MoviePilotTaskPhaseUploading        = "uploading"
+	MoviePilotTaskPhaseSeeding          = "seeding"
+	MoviePilotTaskPhaseCompleted        = "completed"
+	MoviePilotTaskPhaseFailed           = "failed"
+
 	MoviePilotIntentStatusPending       = "pending"
 	MoviePilotIntentStatusAccepted      = "accepted"
 	MoviePilotIntentStatusBound         = "bound"

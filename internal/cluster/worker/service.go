@@ -123,6 +123,14 @@ func getFreshCleanupObject(ctx context.Context, storage driver.Driver, actualPat
 	return nil, errs.ObjectNotFound
 }
 
+func getFreshUploadedObject(ctx context.Context, expectedPath string) (model.Obj, error) {
+	storage, actualPath, err := getCleanupStorageAndActualPath(expectedPath)
+	if err != nil {
+		return nil, err
+	}
+	return getCleanupObject(ctx, storage, actualPath)
+}
+
 type activeTask struct {
 	attempt         protocol.AttemptRef
 	offer           protocol.JobOffer
@@ -1065,6 +1073,9 @@ func (s *Service) sendJobProgress(ctx context.Context, offer protocol.JobOffer, 
 		active.progressAt = time.Now().UTC()
 	}
 	s.mu.Unlock()
+	if offer.TaskContext.Torrent != nil {
+		s.syncMoviePilotTorrentStatus(ctx, offer.TaskContext.Torrent, offer.JobID, stage, model.ClusterStageStatusRunning, completedBytes, totalBytes, progressMessage, "", "", "", totalBytes > 0 && completedBytes >= totalBytes)
+	}
 	payload := protocol.JobProgress{
 		AttemptRef:     offer.AttemptRef,
 		Stage:          strings.TrimSpace(stage),
@@ -1982,7 +1993,10 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		if progressErr := s.sendJobProgress(ctx, offer, model.ClusterStageUploadingMobile, uploadTotal, uploadTotal, 0, "uploaded"); progressErr != nil {
 			log.Warnf("cluster job %s final upload progress notify failed: %v", offer.JobID, progressErr)
 		}
-		remote, getRemoteErr := fs.Get(ctx, expectedPath, &fs.GetArgs{NoLog: true})
+		// fs.PutDirectly may leave a temporary cache object without a remote ID.
+		// Refresh the target directory so cleanup receives the provider's exact
+		// file ID instead of the cache placeholder.
+		remote, getRemoteErr := getFreshUploadedObject(ctx, expectedPath)
 		if getRemoteErr != nil || remote == nil || remote.IsDir() {
 			if getRemoteErr == nil {
 				getRemoteErr = errors.New("uploaded qB object is missing or is a directory")
@@ -2289,6 +2303,9 @@ func (s *Service) reportStageStatus(ctx context.Context, offer protocol.JobOffer
 		active.progressAt = time.Now().UTC()
 	}
 	s.mu.Unlock()
+	if offer.TaskContext.Torrent != nil {
+		s.syncMoviePilotTorrentStatus(ctx, offer.TaskContext.Torrent, offer.JobID, stage, status, 0, 0, "", "", stageError, "", status == model.ClusterStageStatusSucceeded || status == model.ClusterStageStatusFailed)
+	}
 	if status == model.ClusterStageStatusRunning {
 		log.Infof("cluster job %s stage started attempt=%s generation=%d stage=%s", offer.JobID, offer.AttemptID, offer.Generation, stage)
 	}
@@ -2441,11 +2458,41 @@ func (s *Service) sendJobResult(ctx context.Context, offer protocol.JobOffer, re
 		}
 		payload.Error = runErr.Error()
 	}
+	if offer.TaskContext.Torrent != nil {
+		if runErr == nil {
+			phase := ""
+			if offer.JobType == model.ClusterJobTypeTorrentObserve {
+				phase = model.MoviePilotTaskPhaseDownloadComplete
+			} else if offer.JobType == model.ClusterJobTypeMediaTransfer {
+				phase = model.MoviePilotTaskPhaseCompleted
+			}
+			stage := s.currentMoviePilotStage(offer)
+			if stage == "" {
+				stage = model.ClusterStageUploadingMobile
+			}
+			s.syncMoviePilotTorrentStatus(context.WithoutCancel(ctx), offer.TaskContext.Torrent, offer.JobID, stage, model.ClusterStageStatusSucceeded, 0, 0, "", "", "", phase, true)
+		} else {
+			stage := s.currentMoviePilotStage(offer)
+			if stage == "" {
+				stage = model.ClusterStageUploadingMobile
+			}
+			s.syncMoviePilotTorrentStatus(context.WithoutCancel(ctx), offer.TaskContext.Torrent, offer.JobID, stage, model.ClusterStageStatusFailed, 0, 0, "", payload.ErrorCode, payload.Error, model.MoviePilotTaskPhaseFailed, true)
+		}
+	}
 	message, err := protocol.NewEnvelope(protocol.MessageJobResult, payload)
 	if err != nil {
 		return err
 	}
 	return s.sender.Send(ctx, *message)
+}
+
+func (s *Service) currentMoviePilotStage(offer protocol.JobOffer) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if active := s.active[offer.JobID]; active != nil && sameAttempt(active.attempt, offer.AttemptRef) {
+		return strings.TrimSpace(active.stage)
+	}
+	return ""
 }
 
 func primarySourceObject(objects []protocol.SourceObject) protocol.SourceObject {

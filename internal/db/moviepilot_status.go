@@ -258,35 +258,60 @@ func setMoviePilotDeliveryProgress(status *model.MoviePilotTaskStatus, deliverie
 
 func moviePilotTaskPhase(status model.MoviePilotTaskStatus, hasBinding bool, deliveries []model.MoviePilotDeliveryFile) string {
 	if status.Error != "" || status.IntentStatus == model.MoviePilotIntentStatusFailed || status.ClusterJobStatus == model.ClusterJobStatusFailed || status.ClusterJobStatus == model.ClusterJobStatusDeadLetter || status.ClusterJobStageStatus == model.ClusterStageStatusFailed {
-		return "failed"
+		return model.MoviePilotTaskPhaseFailed
 	}
 	if len(deliveries) > 0 {
 		allMaterialized := status.ExpectedFiles > 0 && status.TransferredFiles >= status.ExpectedFiles
-		if allMaterialized {
-			return "completed"
-		}
 		for _, delivery := range deliveries {
-			if delivery.Status == model.MoviePilotDeliveryStatusUploading || delivery.Status == model.MoviePilotDeliveryStatusStaging {
-				return string(delivery.Status)
+			switch delivery.Status {
+			case model.MoviePilotDeliveryStatusUploading:
+				return model.MoviePilotTaskPhaseUploading
+			case model.MoviePilotDeliveryStatusStaging:
+				return model.MoviePilotTaskPhaseStaging
 			}
+		}
+		if allMaterialized {
+			return model.MoviePilotTaskPhaseCompleted
 		}
 	}
 	if status.ClusterJobStage != "" && status.ClusterJobStatus != model.ClusterJobStatusSucceeded {
-		return status.ClusterJobStage
+		return moviePilotTaskPhaseForClusterStage(status.ClusterJobStage, status.ClusterJobStageStatus, status.DownloadProgress, status.TorrentStatus)
 	}
 	if !hasBinding {
 		if status.IntentStatus == model.MoviePilotIntentStatusAccepted {
-			return "waiting_binding"
+			return model.MoviePilotTaskPhaseWaitingBinding
 		}
-		return firstNonEmptyMoviePilotStatus(status.IntentStatus, "pending")
+		return firstNonEmptyMoviePilotStatus(status.IntentStatus, model.MoviePilotTaskPhasePending)
 	}
 	if status.TorrentStatus == model.MoviePilotTorrentStatusSeeding {
-		return "seeding"
+		return model.MoviePilotTaskPhaseSeeding
 	}
 	if status.TorrentStatus == model.MoviePilotTorrentStatusDownloading {
-		return "downloading"
+		return model.MoviePilotTaskPhaseDownloading
 	}
-	return firstNonEmptyMoviePilotStatus(status.TorrentStatus, "bound")
+	if status.TorrentStatus == model.MoviePilotTorrentStatusDownloadCompleted || status.TorrentStatus == model.MoviePilotTorrentStatusFilesDiscovered {
+		return model.MoviePilotTaskPhaseDownloadComplete
+	}
+	if status.TorrentStatus == model.MoviePilotTorrentStatusTransferring {
+		return model.MoviePilotTaskPhaseStaging
+	}
+	return firstNonEmptyMoviePilotStatus(status.TorrentStatus, model.MoviePilotTaskPhaseBound)
+}
+
+func moviePilotTaskPhaseForClusterStage(stage, stageStatus string, downloadProgress float64, torrentStatus string) string {
+	switch stage {
+	case model.ClusterStageQBObserving:
+		if stageStatus == model.ClusterStageStatusSucceeded || downloadProgress >= 0.999999 || torrentStatus == model.MoviePilotTorrentStatusDownloadCompleted || torrentStatus == model.MoviePilotTorrentStatusFilesDiscovered {
+			return model.MoviePilotTaskPhaseDownloadComplete
+		}
+		return model.MoviePilotTaskPhaseDownloading
+	case model.ClusterStageQBCopying:
+		return model.MoviePilotTaskPhaseStaging
+	case model.ClusterStageUploadingMobile:
+		return model.MoviePilotTaskPhaseUploading
+	default:
+		return stage
+	}
 }
 
 func clampMoviePilotProgress(value float64) float64 {

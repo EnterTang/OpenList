@@ -101,3 +101,27 @@ func TestListMoviePilotTaskStatusesIncludesUnboundAndDeliveryProgress(t *testing
 		t.Fatalf("unbound status = %#v", statuses[1])
 	}
 }
+
+func TestMoviePilotTaskPhaseUsesSemanticLifecycleStages(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     model.MoviePilotTaskStatus
+		deliveries []model.MoviePilotDeliveryFile
+		hasBinding bool
+		want       string
+	}{
+		{name: "qB downloading", status: model.MoviePilotTaskStatus{ClusterJobStage: model.ClusterStageQBObserving, ClusterJobStatus: model.ClusterJobStatusRunning}, hasBinding: true, want: model.MoviePilotTaskPhaseDownloading},
+		{name: "qB completed", status: model.MoviePilotTaskStatus{ClusterJobStage: model.ClusterStageQBObserving, ClusterJobStageStatus: model.ClusterStageStatusSucceeded, ClusterJobStatus: model.ClusterJobStatusRunning, DownloadProgress: 1}, hasBinding: true, want: model.MoviePilotTaskPhaseDownloadComplete},
+		{name: "staging", status: model.MoviePilotTaskStatus{ClusterJobStage: model.ClusterStageQBCopying, ClusterJobStatus: model.ClusterJobStatusRunning}, hasBinding: true, want: model.MoviePilotTaskPhaseStaging},
+		{name: "uploading", status: model.MoviePilotTaskStatus{ClusterJobStage: model.ClusterStageUploadingMobile, ClusterJobStatus: model.ClusterJobStatusRunning}, hasBinding: true, want: model.MoviePilotTaskPhaseUploading},
+		{name: "delivery staging", status: model.MoviePilotTaskStatus{}, deliveries: []model.MoviePilotDeliveryFile{{Status: model.MoviePilotDeliveryStatusStaging}}, hasBinding: true, want: model.MoviePilotTaskPhaseStaging},
+		{name: "delivery uploading", status: model.MoviePilotTaskStatus{}, deliveries: []model.MoviePilotDeliveryFile{{Status: model.MoviePilotDeliveryStatusUploading}}, hasBinding: true, want: model.MoviePilotTaskPhaseUploading},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := moviePilotTaskPhase(tt.status, tt.hasBinding, tt.deliveries); got != tt.want {
+				t.Fatalf("phase = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
