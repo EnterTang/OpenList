@@ -15,9 +15,10 @@ import (
 const moviePilotTorrentRegistryType = "moviepilot_qb_torrent"
 
 type moviePilotTorrentRegistryEntry struct {
-	Torrent            protocol.TorrentTaskContext `json:"torrent"`
-	PausedByDisconnect bool                        `json:"paused_by_disconnect"`
-	PausedByCapacity   bool                        `json:"paused_by_capacity"`
+	Torrent            protocol.TorrentTaskContext      `json:"torrent"`
+	Subscription       protocol.SubscriptionTaskContext `json:"subscription,omitempty"`
+	PausedByDisconnect bool                             `json:"paused_by_disconnect"`
+	PausedByCapacity   bool                             `json:"paused_by_capacity"`
 }
 
 func moviePilotTorrentRegistryKey(torrent *protocol.TorrentTaskContext) string {
@@ -37,13 +38,20 @@ func moviePilotTorrentRegistryID(torrent *protocol.TorrentTaskContext) string {
 // acknowledges the job. This lets a restarted Worker pause known incomplete
 // torrents on the next transport loss instead of relying on active memory.
 func (s *Service) rememberMoviePilotTorrent(ctx context.Context, torrent *protocol.TorrentTaskContext) error {
+	return s.rememberMoviePilotTorrentWithSubscription(ctx, torrent, protocol.SubscriptionTaskContext{})
+}
+
+func (s *Service) rememberMoviePilotTorrentWithSubscription(ctx context.Context, torrent *protocol.TorrentTaskContext, subscription protocol.SubscriptionTaskContext) error {
 	if torrent == nil || strings.TrimSpace(torrent.TorrentHash) == "" {
 		return nil
 	}
 	s.mu.Lock()
 	previous := s.moviePilotTorrents[moviePilotTorrentRegistryKey(torrent)]
 	s.mu.Unlock()
-	return s.storeMoviePilotTorrentRegistryEntry(ctx, moviePilotTorrentRegistryEntry{Torrent: *torrent, PausedByDisconnect: previous.PausedByDisconnect, PausedByCapacity: previous.PausedByCapacity})
+	if subscription.SubscriptionID == 0 {
+		subscription = previous.Subscription
+	}
+	return s.storeMoviePilotTorrentRegistryEntry(ctx, moviePilotTorrentRegistryEntry{Torrent: *torrent, Subscription: subscription, PausedByDisconnect: previous.PausedByDisconnect, PausedByCapacity: previous.PausedByCapacity})
 }
 
 func (s *Service) setMoviePilotTorrentDisconnectPaused(ctx context.Context, torrent *protocol.TorrentTaskContext, paused bool) error {
@@ -53,7 +61,7 @@ func (s *Service) setMoviePilotTorrentDisconnectPaused(ctx context.Context, torr
 	s.mu.Lock()
 	previous := s.moviePilotTorrents[moviePilotTorrentRegistryKey(torrent)]
 	s.mu.Unlock()
-	return s.storeMoviePilotTorrentRegistryEntry(ctx, moviePilotTorrentRegistryEntry{Torrent: *torrent, PausedByDisconnect: paused, PausedByCapacity: previous.PausedByCapacity})
+	return s.storeMoviePilotTorrentRegistryEntry(ctx, moviePilotTorrentRegistryEntry{Torrent: *torrent, Subscription: previous.Subscription, PausedByDisconnect: paused, PausedByCapacity: previous.PausedByCapacity})
 }
 
 func (s *Service) setMoviePilotTorrentCapacityPaused(ctx context.Context, torrent *protocol.TorrentTaskContext, paused bool) error {
@@ -63,7 +71,7 @@ func (s *Service) setMoviePilotTorrentCapacityPaused(ctx context.Context, torren
 	s.mu.Lock()
 	previous := s.moviePilotTorrents[moviePilotTorrentRegistryKey(torrent)]
 	s.mu.Unlock()
-	return s.storeMoviePilotTorrentRegistryEntry(ctx, moviePilotTorrentRegistryEntry{Torrent: *torrent, PausedByDisconnect: previous.PausedByDisconnect, PausedByCapacity: paused})
+	return s.storeMoviePilotTorrentRegistryEntry(ctx, moviePilotTorrentRegistryEntry{Torrent: *torrent, Subscription: previous.Subscription, PausedByDisconnect: previous.PausedByDisconnect, PausedByCapacity: paused})
 }
 
 func (s *Service) storeMoviePilotTorrentRegistryEntry(ctx context.Context, entry moviePilotTorrentRegistryEntry) error {

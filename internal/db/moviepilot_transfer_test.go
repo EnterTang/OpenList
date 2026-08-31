@@ -37,6 +37,40 @@ func TestCreateIntentTxRejectsRequestIDReuseForDifferentIntent(t *testing.T) {
 	}
 }
 
+func TestCreateIntentTxRepairsMissingSubscriptionItemAssociation(t *testing.T) {
+	database, err := gorm.Open(sqlite.Open("file:moviepilot_intent_item_repair_test?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AutoMigrate(&model.MoviePilotDownloadIntent{}); err != nil {
+		t.Fatal(err)
+	}
+	first := &model.MoviePilotDownloadIntent{
+		ID: "intent-item-repair", RequestID: "request-item-repair", BridgeInstanceID: "mp-main",
+		SubscriptionID: 1, MediaSource: "tmdb", MediaID: "123", ResourceRef: "resource-a",
+		TorrentFingerprint: "fingerprint-a", RetentionPolicyJSON: "{}",
+	}
+	if err := CreateIntentTx(context.Background(), database, first); err != nil {
+		t.Fatal(err)
+	}
+	second := *first
+	second.ID = "intent-item-repair-retry"
+	second.SubscriptionItemID = 42
+	if err := CreateIntentTx(context.Background(), database, &second); err != nil {
+		t.Fatalf("retry should repair the local item association: %v", err)
+	}
+	if second.ID != first.ID || second.SubscriptionItemID != 42 {
+		t.Fatalf("reused intent = %#v, want existing ID with repaired item", second)
+	}
+	var stored model.MoviePilotDownloadIntent
+	if err := database.First(&stored, "request_id = ?", first.RequestID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.SubscriptionItemID != 42 {
+		t.Fatalf("stored subscription item ID = %d, want 42", stored.SubscriptionItemID)
+	}
+}
+
 func TestMoviePilotBridgeOutboxEnforcesOneRowPerBridgeRequest(t *testing.T) {
 	database, err := gorm.Open(sqlite.Open("file:moviepilot_outbox_unique_test?mode=memory&cache=shared"), &gorm.Config{})
 	if err != nil {

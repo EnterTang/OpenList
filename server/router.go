@@ -131,6 +131,7 @@ func Init(e *gin.Engine) {
 	})
 	moviePilotBridge.StartEventProcessor(context.Background())
 	api.POST("/v1/cluster/moviepilot/events", middlewares.MoviePilotBridgeAuth(moviePilotBridge), handles.ConsumeMoviePilotBridgeEvent(moviePilotBridge))
+	api.GET("/v1/cluster/moviepilot/status", middlewares.MoviePilotBridgeAuth(moviePilotBridge), handles.ListMoviePilotBridgeTaskStatuses)
 	admin(auth.Group("/admin", middlewares.AuthAdmin), moviePilotBridge)
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
@@ -162,6 +163,7 @@ func admin(g *gin.RouterGroup, moviePilotBridge *moviepilotbridge.Service) {
 	clusterAdmin.POST("/nodes/:id/config", handles.ApplyClusterNodeConfig)
 	clusterAdmin.GET("/results", handles.ListClusterUploadResults)
 	clusterAdmin.GET("/jobs", handles.ListClusterJobs)
+	clusterAdmin.GET("/moviepilot/tasks", handles.ListMoviePilotTaskStatuses)
 	clusterAdmin.GET("/moviepilot/transfers", handles.ListMoviePilotTransfers)
 	clusterAdmin.POST("/moviepilot/manual_qb", handles.AdoptCompletedQBTorrent)
 	clusterAdmin.POST("/jobs/dispatch", handles.DispatchClusterMediaJob)

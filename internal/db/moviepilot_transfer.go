@@ -30,13 +30,21 @@ func CreateIntentTx(ctx context.Context, database *gorm.DB, intent *model.MovieP
 		if err == nil {
 			if existing.BridgeInstanceID != intent.BridgeInstanceID ||
 				existing.SubscriptionID != intent.SubscriptionID ||
-				existing.SubscriptionItemID != intent.SubscriptionItemID ||
 				existing.MediaSource != intent.MediaSource ||
 				existing.MediaID != intent.MediaID ||
 				existing.ResourceRef != intent.ResourceRef ||
 				existing.TorrentFingerprint != intent.TorrentFingerprint ||
 				existing.RetentionPolicyJSON != intent.RetentionPolicyJSON {
 				return fmt.Errorf("request id %q already belongs to a different intent", intent.RequestID)
+			}
+			// SubscriptionItemID is Coordinator-local bookkeeping, not part of
+			// the Bridge intent identity. Older rows may have been created before
+			// the item was persisted, so allow a later retry to attach that item.
+			if existing.SubscriptionItemID == 0 && intent.SubscriptionItemID != 0 {
+				if err := tx.Model(&existing).Update("subscription_item_id", intent.SubscriptionItemID).Error; err != nil {
+					return err
+				}
+				existing.SubscriptionItemID = intent.SubscriptionItemID
 			}
 			intent.ID = existing.ID
 			*intent = existing

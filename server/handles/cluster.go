@@ -13,6 +13,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/OpenListTeam/OpenList/v4/server/middlewares"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -117,6 +118,69 @@ func ListClusterJobs(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, jobs)
+}
+
+// ListMoviePilotTaskStatuses serves both Coordinator and Worker panels. A
+// Worker returns only its local accepted/running registry; a Coordinator
+// returns the durable cross-node projection.
+func ListMoviePilotTaskStatuses(c *gin.Context) {
+	var subscriptionID uint
+	if raw := c.Query("subscription_id"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || parsed == 0 {
+			common.ErrorStrResp(c, "subscription_id must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		subscriptionID = uint(parsed)
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if service := cluster.CoordinatorService(); service != nil {
+		items, err := db.ListMoviePilotTaskStatuses(c.Request.Context(), subscriptionID, c.Query("bridge_instance_id"), limit)
+		if err != nil {
+			common.ErrorResp(c, err, http.StatusInternalServerError)
+			return
+		}
+		common.SuccessResp(c, items)
+		return
+	}
+	if service := cluster.WorkerService(); service != nil {
+		items := service.ListMoviePilotTaskStatuses()
+		if subscriptionID > 0 {
+			filtered := items[:0]
+			for _, item := range items {
+				if item.SubscriptionID == subscriptionID {
+					filtered = append(filtered, item)
+				}
+			}
+			items = filtered
+		}
+		common.SuccessResp(c, items)
+		return
+	}
+	common.ErrorStrResp(c, "cluster Coordinator and Worker are disabled", http.StatusBadRequest)
+}
+
+// ListMoviePilotBridgeTaskStatuses is the HMAC-authenticated read endpoint
+// used by the Bridge plugin. The verified bridge instance is the filter, so a
+// plugin cannot inspect another MoviePilot instance's tasks.
+func ListMoviePilotBridgeTaskStatuses(c *gin.Context) {
+	bridge, ok := c.Get(middlewares.MoviePilotBridgeInstanceContextKey)
+	if !ok || bridge == nil {
+		common.ErrorStrResp(c, "MoviePilot Bridge instance is unavailable", http.StatusUnauthorized)
+		return
+	}
+	instance, ok := bridge.(*model.MoviePilotBridgeInstance)
+	if !ok || instance == nil {
+		common.ErrorStrResp(c, "MoviePilot Bridge instance is invalid", http.StatusUnauthorized)
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	items, err := db.ListMoviePilotTaskStatuses(c.Request.Context(), 0, instance.ID, limit)
+	if err != nil {
+		common.ErrorResp(c, err, http.StatusInternalServerError)
+		return
+	}
+	common.SuccessResp(c, items)
 }
 
 func ListMoviePilotTransfers(c *gin.Context) {

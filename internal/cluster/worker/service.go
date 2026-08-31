@@ -99,6 +99,13 @@ type activeTask struct {
 	attempt         protocol.AttemptRef
 	offer           protocol.JobOffer
 	eventSeq        uint64
+	stage           string
+	stageStatus     string
+	completedBytes  int64
+	totalBytes      int64
+	bytesPerSecond  int64
+	progressMessage string
+	progressAt      time.Time
 	ctx             context.Context
 	cancel          context.CancelCauseFunc
 	stagingMount    string
@@ -662,7 +669,7 @@ func (s *Service) acceptJob(ctx context.Context, offer protocol.JobOffer) error 
 		return fmt.Errorf("cluster attempt %s is already claimed without an active execution", offer.AttemptRef.AttemptID)
 	}
 	if offer.TaskContext.Torrent != nil {
-		if err := s.rememberMoviePilotTorrent(ctx, offer.TaskContext.Torrent); err != nil {
+		if err := s.rememberMoviePilotTorrentWithSubscription(ctx, offer.TaskContext.Torrent, offer.TaskContext.Subscription); err != nil {
 			_ = s.queue.ReleaseAttempt(context.WithoutCancel(ctx), attemptKey)
 			return s.sendJobReject(ctx, offer, "worker_torrent_registry_unavailable", err.Error(), true)
 		}
@@ -1019,6 +1026,17 @@ func (s *Service) sendJobProgress(ctx context.Context, offer protocol.JobOffer, 
 	if !ok {
 		return fmt.Errorf("cluster job %s is not active", offer.JobID)
 	}
+	s.mu.Lock()
+	if active := s.active[offer.JobID]; active != nil && sameAttempt(active.attempt, offer.AttemptRef) {
+		active.stage = strings.TrimSpace(stage)
+		active.stageStatus = model.ClusterStageStatusRunning
+		active.completedBytes = completedBytes
+		active.totalBytes = totalBytes
+		active.bytesPerSecond = bytesPerSecond
+		active.progressMessage = strings.TrimSpace(progressMessage)
+		active.progressAt = time.Now().UTC()
+	}
+	s.mu.Unlock()
 	payload := protocol.JobProgress{
 		AttemptRef:     offer.AttemptRef,
 		Stage:          strings.TrimSpace(stage),
@@ -2219,6 +2237,14 @@ func findExistingStagedSource(ctx context.Context, tempRoot string, primary prot
 }
 
 func (s *Service) reportStageStatus(ctx context.Context, offer protocol.JobOffer, stage, status, stageError string) {
+	s.mu.Lock()
+	if active := s.active[offer.JobID]; active != nil && sameAttempt(active.attempt, offer.AttemptRef) {
+		active.stage = strings.TrimSpace(stage)
+		active.stageStatus = strings.TrimSpace(status)
+		active.progressMessage = strings.TrimSpace(stageError)
+		active.progressAt = time.Now().UTC()
+	}
+	s.mu.Unlock()
 	if status == model.ClusterStageStatusRunning {
 		log.Infof("cluster job %s stage started attempt=%s generation=%d stage=%s", offer.JobID, offer.AttemptID, offer.Generation, stage)
 	}

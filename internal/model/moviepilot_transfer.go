@@ -166,6 +166,39 @@ type MoviePilotTransferView struct {
 	RetentionStatus    string     `json:"retention_status"`
 }
 
+// MoviePilotTaskStatus is the shared, redacted status projection used by the
+// Coordinator admin UI and the Bridge status page. It deliberately contains
+// identifiers and progress only; qB credentials and worker-local paths never
+// cross this boundary.
+type MoviePilotTaskStatus struct {
+	RequestID             string    `json:"request_id"`
+	SubscriptionID        uint      `json:"subscription_id"`
+	SubscriptionItemID    uint      `json:"subscription_item_id"`
+	SubscriptionName      string    `json:"subscription_name,omitempty"`
+	ItemName              string    `json:"item_name,omitempty"`
+	Phase                 string    `json:"phase"`
+	IntentStatus          string    `json:"intent_status,omitempty"`
+	TorrentStatus         string    `json:"torrent_status,omitempty"`
+	DownloadProgress      float64   `json:"download_progress,omitempty"`
+	UploadProgress        float64   `json:"upload_progress,omitempty"`
+	TransferredFiles      int       `json:"transferred_files,omitempty"`
+	ExpectedFiles         int       `json:"expected_files,omitempty"`
+	BindingID             string    `json:"binding_id,omitempty"`
+	BridgeInstanceID      string    `json:"bridge_instance_id,omitempty"`
+	WorkerNodeID          string    `json:"worker_node_id,omitempty"`
+	WorkerStatus          string    `json:"worker_status,omitempty"`
+	Downloader            string    `json:"downloader,omitempty"`
+	QBClientID            string    `json:"qb_client_id,omitempty"`
+	TorrentHash           string    `json:"torrent_hash,omitempty"`
+	ClusterJobID          string    `json:"cluster_job_id,omitempty"`
+	ClusterJobStatus      string    `json:"cluster_job_status,omitempty"`
+	ClusterJobStage       string    `json:"cluster_job_stage,omitempty"`
+	ClusterJobStageStatus string    `json:"cluster_job_stage_status,omitempty"`
+	ErrorCode             string    `json:"error_code,omitempty"`
+	Error                 string    `json:"error,omitempty"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
 type MoviePilotBridgeNonce struct {
 	ID        string    `json:"id" gorm:"primaryKey;size:64"`
 	CreatedAt time.Time `json:"created_at"`

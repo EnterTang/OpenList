@@ -82,6 +82,51 @@ func TestProcessPendingOutboxRetriesFailedIntentWithFreshSignature(t *testing.T)
 	}
 }
 
+func TestReconcileSentIntentBindingsRepairsOrphanWithoutSubscriptionRerun(t *testing.T) {
+	database := newBridgeClientDatabase(t)
+	bridge := model.MoviePilotBridgeInstance{ID: "mp-orphan", Name: "orphan", BaseURL: "https://moviepilot.example", SecretRef: "secret", Enabled: true}
+	if err := database.Create(&bridge).Error; err != nil {
+		t.Fatalf("create bridge: %v", err)
+	}
+	now := time.Unix(1700000000, 0).UTC()
+	intent := model.MoviePilotDownloadIntent{
+		ID: "intent-orphan", RequestID: "request-orphan", BridgeInstanceID: bridge.ID,
+		SubscriptionID: 1, MediaSource: "tmdb", MediaID: "123", ResourceRef: "resource-orphan",
+		TorrentFingerprint: "fingerprint-orphan", Status: model.MoviePilotIntentStatusAccepted,
+	}
+	if err := database.Create(&intent).Error; err != nil {
+		t.Fatalf("create intent: %v", err)
+	}
+	if err := database.Create(&model.MoviePilotBridgeOutbox{
+		ID: "outbox-orphan", BridgeID: bridge.ID, RequestID: intent.RequestID, EventID: "event-orphan",
+		PayloadJSON: "{}", Status: "sent", CreatedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-2 * time.Minute), AvailableAt: now.Add(-2 * time.Minute),
+	}).Error; err != nil {
+		t.Fatalf("create sent outbox: %v", err)
+	}
+	httpClient := &captureBridgeHTTPClient{}
+	service := NewService(database, func(context.Context, string) ([]byte, error) {
+		return []byte("orphan-reconcile-signing-key"), nil
+	}, httpClient)
+	service.now = func() time.Time { return now }
+	processed, err := service.ReconcileSentIntentBindings(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("reconcile sent intent: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("reconciled rows = %d, want 1", processed)
+	}
+	if httpClient.request == nil || httpClient.request.URL.Path != "/api/v1/plugin/OpenListBridge/intent/request-orphan/reconcile" {
+		t.Fatalf("reconcile request = %#v", httpClient.request)
+	}
+	var outbox model.MoviePilotBridgeOutbox
+	if err := database.First(&outbox, "id = ?", "outbox-orphan").Error; err != nil {
+		t.Fatalf("reload sent outbox: %v", err)
+	}
+	if !outbox.AvailableAt.After(now) || outbox.LastError != "" {
+		t.Fatalf("outbox after successful reconcile = %#v", outbox)
+	}
+}
+
 func TestProcessPendingEventsMarksHandlerFailureForRetry(t *testing.T) {
 	database, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
 	if err != nil {

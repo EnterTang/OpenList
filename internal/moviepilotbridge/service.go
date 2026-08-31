@@ -32,6 +32,16 @@ type Service struct {
 	processorOnce sync.Once
 }
 
+const (
+	// Give the Bridge callback outbox time to deliver the normal torrent.bound
+	// event before asking it to replay the same binding. This avoids generating
+	// duplicate callbacks during the healthy path while still recovering a
+	// Coordinator restart or a lost callback without a manual subscription run.
+	moviePilotOrphanReconcileMinAge = 30 * time.Second
+	moviePilotOrphanReconcileRetry  = time.Minute
+	moviePilotOrphanReconcileAfter  = 5 * time.Minute
+)
+
 // SetEventHandler installs the durable inbox consumer. The handler is invoked
 // only after an event has been committed to the inbox, so a failed consumer
 // can be retried without asking MoviePilot to resend the event.
@@ -68,6 +78,7 @@ func (s *Service) StartEventProcessor(ctx context.Context) {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			_, _ = s.ProcessPendingOutbox(ctx, 20)
+			_, _ = s.ReconcileSentIntentBindings(ctx, 20)
 			_, _ = s.ProcessPendingEvents(ctx, 20)
 			for {
 				select {
@@ -75,11 +86,84 @@ func (s *Service) StartEventProcessor(ctx context.Context) {
 					return
 				case <-ticker.C:
 					_, _ = s.ProcessPendingOutbox(ctx, 20)
+					_, _ = s.ReconcileSentIntentBindings(ctx, 20)
 					_, _ = s.ProcessPendingEvents(ctx, 20)
 				}
 			}
 		}()
 	})
+}
+
+// ReconcileSentIntentBindings repairs the gap between a Bridge accepting an
+// intent and Coordinator persisting its torrent binding. The normal callback
+// path remains at-least-once, but this sweep makes recovery independent of a
+// later subscription scan or scheduler tick.
+func (s *Service) ReconcileSentIntentBindings(ctx context.Context, limit int) (int, error) {
+	if s == nil || s.database == nil {
+		return 0, errors.New("moviepilot bridge database is required")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	now := s.nowUTC()
+	var rows []model.MoviePilotBridgeOutbox
+	if err := s.database.WithContext(ctx).
+		Where("status = ? AND available_at <= ? AND updated_at <= ?", "sent", now, now.Add(-moviePilotOrphanReconcileMinAge)).
+		Order("updated_at ASC, id ASC").Limit(limit).Find(&rows).Error; err != nil {
+		return 0, err
+	}
+	processed := 0
+	var firstErr error
+	for i := range rows {
+		row := &rows[i]
+		var intent model.MoviePilotDownloadIntent
+		if err := s.database.WithContext(ctx).Where("bridge_instance_id = ? AND request_id = ?", row.BridgeID, row.RequestID).First(&intent).Error; err != nil {
+			if updateErr := s.deferSentIntentReconcile(ctx, row.ID, now, moviePilotOrphanReconcileAfter, err); updateErr != nil {
+				return processed, updateErr
+			}
+			continue
+		}
+		var bindingCount int64
+		if err := s.database.WithContext(ctx).Model(&model.MoviePilotTorrentBinding{}).Where("intent_id = ?", intent.ID).Count(&bindingCount).Error; err != nil {
+			return processed, err
+		}
+		if bindingCount > 0 || intent.Status == model.MoviePilotIntentStatusFailed || intent.Status == model.MoviePilotIntentStatusCancelled {
+			continue
+		}
+		var bridge model.MoviePilotBridgeInstance
+		if err := s.database.WithContext(ctx).First(&bridge, "id = ? AND enabled = ?", row.BridgeID, true).Error; err != nil {
+			if updateErr := s.deferSentIntentReconcile(ctx, row.ID, now, moviePilotOrphanReconcileAfter, err); updateErr != nil {
+				return processed, updateErr
+			}
+			continue
+		}
+		client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
+		reconcileErr := client.ReconcileIntent(ctx, bridge, intent.RequestID)
+		processed++
+		if reconcileErr != nil {
+			if firstErr == nil {
+				firstErr = reconcileErr
+			}
+			if updateErr := s.deferSentIntentReconcile(ctx, row.ID, now, moviePilotOrphanReconcileRetry, reconcileErr); updateErr != nil {
+				return processed, updateErr
+			}
+			continue
+		}
+		if err := s.deferSentIntentReconcile(ctx, row.ID, now, moviePilotOrphanReconcileAfter, nil); err != nil {
+			return processed, err
+		}
+	}
+	return processed, firstErr
+}
+
+func (s *Service) deferSentIntentReconcile(ctx context.Context, outboxID string, now time.Time, delay time.Duration, reconcileErr error) error {
+	lastError := ""
+	if reconcileErr != nil {
+		lastError = reconcileErr.Error()
+	}
+	return s.database.WithContext(ctx).Model(&model.MoviePilotBridgeOutbox{}).Where("id = ? AND status = ?", outboxID, "sent").Updates(map[string]any{
+		"available_at": now.Add(delay), "last_error": lastError, "updated_at": now,
+	}).Error
 }
 
 func NewService(database *gorm.DB, resolve SecretResolver, httpClient HTTPDoer) *Service {
