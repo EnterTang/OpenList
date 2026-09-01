@@ -158,11 +158,13 @@ moviepilot_routes:
 
 staging:
   root: /mnt/staging/openlist
-  max_file_bytes: 161061273600
+  staging_max_file_size_gb: 150
   max_upload_concurrency: 2
-  safety_reserve_bytes: 85899345920
-  pause_download_low_watermark_bytes: 408021893120
-  resume_download_high_watermark_bytes: 461708984320
+  staging_safety_reserve_gb: 80
+  staging_pause_download_watermark_gb: 380
+  staging_resume_download_watermark_gb: 430
+  download_disk_pause_watermark_gb: 20
+  download_disk_resume_watermark_gb: 40
   extension_whitelist: [.mkv, .mp4, .iso]
   antihash_enabled: true
   iso_rename_enabled: true
@@ -209,7 +211,7 @@ staging admission 按下式计算：
 free_bytes - active_staging_bytes - candidate_size - safety_reserve >= 0
 ```
 
-单文件超过 150 GiB 直接拒绝并标记 `staging_file_too_large`。并发为 2 时，运维容量必须能承受两个最大文件加安全余量。低水位暂停未完成的受管下载，高水位后才恢复，避免频繁抖动。
+容量配置统一使用 GB（1 GB = 1024^3 bytes）。单文件超过 150 GB 直接拒绝并标记 `staging_file_too_large`。并发为 2 时，运维容量必须能承受两个最大文件加安全余量。低水位暂停未完成的受管下载，高水位后才恢复，避免频繁抖动。
 
 ## 保种与清理
 
@@ -255,7 +257,7 @@ MoviePilot 的 `hit_and_run` 只作为“可能存在站点规则”的提示。
 | downloader 无 Worker 路由 | `waiting_worker`，不创建跨节点搬运任务 |
 | qB hash 不存在或路径越界 | 标记绑定异常，停止自动清理并告警 |
 | staging 空间不足 | 暂停未完成受管下载，等待高水位恢复 |
-| 单个文件超 150 GiB | 失败且不触碰 qB 原文件 |
+| 单个文件超 150 GB | 失败且不触碰 qB 原文件 |
 | 上传完成但 Coordinator 未确认 manifest | outbox 重试；不删除 staging 和 qB 数据 |
 | 文件子任务部分失败 | 父 torrent 保持保种/待处理，不自动删除 |
 | H&R 规则未知 | 不自动删除，进入人工处理 |
@@ -268,7 +270,7 @@ MoviePilot 的 `hit_and_run` 只作为“可能存在站点规则”的提示。
 - qB：按 hash 查询、容器路径映射、单文件和多文件 torrent、暂停/恢复/删除。
 - 多集：一个种子多个剧集文件分别产生搬运进度与 ETF manifest；任一必需子任务失败时不删除 torrent。
 - 上传：验证 qB 原文件未变；staging 上传后 AntiHash/ISO Rename 的最终 manifest 用于 ETF。
-- 容量：两个并发上传、150 GiB 上限、低/高水位滞回与恢复。
+- 容量：两个并发上传、150 GB 上限、低/高水位滞回与恢复。
 - 保种：时间、分享率、H&R、人工延长、永久保种及 Worker 离线行为。
 - 回归：现有分享来源订阅、普通 qB 离线下载、139 ETF 与集群上传路径保持可用。
 

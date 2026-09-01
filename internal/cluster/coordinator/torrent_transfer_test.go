@@ -47,7 +47,7 @@ func openTorrentTransferTestDB(t *testing.T) *gorm.DB {
 	}
 	if err := database.AutoMigrate(
 		&model.Subscription{}, &model.SubscriptionItem{}, &model.MoviePilotBridgeInstance{},
-		&model.MoviePilotDownloadIntent{}, &model.MoviePilotTorrentBinding{}, &model.MoviePilotDeliveryFile{},
+		&model.MoviePilotDownloadIntent{}, &model.MoviePilotDownloaderReservation{}, &model.MoviePilotTorrentBinding{}, &model.MoviePilotDeliveryFile{},
 		&model.ClusterNode{}, &model.ClusterNodeSession{}, &model.ClusterNodeInventory{}, &model.ClusterJob{}, &model.ClusterJobAttempt{}, &model.ClusterJobStage{},
 	); err != nil {
 		t.Fatal(err)

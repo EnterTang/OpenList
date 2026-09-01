@@ -326,17 +326,46 @@ func buildNodeConfigApply(ctx context.Context, nodeID string, state model.Cluste
 	if err != nil {
 		return protocol.ConfigApply{}, err
 	}
+	configJSON := state.ConfigJSON
 	if !strings.EqualFold(hash, state.DesiredHash) {
-		return protocol.ConfigApply{}, errors.New("stored Worker desired configuration hash mismatch")
+		if !hasLegacyStagingCapacityFields(state.ConfigJSON) {
+			return protocol.ConfigApply{}, errors.New("stored Worker desired configuration hash mismatch")
+		}
+		canonical, marshalErr := json.Marshal(desired)
+		if marshalErr != nil {
+			return protocol.ConfigApply{}, fmt.Errorf("encode migrated desired worker config: %w", marshalErr)
+		}
+		configJSON = string(canonical)
+		if err := db.GetDb().WithContext(ctx).Model(&model.ClusterNodeDesiredConfig{}).Where("node_id = ? AND revision = ?", state.NodeID, state.Revision).Updates(map[string]any{
+			"updated_at": time.Now().UTC(), "desired_hash": hash, "config_json": configJSON,
+		}).Error; err != nil {
+			return protocol.ConfigApply{}, fmt.Errorf("persist migrated desired worker config: %w", err)
+		}
 	}
 	apply := protocol.ConfigApply{
-		Revision: state.Revision, DesiredHash: state.DesiredHash,
-		ConfigJSON: state.ConfigJSON, DesiredConfig: &desired,
+		Revision: state.Revision, DesiredHash: hash,
+		ConfigJSON: configJSON, DesiredConfig: &desired,
 	}
 	if err := sealNodeConfigQBSecrets(ctx, nodeID, &apply, desired); err != nil {
 		return protocol.ConfigApply{}, err
 	}
 	return apply, nil
+}
+
+func hasLegacyStagingCapacityFields(raw string) bool {
+	var payload struct {
+		Staging map[string]json.RawMessage `json:"staging"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return false
+	}
+	for key := range payload.Staging {
+		switch key {
+		case "max_file_bytes", "safety_reserve_bytes", "pause_download_low_watermark_bytes", "resume_download_high_watermark_bytes", "download_disk_low_watermark_gb", "download_disk_high_watermark_gb":
+			return true
+		}
+	}
+	return false
 }
 
 func sealNodeConfigQBSecrets(ctx context.Context, nodeID string, apply *protocol.ConfigApply, desired protocol.WorkerDesiredConfig) error {

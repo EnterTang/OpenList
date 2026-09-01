@@ -71,6 +71,43 @@ func TestCreateIntentTxRepairsMissingSubscriptionItemAssociation(t *testing.T) {
 	}
 }
 
+func TestCreateIntentTxRefreshesSchedulingProjectionOnRetry(t *testing.T) {
+	database, err := gorm.Open(sqlite.Open("file:moviepilot_intent_schedule_retry_test?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AutoMigrate(&model.MoviePilotDownloadIntent{}); err != nil {
+		t.Fatal(err)
+	}
+	first := &model.MoviePilotDownloadIntent{
+		ID: "intent-schedule", RequestID: "request-schedule", BridgeInstanceID: "mp-main",
+		SubscriptionID: 1, MediaSource: "tmdb", MediaID: "123", ResourceRef: "resource-a",
+		TorrentFingerprint: "fingerprint-a", RetentionPolicyJSON: "{}",
+		DownloaderPolicyJSON: `{"mode":"coordinator_select"}`, DownloaderPolicyMode: "coordinator_select",
+		SelectedDownloader: "qb-a", SelectedRouteID: "route-a", ReservationID: "reservation-a",
+		Status: model.MoviePilotIntentStatusWaitingCapacity,
+	}
+	if err := CreateIntentTx(context.Background(), database, first); err != nil {
+		t.Fatal(err)
+	}
+	retry := *first
+	retry.ID = "intent-schedule-retry"
+	retry.DownloaderPolicyJSON = `{"mode":"moviepilot_select"}`
+	retry.DownloaderPolicyMode = "moviepilot_select"
+	retry.SelectedDownloader, retry.SelectedRouteID, retry.ReservationID = "", "", ""
+	retry.Status = model.MoviePilotIntentStatusPending
+	if err := CreateIntentTx(context.Background(), database, &retry); err != nil {
+		t.Fatalf("refresh scheduling projection: %v", err)
+	}
+	var stored model.MoviePilotDownloadIntent
+	if err := database.First(&stored, "request_id = ?", first.RequestID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != model.MoviePilotIntentStatusPending || stored.DownloaderPolicyMode != "moviepilot_select" || stored.SelectedDownloader != "" || stored.SelectedRouteID != "" || stored.ReservationID != "" {
+		t.Fatalf("stale scheduling projection = %#v", stored)
+	}
+}
+
 func TestMoviePilotBridgeOutboxEnforcesOneRowPerBridgeRequest(t *testing.T) {
 	database, err := gorm.Open(sqlite.Open("file:moviepilot_outbox_unique_test?mode=memory&cache=shared"), &gorm.Config{})
 	if err != nil {

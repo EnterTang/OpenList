@@ -89,19 +89,25 @@ type NodeCapabilities struct {
 // for a qB client. It deliberately contains no URL, credential reference, or
 // worker-local filesystem path.
 type MoviePilotRouteInventory struct {
-	BridgeInstanceID          string `json:"bridge_instance_id"`
-	Downloader                string `json:"downloader"`
-	QBClientID                string `json:"qb_client_id"`
-	StagingRootLabel          string `json:"staging_root_label,omitempty"`
-	StagingFreeBytes          int64  `json:"staging_free_bytes,omitempty"`
-	ActiveStagingBytes        int64  `json:"active_staging_bytes,omitempty"`
-	ActiveUploadSlots         int    `json:"active_upload_slots"`
-	UploadConcurrency         int    `json:"upload_concurrency"`
-	DownloadRootLabel         string `json:"download_root_label,omitempty"`
-	DownloadFreeBytes         int64  `json:"download_free_bytes,omitempty"`
-	DownloadLowWatermarkBytes int64  `json:"download_low_watermark_bytes,omitempty"`
-	DownloadCapacityKnown     bool   `json:"download_capacity_known"`
-	QBHealth                  string `json:"qb_health"`
+	BridgeInstanceID           string `json:"bridge_instance_id"`
+	Downloader                 string `json:"downloader"`
+	QBClientID                 string `json:"qb_client_id"`
+	StagingRootLabel           string `json:"staging_root_label,omitempty"`
+	StagingFreeBytes           int64  `json:"staging_free_bytes,omitempty"`
+	ActiveStagingBytes         int64  `json:"active_staging_bytes,omitempty"`
+	ActiveUploadSlots          int    `json:"active_upload_slots"`
+	UploadConcurrency          int    `json:"upload_concurrency"`
+	DownloadRootLabel          string `json:"download_root_label,omitempty"`
+	DownloadFreeBytes          int64  `json:"download_free_bytes,omitempty"`
+	DownloadLowWatermarkBytes  int64  `json:"download_low_watermark_bytes,omitempty"`
+	DownloadCapacityKnown      bool   `json:"download_capacity_known"`
+	DownloadSafetyReserveBytes int64  `json:"download_safety_reserve_bytes,omitempty"`
+	DownloadConcurrency        int    `json:"download_concurrency,omitempty"`
+	DownloadActiveCount        int    `json:"download_active_count,omitempty"`
+	DownloadRemainingBytes     int64  `json:"download_remaining_bytes,omitempty"`
+	DownloadRateBytesPerSecond int64  `json:"download_rate_bytes_per_second,omitempty"`
+	DownloadLoadKnown          bool   `json:"download_load_known"`
+	QBHealth                   string `json:"qb_health"`
 }
 
 type MountInventory struct {
@@ -313,15 +319,18 @@ type TaskContext struct {
 // owns the local files. A torrent cannot be redispatched to another Worker
 // because the qB state and content path are local to this binding.
 type TorrentTaskContext struct {
-	BindingID        string `json:"binding_id"`
-	WorkerNodeID     string `json:"worker_node_id"`
-	BridgeInstanceID string `json:"bridge_instance_id"`
-	Downloader       string `json:"downloader"`
-	QBClientID       string `json:"qb_client_id"`
-	TorrentHash      string `json:"torrent_hash"`
-	RelativePath     string `json:"relative_path"`
-	ContentPath      string `json:"content_path,omitempty"`
-	Action           string `json:"action,omitempty"`
+	BindingID            string `json:"binding_id"`
+	WorkerNodeID         string `json:"worker_node_id"`
+	BridgeInstanceID     string `json:"bridge_instance_id"`
+	Downloader           string `json:"downloader"`
+	QBClientID           string `json:"qb_client_id"`
+	TorrentHash          string `json:"torrent_hash"`
+	RelativePath         string `json:"relative_path"`
+	ContentPath          string `json:"content_path,omitempty"`
+	Action               string `json:"action,omitempty"`
+	DownloaderPolicyMode string `json:"downloader_policy_mode,omitempty"`
+	SelectedRouteID      string `json:"selected_route_id,omitempty"`
+	ReservationID        string `json:"reservation_id,omitempty"`
 	// Manual marks a completed torrent that an administrator selected directly
 	// from a Worker's qB client. It has no MoviePilot Bridge callback, but is
 	// still pinned to the Worker and qB client that own the source files.

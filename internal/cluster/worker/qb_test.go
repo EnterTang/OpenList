@@ -457,13 +457,13 @@ func TestReconcileMoviePilotStagingCapacityUsesLowHighWatermarks(t *testing.T) {
 		QBClients:        []protocol.QBClientConfig{{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
 		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
 		Staging: protocol.StagingConfig{
-			Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 100, ResumeDownloadHighWatermarkBytes: 200,
+			Root: "/srv/staging", StagingPauseDownloadWatermarkGB: 100, StagingResumeDownloadWatermarkGB: 200,
 		},
 	}
 	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
 	torrent := protocol.TorrentTaskContext{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a", TorrentHash: hash}
 	service.moviePilotTorrents[moviePilotTorrentRegistryKey(&torrent)] = moviePilotTorrentRegistryEntry{Torrent: torrent}
-	free := uint64(100)
+	free := uint64(100) * uint64(bytesPerGB)
 	service.stagingFreeSpace = func(context.Context, string) (uint64, error) { return free, nil }
 
 	service.ReconcileMoviePilotStagingCapacity(context.Background())
@@ -475,7 +475,7 @@ func TestReconcileMoviePilotStagingCapacityUsesLowHighWatermarks(t *testing.T) {
 		t.Fatalf("registry entry = %#v, want capacity pause", entry)
 	}
 
-	free = 200
+	free = uint64(200) * uint64(bytesPerGB)
 	service.ReconcileMoviePilotStagingCapacity(context.Background())
 	if len(client.started) != 1 || client.started[0] != hash {
 		t.Fatalf("start calls = %#v", client.started)
@@ -496,7 +496,7 @@ func TestReconcileQBDiskCapacityPausesAndResumesOnlyIncompleteDownloads(t *testi
 	service := New(nil, nil)
 	service.desiredConfig = protocol.WorkerDesiredConfig{
 		QBClients: []protocol.QBClientConfig{{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
-		Staging:   protocol.StagingConfig{DownloadDiskLowWatermarkGB: 1, DownloadDiskHighWatermarkGB: 2},
+		Staging:   protocol.StagingConfig{DownloadDiskPauseWatermarkGB: 1, DownloadDiskResumeWatermarkGB: 2},
 	}
 	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
 	free := uint64(1) * 1024 * 1024 * 1024
@@ -537,10 +537,10 @@ func TestReconnectDoesNotBypassMoviePilotCapacityPause(t *testing.T) {
 	service.desiredConfig = protocol.WorkerDesiredConfig{
 		QBClients:        []protocol.QBClientConfig{{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
 		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
-		Staging:          protocol.StagingConfig{Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 100, ResumeDownloadHighWatermarkBytes: 200},
+		Staging:          protocol.StagingConfig{Root: "/srv/staging", StagingPauseDownloadWatermarkGB: 100, StagingResumeDownloadWatermarkGB: 200},
 	}
 	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
-	service.stagingFreeSpace = func(context.Context, string) (uint64, error) { return 150, nil }
+	service.stagingFreeSpace = func(context.Context, string) (uint64, error) { return 150 * uint64(bytesPerGB), nil }
 	torrent := protocol.TorrentTaskContext{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a", TorrentHash: hash}
 	service.moviePilotTorrents[moviePilotTorrentRegistryKey(&torrent)] = moviePilotTorrentRegistryEntry{Torrent: torrent, PausedByDisconnect: true, PausedByCapacity: true}
 

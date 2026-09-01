@@ -58,6 +58,22 @@ func TestGetAdminConfigExposesEnrollmentTokenOnly(t *testing.T) {
 	}
 }
 
+func TestValidateAdminConfigAcceptsMoviePilotDownloaderPolicyModes(t *testing.T) {
+	cfg := conf.DefaultConfig(t.TempDir()).Cluster
+	cfg.Role = string(RoleCoordinator)
+	cfg.EnrollmentToken = "enrollment-secret"
+	for _, mode := range []string{"moviepilot_select", "coordinator_preferred", "coordinator_select"} {
+		cfg.MoviePilotDownloaderPolicyMode = mode
+		if err := validateAdminConfig(cfg); err != nil {
+			t.Fatalf("policy mode %q rejected: %v", mode, err)
+		}
+	}
+	cfg.MoviePilotDownloaderPolicyMode = "unsupported"
+	if err := validateAdminConfig(cfg); err == nil {
+		t.Fatal("unsupported MoviePilot downloader policy mode was accepted")
+	}
+}
+
 func TestPublicAdminConfigShowsPersistentWorkerKeyPath(t *testing.T) {
 	cfg := conf.DefaultConfig(t.TempDir()).Cluster
 	cfg.Role = string(RoleWorker)

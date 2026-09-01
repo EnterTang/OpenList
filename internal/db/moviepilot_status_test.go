@@ -18,6 +18,7 @@ func TestListMoviePilotTaskStatusesIncludesUnboundAndDeliveryProgress(t *testing
 	}
 	if err := database.AutoMigrate(
 		&model.Subscription{}, &model.SubscriptionItem{}, &model.MoviePilotDownloadIntent{},
+		&model.MoviePilotDownloaderReservation{},
 		&model.MoviePilotTorrentBinding{}, &model.MoviePilotDeliveryFile{}, &model.ClusterJob{},
 		&model.ClusterJobStage{}, &model.ClusterNode{},
 	); err != nil {
@@ -39,6 +40,7 @@ func TestListMoviePilotTaskStatusesIncludesUnboundAndDeliveryProgress(t *testing
 	boundIntent := model.MoviePilotDownloadIntent{
 		ID: "intent-bound", RequestID: "request-bound", BridgeInstanceID: "mp-main",
 		SubscriptionID: subscription.ID, SubscriptionItemID: item.ID, Status: model.MoviePilotIntentStatusBound,
+		DownloaderPolicyMode: "coordinator_select", SelectedRouteID: "route-bound", ReservationID: "reservation-bound",
 		UpdatedAt: now,
 	}
 	unboundIntent := model.MoviePilotDownloadIntent{
@@ -50,6 +52,14 @@ func TestListMoviePilotTaskStatusesIncludesUnboundAndDeliveryProgress(t *testing
 		t.Fatal(err)
 	}
 	if err := database.Create(&unboundIntent).Error; err != nil {
+		t.Fatal(err)
+	}
+	reservation := model.MoviePilotDownloaderReservation{
+		ID: "reservation-bound", RequestID: boundIntent.RequestID, BridgeInstanceID: "mp-main", PolicyMode: "coordinator_select",
+		RouteID: "route-bound", WorkerNodeID: "worker-1", Downloader: "qb-main", QBClientID: "qb-main",
+		Status: model.MoviePilotReservationStatusBound, ExpiresAt: now.Add(time.Hour), BoundAt: &now,
+	}
+	if err := database.Create(&reservation).Error; err != nil {
 		t.Fatal(err)
 	}
 	binding := model.MoviePilotTorrentBinding{
@@ -97,6 +107,9 @@ func TestListMoviePilotTaskStatusesIncludesUnboundAndDeliveryProgress(t *testing
 	if statuses[0].SubscriptionName != subscription.Name || statuses[0].WorkerStatus != model.ClusterNodeStatusOnline || statuses[0].UploadProgress != .75 {
 		t.Fatalf("bound metadata/progress = %#v", statuses[0])
 	}
+	if statuses[0].DownloaderPolicyMode != "coordinator_select" || statuses[0].SelectedRouteID != "route-bound" || statuses[0].ReservationStatus != model.MoviePilotReservationStatusBound || statuses[0].WorkerNodeID != "worker-1" || statuses[0].Downloader != "qb-main" {
+		t.Fatalf("bound scheduling metadata = %#v", statuses[0])
+	}
 	if statuses[1].RequestID != unboundIntent.RequestID || statuses[1].Phase != "waiting_binding" {
 		t.Fatalf("unbound status = %#v", statuses[1])
 	}
@@ -116,6 +129,7 @@ func TestMoviePilotTaskPhaseUsesSemanticLifecycleStages(t *testing.T) {
 		{name: "uploading", status: model.MoviePilotTaskStatus{ClusterJobStage: model.ClusterStageUploadingMobile, ClusterJobStatus: model.ClusterJobStatusRunning}, hasBinding: true, want: model.MoviePilotTaskPhaseUploading},
 		{name: "delivery staging", status: model.MoviePilotTaskStatus{}, deliveries: []model.MoviePilotDeliveryFile{{Status: model.MoviePilotDeliveryStatusStaging}}, hasBinding: true, want: model.MoviePilotTaskPhaseStaging},
 		{name: "delivery uploading", status: model.MoviePilotTaskStatus{}, deliveries: []model.MoviePilotDeliveryFile{{Status: model.MoviePilotDeliveryStatusUploading}}, hasBinding: true, want: model.MoviePilotTaskPhaseUploading},
+		{name: "waiting capacity keeps its phase", status: model.MoviePilotTaskStatus{IntentStatus: model.MoviePilotIntentStatusWaitingCapacity, Error: "no route"}, want: model.MoviePilotTaskPhaseWaitingCapacity},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

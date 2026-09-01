@@ -120,7 +120,11 @@ func Init(e *gin.Engine) {
 	moviePilotBridge := newMoviePilotBridgeService()
 	subscription.SetMoviePilotBridgeClient(moviePilotBridge)
 	if service := cluster.CoordinatorService(); service != nil {
+		service.SetMoviePilotDownloaderPolicyMode(conf.Conf.Cluster.MoviePilotDownloaderPolicyMode)
+		subscription.SetMoviePilotDownloaderPolicyScheduler(service)
 		service.SetMoviePilotTorrentController(moviePilotBridge)
+	} else {
+		subscription.SetMoviePilotDownloaderPolicyScheduler(nil)
 	}
 	moviePilotBridge.SetEventHandler(func(ctx context.Context, bridgeID string, event moviepilotbridge.BridgeEvent) error {
 		service := cluster.CoordinatorService()

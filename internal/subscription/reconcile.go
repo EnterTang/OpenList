@@ -438,7 +438,7 @@ func classifySubscriptionFailure(errorCode, message string) string {
 	code := strings.ToLower(strings.TrimSpace(errorCode))
 	normalizedMessage := strings.ToLower(strings.TrimSpace(message))
 	switch code {
-	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_unexpected_eof", "source_range_failed", "source_link_expired", "network_timeout", "timeout", "rate_limited", "worker_capacity_unavailable", "worker_cleanup_backlog", "worker_journal_unavailable", "worker_start_timeout", "worker_lease_expired", "lease_expired":
+	case "share_save_retryable", "share_save_rate_limited", "share_save_transient", "share_save_gateway_response", "source_unexpected_eof", "source_range_failed", "source_link_expired", "network_timeout", "timeout", "rate_limited", "worker_capacity_unavailable", "downloader_capacity_unavailable", "worker_cleanup_backlog", "worker_journal_unavailable", "worker_start_timeout", "worker_lease_expired", "lease_expired":
 		return model.SubscriptionItemStatusRetryWait
 	case "share_save_result_unknown", "result_unknown", "request_result_unknown", "operation_result_unknown":
 		return model.SubscriptionItemStatusUnknown

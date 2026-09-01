@@ -96,26 +96,49 @@ func TestWorkerDesiredConfigAcceptsWindowsWorkerPaths(t *testing.T) {
 func TestWorkerDesiredConfigValidatesMoviePilotStagingWatermarks(t *testing.T) {
 	base := WorkerDesiredConfig{Staging: StagingConfig{Root: "/srv/staging"}}
 	for _, staging := range []StagingConfig{
-		{Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 100},
-		{Root: "/srv/staging", ResumeDownloadHighWatermarkBytes: 200},
-		{Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 200, ResumeDownloadHighWatermarkBytes: 100},
-		{Root: "/srv/staging", DownloadDiskLowWatermarkGB: 2, DownloadDiskHighWatermarkGB: 2},
-		{Root: "/srv/staging", SafetyReserveBytes: -1},
+		{Root: "/srv/staging", StagingPauseDownloadWatermarkGB: 100},
+		{Root: "/srv/staging", StagingResumeDownloadWatermarkGB: 200},
+		{Root: "/srv/staging", StagingPauseDownloadWatermarkGB: 200, StagingResumeDownloadWatermarkGB: 100},
+		{Root: "/srv/staging", DownloadDiskPauseWatermarkGB: 2, DownloadDiskResumeWatermarkGB: 2},
+		{Root: "/srv/staging", StagingSafetyReserveGB: -1},
 	} {
 		base.Staging = staging
 		require.Error(t, base.Validate(), "staging=%+v", staging)
 	}
-	base.Staging = StagingConfig{Root: "/srv/staging", SafetyReserveBytes: 50, PauseDownloadLowWatermarkBytes: 100, ResumeDownloadHighWatermarkBytes: 200}
+	base.Staging = StagingConfig{Root: "/srv/staging", StagingSafetyReserveGB: 50, StagingPauseDownloadWatermarkGB: 100, StagingResumeDownloadWatermarkGB: 200}
 	require.NoError(t, base.Validate())
 }
 
 func TestWorkerDesiredConfigAcceptsDownloadDiskWatermarksInGB(t *testing.T) {
-	config := WorkerDesiredConfig{Staging: StagingConfig{DownloadDiskLowWatermarkGB: 20, DownloadDiskHighWatermarkGB: 40}}
+	config := WorkerDesiredConfig{Staging: StagingConfig{DownloadDiskPauseWatermarkGB: 20, DownloadDiskResumeWatermarkGB: 40}}
 	if err := config.Validate(); err != nil {
 		t.Fatalf("valid download disk watermarks rejected: %v", err)
 	}
-	config.Staging.DownloadDiskHighWatermarkGB = 20
+	config.Staging.DownloadDiskResumeWatermarkGB = 20
 	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "high watermark") {
 		t.Fatalf("invalid download disk watermarks error = %v", err)
 	}
+}
+
+func TestStagingConfigMigratesLegacyByteFieldsToGB(t *testing.T) {
+	var config StagingConfig
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"max_file_bytes": 161061273600,
+		"safety_reserve_bytes": 85899345920,
+		"pause_download_low_watermark_bytes": 408021893120,
+		"resume_download_high_watermark_bytes": 461708984320,
+		"download_disk_low_watermark_gb": 20,
+		"download_disk_high_watermark_gb": 40
+	}`), &config))
+	require.Equal(t, int64(150), config.StagingMaxFileSizeGB)
+	require.Equal(t, int64(80), config.StagingSafetyReserveGB)
+	require.Equal(t, int64(380), config.StagingPauseDownloadWatermarkGB)
+	require.Equal(t, int64(430), config.StagingResumeDownloadWatermarkGB)
+	require.Equal(t, int64(20), config.DownloadDiskPauseWatermarkGB)
+	require.Equal(t, int64(40), config.DownloadDiskResumeWatermarkGB)
+
+	raw, err := json.Marshal(config)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "_bytes")
+	require.Contains(t, string(raw), "staging_safety_reserve_gb")
 }

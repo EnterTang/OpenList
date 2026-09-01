@@ -46,6 +46,40 @@ func CreateIntentTx(ctx context.Context, database *gorm.DB, intent *model.MovieP
 				}
 				existing.SubscriptionItemID = intent.SubscriptionItemID
 			}
+			// Scheduling metadata is deliberately mutable while an intent is
+			// waiting for capacity or being retried. Once a torrent is bound,
+			// the binding remains authoritative and a late retry cannot move it.
+			if existing.Status != model.MoviePilotIntentStatusBound && existing.Status != model.MoviePilotIntentStatusCompleted && existing.Status != model.MoviePilotIntentStatusCancelled {
+				updates := map[string]any{}
+				if strings.TrimSpace(intent.DownloaderPolicyJSON) != "" {
+					// The policy JSON is the complete scheduling projection. Clear
+					// old route/reservation fields when preferred mode falls back to
+					// MoviePilot selection on a later retry.
+					updates["downloader_policy_json"] = intent.DownloaderPolicyJSON
+					updates["downloader_policy_mode"] = intent.DownloaderPolicyMode
+					updates["selected_downloader"] = intent.SelectedDownloader
+					updates["selected_route_id"] = intent.SelectedRouteID
+					updates["selected_worker_node_id"] = intent.SelectedWorkerNodeID
+					updates["selected_qb_client_id"] = intent.SelectedQBClientID
+					updates["reservation_id"] = intent.ReservationID
+					updates["reservation_expires_at"] = intent.ReservationExpiresAt
+				}
+				if intent.Status != "" && (intent.Status != model.MoviePilotIntentStatusPending || existing.Status == model.MoviePilotIntentStatusWaitingCapacity || existing.Status == model.MoviePilotIntentStatusFailed) {
+					updates["status"] = intent.Status
+				}
+				if intent.LastErrorCode != "" || intent.LastError != "" {
+					updates["last_error_code"] = intent.LastErrorCode
+					updates["last_error"] = intent.LastError
+				}
+				if len(updates) > 0 {
+					if err := tx.Model(&existing).Updates(updates).Error; err != nil {
+						return err
+					}
+					if err := tx.First(&existing, "id = ?", existing.ID).Error; err != nil {
+						return err
+					}
+				}
+			}
 			intent.ID = existing.ID
 			*intent = existing
 			return nil

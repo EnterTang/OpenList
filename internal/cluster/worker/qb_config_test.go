@@ -8,6 +8,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster/protocol"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/qbittorrent"
 )
 
 func TestResolveQBPathUsesLongestPrefix(t *testing.T) {
@@ -114,12 +115,43 @@ func TestMoviePilotRouteInventoryReportsDownloadDiskCapacity(t *testing.T) {
 	service.desiredConfig = protocol.WorkerDesiredConfig{
 		QBClients:        []protocol.QBClientConfig{{ID: "qb-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
 		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
-		Staging:          protocol.StagingConfig{DownloadDiskLowWatermarkGB: 10, DownloadDiskHighWatermarkGB: 20},
+		Staging:          protocol.StagingConfig{DownloadDiskPauseWatermarkGB: 10, DownloadDiskResumeWatermarkGB: 20},
 	}
 	service.downloadFreeSpace = func(context.Context, string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
 
 	routes := service.moviePilotRouteInventory()
 	if len(routes) != 1 || !routes[0].DownloadCapacityKnown || routes[0].DownloadFreeBytes != 30*1024*1024*1024 || routes[0].DownloadLowWatermarkBytes != 10*1024*1024*1024 {
 		t.Fatalf("download capacity route inventory = %#v", routes)
+	}
+}
+
+func TestMoviePilotRouteInventoryReportsQBDownloadLoad(t *testing.T) {
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		DownloadConcurrency: 3,
+		QBClients: []protocol.QBClientConfig{{
+			ID:           "qb-a",
+			PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+		}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{
+			BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a",
+		}},
+	}
+	service.downloadFreeSpace = func(context.Context, string) (uint64, error) { return 50 << 30, nil }
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) {
+		return &fakeQBClient{torrents: []qbittorrent.TorrentInfo{
+			{Progress: 0.25, AmountLeft: 750, Size: 1000, Dlspeed: 100, State: qbittorrent.DOWNLOADING},
+			{Progress: 0.5, AmountLeft: 500, Size: 1000, Dlspeed: 200, State: qbittorrent.PAUSEDDL},
+			{Progress: 1, AmountLeft: 0, Size: 1000, State: qbittorrent.UPLOADING},
+		}}, nil
+	}
+
+	routes := service.moviePilotRouteInventory()
+	if len(routes) != 1 {
+		t.Fatalf("routes = %#v", routes)
+	}
+	route := routes[0]
+	if !route.DownloadLoadKnown || route.DownloadActiveCount != 1 || route.DownloadRemainingBytes != 750 || route.DownloadRateBytesPerSecond != 100 || route.DownloadConcurrency != 3 {
+		t.Fatalf("download telemetry = %#v", route)
 	}
 }

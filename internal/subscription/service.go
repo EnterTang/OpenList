@@ -15,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/moviepilotbridge"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/pkg/errors"
 )
@@ -224,7 +225,13 @@ func run(ctx context.Context, subscriptionID uint, transfer, clusterDispatch boo
 			runErr = durableItemsErr
 		}
 	}
-	if runErr != nil && clusterDispatch && durableStatus == model.SubscriptionStatusRunning && errors.Is(runErr, ErrClusterWorkerUnavailable) {
+	if runErr != nil && clusterDispatch && errors.Is(runErr, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
+		// Download admission is a recoverable backpressure signal. Keep the
+		// subscription running while its item waits for the next retry window.
+		run.Status = model.SubscriptionStatusRunning
+		sub.LastStatus = model.SubscriptionStatusRunning
+		sub.LastError = runErr.Error()
+	} else if runErr != nil && clusterDispatch && durableStatus == model.SubscriptionStatusRunning && errors.Is(runErr, ErrClusterWorkerUnavailable) {
 		// No compatible worker is a recoverable scheduling condition. Keep the
 		// item pending and let the scheduler retry when worker capability returns.
 		run.Status = model.SubscriptionStatusRunning

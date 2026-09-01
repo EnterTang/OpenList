@@ -275,7 +275,7 @@ func (s *Service) reserveMoviePilotStaging(ctx context.Context, stagingRoot stri
 	}
 	usage := s.stagingFreeSpace
 	s.mu.Lock()
-	safetyReserve := s.desiredConfig.Staging.SafetyReserveBytes
+	safetyReserve := stagingSafetyReserveBytes(s.desiredConfig.Staging)
 	s.mu.Unlock()
 	if usage == nil {
 		usage = func(ctx context.Context, root string) (uint64, error) {
@@ -1288,7 +1288,8 @@ func (s *Service) ReconcileMoviePilotStagingCapacity(ctx context.Context) {
 	}
 	s.mu.Unlock()
 	root := strings.TrimSpace(staging.Root)
-	low, high := staging.PauseDownloadLowWatermarkBytes, staging.ResumeDownloadHighWatermarkBytes
+	low := gigabytesToBytes(staging.StagingPauseDownloadWatermarkGB)
+	high := gigabytesToBytes(staging.StagingResumeDownloadWatermarkGB)
 	if root == "" || low <= 0 || high <= 0 {
 		return
 	}
@@ -1758,7 +1759,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 			WorkerPath: file.WorkerPath, DownloadRoot: file.DownloadRoot, Name: file.Name, Size: file.Size,
 		}, QBStagingAdmission{
 			StagingRoot: stagingTempRoot, DownloadRoot: file.DownloadRoot,
-			MaxFileBytes: stagingConfig.MaxFileBytes, ExtensionWhitelist: stagingConfig.ExtensionWhitelist,
+			MaxFileBytes: stagingMaxFileBytes(stagingConfig), ExtensionWhitelist: stagingConfig.ExtensionWhitelist,
 		})
 		releaseStagingReservation()
 		if err != nil {

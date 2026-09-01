@@ -22,15 +22,18 @@ import (
 )
 
 type Service struct {
-	db                     *gorm.DB
-	enrollmentToken        string
-	heartbeatInterval      time.Duration
-	inspectMu              sync.RWMutex
-	inspectProcessMu       sync.Mutex
-	inspectConsumer        ShareInspectConsumer
-	torrentDispatcher      TorrentJobDispatcher
-	moviePilotControllerMu sync.RWMutex
-	moviePilotController   MoviePilotTorrentController
+	db                      *gorm.DB
+	enrollmentToken         string
+	heartbeatInterval       time.Duration
+	inspectMu               sync.RWMutex
+	inspectProcessMu        sync.Mutex
+	inspectConsumer         ShareInspectConsumer
+	torrentDispatcher       TorrentJobDispatcher
+	moviePilotControllerMu  sync.RWMutex
+	moviePilotController    MoviePilotTorrentController
+	moviePilotPolicyMu      sync.RWMutex
+	moviePilotPolicyMode    string
+	moviePilotReservationMu sync.Mutex
 }
 
 const (
@@ -69,7 +72,39 @@ type ShareInspectConsumer func(context.Context, model.ClusterShareInspectManifes
 var ErrShareInspectObservationIncomplete = errors.New("cluster share inspect observation is incomplete")
 
 func New(database *gorm.DB, enrollmentToken string) *Service {
-	return &Service{db: database, enrollmentToken: strings.TrimSpace(enrollmentToken), heartbeatInterval: defaultHeartbeatInterval}
+	return &Service{db: database, enrollmentToken: strings.TrimSpace(enrollmentToken), heartbeatInterval: defaultHeartbeatInterval, moviePilotPolicyMode: "coordinator_preferred"}
+}
+
+// SetMoviePilotDownloaderPolicyMode controls whether the Coordinator selects
+// a qB route before a Bridge creates a MoviePilot download. The preferred mode
+// falls back to MoviePilot's native selection only when no fresh route can be
+// admitted; strict mode keeps the intent waiting instead.
+func (s *Service) SetMoviePilotDownloaderPolicyMode(mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "moviepilot_select" && mode != "coordinator_preferred" && mode != "coordinator_select" {
+		mode = "coordinator_preferred"
+	}
+	s.moviePilotPolicyMu.Lock()
+	s.moviePilotPolicyMode = mode
+	s.moviePilotPolicyMu.Unlock()
+}
+
+func (s *Service) moviePilotDownloaderPolicyMode() string {
+	s.moviePilotPolicyMu.RLock()
+	defer s.moviePilotPolicyMu.RUnlock()
+	if s.moviePilotPolicyMode == "" {
+		return "coordinator_preferred"
+	}
+	return s.moviePilotPolicyMode
+}
+
+// MoviePilotDownloaderPolicyMode exposes the normalized strategy to the
+// subscription runner without exposing Coordinator internals.
+func (s *Service) MoviePilotDownloaderPolicyMode() string {
+	if s == nil {
+		return "coordinator_preferred"
+	}
+	return s.moviePilotDownloaderPolicyMode()
 }
 
 func (s *Service) SetHeartbeatInterval(interval time.Duration) {

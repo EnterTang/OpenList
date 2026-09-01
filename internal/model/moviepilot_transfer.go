@@ -8,6 +8,7 @@ const (
 	// cluster stages remain available in ClusterJobStage for diagnostics.
 	MoviePilotTaskPhasePending          = "pending"
 	MoviePilotTaskPhaseAccepted         = "accepted"
+	MoviePilotTaskPhaseWaitingCapacity  = "waiting_capacity"
 	MoviePilotTaskPhaseWaitingBinding   = "waiting_binding"
 	MoviePilotTaskPhaseBound            = "bound"
 	MoviePilotTaskPhaseDownloading      = "downloading"
@@ -18,14 +19,15 @@ const (
 	MoviePilotTaskPhaseCompleted        = "completed"
 	MoviePilotTaskPhaseFailed           = "failed"
 
-	MoviePilotIntentStatusPending       = "pending"
-	MoviePilotIntentStatusAccepted      = "accepted"
-	MoviePilotIntentStatusBound         = "bound"
-	MoviePilotIntentStatusWaitingWorker = "waiting_worker"
-	MoviePilotIntentStatusDownloading   = "downloading"
-	MoviePilotIntentStatusCompleted     = "completed"
-	MoviePilotIntentStatusFailed        = "failed"
-	MoviePilotIntentStatusCancelled     = "cancelled"
+	MoviePilotIntentStatusPending         = "pending"
+	MoviePilotIntentStatusWaitingCapacity = "waiting_capacity"
+	MoviePilotIntentStatusAccepted        = "accepted"
+	MoviePilotIntentStatusBound           = "bound"
+	MoviePilotIntentStatusWaitingWorker   = "waiting_worker"
+	MoviePilotIntentStatusDownloading     = "downloading"
+	MoviePilotIntentStatusCompleted       = "completed"
+	MoviePilotIntentStatusFailed          = "failed"
+	MoviePilotIntentStatusCancelled       = "cancelled"
 
 	MoviePilotTorrentStatusBound             = "bound"
 	MoviePilotTorrentStatusDownloading       = "downloading"
@@ -51,6 +53,11 @@ const (
 	MoviePilotRetentionStatusManualReview = "manual_review"
 	MoviePilotRetentionStatusDeleting     = "deleting"
 	MoviePilotRetentionStatusDeleted      = "deleted"
+
+	MoviePilotReservationStatusReserved = "reserved"
+	MoviePilotReservationStatusBound    = "bound"
+	MoviePilotReservationStatusReleased = "released"
+	MoviePilotReservationStatusExpired  = "expired"
 )
 
 type MoviePilotBridgeInstance struct {
@@ -68,25 +75,54 @@ type MoviePilotBridgeInstance struct {
 }
 
 type MoviePilotDownloadIntent struct {
-	ID                  string     `json:"id" gorm:"primaryKey;size:64"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
-	RequestID           string     `json:"request_id" gorm:"size:64;uniqueIndex"`
-	BridgeInstanceID    string     `json:"bridge_instance_id" gorm:"size:64;index"`
-	SubscriptionID      uint       `json:"subscription_id" gorm:"index"`
-	SubscriptionItemID  uint       `json:"subscription_item_id" gorm:"index"`
-	MediaSource         string     `json:"media_source" gorm:"size:64"`
-	MediaID             string     `json:"media_id" gorm:"size:128"`
-	TorrentFingerprint  string     `json:"torrent_fingerprint" gorm:"size:128"`
-	ResourceRef         string     `json:"resource_ref" gorm:"type:text"`
-	RetentionPolicyJSON string     `json:"retention_policy_json" gorm:"type:text"`
-	Status              string     `json:"status" gorm:"size:32;index"`
-	LastEventID         string     `json:"last_event_id" gorm:"size:64;index"`
-	LastErrorCode       string     `json:"last_error_code" gorm:"size:128"`
-	LastError           string     `json:"last_error" gorm:"type:text"`
-	AcceptedAt          *time.Time `json:"accepted_at,omitempty"`
-	BoundAt             *time.Time `json:"bound_at,omitempty"`
-	FinishedAt          *time.Time `json:"finished_at,omitempty"`
+	ID                   string     `json:"id" gorm:"primaryKey;size:64"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
+	RequestID            string     `json:"request_id" gorm:"size:64;uniqueIndex"`
+	BridgeInstanceID     string     `json:"bridge_instance_id" gorm:"size:64;index"`
+	SubscriptionID       uint       `json:"subscription_id" gorm:"index"`
+	SubscriptionItemID   uint       `json:"subscription_item_id" gorm:"index"`
+	MediaSource          string     `json:"media_source" gorm:"size:64"`
+	MediaID              string     `json:"media_id" gorm:"size:128"`
+	TorrentFingerprint   string     `json:"torrent_fingerprint" gorm:"size:128"`
+	ResourceRef          string     `json:"resource_ref" gorm:"type:text"`
+	RetentionPolicyJSON  string     `json:"retention_policy_json" gorm:"type:text"`
+	DownloaderPolicyJSON string     `json:"downloader_policy_json" gorm:"type:text"`
+	DownloaderPolicyMode string     `json:"downloader_policy_mode" gorm:"size:32;index"`
+	SelectedDownloader   string     `json:"selected_downloader" gorm:"size:128;index"`
+	SelectedRouteID      string     `json:"selected_route_id" gorm:"size:128;index"`
+	SelectedWorkerNodeID string     `json:"selected_worker_node_id" gorm:"size:64;index"`
+	SelectedQBClientID   string     `json:"selected_qb_client_id" gorm:"size:128;index"`
+	ReservationID        string     `json:"reservation_id" gorm:"size:64;index"`
+	ReservationExpiresAt *time.Time `json:"reservation_expires_at,omitempty"`
+	Status               string     `json:"status" gorm:"size:32;index"`
+	LastEventID          string     `json:"last_event_id" gorm:"size:64;index"`
+	LastErrorCode        string     `json:"last_error_code" gorm:"size:128"`
+	LastError            string     `json:"last_error" gorm:"type:text"`
+	AcceptedAt           *time.Time `json:"accepted_at,omitempty"`
+	BoundAt              *time.Time `json:"bound_at,omitempty"`
+	FinishedAt           *time.Time `json:"finished_at,omitempty"`
+}
+
+// MoviePilotDownloaderReservation is a short-lived Coordinator admission
+// record. It reserves qB download capacity before MoviePilot creates a task;
+// it never contains qB credentials or Worker-local paths.
+type MoviePilotDownloaderReservation struct {
+	ID               string     `json:"id" gorm:"primaryKey;size:64"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+	RequestID        string     `json:"request_id" gorm:"size:64;uniqueIndex"`
+	BridgeInstanceID string     `json:"bridge_instance_id" gorm:"size:64;index"`
+	PolicyMode       string     `json:"policy_mode" gorm:"size:32;index"`
+	RouteID          string     `json:"route_id" gorm:"size:128;index"`
+	WorkerNodeID     string     `json:"worker_node_id" gorm:"size:64;index"`
+	Downloader       string     `json:"downloader" gorm:"size:128;index"`
+	QBClientID       string     `json:"qb_client_id" gorm:"size:128"`
+	ExpectedBytes    int64      `json:"expected_bytes"`
+	Status           string     `json:"status" gorm:"size:32;index"`
+	ExpiresAt        time.Time  `json:"expires_at" gorm:"index"`
+	BoundAt          *time.Time `json:"bound_at,omitempty"`
+	LastError        string     `json:"last_error" gorm:"type:text"`
 }
 
 type TorrentRetentionPolicy struct {
@@ -186,32 +222,37 @@ type MoviePilotTransferView struct {
 // identifiers and progress only; qB credentials and worker-local paths never
 // cross this boundary.
 type MoviePilotTaskStatus struct {
-	RequestID             string    `json:"request_id"`
-	SubscriptionID        uint      `json:"subscription_id"`
-	SubscriptionItemID    uint      `json:"subscription_item_id"`
-	SubscriptionName      string    `json:"subscription_name,omitempty"`
-	ItemName              string    `json:"item_name,omitempty"`
-	Phase                 string    `json:"phase"`
-	IntentStatus          string    `json:"intent_status,omitempty"`
-	TorrentStatus         string    `json:"torrent_status,omitempty"`
-	DownloadProgress      float64   `json:"download_progress,omitempty"`
-	UploadProgress        float64   `json:"upload_progress,omitempty"`
-	TransferredFiles      int       `json:"transferred_files,omitempty"`
-	ExpectedFiles         int       `json:"expected_files,omitempty"`
-	BindingID             string    `json:"binding_id,omitempty"`
-	BridgeInstanceID      string    `json:"bridge_instance_id,omitempty"`
-	WorkerNodeID          string    `json:"worker_node_id,omitempty"`
-	WorkerStatus          string    `json:"worker_status,omitempty"`
-	Downloader            string    `json:"downloader,omitempty"`
-	QBClientID            string    `json:"qb_client_id,omitempty"`
-	TorrentHash           string    `json:"torrent_hash,omitempty"`
-	ClusterJobID          string    `json:"cluster_job_id,omitempty"`
-	ClusterJobStatus      string    `json:"cluster_job_status,omitempty"`
-	ClusterJobStage       string    `json:"cluster_job_stage,omitempty"`
-	ClusterJobStageStatus string    `json:"cluster_job_stage_status,omitempty"`
-	ErrorCode             string    `json:"error_code,omitempty"`
-	Error                 string    `json:"error,omitempty"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	RequestID             string     `json:"request_id"`
+	SubscriptionID        uint       `json:"subscription_id"`
+	SubscriptionItemID    uint       `json:"subscription_item_id"`
+	SubscriptionName      string     `json:"subscription_name,omitempty"`
+	ItemName              string     `json:"item_name,omitempty"`
+	Phase                 string     `json:"phase"`
+	IntentStatus          string     `json:"intent_status,omitempty"`
+	DownloaderPolicyMode  string     `json:"downloader_policy_mode,omitempty"`
+	SelectedRouteID       string     `json:"selected_route_id,omitempty"`
+	ReservationID         string     `json:"reservation_id,omitempty"`
+	ReservationStatus     string     `json:"reservation_status,omitempty"`
+	ReservationExpiresAt  *time.Time `json:"reservation_expires_at,omitempty"`
+	TorrentStatus         string     `json:"torrent_status,omitempty"`
+	DownloadProgress      float64    `json:"download_progress,omitempty"`
+	UploadProgress        float64    `json:"upload_progress,omitempty"`
+	TransferredFiles      int        `json:"transferred_files,omitempty"`
+	ExpectedFiles         int        `json:"expected_files,omitempty"`
+	BindingID             string     `json:"binding_id,omitempty"`
+	BridgeInstanceID      string     `json:"bridge_instance_id,omitempty"`
+	WorkerNodeID          string     `json:"worker_node_id,omitempty"`
+	WorkerStatus          string     `json:"worker_status,omitempty"`
+	Downloader            string     `json:"downloader,omitempty"`
+	QBClientID            string     `json:"qb_client_id,omitempty"`
+	TorrentHash           string     `json:"torrent_hash,omitempty"`
+	ClusterJobID          string     `json:"cluster_job_id,omitempty"`
+	ClusterJobStatus      string     `json:"cluster_job_status,omitempty"`
+	ClusterJobStage       string     `json:"cluster_job_stage,omitempty"`
+	ClusterJobStageStatus string     `json:"cluster_job_stage_status,omitempty"`
+	ErrorCode             string     `json:"error_code,omitempty"`
+	Error                 string     `json:"error,omitempty"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
 type MoviePilotBridgeNonce struct {

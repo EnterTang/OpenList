@@ -134,24 +134,25 @@ type ClusterRedis struct {
 }
 
 type Cluster struct {
-	Role                      string       `json:"role" env:"ROLE"`
-	NodeID                    string       `json:"node_id" env:"NODE_ID"`
-	CoordinatorURL            string       `json:"coordinator_url" env:"COORDINATOR_URL"`
-	EnrollmentToken           string       `json:"enrollment_token" env:"ENROLLMENT_TOKEN"`
-	SecretMasterKey           string       `json:"-" env:"SECRET_MASTER_KEY"`
-	SecretMasterKeyPrevious   string       `json:"-" env:"SECRET_MASTER_KEY_PREVIOUS"`
-	WorkerKeyFile             string       `json:"worker_key_file" env:"WORKER_KEY_FILE"`
-	WebSocketPath             string       `json:"websocket_path" env:"WEBSOCKET_PATH"`
-	HeartbeatIntervalSecond   int          `json:"heartbeat_interval_seconds" env:"HEARTBEAT_INTERVAL_SECONDS"`
-	ReconnectIntervalSecond   int          `json:"reconnect_interval_seconds" env:"RECONNECT_INTERVAL_SECONDS"`
-	ETFRootPath               string       `json:"etf_root_path" env:"ETF_ROOT_PATH"`
-	TargetBaseURL             string       `json:"target_base_url" env:"TARGET_BASE_URL"`
-	TargetAPIToken            string       `json:"target_api_token" env:"TARGET_API_TOKEN"`
-	TargetSupportsIdempotency bool         `json:"target_supports_idempotency" env:"TARGET_SUPPORTS_IDEMPOTENCY"`
-	QuietWindowSecond         int          `json:"quiet_window_seconds" env:"QUIET_WINDOW_SECONDS"`
-	SharePeriodUnit           int          `json:"share_period_unit" env:"SHARE_PERIOD_UNIT"`
-	ShareType                 string       `json:"share_type" env:"SHARE_TYPE"`
-	Redis                     ClusterRedis `json:"redis" envPrefix:"REDIS_"`
+	Role                           string       `json:"role" env:"ROLE"`
+	NodeID                         string       `json:"node_id" env:"NODE_ID"`
+	CoordinatorURL                 string       `json:"coordinator_url" env:"COORDINATOR_URL"`
+	EnrollmentToken                string       `json:"enrollment_token" env:"ENROLLMENT_TOKEN"`
+	SecretMasterKey                string       `json:"-" env:"SECRET_MASTER_KEY"`
+	SecretMasterKeyPrevious        string       `json:"-" env:"SECRET_MASTER_KEY_PREVIOUS"`
+	WorkerKeyFile                  string       `json:"worker_key_file" env:"WORKER_KEY_FILE"`
+	WebSocketPath                  string       `json:"websocket_path" env:"WEBSOCKET_PATH"`
+	HeartbeatIntervalSecond        int          `json:"heartbeat_interval_seconds" env:"HEARTBEAT_INTERVAL_SECONDS"`
+	ReconnectIntervalSecond        int          `json:"reconnect_interval_seconds" env:"RECONNECT_INTERVAL_SECONDS"`
+	ETFRootPath                    string       `json:"etf_root_path" env:"ETF_ROOT_PATH"`
+	TargetBaseURL                  string       `json:"target_base_url" env:"TARGET_BASE_URL"`
+	TargetAPIToken                 string       `json:"target_api_token" env:"TARGET_API_TOKEN"`
+	TargetSupportsIdempotency      bool         `json:"target_supports_idempotency" env:"TARGET_SUPPORTS_IDEMPOTENCY"`
+	MoviePilotDownloaderPolicyMode string       `json:"moviepilot_downloader_policy_mode" env:"MOVIEPILOT_DOWNLOADER_POLICY_MODE"`
+	QuietWindowSecond              int          `json:"quiet_window_seconds" env:"QUIET_WINDOW_SECONDS"`
+	SharePeriodUnit                int          `json:"share_period_unit" env:"SHARE_PERIOD_UNIT"`
+	ShareType                      string       `json:"share_type" env:"SHARE_TYPE"`
+	Redis                          ClusterRedis `json:"redis" envPrefix:"REDIS_"`
 }
 
 type ExternalSubscription struct {
@@ -314,13 +315,14 @@ func DefaultConfig(dataDir string) *Config {
 			Enable: false,
 		},
 		Cluster: Cluster{
-			Role:                    "standalone",
-			WebSocketPath:           "/api/cluster/ws",
-			HeartbeatIntervalSecond: 15,
-			ReconnectIntervalSecond: 5,
-			QuietWindowSecond:       30,
-			SharePeriodUnit:         0,
-			ShareType:               "cloud_drive",
+			Role:                           "standalone",
+			WebSocketPath:                  "/api/cluster/ws",
+			HeartbeatIntervalSecond:        15,
+			ReconnectIntervalSecond:        5,
+			QuietWindowSecond:              30,
+			SharePeriodUnit:                0,
+			ShareType:                      "cloud_drive",
+			MoviePilotDownloaderPolicyMode: "coordinator_preferred",
 			Redis: ClusterRedis{
 				Address:          "127.0.0.1:6379",
 				ResultStream:     "cluster:upload-results:v1",

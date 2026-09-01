@@ -389,15 +389,29 @@ func (s *Service) handleTorrentBound(ctx context.Context, bridgeID string, event
 	if err := s.db.WithContext(ctx).Where("bridge_instance_id = ? AND request_id = ?", bridgeID, event.RequestID).First(&intent).Error; err != nil {
 		return err
 	}
-	workerID, qbClientID, err := s.resolveMoviePilotWorkerRoute(ctx, bridgeID, event.Torrent.Downloader)
+	workerID, qbClientID, err := s.resolveReservedMoviePilotRoute(ctx, bridgeID, &intent, event)
 	if err != nil {
-		_ = s.db.WithContext(ctx).Model(&intent).Updates(map[string]any{
+		updates := map[string]any{
 			"status": model.MoviePilotIntentStatusWaitingWorker, "last_error_code": "worker_route_unavailable", "last_error": err.Error(),
-		}).Error
+		}
+		if strings.TrimSpace(intent.SelectedDownloader) != "" {
+			updates["status"] = model.MoviePilotIntentStatusFailed
+			updates["last_error_code"] = "downloader_selection_mismatch"
+			_ = s.ReleaseMoviePilotDownloaderReservation(ctx, intent.RequestID)
+		}
+		_ = s.db.WithContext(ctx).Model(&intent).Updates(updates).Error
 		return err
 	}
 	binding, err := db.BindTorrentTx(ctx, s.db, &intent, bridgeID, event.Torrent.Downloader, workerID, qbClientID, event.Torrent.TorrentHash, event.Torrent.ContentPath)
 	if err != nil {
+		_ = s.ReleaseMoviePilotDownloaderReservation(ctx, intent.RequestID)
+		return err
+	}
+	if err := s.bindMoviePilotDownloaderReservation(ctx, &intent); err != nil {
+		_ = s.ReleaseMoviePilotDownloaderReservation(ctx, intent.RequestID)
+		_ = s.db.WithContext(ctx).Model(&intent).Updates(map[string]any{
+			"status": model.MoviePilotIntentStatusFailed, "last_error_code": "downloader_reservation_invalid", "last_error": err.Error(),
+		}).Error
 		return err
 	}
 	var item model.SubscriptionItem
@@ -408,7 +422,7 @@ func (s *Service) handleTorrentBound(ctx context.Context, bridgeID string, event
 	if err := s.db.WithContext(ctx).First(&sub, "id = ?", intent.SubscriptionID).Error; err != nil {
 		return err
 	}
-	taskContext := moviePilotTorrentTaskContext(&sub, &item, binding, binding.ID, event.Torrent.Media)
+	taskContext := moviePilotTorrentTaskContextWithIntent(&sub, &item, binding, &intent, binding.ID, event.Torrent.Media)
 	parent, err := s.ensureTorrentParent(ctx, binding, taskContext)
 	if err != nil {
 		return err
@@ -428,6 +442,7 @@ func (s *Service) handleTorrentBound(ctx context.Context, bridgeID string, event
 	}
 	if err := s.db.WithContext(ctx).Model(&model.MoviePilotDownloadIntent{}).Where("id = ?", intent.ID).Updates(map[string]any{
 		"status": advanceMoviePilotIntentStatus(intent.Status, model.MoviePilotIntentStatusBound), "last_event_id": event.EventID, "last_error_code": "", "last_error": "",
+		"selected_worker_node_id": workerID, "selected_qb_client_id": qbClientID,
 	}).Error; err != nil {
 		return err
 	}
@@ -605,16 +620,18 @@ func advanceMoviePilotIntentStatus(current, candidate string) string {
 		switch status {
 		case model.MoviePilotIntentStatusPending:
 			return 1
-		case model.MoviePilotIntentStatusAccepted:
+		case model.MoviePilotIntentStatusWaitingCapacity:
 			return 2
-		case model.MoviePilotIntentStatusWaitingWorker:
+		case model.MoviePilotIntentStatusAccepted:
 			return 3
-		case model.MoviePilotIntentStatusBound:
+		case model.MoviePilotIntentStatusWaitingWorker:
 			return 4
-		case model.MoviePilotIntentStatusDownloading:
+		case model.MoviePilotIntentStatusBound:
 			return 5
-		case model.MoviePilotIntentStatusCompleted:
+		case model.MoviePilotIntentStatusDownloading:
 			return 6
+		case model.MoviePilotIntentStatusCompleted:
+			return 7
 		default:
 			return 0
 		}
@@ -648,6 +665,11 @@ func (s *Service) handleTorrentFailed(ctx context.Context, bridgeID string, even
 	var intent model.MoviePilotDownloadIntent
 	if err := s.db.WithContext(ctx).Where("bridge_instance_id = ? AND request_id = ?", bridgeID, event.RequestID).First(&intent).Error; err != nil {
 		return err
+	}
+	if strings.TrimSpace(intent.ReservationID) != "" {
+		if err := s.ReleaseMoviePilotDownloaderReservation(ctx, intent.RequestID); err != nil {
+			return err
+		}
 	}
 	var binding model.MoviePilotTorrentBinding
 	bindingErr := s.db.WithContext(ctx).Where("intent_id = ?", intent.ID).First(&binding).Error
@@ -778,6 +800,10 @@ func (s *Service) loadMoviePilotSubscriptionItem(ctx context.Context, intent *mo
 }
 
 func moviePilotTorrentTaskContext(sub *model.Subscription, item *model.SubscriptionItem, binding *model.MoviePilotTorrentBinding, mediaItemID string, media moviepilotbridge.MediaIdentity) protocol.TaskContext {
+	return moviePilotTorrentTaskContextWithIntent(sub, item, binding, nil, mediaItemID, media)
+}
+
+func moviePilotTorrentTaskContextWithIntent(sub *model.Subscription, item *model.SubscriptionItem, binding *model.MoviePilotTorrentBinding, intent *model.MoviePilotDownloadIntent, mediaItemID string, media moviepilotbridge.MediaIdentity) protocol.TaskContext {
 	if sub == nil {
 		sub = &model.Subscription{}
 	}
@@ -826,6 +852,12 @@ func moviePilotTorrentTaskContext(sub *model.Subscription, item *model.Subscript
 	if deliveryFolder == "" {
 		deliveryFolder = strings.TrimSpace(sub.TargetRoot)
 	}
+	policyMode, routeID, reservationID := "", "", ""
+	if intent != nil {
+		policyMode = intent.DownloaderPolicyMode
+		routeID = intent.SelectedRouteID
+		reservationID = intent.ReservationID
+	}
 	return protocol.TaskContext{
 		ParentBatchID: parentIDForBinding(binding), MediaItemID: mediaItemID, WorkflowVersion: moviePilotTorrentWorkflow,
 		SealedManifestVersion: moviePilotTorrentManifest, TargetProfile: "", DeliveryMode: model.SubscriptionDeliveryModeTransfer,
@@ -837,6 +869,7 @@ func moviePilotTorrentTaskContext(sub *model.Subscription, item *model.Subscript
 		DeliveryTarget: protocol.ProviderTargetRequirement{Provider: deliveryProvider, Folder: deliveryFolder, NeedUpload: true, RequiredBytes: item.FileSize},
 		Torrent: &protocol.TorrentTaskContext{BindingID: binding.ID, WorkerNodeID: binding.WorkerNodeID, BridgeInstanceID: binding.BridgeInstanceID,
 			Downloader: binding.DownloaderAlias, QBClientID: binding.QBClientID, TorrentHash: binding.TorrentHash, ContentPath: binding.ContentPath,
+			DownloaderPolicyMode: policyMode, SelectedRouteID: routeID, ReservationID: reservationID,
 			Manual: isManualQBBinding(binding)},
 	}
 }
@@ -1279,7 +1312,7 @@ func (s *Service) dispatchDeliveryFile(ctx context.Context, delivery *model.Movi
 			return err
 		}
 	}
-	task := moviePilotTorrentTaskContext(&sub, &item, &binding, parentIDForBinding(&binding), moviepilotbridge.MediaIdentity{MediaSource: intent.MediaSource, MediaID: intent.MediaID, MediaType: sub.MediaType, Season: delivery.Season, Episode: delivery.Episode})
+	task := moviePilotTorrentTaskContextWithIntent(&sub, &item, &binding, &intent, parentIDForBinding(&binding), moviepilotbridge.MediaIdentity{MediaSource: intent.MediaSource, MediaID: intent.MediaID, MediaType: sub.MediaType, Season: delivery.Season, Episode: delivery.Episode})
 	task.MediaItemID = "moviepilot-delivery:" + delivery.ID
 	task.Torrent.RelativePath = delivery.RelativePath
 	task.SourceObjects = []protocol.SourceObject{{Provider: "qbittorrent", SourceFileID: "torrent:" + binding.TorrentHash + ":" + delivery.RelativePath, SourceRelativePath: delivery.RelativePath, Size: delivery.SourceSize}}

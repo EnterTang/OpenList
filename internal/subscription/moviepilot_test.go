@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -13,10 +14,36 @@ import (
 )
 
 type fakeMoviePilotBridgeClient struct {
-	searches []moviepilotbridge.ResourceSearchRequest
-	intents  []moviepilotbridge.DownloadIntentRequest
-	results  []moviepilotbridge.ResourceSearchResult
-	bridges  []string
+	searches     []moviepilotbridge.ResourceSearchRequest
+	intents      []moviepilotbridge.DownloadIntentRequest
+	intentModels []model.MoviePilotDownloadIntent
+	results      []moviepilotbridge.ResourceSearchResult
+	bridges      []string
+}
+
+type fakeMoviePilotDownloaderPolicyScheduler struct {
+	policy        moviepilotbridge.DownloaderPolicy
+	selectionErr  error
+	selectedCalls []struct {
+		bridgeID     string
+		requestID    string
+		expectedSize int64
+	}
+	released []string
+}
+
+func (f *fakeMoviePilotDownloaderPolicyScheduler) SelectMoviePilotDownloaderPolicy(_ context.Context, bridgeID, requestID string, expectedSize int64) (moviepilotbridge.DownloaderPolicy, error) {
+	f.selectedCalls = append(f.selectedCalls, struct {
+		bridgeID     string
+		requestID    string
+		expectedSize int64
+	}{bridgeID: bridgeID, requestID: requestID, expectedSize: expectedSize})
+	return f.policy, f.selectionErr
+}
+
+func (f *fakeMoviePilotDownloaderPolicyScheduler) ReleaseMoviePilotDownloaderReservation(_ context.Context, requestID string) error {
+	f.released = append(f.released, requestID)
+	return nil
 }
 
 func (f *fakeMoviePilotBridgeClient) SearchResources(_ context.Context, _ string, request moviepilotbridge.ResourceSearchRequest) ([]moviepilotbridge.ResourceSearchResult, error) {
@@ -24,8 +51,11 @@ func (f *fakeMoviePilotBridgeClient) SearchResources(_ context.Context, _ string
 	return append([]moviepilotbridge.ResourceSearchResult(nil), f.results...), nil
 }
 
-func (f *fakeMoviePilotBridgeClient) SubmitIntent(_ context.Context, _ string, _ *model.MoviePilotDownloadIntent, request moviepilotbridge.DownloadIntentRequest) error {
+func (f *fakeMoviePilotBridgeClient) SubmitIntent(_ context.Context, _ string, intent *model.MoviePilotDownloadIntent, request moviepilotbridge.DownloadIntentRequest) error {
 	f.intents = append(f.intents, request)
+	if intent != nil {
+		f.intentModels = append(f.intentModels, *intent)
+	}
 	return nil
 }
 
@@ -243,6 +273,115 @@ func TestSubmitMoviePilotIntentUsesStableIdempotencyKey(t *testing.T) {
 	}
 	if len(client.intents) != 2 || client.intents[0].RequestID == "" || client.intents[0].RequestID != client.intents[1].RequestID {
 		t.Fatalf("intent requests = %#v", client.intents)
+	}
+}
+
+func TestSubmitMoviePilotIntentUsesCoordinatorDownloaderPolicy(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	client := &fakeMoviePilotBridgeClient{}
+	scheduler := &fakeMoviePilotDownloaderPolicyScheduler{policy: moviepilotbridge.DownloaderPolicy{
+		Mode: moviepilotbridge.DownloaderPolicyCoordinatorSelect, Downloader: "qb-win",
+		RouteID: "route-win", ReservationID: "reservation-win",
+	}}
+	SetMoviePilotBridgeClient(client)
+	SetMoviePilotDownloaderPolicyScheduler(scheduler)
+	t.Cleanup(func() {
+		SetMoviePilotBridgeClient(nil)
+		SetMoviePilotDownloaderPolicyScheduler(nil)
+	})
+	sub := &model.Subscription{ID: 41, Name: "Coordinator route", TMDBID: 456, MediaType: "movie", BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-route", SelectedFingerprint: "fingerprint-route",
+		MediaSource: "tmdb", MediaID: "456", MediaType: "movie", Size: 99,
+	}}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	if err := SubmitMoviePilotIntent(context.Background(), sub); err != nil {
+		t.Fatalf("submit intent: %v", err)
+	}
+	if len(scheduler.selectedCalls) != 1 || scheduler.selectedCalls[0].bridgeID != "mp-main" || scheduler.selectedCalls[0].expectedSize != 99 {
+		t.Fatalf("scheduler calls = %#v", scheduler.selectedCalls)
+	}
+	if len(client.intents) != 1 || client.intents[0].DownloaderPolicy.Mode != scheduler.policy.Mode ||
+		client.intents[0].DownloaderPolicy.Downloader != scheduler.policy.Downloader ||
+		client.intents[0].DownloaderPolicy.RouteID != scheduler.policy.RouteID ||
+		client.intents[0].DownloaderPolicy.ReservationID != scheduler.policy.ReservationID {
+		t.Fatalf("submitted policy = %#v", client.intents)
+	}
+	if len(client.intentModels) != 1 || client.intentModels[0].DownloaderPolicyMode != moviepilotbridge.DownloaderPolicyCoordinatorSelect || client.intentModels[0].SelectedDownloader != "qb-win" || client.intentModels[0].SelectedRouteID != "route-win" || client.intentModels[0].ReservationID != "reservation-win" {
+		t.Fatalf("submitted scheduling metadata = %#v", client.intentModels)
+	}
+}
+
+func TestRunMoviePilotMarksCapacityAsRetryable(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	client := &fakeMoviePilotBridgeClient{}
+	scheduler := &fakeMoviePilotDownloaderPolicyScheduler{
+		policy:       moviepilotbridge.DownloaderPolicy{Mode: moviepilotbridge.DownloaderPolicyCoordinatorSelect},
+		selectionErr: moviepilotbridge.ErrDownloaderCapacityUnavailable,
+	}
+	SetMoviePilotBridgeClient(client)
+	SetMoviePilotDownloaderPolicyScheduler(scheduler)
+	t.Cleanup(func() {
+		SetMoviePilotBridgeClient(nil)
+		SetMoviePilotDownloaderPolicyScheduler(nil)
+	})
+	sub := &model.Subscription{ID: 42, Name: "Capacity wait", TMDBID: 789, MediaType: "movie", SourceType: model.SubscriptionSourceMoviePilot, BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-capacity", SelectedFingerprint: "fingerprint-capacity", MediaSource: "tmdb", MediaID: "789", MediaType: "movie", Size: 10,
+	}}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, err := runMoviePilot(context.Background(), sub, true)
+	if !errors.Is(err, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
+		t.Fatalf("run error = %v, want retryable capacity error", err)
+	}
+	items, err := db.ListSubscriptionItems(sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != model.SubscriptionItemStatusRetryWait || items[0].LastErrorCode != "downloader_capacity_unavailable" || items[0].RetryAt == nil {
+		t.Fatalf("capacity item = %#v", items)
+	}
+	var intent model.MoviePilotDownloadIntent
+	if err := db.GetDb().Where("request_id = ?", moviePilotIntentRequestID(sub.ID, sub.BoundTorrent.ResourceRef, sub.BoundTorrent.SelectedFingerprint)).First(&intent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if intent.Status != model.MoviePilotIntentStatusWaitingCapacity || intent.DownloaderPolicyMode != moviepilotbridge.DownloaderPolicyCoordinatorSelect {
+		t.Fatalf("waiting intent = %#v", intent)
+	}
+}
+
+func TestRunClusterKeepsSubscriptionRunningOnCapacityBackpressure(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	client := &fakeMoviePilotBridgeClient{}
+	scheduler := &fakeMoviePilotDownloaderPolicyScheduler{selectionErr: moviepilotbridge.ErrDownloaderCapacityUnavailable}
+	SetMoviePilotBridgeClient(client)
+	SetMoviePilotDownloaderPolicyScheduler(scheduler)
+	t.Cleanup(func() {
+		SetMoviePilotBridgeClient(nil)
+		SetMoviePilotDownloaderPolicyScheduler(nil)
+	})
+	sub := &model.Subscription{ID: 43, Name: "Cluster capacity wait", TMDBID: 790, MediaType: "movie", SourceType: model.SubscriptionSourceMoviePilot, TransferEnabled: true, BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-cluster-capacity", SelectedFingerprint: "fingerprint-cluster-capacity", MediaSource: "tmdb", MediaID: "790", MediaType: "movie", Size: 10,
+	}}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	result, err := RunCluster(context.Background(), sub.ID)
+	if !errors.Is(err, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
+		t.Fatalf("cluster run error = %v, want capacity backpressure", err)
+	}
+	if result == nil || result.Run == nil || result.Run.Status != model.SubscriptionStatusRunning || result.Subscription.LastStatus != model.SubscriptionStatusRunning {
+		t.Fatalf("cluster capacity result = %#v", result)
+	}
+	var stored model.Subscription
+	if err := db.GetDb().First(&stored, sub.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.LastStatus != model.SubscriptionStatusRunning {
+		t.Fatalf("stored subscription status = %q", stored.LastStatus)
 	}
 }
 

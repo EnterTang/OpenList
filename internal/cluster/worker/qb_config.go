@@ -15,6 +15,29 @@ import (
 )
 
 const moviePilotDefaultUploadConcurrency = 2
+const bytesPerGB int64 = 1024 * 1024 * 1024
+
+func gigabytesToBytes(value int64) int64 {
+	if value <= 0 {
+		return value
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if value > maxInt64/bytesPerGB {
+		return maxInt64
+	}
+	return value * bytesPerGB
+}
+
+func stagingMaxFileBytes(config protocol.StagingConfig) int64 {
+	if config.StagingMaxFileSizeGB <= 0 {
+		return maxQBStagingFileBytes
+	}
+	return gigabytesToBytes(config.StagingMaxFileSizeGB)
+}
+
+func stagingSafetyReserveBytes(config protocol.StagingConfig) int64 {
+	return gigabytesToBytes(config.StagingSafetyReserveGB)
+}
 
 // ResolveMoviePilotRoute resolves the configured MoviePilot downloader to the
 // qB client that owns its files. Secrets are intentionally not returned here;
@@ -107,6 +130,57 @@ func moviePilotUploadConcurrency(config protocol.StagingConfig) int {
 	return moviePilotDefaultUploadConcurrency
 }
 
+type moviePilotDownloadTelemetry struct {
+	activeCount    int
+	remainingBytes int64
+	rateBytes      int64
+	known          bool
+	health         string
+}
+
+// moviePilotDownloadTelemetry reads the complete qB list once per client and
+// returns only aggregate load. qB URLs, credentials, hashes and local paths
+// never enter the Coordinator inventory.
+func (s *Service) moviePilotDownloadTelemetry(ctx context.Context, config protocol.QBClientConfig) moviePilotDownloadTelemetry {
+	s.mu.Lock()
+	factory := s.qbClientFactory
+	_, hasSecret := s.qbSecrets[strings.TrimSpace(config.ID)]
+	s.mu.Unlock()
+	if factory == nil && !hasSecret {
+		return moviePilotDownloadTelemetry{}
+	}
+	client, err := s.qbClientForCapacity(config)
+	if err != nil {
+		s.recordQBHealth(config.ID, "unhealthy")
+		return moviePilotDownloadTelemetry{health: "unhealthy"}
+	}
+	torrents, err := client.GetTorrents(ctx)
+	if err != nil {
+		s.recordQBHealth(config.ID, "unhealthy")
+		return moviePilotDownloadTelemetry{health: "unhealthy"}
+	}
+	s.recordQBHealth(config.ID, "healthy")
+	telemetry := moviePilotDownloadTelemetry{known: true, health: "healthy"}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	for _, torrent := range torrents {
+		if !isIncompleteTorrent(torrent) || isPausedDownload(torrent) {
+			continue
+		}
+		telemetry.activeCount++
+		remaining := torrent.AmountLeft
+		if remaining <= 0 && torrent.Size > 0 && torrent.Progress < 1 {
+			remaining = int64(float64(torrent.Size) * (1 - torrent.Progress))
+		}
+		if remaining > 0 && telemetry.remainingBytes <= maxInt64-remaining {
+			telemetry.remainingBytes += remaining
+		}
+		if torrent.Dlspeed > 0 && telemetry.rateBytes <= maxInt64-int64(torrent.Dlspeed) {
+			telemetry.rateBytes += int64(torrent.Dlspeed)
+		}
+	}
+	return telemetry
+}
+
 func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory {
 	s.mu.Lock()
 	config := cloneDesiredConfig(s.desiredConfig)
@@ -145,6 +219,7 @@ func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory
 		free  int64
 		known bool
 	}, len(config.QBClients))
+	downloadTelemetry := make(map[string]moviePilotDownloadTelemetry, len(config.QBClients))
 	result := make([]protocol.MoviePilotRouteInventory, 0, len(config.MoviePilotRoutes))
 	for _, route := range config.MoviePilotRoutes {
 		clientID := strings.TrimSpace(route.QBClientID)
@@ -156,20 +231,37 @@ func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory
 			}
 			downloadCapacities[clientID] = capacity
 		}
+		telemetry, telemetryCached := downloadTelemetry[clientID]
+		if !telemetryCached {
+			if clientConfig, clientConfigured := config.QBClient(clientID); clientConfigured {
+				telemetry = s.moviePilotDownloadTelemetry(context.Background(), clientConfig)
+			}
+			downloadTelemetry[clientID] = telemetry
+		}
+		routeHealth := firstNonEmpty(health[clientID], "unknown")
+		if telemetry.health != "" {
+			routeHealth = telemetry.health
+		}
 		result = append(result, protocol.MoviePilotRouteInventory{
-			BridgeInstanceID:          strings.TrimSpace(route.BridgeInstanceID),
-			Downloader:                strings.TrimSpace(route.Downloader),
-			QBClientID:                strings.TrimSpace(route.QBClientID),
-			StagingRootLabel:          "moviepilot-staging",
-			StagingFreeBytes:          freeBytes,
-			ActiveStagingBytes:        activeBytes[strings.TrimSpace(route.QBClientID)],
-			ActiveUploadSlots:         active[strings.TrimSpace(route.QBClientID)],
-			UploadConcurrency:         moviePilotUploadConcurrency(config.Staging),
-			DownloadRootLabel:         "qb-download",
-			DownloadFreeBytes:         capacity.free,
-			DownloadLowWatermarkBytes: downloadWatermarkLowBytes(config.Staging),
-			DownloadCapacityKnown:     capacity.known,
-			QBHealth:                  firstNonEmpty(health[strings.TrimSpace(route.QBClientID)], "unknown"),
+			BridgeInstanceID:           strings.TrimSpace(route.BridgeInstanceID),
+			Downloader:                 strings.TrimSpace(route.Downloader),
+			QBClientID:                 strings.TrimSpace(route.QBClientID),
+			StagingRootLabel:           "moviepilot-staging",
+			StagingFreeBytes:           freeBytes,
+			ActiveStagingBytes:         activeBytes[strings.TrimSpace(route.QBClientID)],
+			ActiveUploadSlots:          active[strings.TrimSpace(route.QBClientID)],
+			UploadConcurrency:          moviePilotUploadConcurrency(config.Staging),
+			DownloadRootLabel:          "qb-download",
+			DownloadFreeBytes:          capacity.free,
+			DownloadLowWatermarkBytes:  downloadWatermarkLowBytes(config.Staging),
+			DownloadCapacityKnown:      capacity.known,
+			DownloadSafetyReserveBytes: nonNegativeInt64(stagingSafetyReserveBytes(config.Staging)),
+			DownloadConcurrency:        config.DownloadConcurrency,
+			DownloadActiveCount:        telemetry.activeCount,
+			DownloadRemainingBytes:     telemetry.remainingBytes,
+			DownloadRateBytesPerSecond: telemetry.rateBytes,
+			DownloadLoadKnown:          telemetry.known,
+			QBHealth:                   routeHealth,
 		})
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -188,6 +280,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func nonNegativeInt64(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 func clampUint64ToInt64(value uint64) int64 {

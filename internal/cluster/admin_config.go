@@ -14,21 +14,22 @@ import (
 )
 
 type AdminConfig struct {
-	Role                      string           `json:"role"`
-	ActiveRole                string           `json:"active_role"`
-	NodeID                    string           `json:"node_id"`
-	CoordinatorURL            string           `json:"coordinator_url"`
-	EnrollmentToken           string           `json:"enrollment_token"`
-	EnrollmentTokenConfigured bool             `json:"enrollment_token_configured"`
-	WorkerKeyFile             string           `json:"worker_key_file"`
-	WebSocketPath             string           `json:"websocket_path"`
-	ETFRootPath               string           `json:"etf_root_path"`
-	TargetBaseURL             string           `json:"target_base_url"`
-	TargetAPITokenConfigured  bool             `json:"target_api_token_configured"`
-	TargetSupportsIdempotency bool             `json:"target_supports_idempotency"`
-	Redis                     AdminRedisConfig `json:"redis"`
-	Runtime                   RuntimeStatus    `json:"runtime"`
-	RestartRequired           bool             `json:"restart_required"`
+	Role                           string           `json:"role"`
+	ActiveRole                     string           `json:"active_role"`
+	NodeID                         string           `json:"node_id"`
+	CoordinatorURL                 string           `json:"coordinator_url"`
+	EnrollmentToken                string           `json:"enrollment_token"`
+	EnrollmentTokenConfigured      bool             `json:"enrollment_token_configured"`
+	WorkerKeyFile                  string           `json:"worker_key_file"`
+	WebSocketPath                  string           `json:"websocket_path"`
+	ETFRootPath                    string           `json:"etf_root_path"`
+	TargetBaseURL                  string           `json:"target_base_url"`
+	TargetAPITokenConfigured       bool             `json:"target_api_token_configured"`
+	TargetSupportsIdempotency      bool             `json:"target_supports_idempotency"`
+	MoviePilotDownloaderPolicyMode string           `json:"moviepilot_downloader_policy_mode"`
+	Redis                          AdminRedisConfig `json:"redis"`
+	Runtime                        RuntimeStatus    `json:"runtime"`
+	RestartRequired                bool             `json:"restart_required"`
 }
 
 type AdminRedisConfig struct {
@@ -43,19 +44,20 @@ type AdminRedisConfig struct {
 // preserve the existing value; callers must set the matching clear flag to
 // remove a persisted secret.
 type AdminConfigUpdate struct {
-	Role                      string                 `json:"role"`
-	NodeID                    string                 `json:"node_id"`
-	CoordinatorURL            string                 `json:"coordinator_url"`
-	EnrollmentToken           string                 `json:"enrollment_token"`
-	ClearEnrollmentToken      bool                   `json:"clear_enrollment_token"`
-	WorkerKeyFile             string                 `json:"worker_key_file"`
-	WebSocketPath             string                 `json:"websocket_path"`
-	ETFRootPath               string                 `json:"etf_root_path"`
-	TargetBaseURL             string                 `json:"target_base_url"`
-	TargetAPIToken            string                 `json:"target_api_token"`
-	ClearTargetAPIToken       bool                   `json:"clear_target_api_token"`
-	TargetSupportsIdempotency bool                   `json:"target_supports_idempotency"`
-	Redis                     AdminRedisConfigUpdate `json:"redis"`
+	Role                           string                 `json:"role"`
+	NodeID                         string                 `json:"node_id"`
+	CoordinatorURL                 string                 `json:"coordinator_url"`
+	EnrollmentToken                string                 `json:"enrollment_token"`
+	ClearEnrollmentToken           bool                   `json:"clear_enrollment_token"`
+	WorkerKeyFile                  string                 `json:"worker_key_file"`
+	WebSocketPath                  string                 `json:"websocket_path"`
+	ETFRootPath                    string                 `json:"etf_root_path"`
+	TargetBaseURL                  string                 `json:"target_base_url"`
+	TargetAPIToken                 string                 `json:"target_api_token"`
+	ClearTargetAPIToken            bool                   `json:"clear_target_api_token"`
+	TargetSupportsIdempotency      bool                   `json:"target_supports_idempotency"`
+	MoviePilotDownloaderPolicyMode string                 `json:"moviepilot_downloader_policy_mode"`
+	Redis                          AdminRedisConfigUpdate `json:"redis"`
 }
 
 type AdminRedisConfigUpdate struct {
@@ -115,6 +117,10 @@ func applyAdminConfigUpdate(cfg *conf.Cluster, req AdminConfigUpdate) {
 	cfg.ETFRootPath = strings.TrimSpace(req.ETFRootPath)
 	cfg.TargetBaseURL = strings.TrimRight(strings.TrimSpace(req.TargetBaseURL), "/")
 	cfg.TargetSupportsIdempotency = req.TargetSupportsIdempotency
+	cfg.MoviePilotDownloaderPolicyMode = strings.ToLower(strings.TrimSpace(req.MoviePilotDownloaderPolicyMode))
+	if cfg.MoviePilotDownloaderPolicyMode == "" {
+		cfg.MoviePilotDownloaderPolicyMode = "coordinator_preferred"
+	}
 	cfg.Redis.Address = strings.TrimSpace(req.Redis.Address)
 	cfg.Redis.Username = strings.TrimSpace(req.Redis.Username)
 	cfg.Redis.DB = req.Redis.DB
@@ -160,6 +166,10 @@ func validateAdminConfig(cfg conf.Cluster) error {
 		if strings.TrimSpace(cfg.EnrollmentToken) == "" {
 			return errors.New("cluster enrollment token is required for coordinator and hybrid roles")
 		}
+	}
+	policyMode := strings.ToLower(strings.TrimSpace(cfg.MoviePilotDownloaderPolicyMode))
+	if policyMode != "moviepilot_select" && policyMode != "coordinator_preferred" && policyMode != "coordinator_select" {
+		return fmt.Errorf("unsupported MoviePilot downloader policy mode %q", cfg.MoviePilotDownloaderPolicyMode)
 	}
 	if role.RunsWorker() {
 		if strings.TrimSpace(cfg.NodeID) == "" {
@@ -220,18 +230,19 @@ func publicAdminConfig(cfg conf.Cluster, restartRequired bool) AdminConfig {
 		}
 	}
 	return AdminConfig{
-		Role:                      string(ParseRole(cfg.Role)),
-		ActiveRole:                string(ParseRole(conf.Conf.Cluster.Role)),
-		NodeID:                    cfg.NodeID,
-		CoordinatorURL:            cfg.CoordinatorURL,
-		EnrollmentToken:           cfg.EnrollmentToken,
-		EnrollmentTokenConfigured: cfg.EnrollmentToken != "",
-		WorkerKeyFile:             workerKeyFile,
-		WebSocketPath:             cfg.WebSocketPath,
-		ETFRootPath:               cfg.ETFRootPath,
-		TargetBaseURL:             cfg.TargetBaseURL,
-		TargetAPITokenConfigured:  cfg.TargetAPIToken != "",
-		TargetSupportsIdempotency: cfg.TargetSupportsIdempotency,
+		Role:                           string(ParseRole(cfg.Role)),
+		ActiveRole:                     string(ParseRole(conf.Conf.Cluster.Role)),
+		NodeID:                         cfg.NodeID,
+		CoordinatorURL:                 cfg.CoordinatorURL,
+		EnrollmentToken:                cfg.EnrollmentToken,
+		EnrollmentTokenConfigured:      cfg.EnrollmentToken != "",
+		WorkerKeyFile:                  workerKeyFile,
+		WebSocketPath:                  cfg.WebSocketPath,
+		ETFRootPath:                    cfg.ETFRootPath,
+		TargetBaseURL:                  cfg.TargetBaseURL,
+		TargetAPITokenConfigured:       cfg.TargetAPIToken != "",
+		TargetSupportsIdempotency:      cfg.TargetSupportsIdempotency,
+		MoviePilotDownloaderPolicyMode: firstNonEmptyAdminConfig(cfg.MoviePilotDownloaderPolicyMode, "coordinator_preferred"),
 		Redis: AdminRedisConfig{
 			Address:            cfg.Redis.Address,
 			Username:           cfg.Redis.Username,
@@ -242,6 +253,13 @@ func publicAdminConfig(cfg conf.Cluster, restartRequired bool) AdminConfig {
 		Runtime:         DefaultRuntime.Status(),
 		RestartRequired: restartRequired,
 	}
+}
+
+func firstNonEmptyAdminConfig(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	return fallback
 }
 
 func readPersistedClusterConfig() (conf.Cluster, error) {

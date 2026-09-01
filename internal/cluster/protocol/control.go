@@ -51,21 +51,70 @@ type MoviePilotRoute struct {
 type StagingConfig struct {
 	Root                             string `json:"root,omitempty"`
 	MaxUploadConcurrency             int    `json:"max_upload_concurrency,omitempty"`
-	MaxFileBytes                     int64  `json:"max_file_bytes,omitempty"`
-	SafetyReserveBytes               int64  `json:"safety_reserve_bytes,omitempty"`
-	PauseDownloadLowWatermarkBytes   int64  `json:"pause_download_low_watermark_bytes,omitempty"`
-	ResumeDownloadHighWatermarkBytes int64  `json:"resume_download_high_watermark_bytes,omitempty"`
+	StagingMaxFileSizeGB             int64  `json:"staging_max_file_size_gb,omitempty"`
+	StagingSafetyReserveGB           int64  `json:"staging_safety_reserve_gb,omitempty"`
+	StagingPauseDownloadWatermarkGB  int64  `json:"staging_pause_download_watermark_gb,omitempty"`
+	StagingResumeDownloadWatermarkGB int64  `json:"staging_resume_download_watermark_gb,omitempty"`
 	// Download disk watermarks are configured in GB fields using 1024^3 bytes
 	// per unit. They apply to every configured qB client; zero disables them.
-	DownloadDiskLowWatermarkGB  int64    `json:"download_disk_low_watermark_gb,omitempty"`
-	DownloadDiskHighWatermarkGB int64    `json:"download_disk_high_watermark_gb,omitempty"`
-	ExtensionWhitelist          []string `json:"extension_whitelist,omitempty"`
-	AntiHashEnabled             bool     `json:"antihash_enabled"`
-	ISORenameEnabled            bool     `json:"iso_rename_enabled"`
+	DownloadDiskPauseWatermarkGB  int64    `json:"download_disk_pause_watermark_gb,omitempty"`
+	DownloadDiskResumeWatermarkGB int64    `json:"download_disk_resume_watermark_gb,omitempty"`
+	ExtensionWhitelist            []string `json:"extension_whitelist,omitempty"`
+	AntiHashEnabled               bool     `json:"antihash_enabled"`
+	ISORenameEnabled              bool     `json:"iso_rename_enabled"`
 }
 
-const maxMoviePilotStagingFileBytes int64 = 150 * 1024 * 1024 * 1024
+const maxMoviePilotStagingFileGB int64 = 150
 const bytesPerGB int64 = 1024 * 1024 * 1024
+
+// UnmarshalJSON keeps stored Worker configurations readable after the
+// capacity settings were renamed and converted from bytes to GB. New config
+// writes use only the canonical GB fields above.
+func (c *StagingConfig) UnmarshalJSON(data []byte) error {
+	type stagingConfig StagingConfig
+	legacy := struct {
+		*stagingConfig
+		MaxFileBytes                     *int64 `json:"max_file_bytes"`
+		SafetyReserveBytes               *int64 `json:"safety_reserve_bytes"`
+		PauseDownloadLowWatermarkBytes   *int64 `json:"pause_download_low_watermark_bytes"`
+		ResumeDownloadHighWatermarkBytes *int64 `json:"resume_download_high_watermark_bytes"`
+		DownloadDiskLowWatermarkGB       *int64 `json:"download_disk_low_watermark_gb"`
+		DownloadDiskHighWatermarkGB      *int64 `json:"download_disk_high_watermark_gb"`
+	}{stagingConfig: (*stagingConfig)(c)}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	if c.StagingMaxFileSizeGB == 0 && legacy.MaxFileBytes != nil {
+		c.StagingMaxFileSizeGB = bytesToGB(*legacy.MaxFileBytes)
+	}
+	if c.StagingSafetyReserveGB == 0 && legacy.SafetyReserveBytes != nil {
+		c.StagingSafetyReserveGB = bytesToGB(*legacy.SafetyReserveBytes)
+	}
+	if c.StagingPauseDownloadWatermarkGB == 0 && legacy.PauseDownloadLowWatermarkBytes != nil {
+		c.StagingPauseDownloadWatermarkGB = bytesToGB(*legacy.PauseDownloadLowWatermarkBytes)
+	}
+	if c.StagingResumeDownloadWatermarkGB == 0 && legacy.ResumeDownloadHighWatermarkBytes != nil {
+		c.StagingResumeDownloadWatermarkGB = bytesToGB(*legacy.ResumeDownloadHighWatermarkBytes)
+	}
+	if c.DownloadDiskPauseWatermarkGB == 0 && legacy.DownloadDiskLowWatermarkGB != nil {
+		c.DownloadDiskPauseWatermarkGB = *legacy.DownloadDiskLowWatermarkGB
+	}
+	if c.DownloadDiskResumeWatermarkGB == 0 && legacy.DownloadDiskHighWatermarkGB != nil {
+		c.DownloadDiskResumeWatermarkGB = *legacy.DownloadDiskHighWatermarkGB
+	}
+	return nil
+}
+
+func bytesToGB(value int64) int64 {
+	if value <= 0 {
+		return value
+	}
+	result := value / bytesPerGB
+	if value%bytesPerGB != 0 {
+		result++
+	}
+	return result
+}
 
 type TargetBinding struct {
 	MountPath      string `json:"mount_path"`
@@ -129,22 +178,22 @@ func (c WorkerDesiredConfig) Validate() error {
 	if c.Staging.MaxUploadConcurrency < 0 || c.Staging.MaxUploadConcurrency > 2 {
 		return errors.New("MoviePilot staging upload concurrency must be between 1 and 2")
 	}
-	if c.Staging.MaxFileBytes < 0 || c.Staging.MaxFileBytes > maxMoviePilotStagingFileBytes {
-		return fmt.Errorf("MoviePilot staging max file size must not exceed %d bytes", maxMoviePilotStagingFileBytes)
+	if c.Staging.StagingMaxFileSizeGB < 0 || c.Staging.StagingMaxFileSizeGB > maxMoviePilotStagingFileGB {
+		return fmt.Errorf("MoviePilot staging max file size must not exceed %d GB", maxMoviePilotStagingFileGB)
 	}
-	if c.Staging.SafetyReserveBytes < 0 || c.Staging.PauseDownloadLowWatermarkBytes < 0 || c.Staging.ResumeDownloadHighWatermarkBytes < 0 || c.Staging.DownloadDiskLowWatermarkGB < 0 || c.Staging.DownloadDiskHighWatermarkGB < 0 {
-		return errors.New("MoviePilot staging capacity values must not be negative")
+	if c.Staging.StagingSafetyReserveGB < 0 || c.Staging.StagingPauseDownloadWatermarkGB < 0 || c.Staging.StagingResumeDownloadWatermarkGB < 0 || c.Staging.DownloadDiskPauseWatermarkGB < 0 || c.Staging.DownloadDiskResumeWatermarkGB < 0 {
+		return errors.New("MoviePilot staging and download disk capacity values must not be negative")
 	}
-	low := c.Staging.PauseDownloadLowWatermarkBytes
-	high := c.Staging.ResumeDownloadHighWatermarkBytes
+	low := c.Staging.StagingPauseDownloadWatermarkGB
+	high := c.Staging.StagingResumeDownloadWatermarkGB
 	if (low == 0) != (high == 0) {
 		return errors.New("MoviePilot staging pause and resume watermarks must be configured together")
 	}
 	if low > 0 && high < low {
 		return errors.New("MoviePilot staging resume watermark must not be below pause watermark")
 	}
-	downloadLow := c.Staging.DownloadDiskLowWatermarkGB
-	downloadHigh := c.Staging.DownloadDiskHighWatermarkGB
+	downloadLow := c.Staging.DownloadDiskPauseWatermarkGB
+	downloadHigh := c.Staging.DownloadDiskResumeWatermarkGB
 	if (downloadLow == 0) != (downloadHigh == 0) {
 		return errors.New("MoviePilot download disk low and high watermarks must be configured together")
 	}

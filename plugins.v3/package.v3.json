@@ -9,7 +9,8 @@
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
-      "v1.0.0": "首个 MoviePilot V3 版本：提供 OpenList 资源搜索、下载意图和精确 qB 状态回传。"
+      "v1.0.0": "首个 MoviePilot V3 版本：提供 OpenList 资源搜索、下载意图和精确 qB 状态回传。",
+      "v1.1.0": "支持 Coordinator 指定下载器策略，并校验 qB 绑定与路由一致。"
     }
   }
 }

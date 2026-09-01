@@ -356,6 +356,8 @@ func (r *Runtime) Start() error {
 		}
 		service.SetShareInspectConsumer(consumeSubscriptionShareInspect)
 		service.SetTorrentJobDispatcher(r)
+		service.SetMoviePilotDownloaderPolicyMode(conf.Conf.Cluster.MoviePilotDownloaderPolicyMode)
+		subscription.SetMoviePilotDownloaderPolicyScheduler(service)
 		r.coordinatorService = service
 		r.hub = transport.NewHub(transport.HubOptions{
 			CoordinatorID: coordinatorID(),
@@ -762,6 +764,9 @@ func (r *Runtime) runManifestProcessor(ctx context.Context) {
 }
 
 func (r *Runtime) processManifestProcessorTick(ctx context.Context, service *coordinator.Service) {
+	if err := service.ReapMoviePilotDownloaderReservations(ctx); err != nil {
+		log.Errorf("reap MoviePilot downloader reservations: %v", err)
+	}
 	if _, err := service.ReconcileWorkerOfflineTorrentControl(ctx, 100); err != nil {
 		log.Errorf("reconcile MoviePilot torrents for Worker availability: %v", err)
 	}
@@ -1203,6 +1208,7 @@ func (r *Runtime) Stop() {
 
 func (r *Runtime) stopLocked() {
 	subscription.RegisterClusterDispatcher(nil)
+	subscription.SetMoviePilotDownloaderPolicyScheduler(nil)
 	if r.cancel != nil {
 		r.cancel()
 	}

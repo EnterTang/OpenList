@@ -15,7 +15,7 @@
 | 范围 | 状态 | 说明 |
 |---|---|---|
 | Task 1～4：契约、持久化、HMAC、订阅搜索与 intent | 已完成 | 已覆盖 opaque resource、payload 幂等、nonce/inbox/outbox 和资源绑定 |
-| Task 5～6：Worker qB 路由、路径映射、staging | 已完成 | 支持容器/私网 WebUI、加密凭据、严格 affinity、150 GiB、并发 2、源文件不变 |
+| Task 5～6：Worker qB 路由、路径映射、staging | 已完成 | 支持容器/私网 WebUI、加密凭据、严格 affinity、150 GB、并发 2、源文件不变 |
 | Task 7：多集 delivery、进度、manifest、ETF | 已完成 | 每文件 delivery；ETF 仍由 Coordinator 现有 materializer 写入 |
 | Task 8：保种、容量、离线保护 | 已完成 | 时间/分享率/H&R 人工复核/延长/永久保种；Worker 与 Bridge 双层暂停 |
 | Task 9：MoviePilot V3 插件 | 代码与自动测试完成 | 已实现 V3 host、精确 hash、request label 恢复、签名 outbox；仍需目标 MoviePilot 实例实机验收 |
@@ -28,7 +28,7 @@
 - MoviePilot V3 插件位于外部插件仓 plugins.v3/openlistbridge/，使用 _PluginBase 和稳定 app.sdk。
 - 每个 Bridge 请求使用 HTTPS、实例独立 HMAC-SHA256、5 分钟时钟窗口和持久化 nonce 防重放。
 - qB 原文件不可移动、改名、改扩展名、写入 AntiHash；只允许处理和删除 staging 副本。
-- Worker 最大上传并发是 2，单文件 staging 上限是 150 GiB；容量控制使用低/高水位滞回。
+- Worker 最大上传并发是 2，单文件 staging 上限是 150 GB；容量控制使用低/高水位滞回。
 - qB 任务只能派发到绑定 Worker；离线时等待，不使用 PreferredWorkerNodeID 回退。
 - 一个 torrent 是保种父任务，一个待搬运文件是子任务；只有全部必需子任务和 ETF 成功后才可清理 torrent。
 - Coordinator 写 ETF；Worker 只回传既有 UploadETFManifest。
@@ -274,7 +274,7 @@ func TestWorkerDesiredConfigRejectsRouteWithoutPathMapping(t *testing.T) {
 
 - [ ] **Step 2: Run go test ./internal/cluster/protocol ./internal/cluster/worker -run TestWorkerDesiredConfigRejectsRouteWithoutPathMapping -count=1. Expected: qB config types do not exist.**
 
-- [ ] **Step 3: Implement config validation.** Require unique IDs, Worker-reachable HTTP/HTTPS WebUI URL without userinfo/query/fragment, encrypted Worker secret reference, absolute non-root Worker paths, longest-prefix mappings, upload concurrency from 1 through 2, and maximum file size at most 150 GiB.
+- [ ] **Step 3: Implement config validation.** Require unique IDs, Worker-reachable HTTP/HTTPS WebUI URL without userinfo/query/fragment, encrypted Worker secret reference, absolute non-root Worker paths, longest-prefix mappings, upload concurrency from 1 through 2, and maximum file size at most 150 GB.
 
 - [ ] **Step 4: Extend inventory without secrets.** Report bridge/downloader/qB-client tuple, root labels, free and active staging bytes, upload slots, qB health, and qb.copy. Exclude URL, credentials and local filesystem paths.
 
@@ -337,7 +337,7 @@ func TestCopyQBFileToStagingRejectsPathEscape(t *testing.T) {
 
 - [ ] **Step 6: Integrate source selection.** Keep prepareMediaTransferShareSave for shares. Select prepareMediaTransferQBStaging for TaskContext.Torrent. Keep present 139 upload-plugin and UploadETFManifest flow.
 
-- [ ] **Step 7: Test two-file concurrency, 150 GiB rejection, source inode/content unchanged, stage cleanup, and share regression.**
+- [ ] **Step 7: Test two-file concurrency, 150 GB rejection, source inode/content unchanged, stage cleanup, and share regression.**
 
 - [ ] **Step 8: Verify and commit.**
 
@@ -519,7 +519,7 @@ func TestMoviePilotTorrentWithTwoEpisodesTransfersThenSeeds(t *testing.T) {
 
 - [ ] **Step 4: Add failure coverage.** Duplicate callback, Bridge outage after qB creation, Worker offline, staging exhaustion, partial file failure, unknown H&R, expired signature and qB already deleted during retry.
 
-- [ ] **Step 5: Write operations runbook.** Include certificates, secret rotation, Worker path mappings, minimum disk calculation 2 times 150 GiB plus safety reserve, ETF root prerequisite, health checks, recovery commands and sidecar watchdog deployment.
+- [ ] **Step 5: Write operations runbook.** Include certificates, secret rotation, Worker path mappings, minimum disk calculation 2 times 150 GB plus safety reserve, ETF root prerequisite, health checks, recovery commands and sidecar watchdog deployment.
 
 - [ ] **Step 6: Run release verification.**
 

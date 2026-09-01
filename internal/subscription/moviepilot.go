@@ -23,13 +23,26 @@ type MoviePilotBridgeClient interface {
 	SubmitIntent(context.Context, string, *model.MoviePilotDownloadIntent, moviepilotbridge.DownloadIntentRequest) error
 }
 
+// MoviePilotDownloaderPolicyScheduler is registered by the Coordinator at
+// runtime. Keeping this narrow callback here avoids an import cycle while
+// allowing subscription execution to ask for a route before it calls Bridge.
+type MoviePilotDownloaderPolicyScheduler interface {
+	SelectMoviePilotDownloaderPolicy(context.Context, string, string, int64) (moviepilotbridge.DownloaderPolicy, error)
+	ReleaseMoviePilotDownloaderReservation(context.Context, string) error
+}
+
+type moviePilotDownloaderPolicyModeProvider interface {
+	MoviePilotDownloaderPolicyMode() string
+}
+
 type moviePilotBridgeCatalog interface {
 	ListEnabledInstanceIDs(context.Context) ([]string, error)
 }
 
 var moviePilotBridgeRegistry struct {
 	sync.RWMutex
-	client MoviePilotBridgeClient
+	client    MoviePilotBridgeClient
+	scheduler MoviePilotDownloaderPolicyScheduler
 }
 
 func SetMoviePilotBridgeClient(client MoviePilotBridgeClient) {
@@ -42,6 +55,18 @@ func currentMoviePilotBridgeClient() MoviePilotBridgeClient {
 	moviePilotBridgeRegistry.RLock()
 	defer moviePilotBridgeRegistry.RUnlock()
 	return moviePilotBridgeRegistry.client
+}
+
+func SetMoviePilotDownloaderPolicyScheduler(scheduler MoviePilotDownloaderPolicyScheduler) {
+	moviePilotBridgeRegistry.Lock()
+	moviePilotBridgeRegistry.scheduler = scheduler
+	moviePilotBridgeRegistry.Unlock()
+}
+
+func currentMoviePilotDownloaderPolicyScheduler() MoviePilotDownloaderPolicyScheduler {
+	moviePilotBridgeRegistry.RLock()
+	defer moviePilotBridgeRegistry.RUnlock()
+	return moviePilotBridgeRegistry.scheduler
 }
 
 func moviePilotBridgeAvailable() bool {
@@ -376,21 +401,68 @@ func submitMoviePilotIntent(ctx context.Context, sub *model.Subscription, subscr
 	if err := json.Unmarshal(policyRaw, &policy); err != nil {
 		return err
 	}
+	requestPolicy := moviepilotbridge.DownloaderPolicy{Mode: moviepilotbridge.DownloaderPolicyMoviePilotSelect}
+	scheduler := currentMoviePilotDownloaderPolicyScheduler()
+	if scheduler != nil {
+		selected, selectErr := scheduler.SelectMoviePilotDownloaderPolicy(ctx, bound.BridgeInstanceID, requestID, bound.Size)
+		if selectErr != nil {
+			if !errors.Is(selectErr, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
+				return selectErr
+			}
+			waitingPolicyMode := moviepilotbridge.DownloaderPolicyCoordinatorSelect
+			if provider, ok := scheduler.(moviePilotDownloaderPolicyModeProvider); ok {
+				candidateMode := strings.ToLower(strings.TrimSpace(provider.MoviePilotDownloaderPolicyMode()))
+				if candidateMode == moviepilotbridge.DownloaderPolicyCoordinatorPreferred || candidateMode == moviepilotbridge.DownloaderPolicyCoordinatorSelect {
+					waitingPolicyMode = candidateMode
+				}
+			}
+			waitingPolicyJSON, marshalErr := json.Marshal(moviepilotbridge.DownloaderPolicy{Mode: waitingPolicyMode})
+			if marshalErr != nil {
+				return marshalErr
+			}
+			intent := &model.MoviePilotDownloadIntent{
+				ID: uuid.NewString(), RequestID: requestID, BridgeInstanceID: bound.BridgeInstanceID,
+				SubscriptionID: sub.ID, SubscriptionItemID: subscriptionItemID, MediaSource: bound.MediaSource, MediaID: bound.MediaID,
+				TorrentFingerprint: bound.SelectedFingerprint, ResourceRef: bound.ResourceRef, RetentionPolicyJSON: string(policyRaw),
+				DownloaderPolicyJSON: string(waitingPolicyJSON), DownloaderPolicyMode: waitingPolicyMode,
+				Status: model.MoviePilotIntentStatusWaitingCapacity, LastErrorCode: "downloader_capacity_unavailable", LastError: selectErr.Error(),
+			}
+			if persistErr := db.CreateIntentTx(ctx, db.GetDb(), intent); persistErr != nil {
+				return fmt.Errorf("select MoviePilot downloader: %v; persist waiting intent: %w", selectErr, persistErr)
+			}
+			return fmt.Errorf("select MoviePilot downloader: %w", selectErr)
+		}
+		requestPolicy = selected
+	}
+	policyJSON, err := json.Marshal(requestPolicy)
+	if err != nil {
+		return err
+	}
 	intent := &model.MoviePilotDownloadIntent{
 		ID: uuid.NewString(), RequestID: requestID, BridgeInstanceID: bound.BridgeInstanceID,
 		SubscriptionID: sub.ID, SubscriptionItemID: subscriptionItemID, MediaSource: bound.MediaSource, MediaID: bound.MediaID,
 		TorrentFingerprint: bound.SelectedFingerprint, ResourceRef: bound.ResourceRef, RetentionPolicyJSON: string(policyRaw),
-		Status: model.MoviePilotIntentStatusPending,
+		DownloaderPolicyJSON: string(policyJSON), DownloaderPolicyMode: requestPolicy.Mode,
+		SelectedDownloader: requestPolicy.Downloader, SelectedRouteID: requestPolicy.RouteID,
+		ReservationID: requestPolicy.ReservationID,
+		Status:        model.MoviePilotIntentStatusPending,
 	}
-	payload := moviePilotIntentPayload(sub, bound, requestID, policy)
-	return client.SubmitIntent(ctx, bound.BridgeInstanceID, intent, payload)
+	payload := moviePilotIntentPayload(sub, bound, requestID, policy, requestPolicy)
+	if err := client.SubmitIntent(ctx, bound.BridgeInstanceID, intent, payload); err != nil {
+		// The real Bridge client durably queues the exact intent before it
+		// returns a transport error. Keep the reservation alive for that
+		// outbox retry; releasing it here could let another request take the
+		// route and make the later retry fail its binding check.
+		return err
+	}
+	return nil
 }
 
 func moviePilotIntentRequestID(subscriptionID uint, resourceRef, fingerprint string) string {
 	return shortHash(fmt.Sprintf("subscription:%d:%s:%s", subscriptionID, resourceRef, fingerprint))
 }
 
-func moviePilotIntentPayload(sub *model.Subscription, bound *model.SubscriptionBoundTorrent, requestID string, policy map[string]interface{}) moviepilotbridge.DownloadIntentRequest {
+func moviePilotIntentPayload(sub *model.Subscription, bound *model.SubscriptionBoundTorrent, requestID string, policy map[string]interface{}, downloaderPolicy moviepilotbridge.DownloaderPolicy) moviepilotbridge.DownloadIntentRequest {
 	return moviepilotbridge.DownloadIntentRequest{
 		RequestID: requestID, SubscriptionID: strconv.FormatUint(uint64(sub.ID), 10),
 		Media: moviepilotbridge.MediaIdentity{
@@ -401,7 +473,7 @@ func moviePilotIntentPayload(sub *model.Subscription, bound *model.SubscriptionB
 			Title: bound.TorrentTitle, ResourceRef: bound.ResourceRef, Site: bound.Site,
 			Size: bound.Size, SelectedFingerprint: bound.SelectedFingerprint,
 		},
-		DownloaderPolicy: moviepilotbridge.DownloaderPolicy{Mode: "moviepilot_select"},
+		DownloaderPolicy: downloaderPolicy,
 		RetentionPolicy:  policy,
 	}
 }
@@ -435,6 +507,16 @@ func runMoviePilot(ctx context.Context, sub *model.Subscription, transfer bool) 
 	}
 	if transfer {
 		if err := submitMoviePilotIntent(ctx, sub, saved.ID); err != nil {
+			if errors.Is(err, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
+				retryAt := time.Now().UTC().Add(subscriptionRetryDelay)
+				saved.Status = model.SubscriptionItemStatusRetryWait
+				saved.LastErrorCode = "downloader_capacity_unavailable"
+				saved.LastError = err.Error()
+				saved.RetryAt = &retryAt
+				if _, _, persistErr := db.UpsertSubscriptionItemForceStatus(saved); persistErr != nil {
+					return nil, sub.LastTreeHash, 0, 0, 0, fmt.Errorf("persist MoviePilot capacity retry: %w", persistErr)
+				}
+			}
 			return nil, sub.LastTreeHash, 0, 0, 0, err
 		}
 	}

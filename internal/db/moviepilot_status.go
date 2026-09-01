@@ -39,6 +39,7 @@ func ListMoviePilotTaskStatuses(ctx context.Context, subscriptionID uint, bridge
 	intentIDs := make([]string, 0, len(intents))
 	itemIDs := make([]uint, 0, len(intents))
 	subscriptionIDs := make([]uint, 0, len(intents))
+	reservationIDs := make([]string, 0, len(intents))
 	for _, intent := range intents {
 		intentIDs = append(intentIDs, intent.ID)
 		if intent.SubscriptionItemID > 0 {
@@ -46,6 +47,22 @@ func ListMoviePilotTaskStatuses(ctx context.Context, subscriptionID uint, bridge
 		}
 		if intent.SubscriptionID > 0 {
 			subscriptionIDs = append(subscriptionIDs, intent.SubscriptionID)
+		}
+		if strings.TrimSpace(intent.ReservationID) != "" {
+			reservationIDs = append(reservationIDs, intent.ReservationID)
+		}
+	}
+	reservationByID := make(map[string]model.MoviePilotDownloaderReservation, len(reservationIDs))
+	if len(reservationIDs) > 0 {
+		var reservations []model.MoviePilotDownloaderReservation
+		if err := db.WithContext(ctx).Where("id IN ?", reservationIDs).Find(&reservations).Error; err != nil {
+			if !isMoviePilotMissingTableError(err) {
+				return nil, err
+			}
+		} else {
+			for _, reservation := range reservations {
+				reservationByID[reservation.ID] = reservation
+			}
 		}
 	}
 
@@ -159,11 +176,29 @@ func ListMoviePilotTaskStatuses(ctx context.Context, subscriptionID uint, bridge
 			RequestID: intent.RequestID, SubscriptionID: intent.SubscriptionID,
 			SubscriptionItemID: intent.SubscriptionItemID, SubscriptionName: subscription.Name,
 			ItemName:     firstNonEmptyMoviePilotStatus(item.FileName, item.TargetName, item.FilePath),
-			IntentStatus: intent.Status, BridgeInstanceID: intent.BridgeInstanceID,
+			IntentStatus: intent.Status, DownloaderPolicyMode: intent.DownloaderPolicyMode,
+			SelectedRouteID: intent.SelectedRouteID, ReservationID: intent.ReservationID,
+			ReservationExpiresAt: intent.ReservationExpiresAt, BridgeInstanceID: intent.BridgeInstanceID,
 			ClusterJobID: job.ID, ClusterJobStatus: job.Status, ClusterJobStage: stage.Name,
 			ClusterJobStageStatus: stage.Status, ErrorCode: firstNonEmptyMoviePilotStatus(intent.LastErrorCode, job.LastErrorCode, stage.ErrorCode),
 			Error:     firstNonEmptyMoviePilotStatus(intent.LastError, job.LastError, stage.Error),
 			UpdatedAt: intent.UpdatedAt,
+		}
+		if reservation, ok := reservationByID[intent.ReservationID]; ok {
+			status.ReservationStatus = reservation.Status
+			status.ReservationExpiresAt = &reservation.ExpiresAt
+			if status.SelectedRouteID == "" {
+				status.SelectedRouteID = reservation.RouteID
+			}
+			if status.WorkerNodeID == "" {
+				status.WorkerNodeID = reservation.WorkerNodeID
+			}
+			if status.Downloader == "" {
+				status.Downloader = reservation.Downloader
+			}
+			if status.QBClientID == "" {
+				status.QBClientID = reservation.QBClientID
+			}
 		}
 		if hasBinding {
 			status.BindingID = binding.ID
@@ -208,18 +243,41 @@ func moviePilotTaskStatusesWithoutBindings(ctx context.Context, intents []model.
 			}
 		}
 	}
+	reservationByID := make(map[string]model.MoviePilotDownloaderReservation, len(intents))
+	ids := make([]string, 0, len(intents))
+	for _, intent := range intents {
+		if strings.TrimSpace(intent.ReservationID) != "" {
+			ids = append(ids, intent.ReservationID)
+		}
+	}
+	if len(ids) > 0 {
+		var rows []model.MoviePilotDownloaderReservation
+		if err := db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err == nil {
+			for _, row := range rows {
+				reservationByID[row.ID] = row
+			}
+		}
+	}
 	result := make([]model.MoviePilotTaskStatus, 0, len(intents))
 	for _, intent := range intents {
 		item := itemsByID[intent.SubscriptionItemID]
 		subscription := subscriptionsByID[intent.SubscriptionID]
-		result = append(result, model.MoviePilotTaskStatus{
+		status := model.MoviePilotTaskStatus{
 			RequestID: intent.RequestID, SubscriptionID: intent.SubscriptionID,
 			SubscriptionItemID: intent.SubscriptionItemID, SubscriptionName: subscription.Name,
 			ItemName:     firstNonEmptyMoviePilotStatus(item.FileName, item.TargetName, item.FilePath),
-			IntentStatus: intent.Status, BridgeInstanceID: intent.BridgeInstanceID,
+			IntentStatus: intent.Status, DownloaderPolicyMode: intent.DownloaderPolicyMode,
+			SelectedRouteID: intent.SelectedRouteID, ReservationID: intent.ReservationID,
+			ReservationExpiresAt: intent.ReservationExpiresAt, BridgeInstanceID: intent.BridgeInstanceID,
 			Phase:     moviePilotTaskPhase(model.MoviePilotTaskStatus{IntentStatus: intent.Status, Error: intent.LastError}, false, nil),
 			ErrorCode: intent.LastErrorCode, Error: intent.LastError, UpdatedAt: intent.UpdatedAt,
-		})
+		}
+		if reservation, ok := reservationByID[intent.ReservationID]; ok {
+			status.ReservationStatus, status.ReservationExpiresAt = reservation.Status, &reservation.ExpiresAt
+			status.Downloader, status.WorkerNodeID, status.QBClientID = reservation.Downloader, reservation.WorkerNodeID, reservation.QBClientID
+			status.SelectedRouteID = firstNonEmptyMoviePilotStatus(status.SelectedRouteID, reservation.RouteID)
+		}
+		result = append(result, status)
 	}
 	return result
 }
@@ -257,7 +315,7 @@ func setMoviePilotDeliveryProgress(status *model.MoviePilotTaskStatus, deliverie
 }
 
 func moviePilotTaskPhase(status model.MoviePilotTaskStatus, hasBinding bool, deliveries []model.MoviePilotDeliveryFile) string {
-	if status.Error != "" || status.IntentStatus == model.MoviePilotIntentStatusFailed || status.ClusterJobStatus == model.ClusterJobStatusFailed || status.ClusterJobStatus == model.ClusterJobStatusDeadLetter || status.ClusterJobStageStatus == model.ClusterStageStatusFailed {
+	if status.IntentStatus != model.MoviePilotIntentStatusWaitingCapacity && (status.Error != "" || status.IntentStatus == model.MoviePilotIntentStatusFailed || status.ClusterJobStatus == model.ClusterJobStatusFailed || status.ClusterJobStatus == model.ClusterJobStatusDeadLetter || status.ClusterJobStageStatus == model.ClusterStageStatusFailed) {
 		return model.MoviePilotTaskPhaseFailed
 	}
 	if len(deliveries) > 0 {

@@ -99,12 +99,11 @@ func (s *Service) qbClientForCapacity(config protocol.QBClientConfig) (qbittorre
 }
 
 func downloadWatermarkBytes(staging protocol.StagingConfig) (uint64, uint64, bool) {
-	low := staging.DownloadDiskLowWatermarkGB
-	high := staging.DownloadDiskHighWatermarkGB
+	low := staging.DownloadDiskPauseWatermarkGB
+	high := staging.DownloadDiskResumeWatermarkGB
 	if low <= 0 || high <= 0 {
 		return 0, 0, false
 	}
-	const bytesPerGB int64 = 1024 * 1024 * 1024
 	maxInt64 := uint64(^uint64(0) >> 1)
 	if uint64(high) > maxInt64/uint64(bytesPerGB) {
 		return 0, 0, false

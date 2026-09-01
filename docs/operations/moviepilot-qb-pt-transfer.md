@@ -12,7 +12,7 @@
 
 ## Worker 配置
 
-下列字段属于 `WorkerDesiredConfig` 的 `qb_clients`、`moviepilot_routes` 与 `staging`。字节数使用整数；150 GiB 为单文件硬上限。
+下列字段属于 `WorkerDesiredConfig` 的 `qb_clients`、`moviepilot_routes` 与 `staging`。容量配置统一使用 GB（1 GB = 1024^3 bytes）；150 GB 为单文件硬上限。
 
 ```yaml
 qb_clients:
@@ -30,17 +30,21 @@ moviepilot_routes:
 
 staging:
   root: /mnt/staging/openlist
-  max_file_bytes: 161061273600       # 150 GiB
+  staging_max_file_size_gb: 150       # 1 GB = 1024^3 bytes
   max_upload_concurrency: 2
-  safety_reserve_bytes: 85899345920  # 80 GiB
-  pause_download_low_watermark_bytes: 408021893120
-  resume_download_high_watermark_bytes: 461708984320
+  staging_safety_reserve_gb: 80
+  staging_pause_download_watermark_gb: 380
+  staging_resume_download_watermark_gb: 430
+  download_disk_pause_watermark_gb: 20
+  download_disk_resume_watermark_gb: 40
   extension_whitelist: [.mkv, .mp4, .iso]
   antihash_enabled: true
   iso_rename_enabled: true
 ```
 
-`pause_download_low_watermark_bytes` 和 `resume_download_high_watermark_bytes` 必须同时设置，且高水位不得低于低水位。低水位以下会暂停未完成的受管 torrent；仅在高水位及以上恢复。`safety_reserve_bytes` 同时参与每次复制的准入计算：`free - reserved - file_size - safety_reserve >= 0`。
+容量配置统一使用 GB（1 GB = 1024^3 bytes）。`staging_pause_download_watermark_gb` 和 `staging_resume_download_watermark_gb` 控制 staging 盘：必须同时设置，且恢复水位不得低于暂停水位；暂停水位以下会暂停未完成的受管 torrent，仅在恢复水位及以上恢复。`staging_safety_reserve_gb` 参与每次复制的 staging 准入计算：`free - reserved - file_size - safety_reserve >= 0`。
+
+`download_disk_pause_watermark_gb` 和 `download_disk_resume_watermark_gb` 控制 qB 下载盘：必须同时设置，且恢复水位必须高于暂停水位；下载盘剩余空间低于或等于暂停水位时暂停未完成 qB，达到恢复水位时仅恢复由该策略暂停的任务。两项均为 0 表示关闭下载盘容量策略。
 
 `webui_url` 可使用 Worker 可达的容器 DNS 或私网地址，例如 `http://qbittorrent:8080`，不限于 loopback。HTTP 只应部署在 Worker 与 qB 的可信隔离网络中；跨主机链路应使用 HTTPS，并用防火墙限制为 Worker 可访问。`secret_ref` 必填且必须能解密出用户名和密码，不会降级为匿名 qB 会话。Worker 同时兼容 qB 5 的 `start/stop` 与 qB 4 的 `resume/pause` 控制端点。
 

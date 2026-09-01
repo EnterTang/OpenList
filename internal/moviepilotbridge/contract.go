@@ -117,9 +117,24 @@ type TorrentResource struct {
 }
 
 type DownloaderPolicy struct {
-	Mode    string   `json:"mode"`
-	Allowed []string `json:"allowed,omitempty"`
+	Mode           string   `json:"mode"`
+	Downloader     string   `json:"downloader,omitempty"`
+	RouteID        string   `json:"route_id,omitempty"`
+	ReservationID  string   `json:"reservation_id,omitempty"`
+	FallbackReason string   `json:"fallback_reason,omitempty"`
+	Allowed        []string `json:"allowed,omitempty"`
 }
+
+const (
+	DownloaderPolicyMoviePilotSelect     = "moviepilot_select"
+	DownloaderPolicyCoordinatorSelect    = "coordinator_select"
+	DownloaderPolicyCoordinatorPreferred = "coordinator_preferred"
+)
+
+// ErrDownloaderCapacityUnavailable is shared by the Coordinator scheduler
+// and subscription runner so an admission failure can be persisted as a
+// retryable waiting state instead of being mistaken for a terminal failure.
+var ErrDownloaderCapacityUnavailable = errors.New("no MoviePilot downloader route satisfies current capacity")
 
 type TorrentControlRequest struct {
 	RequestID   string `json:"request_id"`
@@ -244,8 +259,25 @@ func (r DownloadIntentRequest) Validate() error {
 	if strings.TrimSpace(r.Media.MediaSource) == "" || strings.TrimSpace(r.Media.MediaID) == "" {
 		return errors.New("media_source and media_id are required")
 	}
-	if strings.TrimSpace(r.DownloaderPolicy.Mode) != "moviepilot_select" {
-		return errors.New("downloader policy mode must be moviepilot_select")
+	mode := strings.TrimSpace(r.DownloaderPolicy.Mode)
+	switch mode {
+	case DownloaderPolicyMoviePilotSelect:
+		if strings.TrimSpace(r.DownloaderPolicy.Downloader) != "" || strings.TrimSpace(r.DownloaderPolicy.RouteID) != "" || strings.TrimSpace(r.DownloaderPolicy.ReservationID) != "" {
+			return errors.New("moviepilot_select must not include a Coordinator downloader, route, or reservation")
+		}
+	case DownloaderPolicyCoordinatorSelect:
+		if strings.TrimSpace(r.DownloaderPolicy.Downloader) == "" {
+			return errors.New("coordinator_select requires a downloader")
+		}
+		if strings.TrimSpace(r.DownloaderPolicy.RouteID) == "" || strings.TrimSpace(r.DownloaderPolicy.ReservationID) == "" {
+			return errors.New("coordinator_select requires route_id and reservation_id")
+		}
+	case DownloaderPolicyCoordinatorPreferred:
+		if strings.TrimSpace(r.DownloaderPolicy.Downloader) != "" && (strings.TrimSpace(r.DownloaderPolicy.RouteID) == "" || strings.TrimSpace(r.DownloaderPolicy.ReservationID) == "") {
+			return errors.New("coordinator_preferred requires route_id and reservation_id when a downloader is selected")
+		}
+	default:
+		return fmt.Errorf("unsupported downloader policy mode %q", r.DownloaderPolicy.Mode)
 	}
 	if strings.TrimSpace(r.Torrent.Enclosure) != "" {
 		return errors.New("torrent enclosure is forbidden; use the opaque resource_ref returned by MoviePilot search")
