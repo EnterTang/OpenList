@@ -3,6 +3,7 @@
 .tmp-build/
 output/
 /dist/
+.worktrees/
 
 # Binaries for programs and plugins
 *.exe
