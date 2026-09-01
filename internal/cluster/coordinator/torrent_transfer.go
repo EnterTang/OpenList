@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -679,7 +680,7 @@ func (s *Service) resolveMoviePilotWorkerRoute(ctx context.Context, bridgeID, do
 		return "", "", err
 	}
 	seen := make(map[string]struct{})
-	workerID, qbID := "", ""
+	var candidates []moviePilotWorkerRouteCandidate
 	for _, inventory := range inventories {
 		if _, ok := seen[inventory.NodeID]; ok {
 			continue
@@ -704,16 +705,57 @@ func (s *Service) resolveMoviePilotWorkerRoute(ctx context.Context, bridgeID, do
 			if health := strings.ToLower(strings.TrimSpace(route.QBHealth)); health != "ready" && health != "healthy" {
 				continue
 			}
-			if workerID != "" && (workerID != inventory.NodeID || qbID != route.QBClientID) {
-				return "", "", errors.New("MoviePilot downloader route is advertised by multiple Workers")
-			}
-			workerID, qbID = inventory.NodeID, route.QBClientID
+			candidates = append(candidates, moviePilotWorkerRouteCandidate{
+				workerID: inventory.NodeID, qbID: strings.TrimSpace(route.QBClientID),
+				activeSlots: route.ActiveUploadSlots, uploadConcurrency: route.UploadConcurrency,
+				activeBytes: route.ActiveStagingBytes, freeBytes: route.StagingFreeBytes,
+			})
 		}
 	}
-	if workerID == "" || qbID == "" {
+	if len(candidates) == 0 {
 		return "", "", fmt.Errorf("no healthy Worker route is advertised for MoviePilot bridge %q downloader %q", bridgeID, downloader)
 	}
-	return workerID, qbID, nil
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].betterThan(candidates[j])
+	})
+	return candidates[0].workerID, candidates[0].qbID, nil
+}
+
+type moviePilotWorkerRouteCandidate struct {
+	workerID          string
+	qbID              string
+	activeSlots       int
+	uploadConcurrency int
+	activeBytes       int64
+	freeBytes         int64
+}
+
+func (candidate moviePilotWorkerRouteCandidate) betterThan(other moviePilotWorkerRouteCandidate) bool {
+	candidateFull := candidate.uploadConcurrency > 0 && candidate.activeSlots >= candidate.uploadConcurrency
+	otherFull := other.uploadConcurrency > 0 && other.activeSlots >= other.uploadConcurrency
+	if candidateFull != otherFull {
+		return !candidateFull
+	}
+	if candidate.uploadConcurrency > 0 && other.uploadConcurrency > 0 {
+		left := int64(candidate.activeSlots) * int64(other.uploadConcurrency)
+		right := int64(other.activeSlots) * int64(candidate.uploadConcurrency)
+		if left != right {
+			return left < right
+		}
+	}
+	if candidate.activeSlots != other.activeSlots {
+		return candidate.activeSlots < other.activeSlots
+	}
+	if candidate.activeBytes != other.activeBytes {
+		return candidate.activeBytes < other.activeBytes
+	}
+	if candidate.freeBytes != other.freeBytes {
+		return candidate.freeBytes > other.freeBytes
+	}
+	if candidate.workerID != other.workerID {
+		return candidate.workerID < other.workerID
+	}
+	return candidate.qbID < other.qbID
 }
 
 func (s *Service) loadMoviePilotSubscriptionItem(ctx context.Context, intent *model.MoviePilotDownloadIntent, item *model.SubscriptionItem) error {
@@ -1281,6 +1323,9 @@ func (s *Service) ReconcileTorrentRetention(ctx context.Context, limit int) erro
 	if err := s.refreshRetentionEligibility(ctx, limit); err != nil {
 		return err
 	}
+	if err := s.dispatchDownloadPressureRetention(ctx, limit); err != nil {
+		return err
+	}
 	candidates, err := db.ListRetentionCandidates(ctx, s.db, time.Now().UTC(), limit)
 	if err != nil {
 		return err
@@ -1294,25 +1339,8 @@ func (s *Service) ReconcileTorrentRetention(ctx context.Context, limit int) erro
 		if !ready {
 			continue
 		}
-		var parent model.ClusterJob
-		if err := s.db.WithContext(ctx).First(&parent, "id = ?", binding.ObserveJobID).Error; err != nil {
-			continue
-		}
-		var task protocol.TaskContext
-		if err := json.Unmarshal([]byte(parent.TaskContextJSON), &task); err != nil || task.Torrent == nil {
-			continue
-		}
-		task.ParentBatchID = parent.ID
-		task.MediaItemID = "moviepilot-retention:" + binding.ID
-		task.SourceObjects = nil
-		task.Torrent.Action = "delete"
-		task.Torrent.RelativePath = ""
 		key := fmt.Sprintf("%sretention:%s:%d", moviePilotTorrentDeliveryPrefix, binding.ID, binding.RetentionEligibleAt.UTC().UnixNano())
-		_, err := s.torrentDispatcher.DispatchTorrentJob(ctx, TorrentJobDispatchRequest{
-			JobType: model.ClusterJobTypeTorrentRetention, NodeID: binding.WorkerNodeID, IdempotencyKey: key,
-			TaskContext: task, RequiredCapabilities: []string{"qb.control", "result.report"},
-		})
-		if err != nil {
+		if err := s.dispatchTorrentRetentionDelete(ctx, binding, key); err != nil {
 			continue
 		}
 		_ = s.db.WithContext(ctx).Model(&model.MoviePilotTorrentBinding{}).Where("id = ? AND retention_status = ?", binding.ID, model.MoviePilotRetentionStatusEligible).Updates(map[string]any{
@@ -1321,6 +1349,114 @@ func (s *Service) ReconcileTorrentRetention(ctx context.Context, limit int) erro
 		}).Error
 	}
 	return nil
+}
+
+// dispatchDownloadPressureRetention removes completed MoviePilot torrents
+// before their normal seed/ratio policy when the Worker reports that the
+// download volume is below its configured low watermark. Delivery readiness
+// remains mandatory: qB files are never deleted while any required cloud
+// delivery is still pending or uploading.
+func (s *Service) dispatchDownloadPressureRetention(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		limit = 100
+	}
+	var inventories []model.ClusterNodeInventory
+	if err := s.db.WithContext(ctx).Order("node_id ASC, revision DESC").Find(&inventories).Error; err != nil {
+		return err
+	}
+	pressured := make(map[string]struct{})
+	seenNodes := make(map[string]struct{})
+	for _, inventory := range inventories {
+		if _, seen := seenNodes[inventory.NodeID]; seen {
+			continue
+		}
+		seenNodes[inventory.NodeID] = struct{}{}
+		var node model.ClusterNode
+		if err := s.db.WithContext(ctx).First(&node, "id = ?", inventory.NodeID).Error; err != nil || node.Status != model.ClusterNodeStatusOnline || node.Disabled || node.Drain || strings.TrimSpace(node.LastSessionID) == "" {
+			continue
+		}
+		var connected int64
+		if err := s.db.WithContext(ctx).Model(&model.ClusterNodeSession{}).Where("id = ? AND node_id = ? AND status = ?", node.LastSessionID, node.ID, model.ClusterSessionStatusConnected).Count(&connected).Error; err != nil || connected != 1 {
+			continue
+		}
+		var capabilities protocol.NodeCapabilities
+		if err := json.Unmarshal([]byte(inventory.CapabilitiesJSON), &capabilities); err != nil {
+			continue
+		}
+		for _, route := range capabilities.MoviePilotRoutes {
+			if route.DownloadCapacityKnown && route.DownloadLowWatermarkBytes > 0 && route.DownloadFreeBytes <= route.DownloadLowWatermarkBytes {
+				pressured[moviePilotRouteKey(inventory.NodeID, route.BridgeInstanceID, route.Downloader, route.QBClientID)] = struct{}{}
+			}
+		}
+	}
+	if len(pressured) == 0 {
+		return nil
+	}
+	var bindings []model.MoviePilotTorrentBinding
+	if err := s.db.WithContext(ctx).Where("status IN ? AND retention_status NOT IN ?", []string{
+		model.MoviePilotTorrentStatusDownloadCompleted,
+		model.MoviePilotTorrentStatusFilesDiscovered,
+		model.MoviePilotTorrentStatusTransferring,
+		model.MoviePilotTorrentStatusSeeding,
+		model.MoviePilotTorrentStatusRetentionReview,
+	}, []string{model.MoviePilotRetentionStatusDeleting, model.MoviePilotRetentionStatusDeleted}).Order("updated_at ASC, id ASC").Limit(limit).Find(&bindings).Error; err != nil {
+		return err
+	}
+	for i := range bindings {
+		binding := &bindings[i]
+		if _, ok := pressured[moviePilotRouteKey(binding.WorkerNodeID, binding.BridgeInstanceID, binding.DownloaderAlias, binding.QBClientID)]; !ok {
+			continue
+		}
+		if binding.LastQBProgress < 0.999999 && binding.Status != model.MoviePilotTorrentStatusSeeding {
+			continue
+		}
+		ready, err := s.moviePilotDeliveryReadyForRetention(ctx, binding.ID)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			continue
+		}
+		key := moviePilotTorrentDeliveryPrefix + "pressure:" + binding.ID
+		if err := s.dispatchTorrentRetentionDelete(ctx, binding, key); err != nil {
+			continue
+		}
+		_ = s.db.WithContext(ctx).Model(&model.MoviePilotTorrentBinding{}).
+			Where("id = ? AND status NOT IN ?", binding.ID, []string{model.MoviePilotTorrentStatusDeleting, model.MoviePilotTorrentStatusDeleted}).
+			Updates(map[string]any{
+				"status": model.MoviePilotTorrentStatusDeleting, "retention_status": model.MoviePilotRetentionStatusDeleting,
+				"deleting_at": time.Now().UTC(), "last_error_code": "", "last_error": "",
+			}).Error
+	}
+	return nil
+}
+
+func moviePilotRouteKey(workerID, bridgeID, downloader, qbID string) string {
+	return strings.ToLower(strings.Join([]string{strings.TrimSpace(workerID), strings.TrimSpace(bridgeID), strings.TrimSpace(downloader), strings.TrimSpace(qbID)}, "\x00"))
+}
+
+func (s *Service) dispatchTorrentRetentionDelete(ctx context.Context, binding *model.MoviePilotTorrentBinding, key string) error {
+	if binding == nil {
+		return errors.New("torrent binding is required")
+	}
+	var parent model.ClusterJob
+	if err := s.db.WithContext(ctx).First(&parent, "id = ?", binding.ObserveJobID).Error; err != nil {
+		return err
+	}
+	var task protocol.TaskContext
+	if err := json.Unmarshal([]byte(parent.TaskContextJSON), &task); err != nil || task.Torrent == nil {
+		return errors.New("torrent retention parent has no torrent context")
+	}
+	task.ParentBatchID = parent.ID
+	task.MediaItemID = "moviepilot-retention:" + binding.ID
+	task.SourceObjects = nil
+	task.Torrent.Action = "delete"
+	task.Torrent.RelativePath = ""
+	_, err := s.torrentDispatcher.DispatchTorrentJob(ctx, TorrentJobDispatchRequest{
+		JobType: model.ClusterJobTypeTorrentRetention, NodeID: binding.WorkerNodeID, IdempotencyKey: key,
+		TaskContext: task, RequiredCapabilities: []string{"qb.control", "result.report"},
+	})
+	return err
 }
 
 const retentionInspectionInterval = time.Minute

@@ -85,6 +85,43 @@ func TestGetTorrentByHashUsesHashesParameter(t *testing.T) {
 	}
 }
 
+func TestGetTorrentsListsAllTorrentsWithoutHashFilter(t *testing.T) {
+	hash := strings.Repeat("f", 40)
+	var gotForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/app/version" {
+			_, _ = io.WriteString(w, "5.0.0")
+			return
+		}
+		if r.URL.Path != "/api/v2/torrents/info" {
+			http.NotFound(w, r)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		gotForm = r.Form
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]TorrentInfo{{Hash: hash, Name: "Show", Progress: 1}})
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("new qB client: %v", err)
+	}
+	infos, err := client.GetTorrents(context.Background())
+	if err != nil {
+		t.Fatalf("get torrents: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Hash != hash {
+		t.Fatalf("unexpected torrents: %#v", infos)
+	}
+	if len(gotForm) != 0 {
+		t.Fatalf("all-torrents request unexpectedly had filters: %#v", gotForm)
+	}
+}
+
 func TestControlByHashSendsHashWithoutTagLookup(t *testing.T) {
 	hash := strings.Repeat("e", 40)
 	var endpoints []string

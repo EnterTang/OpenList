@@ -13,6 +13,7 @@ import (
 
 type fakeQBClient struct {
 	info                qbittorrent.TorrentInfo
+	torrents            []qbittorrent.TorrentInfo
 	getErr              error
 	files               []qbittorrent.FileInfo
 	started             []string
@@ -27,6 +28,15 @@ func (f *fakeQBClient) GetInfo(string) (qbittorrent.TorrentInfo, error) {
 	return f.info, nil
 }
 func (f *fakeQBClient) GetFiles(string) ([]qbittorrent.FileInfo, error) { return f.files, nil }
+func (f *fakeQBClient) GetTorrents(context.Context) ([]qbittorrent.TorrentInfo, error) {
+	if f.torrents != nil {
+		return f.torrents, nil
+	}
+	if f.info.Hash == "" {
+		return nil, nil
+	}
+	return []qbittorrent.TorrentInfo{f.info}, nil
+}
 func (f *fakeQBClient) GetTorrentByHash(context.Context, string) (qbittorrent.TorrentInfo, error) {
 	if f.deletedMakesMissing && len(f.deleted) > 0 {
 		return qbittorrent.TorrentInfo{}, qbittorrent.NewInfoNotFoundError(f.info.Hash)
@@ -473,6 +483,50 @@ func TestReconcileMoviePilotStagingCapacityUsesLowHighWatermarks(t *testing.T) {
 	entry = service.moviePilotTorrents[moviePilotTorrentRegistryKey(&torrent)]
 	if entry.PausedByCapacity {
 		t.Fatalf("registry entry = %#v, want capacity pause cleared", entry)
+	}
+}
+
+func TestReconcileQBDiskCapacityPausesAndResumesOnlyIncompleteDownloads(t *testing.T) {
+	incompleteHash := strings.Repeat("4", 40)
+	completeHash := strings.Repeat("5", 40)
+	client := &fakeQBClient{torrents: []qbittorrent.TorrentInfo{
+		{Hash: incompleteHash, Progress: .5, AmountLeft: 500, SavePath: "/downloads", State: qbittorrent.DOWNLOADING},
+		{Hash: completeHash, Progress: 1, AmountLeft: 0, SavePath: "/downloads", State: qbittorrent.STALLEDUP},
+	}}
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients: []protocol.QBClientConfig{{ID: "qb-a", WebUIURL: "http://127.0.0.1:8080", SecretRef: "secret-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
+		Staging:   protocol.StagingConfig{DownloadDiskLowWatermarkGB: 1, DownloadDiskHighWatermarkGB: 2},
+	}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
+	free := uint64(1) * 1024 * 1024 * 1024
+	service.downloadFreeSpace = func(context.Context, string) (uint64, error) { return free, nil }
+
+	service.ReconcileQBDiskCapacity(context.Background())
+	if len(client.stopped) != 1 || client.stopped[0] != incompleteHash {
+		t.Fatalf("stop calls = %#v, want only incomplete torrent", client.stopped)
+	}
+	if len(service.capacityPausedTorrents) != 1 {
+		t.Fatalf("capacity pauses = %#v, want one entry", service.capacityPausedTorrents)
+	}
+
+	free = uint64(2) * 1024 * 1024 * 1024
+	service.ReconcileQBDiskCapacity(context.Background())
+	if len(client.started) != 1 || client.started[0] != incompleteHash {
+		t.Fatalf("start calls = %#v, want paused torrent", client.started)
+	}
+	if len(service.capacityPausedTorrents) != 0 {
+		t.Fatalf("capacity pauses after recovery = %#v, want empty", service.capacityPausedTorrents)
+	}
+
+	service.desiredConfig.Staging = protocol.StagingConfig{}
+	service.capacityPausedTorrents[qbCapacityPauseKey("qb-a", incompleteHash)] = qbCapacityPauseEntry{QBClientID: "qb-a", TorrentHash: incompleteHash, DownloadRoot: "/srv/downloads"}
+	service.ReconcileQBDiskCapacity(context.Background())
+	if len(client.started) != 2 || client.started[1] != incompleteHash {
+		t.Fatalf("start calls after disabling policy = %#v, want paused torrent restored", client.started)
+	}
+	if len(service.capacityPausedTorrents) != 0 {
+		t.Fatalf("capacity pauses after disabling policy = %#v, want empty", service.capacityPausedTorrents)
 	}
 }
 

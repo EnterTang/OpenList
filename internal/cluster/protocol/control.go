@@ -49,18 +49,23 @@ type MoviePilotRoute struct {
 }
 
 type StagingConfig struct {
-	Root                             string   `json:"root,omitempty"`
-	MaxUploadConcurrency             int      `json:"max_upload_concurrency,omitempty"`
-	MaxFileBytes                     int64    `json:"max_file_bytes,omitempty"`
-	SafetyReserveBytes               int64    `json:"safety_reserve_bytes,omitempty"`
-	PauseDownloadLowWatermarkBytes   int64    `json:"pause_download_low_watermark_bytes,omitempty"`
-	ResumeDownloadHighWatermarkBytes int64    `json:"resume_download_high_watermark_bytes,omitempty"`
-	ExtensionWhitelist               []string `json:"extension_whitelist,omitempty"`
-	AntiHashEnabled                  bool     `json:"antihash_enabled"`
-	ISORenameEnabled                 bool     `json:"iso_rename_enabled"`
+	Root                             string `json:"root,omitempty"`
+	MaxUploadConcurrency             int    `json:"max_upload_concurrency,omitempty"`
+	MaxFileBytes                     int64  `json:"max_file_bytes,omitempty"`
+	SafetyReserveBytes               int64  `json:"safety_reserve_bytes,omitempty"`
+	PauseDownloadLowWatermarkBytes   int64  `json:"pause_download_low_watermark_bytes,omitempty"`
+	ResumeDownloadHighWatermarkBytes int64  `json:"resume_download_high_watermark_bytes,omitempty"`
+	// Download disk watermarks are configured in GB fields using 1024^3 bytes
+	// per unit. They apply to every configured qB client; zero disables them.
+	DownloadDiskLowWatermarkGB  int64    `json:"download_disk_low_watermark_gb,omitempty"`
+	DownloadDiskHighWatermarkGB int64    `json:"download_disk_high_watermark_gb,omitempty"`
+	ExtensionWhitelist          []string `json:"extension_whitelist,omitempty"`
+	AntiHashEnabled             bool     `json:"antihash_enabled"`
+	ISORenameEnabled            bool     `json:"iso_rename_enabled"`
 }
 
 const maxMoviePilotStagingFileBytes int64 = 150 * 1024 * 1024 * 1024
+const bytesPerGB int64 = 1024 * 1024 * 1024
 
 type TargetBinding struct {
 	MountPath      string `json:"mount_path"`
@@ -127,7 +132,7 @@ func (c WorkerDesiredConfig) Validate() error {
 	if c.Staging.MaxFileBytes < 0 || c.Staging.MaxFileBytes > maxMoviePilotStagingFileBytes {
 		return fmt.Errorf("MoviePilot staging max file size must not exceed %d bytes", maxMoviePilotStagingFileBytes)
 	}
-	if c.Staging.SafetyReserveBytes < 0 || c.Staging.PauseDownloadLowWatermarkBytes < 0 || c.Staging.ResumeDownloadHighWatermarkBytes < 0 {
+	if c.Staging.SafetyReserveBytes < 0 || c.Staging.PauseDownloadLowWatermarkBytes < 0 || c.Staging.ResumeDownloadHighWatermarkBytes < 0 || c.Staging.DownloadDiskLowWatermarkGB < 0 || c.Staging.DownloadDiskHighWatermarkGB < 0 {
 		return errors.New("MoviePilot staging capacity values must not be negative")
 	}
 	low := c.Staging.PauseDownloadLowWatermarkBytes
@@ -137,6 +142,17 @@ func (c WorkerDesiredConfig) Validate() error {
 	}
 	if low > 0 && high < low {
 		return errors.New("MoviePilot staging resume watermark must not be below pause watermark")
+	}
+	downloadLow := c.Staging.DownloadDiskLowWatermarkGB
+	downloadHigh := c.Staging.DownloadDiskHighWatermarkGB
+	if (downloadLow == 0) != (downloadHigh == 0) {
+		return errors.New("MoviePilot download disk low and high watermarks must be configured together")
+	}
+	if downloadLow > 0 && downloadHigh <= downloadLow {
+		return errors.New("MoviePilot download disk high watermark must be greater than low watermark")
+	}
+	if downloadHigh > 0 && downloadHigh > (int64(^uint64(0)>>1))/bytesPerGB {
+		return errors.New("MoviePilot download disk watermark is too large")
 	}
 	if root := strings.TrimSpace(c.Staging.Root); root != "" {
 		if err := validateWorkerLocalPath(root, "MoviePilot staging root"); err != nil {

@@ -166,33 +166,35 @@ type Service struct {
 	control map[string]chan error
 	permits map[string]chan protocol.StagePermit
 
-	controlNodeID         string
-	controlKeys           *secure.KeyPair
-	storageOperator       StorageOperator
-	desiredConfig         protocol.WorkerDesiredConfig
-	configObserved        observedState
-	storageObserved       map[string]observedState
-	qbSecrets             map[string]map[string]any
-	qbHealth              map[string]string
-	observedRevision      uint64
-	downloadGate          *limitGate
-	uploadGate            *limitGate
-	moviePilotUploadGate  *limitGate
-	targetGates           map[string]*limitGate
-	qbClientFactory       func(protocol.QBClientConfig) (qbittorrent.Client, error)
-	inventoryRefresh      func(context.Context) error
-	stagingFreeSpace      func(context.Context, string) (uint64, error)
-	stagingReservationMu  sync.Mutex
-	stagingReservations   map[string]int64
-	moviePilotTorrents    map[string]moviePilotTorrentRegistryEntry
-	mediaTransferBoundary func(context.Context, protocol.JobOffer, resolvedMediaTransferTargets) error
-	shareSaveSaver        func(context.Context, string, string, string, []string) ([]string, error)
-	shareSaveBatchSaver   func(context.Context, string, string, string, []string) ([]string, error)
-	stagedSourceFinder    func(context.Context, string, protocol.SourceObject) (string, bool)
-	shareSaveFlights      singleflight.Group[mediaTransferShareSaveBatchResult]
-	shareSaveFlightMu     sync.Mutex
-	shareSaveFlightCalls  map[string]int
-	shareSaveFlightJoined func(string)
+	controlNodeID          string
+	controlKeys            *secure.KeyPair
+	storageOperator        StorageOperator
+	desiredConfig          protocol.WorkerDesiredConfig
+	configObserved         observedState
+	storageObserved        map[string]observedState
+	qbSecrets              map[string]map[string]any
+	qbHealth               map[string]string
+	observedRevision       uint64
+	downloadGate           *limitGate
+	uploadGate             *limitGate
+	moviePilotUploadGate   *limitGate
+	targetGates            map[string]*limitGate
+	qbClientFactory        func(protocol.QBClientConfig) (qbittorrent.Client, error)
+	inventoryRefresh       func(context.Context) error
+	stagingFreeSpace       func(context.Context, string) (uint64, error)
+	downloadFreeSpace      func(context.Context, string) (uint64, error)
+	stagingReservationMu   sync.Mutex
+	stagingReservations    map[string]int64
+	moviePilotTorrents     map[string]moviePilotTorrentRegistryEntry
+	capacityPausedTorrents map[string]qbCapacityPauseEntry
+	mediaTransferBoundary  func(context.Context, protocol.JobOffer, resolvedMediaTransferTargets) error
+	shareSaveSaver         func(context.Context, string, string, string, []string) ([]string, error)
+	shareSaveBatchSaver    func(context.Context, string, string, string, []string) ([]string, error)
+	stagedSourceFinder     func(context.Context, string, protocol.SourceObject) (string, bool)
+	shareSaveFlights       singleflight.Group[mediaTransferShareSaveBatchResult]
+	shareSaveFlightMu      sync.Mutex
+	shareSaveFlightCalls   map[string]int
+	shareSaveFlightJoined  func(string)
 }
 
 // SetInventoryRefresh installs the runtime callback used to publish an
@@ -242,8 +244,16 @@ func New(queue resultQueue, sender Sender) *Service {
 			}
 			return usage.Free, nil
 		},
-		stagingReservations: make(map[string]int64),
-		moviePilotTorrents:  make(map[string]moviePilotTorrentRegistryEntry),
+		downloadFreeSpace: func(ctx context.Context, root string) (uint64, error) {
+			usage, err := disk.UsageWithContext(ctx, root)
+			if err != nil {
+				return 0, err
+			}
+			return usage.Free, nil
+		},
+		stagingReservations:    make(map[string]int64),
+		moviePilotTorrents:     make(map[string]moviePilotTorrentRegistryEntry),
+		capacityPausedTorrents: make(map[string]qbCapacityPauseEntry),
 	}
 }
 
@@ -1140,6 +1150,7 @@ func (s *Service) CancelActive(cause error) {
 func (s *Service) OnTransportReconnected(ctx context.Context) {
 	s.ResumeMoviePilotTorrents(ctx)
 	s.ReconcileMoviePilotStagingCapacity(ctx)
+	s.ReconcileQBDiskCapacity(ctx)
 	s.mu.Lock()
 	tasks := make([]*activeTask, 0, len(s.active))
 	for _, task := range s.active {
@@ -1246,8 +1257,9 @@ func (s *Service) ResumeMoviePilotTorrents(ctx context.Context) {
 		}
 		s.mu.Lock()
 		pausedByCapacity := s.moviePilotTorrents[moviePilotTorrentRegistryKey(torrent)].PausedByCapacity
+		_, globallyPausedByCapacity := s.capacityPausedTorrents[qbCapacityPauseKey(torrent.QBClientID, torrent.TorrentHash)]
 		s.mu.Unlock()
-		if pausedByCapacity {
+		if pausedByCapacity || globallyPausedByCapacity {
 			if err := s.setMoviePilotTorrentDisconnectPaused(ctx, torrent, false); err != nil {
 				log.Warnf("clear MoviePilot qB torrent %s disconnect pause: %v", torrent.TorrentHash, err)
 			}
@@ -1323,6 +1335,7 @@ func (s *Service) ReconcileMoviePilotStagingCapacity(ctx context.Context) {
 func (s *Service) RunMoviePilotStagingCapacityMonitor(ctx context.Context) error {
 	for {
 		s.ReconcileMoviePilotStagingCapacity(ctx)
+		s.ReconcileQBDiskCapacity(ctx)
 		timer := time.NewTimer(moviePilotStagingCapacityCheckInterval)
 		select {
 		case <-ctx.Done():

@@ -115,6 +115,86 @@ func TestResolveMoviePilotWorkerRouteRejectsOfflineWorkerInventory(t *testing.T)
 	}
 }
 
+func TestResolveMoviePilotWorkerRouteChoosesLeastLoadedHealthyWorker(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	for _, worker := range []struct {
+		id, session string
+		route       protocol.MoviePilotRouteInventory
+	}{
+		{id: "worker-busy", session: "session-busy", route: protocol.MoviePilotRouteInventory{BridgeInstanceID: "bridge-load", Downloader: "qb-main", QBClientID: "qb-busy", QBHealth: "healthy", ActiveUploadSlots: 2, UploadConcurrency: 2, StagingFreeBytes: 100}},
+		{id: "worker-idle", session: "session-idle", route: protocol.MoviePilotRouteInventory{BridgeInstanceID: "bridge-load", Downloader: "qb-main", QBClientID: "qb-idle", QBHealth: "healthy", ActiveUploadSlots: 0, UploadConcurrency: 2, StagingFreeBytes: 50}},
+	} {
+		raw, _ := json.Marshal(protocol.NodeCapabilities{MoviePilotRoutes: []protocol.MoviePilotRouteInventory{worker.route}})
+		for _, value := range []any{
+			&model.ClusterNode{ID: worker.id, Status: model.ClusterNodeStatusOnline, LastSessionID: worker.session},
+			&model.ClusterNodeSession{ID: worker.session, NodeID: worker.id, Status: model.ClusterSessionStatusConnected},
+			&model.ClusterNodeInventory{ID: "inventory-" + worker.id, NodeID: worker.id, Revision: 1, CapabilitiesJSON: string(raw)},
+		} {
+			if err := database.Create(value).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	workerID, qbID, err := New(database, "").resolveMoviePilotWorkerRoute(context.Background(), "bridge-load", "qb-main")
+	if err != nil {
+		t.Fatalf("resolve route: %v", err)
+	}
+	if workerID != "worker-idle" || qbID != "qb-idle" {
+		t.Fatalf("selected route = %s/%s, want worker-idle/qb-idle", workerID, qbID)
+	}
+}
+
+func TestDispatchDownloadPressureRetentionRequiresMaterializedDelivery(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	hash := strings.Repeat("6", 40)
+	intent := model.MoviePilotDownloadIntent{ID: "intent-pressure", RequestID: "request-pressure", BridgeInstanceID: "bridge-pressure", Status: model.MoviePilotIntentStatusBound}
+	binding := model.MoviePilotTorrentBinding{
+		ID: "binding-pressure", IntentID: intent.ID, BridgeInstanceID: intent.BridgeInstanceID,
+		DownloaderAlias: "qb-main", WorkerNodeID: "worker-pressure", QBClientID: "qb-main", TorrentHash: hash,
+		Status: model.MoviePilotTorrentStatusSeeding, RetentionStatus: model.MoviePilotRetentionStatusHeld, LastQBProgress: 1,
+		ObserveJobID: "observe-pressure",
+	}
+	torrent := protocol.TaskContext{Torrent: &protocol.TorrentTaskContext{
+		BindingID: binding.ID, WorkerNodeID: binding.WorkerNodeID, BridgeInstanceID: binding.BridgeInstanceID,
+		Downloader: binding.DownloaderAlias, QBClientID: binding.QBClientID, TorrentHash: binding.TorrentHash,
+	}}
+	taskJSON, _ := json.Marshal(torrent)
+	for _, value := range []any{
+		&intent, &binding,
+		&model.MoviePilotDeliveryFile{ID: "delivery-pressure", TorrentBindingID: binding.ID, Required: true, Status: model.MoviePilotDeliveryStatusMaterialized, ManifestID: "manifest-pressure"},
+		&model.ClusterJob{ID: "observe-pressure", Type: model.ClusterJobTypeTorrentObserve, TaskContextJSON: string(taskJSON)},
+		&model.ClusterNode{ID: binding.WorkerNodeID, Status: model.ClusterNodeStatusOnline, LastSessionID: "session-pressure"},
+		&model.ClusterNodeSession{ID: "session-pressure", NodeID: binding.WorkerNodeID, Status: model.ClusterSessionStatusConnected},
+	} {
+		if err := database.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, _ := json.Marshal(protocol.NodeCapabilities{MoviePilotRoutes: []protocol.MoviePilotRouteInventory{{
+		BridgeInstanceID: binding.BridgeInstanceID, Downloader: binding.DownloaderAlias, QBClientID: binding.QBClientID,
+		QBHealth: "healthy", DownloadCapacityKnown: true, DownloadFreeBytes: 1, DownloadLowWatermarkBytes: 2,
+	}}})
+	if err := database.Create(&model.ClusterNodeInventory{ID: "inventory-" + binding.WorkerNodeID, NodeID: binding.WorkerNodeID, Revision: 1, CapabilitiesJSON: string(raw)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	recorder := &torrentDispatchRecorder{}
+	service := New(database, "")
+	service.SetTorrentJobDispatcher(recorder)
+	if err := service.dispatchDownloadPressureRetention(context.Background(), 10); err != nil {
+		t.Fatalf("dispatch pressure retention: %v", err)
+	}
+	if len(recorder.requests) != 1 || recorder.requests[0].TaskContext.Torrent.Action != "delete" {
+		t.Fatalf("pressure retention requests = %#v", recorder.requests)
+	}
+	var updated model.MoviePilotTorrentBinding
+	if err := database.First(&updated, "id = ?", binding.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.MoviePilotTorrentStatusDeleting || updated.RetentionStatus != model.MoviePilotRetentionStatusDeleting {
+		t.Fatalf("binding after pressure dispatch = %#v", updated)
+	}
+}
+
 func TestAdoptCompletedQBTorrentUsesManualWorkerTransferWorkflow(t *testing.T) {
 	database := openTorrentTransferTestDB(t)
 	sub := model.Subscription{

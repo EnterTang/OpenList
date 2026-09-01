@@ -159,6 +159,19 @@ func (s *Service) ConfigureControlPlane(nodeID string, keys *secure.KeyPair, ope
 				s.moviePilotTorrents[moviePilotTorrentRegistryKey(&entry.Torrent)] = entry
 			}
 		}
+		var capacityStates []model.ClusterWorkerObservedState
+		if db.GetDb().Where("resource_type = ?", qbCapacityPauseType).Find(&capacityStates).Error == nil {
+			if s.capacityPausedTorrents == nil {
+				s.capacityPausedTorrents = make(map[string]qbCapacityPauseEntry)
+			}
+			for _, state := range capacityStates {
+				var entry qbCapacityPauseEntry
+				if json.Unmarshal([]byte(state.PayloadJSON), &entry) != nil || strings.TrimSpace(entry.QBClientID) == "" || strings.TrimSpace(entry.TorrentHash) == "" {
+					continue
+				}
+				s.capacityPausedTorrents[qbCapacityPauseKey(entry.QBClientID, entry.TorrentHash)] = entry
+			}
+		}
 	}
 }
 
@@ -250,6 +263,7 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 			s.probeMoviePilotQBClients()
 			s.ResumeMoviePilotTorrents(ctx)
 			s.ReconcileMoviePilotStagingCapacity(ctx)
+			s.ReconcileQBDiskCapacity(ctx)
 			return nil
 		}
 		return controlFailure{"revision_conflict", "desired config revision was already applied with a different hash"}
@@ -275,6 +289,7 @@ func (s *Service) applyDesiredConfig(ctx context.Context, apply protocol.ConfigA
 	s.probeMoviePilotQBClients()
 	s.ResumeMoviePilotTorrents(ctx)
 	s.ReconcileMoviePilotStagingCapacity(ctx)
+	s.ReconcileQBDiskCapacity(ctx)
 	return nil
 }
 

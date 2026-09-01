@@ -24,6 +24,7 @@ type Client interface {
 	AddFromLink(link string, savePath string, id string) error
 	GetInfo(id string) (TorrentInfo, error)
 	GetFiles(id string) ([]FileInfo, error)
+	GetTorrents(context.Context) ([]TorrentInfo, error)
 	GetTorrentByHash(context.Context, string) (TorrentInfo, error)
 	GetFilesByHash(context.Context, string) ([]FileInfo, error)
 	StartByHash(context.Context, string) error
@@ -391,6 +392,28 @@ func (c *client) GetTorrentByHash(ctx context.Context, hash string) (TorrentInfo
 		return TorrentInfo{}, err
 	}
 	return c.getTorrentByHash(ctx, normalized)
+}
+
+// GetTorrents returns the complete qB torrent list. It is used by Worker
+// capacity policies because those policies must also cover downloads that
+// have not yet been associated with a MoviePilot binding.
+func (c *client) GetTorrents(ctx context.Context) ([]TorrentInfo, error) {
+	if err := c.checkAuthorization(); err != nil {
+		return nil, err
+	}
+	response, err := c.postContext(ctx, "/api/v2/torrents/info", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to query qBittorrent torrent list: %s", response.Status)
+	}
+	var infos []TorrentInfo
+	if err := json.NewDecoder(response.Body).Decode(&infos); err != nil {
+		return nil, err
+	}
+	return infos, nil
 }
 
 func (c *client) getTorrentByHash(ctx context.Context, hash string) (TorrentInfo, error) {

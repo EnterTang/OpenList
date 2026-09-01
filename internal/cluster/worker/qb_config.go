@@ -141,18 +141,35 @@ func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory
 			freeBytes = clampUint64ToInt64(usage.Free)
 		}
 	}
+	downloadCapacities := make(map[string]struct {
+		free  int64
+		known bool
+	}, len(config.QBClients))
 	result := make([]protocol.MoviePilotRouteInventory, 0, len(config.MoviePilotRoutes))
 	for _, route := range config.MoviePilotRoutes {
+		clientID := strings.TrimSpace(route.QBClientID)
+		capacity, cached := downloadCapacities[clientID]
+		if !cached {
+			clientConfig, clientConfigured := config.QBClient(clientID)
+			if clientConfigured {
+				capacity.free, capacity.known = s.downloadRootCapacity(context.Background(), clientConfig)
+			}
+			downloadCapacities[clientID] = capacity
+		}
 		result = append(result, protocol.MoviePilotRouteInventory{
-			BridgeInstanceID:   strings.TrimSpace(route.BridgeInstanceID),
-			Downloader:         strings.TrimSpace(route.Downloader),
-			QBClientID:         strings.TrimSpace(route.QBClientID),
-			StagingRootLabel:   "moviepilot-staging",
-			StagingFreeBytes:   freeBytes,
-			ActiveStagingBytes: activeBytes[strings.TrimSpace(route.QBClientID)],
-			ActiveUploadSlots:  active[strings.TrimSpace(route.QBClientID)],
-			UploadConcurrency:  moviePilotUploadConcurrency(config.Staging),
-			QBHealth:           firstNonEmpty(health[strings.TrimSpace(route.QBClientID)], "unknown"),
+			BridgeInstanceID:          strings.TrimSpace(route.BridgeInstanceID),
+			Downloader:                strings.TrimSpace(route.Downloader),
+			QBClientID:                strings.TrimSpace(route.QBClientID),
+			StagingRootLabel:          "moviepilot-staging",
+			StagingFreeBytes:          freeBytes,
+			ActiveStagingBytes:        activeBytes[strings.TrimSpace(route.QBClientID)],
+			ActiveUploadSlots:         active[strings.TrimSpace(route.QBClientID)],
+			UploadConcurrency:         moviePilotUploadConcurrency(config.Staging),
+			DownloadRootLabel:         "qb-download",
+			DownloadFreeBytes:         capacity.free,
+			DownloadLowWatermarkBytes: downloadWatermarkLowBytes(config.Staging),
+			DownloadCapacityKnown:     capacity.known,
+			QBHealth:                  firstNonEmpty(health[strings.TrimSpace(route.QBClientID)], "unknown"),
 		})
 	}
 	sort.Slice(result, func(i, j int) bool {

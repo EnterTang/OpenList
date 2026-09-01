@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -98,6 +99,7 @@ func TestWorkerDesiredConfigValidatesMoviePilotStagingWatermarks(t *testing.T) {
 		{Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 100},
 		{Root: "/srv/staging", ResumeDownloadHighWatermarkBytes: 200},
 		{Root: "/srv/staging", PauseDownloadLowWatermarkBytes: 200, ResumeDownloadHighWatermarkBytes: 100},
+		{Root: "/srv/staging", DownloadDiskLowWatermarkGB: 2, DownloadDiskHighWatermarkGB: 2},
 		{Root: "/srv/staging", SafetyReserveBytes: -1},
 	} {
 		base.Staging = staging
@@ -105,4 +107,15 @@ func TestWorkerDesiredConfigValidatesMoviePilotStagingWatermarks(t *testing.T) {
 	}
 	base.Staging = StagingConfig{Root: "/srv/staging", SafetyReserveBytes: 50, PauseDownloadLowWatermarkBytes: 100, ResumeDownloadHighWatermarkBytes: 200}
 	require.NoError(t, base.Validate())
+}
+
+func TestWorkerDesiredConfigAcceptsDownloadDiskWatermarksInGB(t *testing.T) {
+	config := WorkerDesiredConfig{Staging: StagingConfig{DownloadDiskLowWatermarkGB: 20, DownloadDiskHighWatermarkGB: 40}}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("valid download disk watermarks rejected: %v", err)
+	}
+	config.Staging.DownloadDiskHighWatermarkGB = 20
+	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "high watermark") {
+		t.Fatalf("invalid download disk watermarks error = %v", err)
+	}
 }

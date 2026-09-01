@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -105,5 +106,20 @@ func TestMoviePilotRouteInventoryReportsActiveStagingBytesAndObservedQBHealth(t 
 
 	if len(routes) != 1 || routes[0].QBHealth != "unhealthy" || routes[0].ActiveStagingBytes != 42 || routes[0].ActiveUploadSlots != 1 {
 		t.Fatalf("unexpected route inventory: %#v", routes)
+	}
+}
+
+func TestMoviePilotRouteInventoryReportsDownloadDiskCapacity(t *testing.T) {
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients:        []protocol.QBClientConfig{{ID: "qb-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}}}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+		Staging:          protocol.StagingConfig{DownloadDiskLowWatermarkGB: 10, DownloadDiskHighWatermarkGB: 20},
+	}
+	service.downloadFreeSpace = func(context.Context, string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
+
+	routes := service.moviePilotRouteInventory()
+	if len(routes) != 1 || !routes[0].DownloadCapacityKnown || routes[0].DownloadFreeBytes != 30*1024*1024*1024 || routes[0].DownloadLowWatermarkBytes != 10*1024*1024*1024 {
+		t.Fatalf("download capacity route inventory = %#v", routes)
 	}
 }
