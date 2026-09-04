@@ -215,23 +215,42 @@ func reconcileLatestSubscriptionRunTx(tx *gorm.DB, subscriptionID uint, items []
 	}).Error
 }
 
+type subscriptionExecutionFollowupAction string
+
+const (
+	subscriptionFollowupNone       subscriptionExecutionFollowupAction = ""
+	subscriptionFollowupNormalRun  subscriptionExecutionFollowupAction = "normal_run"
+	subscriptionFollowupClusterJob subscriptionExecutionFollowupAction = "cluster_job"
+)
+
 // SubscriptionNeedsExecutionFollowup reports whether a scheduled run should
 // bypass its normal discovery interval. It only returns true for retryable
 // pending work without an active job; terminal failures remain operator- or
 // endpoint-triggered retries and cannot cause an infinite scheduler loop.
 func SubscriptionNeedsExecutionFollowup(ctx context.Context, subscriptionID uint) (bool, error) {
+	action, err := subscriptionExecutionFollowupActionFor(ctx, subscriptionID)
+	return action != subscriptionFollowupNone, err
+}
+
+// subscriptionExecutionFollowupActionFor classifies due retryable work for
+// the scheduler. Most retryable items are durable cluster jobs and must use
+// the replay path. MoviePilot capacity waits are different: they have no
+// ClusterJob, so replaying failed cluster jobs cannot make a new downloader
+// admission attempt. They need a normal run to re-select and submit the
+// existing MoviePilot intent.
+func subscriptionExecutionFollowupActionFor(ctx context.Context, subscriptionID uint) (subscriptionExecutionFollowupAction, error) {
 	if subscriptionID == 0 {
-		return false, errors.New("subscription id is required")
+		return subscriptionFollowupNone, errors.New("subscription id is required")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	var sub model.Subscription
 	if err := db.GetDb().WithContext(ctx).First(&sub, subscriptionID).Error; err != nil {
-		return false, err
+		return subscriptionFollowupNone, err
 	}
 	if !sub.TransferEnabled {
-		return false, nil
+		return subscriptionFollowupNone, nil
 	}
 	var items []model.SubscriptionItem
 	if err := db.GetDb().WithContext(ctx).Where("subscription_id = ? AND status IN ?", subscriptionID, []string{
@@ -239,14 +258,14 @@ func SubscriptionNeedsExecutionFollowup(ctx context.Context, subscriptionID uint
 		model.SubscriptionItemStatusRetryWait,
 		model.SubscriptionItemStatusUnknown,
 	}).Where("retry_at IS NULL OR retry_at <= ?", time.Now().UTC()).Find(&items).Error; err != nil {
-		return false, err
+		return subscriptionFollowupNone, err
 	}
 	if len(items) == 0 {
-		return false, nil
+		return subscriptionFollowupNone, nil
 	}
 	var jobs []model.ClusterJob
 	if err := db.GetDb().WithContext(ctx).Where("subscription_id = ? AND type = ?", subscriptionID, model.ClusterJobTypeMediaTransfer).Find(&jobs).Error; err != nil {
-		return false, err
+		return subscriptionFollowupNone, err
 	}
 	activeByItemID := make(map[uint]struct{}, len(jobs))
 	for i := range jobs {
@@ -270,11 +289,14 @@ func SubscriptionNeedsExecutionFollowup(ctx context.Context, subscriptionID uint
 		if items[i].Status == model.SubscriptionItemStatusBlocked {
 			continue
 		}
+		if strings.TrimSpace(items[i].ClusterJobID) == "" && items[i].LastErrorCode == "downloader_capacity_unavailable" {
+			return subscriptionFollowupNormalRun, nil
+		}
 		if items[i].Status == model.SubscriptionItemStatusRetryWait || items[i].Status == model.SubscriptionItemStatusUnknown || strings.TrimSpace(items[i].LastError) == "" || strings.Contains(items[i].LastError, "no durable cluster job") {
-			return true, nil
+			return subscriptionFollowupClusterJob, nil
 		}
 	}
-	return false, nil
+	return subscriptionFollowupNone, nil
 }
 
 // ReconcileActiveSubscriptionExecutions is used by the coordinator loop so

@@ -63,13 +63,14 @@ func CreateIntentTx(ctx context.Context, database *gorm.DB, intent *model.MovieP
 					updates["selected_qb_client_id"] = intent.SelectedQBClientID
 					updates["reservation_id"] = intent.ReservationID
 					updates["reservation_expires_at"] = intent.ReservationExpiresAt
+					// A successful retry must clear the delivery error that caused
+					// the intent to wait. Leaving it behind makes the reservation
+					// reaper mistake a newly selected route for a stale failed one.
+					updates["last_error_code"] = intent.LastErrorCode
+					updates["last_error"] = intent.LastError
 				}
 				if intent.Status != "" && (intent.Status != model.MoviePilotIntentStatusPending || existing.Status == model.MoviePilotIntentStatusWaitingCapacity || existing.Status == model.MoviePilotIntentStatusFailed) {
 					updates["status"] = intent.Status
-				}
-				if intent.LastErrorCode != "" || intent.LastError != "" {
-					updates["last_error_code"] = intent.LastErrorCode
-					updates["last_error"] = intent.LastError
 				}
 				if len(updates) > 0 {
 					if err := tx.Model(&existing).Updates(updates).Error; err != nil {

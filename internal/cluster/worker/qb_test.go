@@ -23,6 +23,24 @@ type fakeQBClient struct {
 	deletedMakesMissing bool
 }
 
+type fakeQBFreeSpaceClient struct {
+	fakeQBClient
+	freeSpace          uint64
+	freeSpaceErr       error
+	freeSpacePath      string
+	globalFreeSpace    uint64
+	globalFreeSpaceErr error
+}
+
+func (f *fakeQBFreeSpaceClient) GetFreeSpaceAtPath(_ context.Context, path string) (uint64, error) {
+	f.freeSpacePath = path
+	return f.freeSpace, f.freeSpaceErr
+}
+
+func (f *fakeQBFreeSpaceClient) GetFreeSpace(context.Context) (uint64, error) {
+	return f.globalFreeSpace, f.globalFreeSpaceErr
+}
+
 func (f *fakeQBClient) AddFromLink(string, string, string) error { return nil }
 func (f *fakeQBClient) GetInfo(string) (qbittorrent.TorrentInfo, error) {
 	return f.info, nil
@@ -90,6 +108,72 @@ func TestDiscoverTorrentFilesResolvesMultiFileTorrentToWorkerPaths(t *testing.T)
 	}
 	if files[0].WorkerPath != "/srv/downloads/Show/Season 01/E01.mkv" || files[1].WorkerPath != "/srv/downloads/Show/Season 01/E02.mkv" {
 		t.Fatalf("unexpected Worker paths: %#v", files)
+	}
+}
+
+func TestDiscoverTorrentFilesRemovesDuplicatedContentDirectoryPrefix(t *testing.T) {
+	hash := strings.Repeat("a", 40)
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients: []protocol.QBClientConfig{{
+			ID: "qb-a", PathMappings: []protocol.QBPathMapping{{QBPath: `/downloads`, WorkerPath: `/srv/downloads`}},
+		}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+		Staging:          protocol.StagingConfig{ExtensionWhitelist: []string{".mkv"}},
+	}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) {
+		return &fakeQBClient{
+			info:  qbittorrent.TorrentInfo{Hash: hash, Progress: 1, ContentPath: `/downloads/Show`},
+			files: []qbittorrent.FileInfo{{Name: `Show\Season 01\E01.mkv`, Size: 100, Progress: 1}},
+		}, nil
+	}
+
+	files, err := service.DiscoverTorrentFiles(context.Background(), &protocol.TorrentTaskContext{
+		BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a", TorrentHash: hash,
+	})
+	if err != nil {
+		t.Fatalf("discover torrent files: %v", err)
+	}
+	if len(files) != 1 || files[0].Name != `Season 01/E01.mkv` || files[0].WorkerPath != `/srv/downloads/Show/Season 01/E01.mkv` {
+		t.Fatalf("normalized qB file = %#v", files)
+	}
+}
+
+func TestMoviePilotQBStagingFreeSpaceUsesQBPathWhenStagingIsMapped(t *testing.T) {
+	service := New(nil, nil)
+	service.stagingFreeSpace = func(context.Context, string) (uint64, error) { return 99, nil }
+	client := &fakeQBFreeSpaceClient{freeSpace: 42}
+	usage := service.moviePilotQBStagingFreeSpace(protocol.QBClientConfig{
+		PathMappings: []protocol.QBPathMapping{{QBPath: `/downloads`, WorkerPath: `/srv/downloads`}},
+	}, client, `/srv/downloads/.openlist-staging`)
+
+	free, err := usage(context.Background(), `/srv/downloads/.openlist-staging`)
+	if err != nil {
+		t.Fatalf("query qB staging capacity: %v", err)
+	}
+	if free != 42 || client.freeSpacePath != `/downloads/.openlist-staging` {
+		t.Fatalf("staging capacity/path = %d/%q, want 42/%q", free, client.freeSpacePath, `/downloads/.openlist-staging`)
+	}
+}
+
+func TestMoviePilotQBStagingFreeSpaceUsesQBGlobalCapacityForOlderQB(t *testing.T) {
+	stagingRoot := `/srv/downloads/.openlist-staging`
+	service := New(nil, nil)
+	service.stagingFreeSpace = func(context.Context, string) (uint64, error) { return 99, nil }
+	client := &fakeQBFreeSpaceClient{
+		freeSpaceErr:    qbittorrent.ErrFreeSpaceAtPathUnsupported,
+		globalFreeSpace: 42,
+	}
+	usage := service.moviePilotQBStagingFreeSpace(protocol.QBClientConfig{
+		PathMappings: []protocol.QBPathMapping{{QBPath: `/downloads`, WorkerPath: `/srv/downloads`}},
+	}, client, stagingRoot)
+
+	free, err := usage(context.Background(), stagingRoot)
+	if err != nil {
+		t.Fatalf("query qB global staging capacity: %v", err)
+	}
+	if free != 42 {
+		t.Fatalf("staging capacity = %d, want 42 from qB global API", free)
 	}
 }
 

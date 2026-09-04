@@ -85,6 +85,133 @@ func TestGetTorrentByHashUsesHashesParameter(t *testing.T) {
 	}
 }
 
+func TestGetInfoUsesNativeHashLookupForHashIdentifiers(t *testing.T) {
+	hash := strings.Repeat("1", 40)
+	var requested url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/app/version" {
+			if r.Method != http.MethodGet {
+				t.Fatalf("version method = %s, want GET", r.Method)
+			}
+			_, _ = io.WriteString(w, "5.2.0")
+			return
+		}
+		if r.URL.Path != "/api/v2/torrents/info" {
+			http.NotFound(w, r)
+			return
+		}
+		requested = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]TorrentInfo{{Hash: hash, ContentPath: "/downloads/Show"}})
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("new qB client: %v", err)
+	}
+	info, err := client.GetInfo(hash)
+	if err != nil {
+		t.Fatalf("get info by hash: %v", err)
+	}
+	if info.Hash != hash || requested.Get("hashes") != hash || requested.Get("tag") != "" {
+		t.Fatalf("hash lookup = %#v/%#v, want hashes=%q without tag", info, requested, hash)
+	}
+}
+
+func TestGetFreeSpaceAtPathUsesQBBvisiblePath(t *testing.T) {
+	var requestedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/app/version" {
+			_, _ = io.WriteString(w, "5.2.0")
+			return
+		}
+		if r.URL.Path != "/api/v2/app/getFreeSpaceAtPathAction" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Fatalf("free-space method = %s, want POST", r.Method)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		requestedPath = r.Form.Get("path")
+		_, _ = io.WriteString(w, "123456789")
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("new qB client: %v", err)
+	}
+	free, err := client.(FreeSpaceClient).GetFreeSpaceAtPath(context.Background(), `F:\downloads\Show`)
+	if err != nil {
+		t.Fatalf("get free space at path: %v", err)
+	}
+	if free != 123456789 || requestedPath != `F:\downloads\Show` {
+		t.Fatalf("free space/path = %d/%q, want %d/%q", free, requestedPath, 123456789, `F:\downloads\Show`)
+	}
+}
+
+func TestGetFreeSpaceUsesSyncMainDataForOlderQB(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/app/version" {
+			_, _ = io.WriteString(w, "5.2.3")
+			return
+		}
+		if r.URL.Path != "/api/v2/sync/maindata" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			t.Fatalf("global free-space method = %s, want GET", r.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"server_state": map[string]int64{"free_space_on_disk": 386332295168},
+		})
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("new qB client: %v", err)
+	}
+	free, err := client.(GlobalFreeSpaceClient).GetFreeSpace(context.Background())
+	if err != nil {
+		t.Fatalf("get global free space: %v", err)
+	}
+	if free != 386332295168 {
+		t.Fatalf("global free space = %d, want %d", free, 386332295168)
+	}
+}
+
+func TestHTTPQBEndpointRetriesHTTPSWhenServerRequiresIt(t *testing.T) {
+	webUIURL, err := url.Parse("http://qb.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schemes []string
+	qb := &client{url: webUIURL, client: http.Client{Jar: jar, Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		schemes = append(schemes, request.URL.Scheme)
+		if request.URL.Scheme == "http" {
+			return &http.Response{StatusCode: http.StatusBadRequest, Status: "400 Bad Request", Body: io.NopCloser(strings.NewReader("Client sent an HTTP request to an HTTPS server.")), Header: make(http.Header)}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader("5.2.0")), Header: make(http.Header)}, nil
+	})}}
+
+	if !qb.authorized() {
+		t.Fatal("HTTPS fallback did not authorize qB request")
+	}
+	if strings.Join(schemes, ",") != "http,https" {
+		t.Fatalf("request schemes = %#v, want HTTP then HTTPS", schemes)
+	}
+}
+
 func TestGetTorrentsListsAllTorrentsWithoutHashFilter(t *testing.T) {
 	hash := strings.Repeat("f", 40)
 	var gotForm url.Values
@@ -161,6 +288,33 @@ func TestControlByHashSendsHashWithoutTagLookup(t *testing.T) {
 		if requestedHash != hash {
 			t.Fatalf("control hash = %q, want %q", requestedHash, hash)
 		}
+	}
+}
+
+func TestDeleteUsesNativeHashWithoutDeletingLegacyTag(t *testing.T) {
+	hash := strings.Repeat("2", 40)
+	deleteTagsCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/app/version" {
+			_, _ = io.WriteString(w, "5.0.0")
+			return
+		}
+		if r.URL.Path == "/api/v2/torrents/deleteTags" {
+			deleteTagsCalled = true
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("new qB client: %v", err)
+	}
+	if err := client.Delete(hash, false); err != nil {
+		t.Fatalf("delete qB torrent by hash: %v", err)
+	}
+	if deleteTagsCalled {
+		t.Fatal("native hash deletion unexpectedly used the legacy tag protocol")
 	}
 }
 

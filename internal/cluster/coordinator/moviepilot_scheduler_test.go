@@ -62,6 +62,67 @@ func TestChooseMoviePilotAdmissionCandidatePrefersPostReservationFreeSpace(t *te
 	}
 }
 
+func TestChooseMoviePilotAdmissionCandidateExplainsCapacityRejection(t *testing.T) {
+	candidates := []moviePilotAdmissionCandidate{{
+		routeID: "route-capacity", reservedCount: 1,
+		route: protocol.MoviePilotRouteInventory{
+			Downloader: "qb-capacity", DownloadFreeBytes: 100, DownloadConcurrency: 2, DownloadActiveCount: 1,
+		},
+	}}
+
+	selected, reason := chooseMoviePilotAdmissionCandidate(candidates, 10)
+	if selected != nil || !strings.Contains(reason, "qb-capacity: download concurrency reached (1 active + 1 reserved >= 2)") {
+		t.Fatalf("selected = %#v, reason = %q", selected, reason)
+	}
+}
+
+func TestReapMoviePilotDownloaderReservationsReleasesOrphanedRows(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	now := time.Now().UTC()
+	old := now.Add(-2 * moviePilotReservationOrphanGrace)
+	rows := []model.MoviePilotDownloaderReservation{
+		{ID: "reservation-orphan", RequestID: "request-orphan", RouteID: "route-a", Status: model.MoviePilotReservationStatusReserved, CreatedAt: old, UpdatedAt: old, ExpiresAt: now.Add(time.Hour)},
+		{ID: "reservation-fresh", RequestID: "request-fresh", RouteID: "route-a", Status: model.MoviePilotReservationStatusReserved, CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)},
+		{ID: "reservation-pending", RequestID: "request-pending", RouteID: "route-a", Status: model.MoviePilotReservationStatusReserved, CreatedAt: old, UpdatedAt: old, ExpiresAt: now.Add(time.Hour)},
+		{ID: "reservation-failed", RequestID: "request-failed", RouteID: "route-a", Status: model.MoviePilotReservationStatusReserved, CreatedAt: old, UpdatedAt: old, ExpiresAt: now.Add(time.Hour)},
+		{ID: "reservation-fresh-error", RequestID: "request-fresh-error", RouteID: "route-a", Status: model.MoviePilotReservationStatusReserved, CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)},
+	}
+	for i := range rows {
+		if err := database.Create(&rows[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	intents := []model.MoviePilotDownloadIntent{
+		{ID: "intent-pending", RequestID: "request-pending", ReservationID: "reservation-pending", Status: model.MoviePilotIntentStatusPending},
+		{ID: "intent-failed", RequestID: "request-failed", ReservationID: "reservation-failed", Status: model.MoviePilotIntentStatusPending, CreatedAt: old, UpdatedAt: old, LastErrorCode: "download_binding_timeout", LastError: "binding timed out"},
+		{ID: "intent-fresh-error", RequestID: "request-fresh-error", ReservationID: "reservation-fresh-error", Status: model.MoviePilotIntentStatusPending, CreatedAt: now, UpdatedAt: now, LastErrorCode: "download_binding_timeout", LastError: "binding timed out"},
+	}
+	for i := range intents {
+		if err := database.Create(&intents[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := New(database, "")
+	if err := service.ReapMoviePilotDownloaderReservations(context.Background()); err != nil {
+		t.Fatalf("reap reservations: %v", err)
+	}
+	var got []model.MoviePilotDownloaderReservation
+	if err := database.Order("id ASC").Find(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	statuses := make(map[string]string, len(got))
+	for _, row := range got {
+		statuses[row.ID] = row.Status
+	}
+	if statuses["reservation-orphan"] != model.MoviePilotReservationStatusReleased || statuses["reservation-failed"] != model.MoviePilotReservationStatusReleased {
+		t.Fatalf("orphan statuses = %#v", statuses)
+	}
+	if statuses["reservation-fresh"] != model.MoviePilotReservationStatusReserved || statuses["reservation-pending"] != model.MoviePilotReservationStatusReserved || statuses["reservation-fresh-error"] != model.MoviePilotReservationStatusReserved {
+		t.Fatalf("live reservation statuses = %#v", statuses)
+	}
+}
+
 func TestSelectMoviePilotDownloaderPolicyReservesAndIsIdempotent(t *testing.T) {
 	database := openTorrentTransferTestDB(t)
 	seedMoviePilotAdmissionRoute(t, database, "worker-a", "session-a", protocol.MoviePilotRouteInventory{
@@ -101,6 +162,24 @@ func TestSelectMoviePilotDownloaderPolicyReservesAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSelectMoviePilotDownloaderPolicyAutomaticallyUsesStrictCoordinatorSelection(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	seedMoviePilotAdmissionRoute(t, database, "worker-auto", "session-auto", protocol.MoviePilotRouteInventory{
+		BridgeInstanceID: "bridge-auto", Downloader: "qb-auto", QBClientID: "qb-auto", QBHealth: "healthy",
+		DownloadCapacityKnown: true, DownloadFreeBytes: 100, DownloadConcurrency: 2, DownloadLoadKnown: true,
+	})
+	service := New(database, "")
+	service.SetMoviePilotDownloaderPolicyMode(moviepilotbridge.DownloaderPolicyCoordinatorPreferred)
+
+	policy, err := service.SelectMoviePilotDownloaderPolicyAutomatically(context.Background(), "bridge-auto", "request-auto", 10)
+	if err != nil {
+		t.Fatalf("automatic selection: %v", err)
+	}
+	if policy.Mode != moviepilotbridge.DownloaderPolicyCoordinatorSelect || policy.Downloader != "qb-auto" || policy.RouteID == "" || policy.ReservationID == "" {
+		t.Fatalf("automatic policy = %#v", policy)
+	}
+}
+
 func TestSelectMoviePilotDownloaderPolicyHonorsReservationsAndStrictCapacity(t *testing.T) {
 	database := openTorrentTransferTestDB(t)
 	seedMoviePilotAdmissionRoute(t, database, "worker-a", "session-a", protocol.MoviePilotRouteInventory{
@@ -132,6 +211,57 @@ func TestSelectMoviePilotDownloaderPolicyHonorsReservationsAndStrictCapacity(t *
 	}
 	if reservation.Status != model.MoviePilotReservationStatusReserved {
 		t.Fatalf("reused reservation status = %q", reservation.Status)
+	}
+}
+
+func TestSelectMoviePilotDownloaderPolicyForDownloaderReservesRequestedRoute(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	seedMoviePilotAdmissionRoute(t, database, "worker-a", "session-a", protocol.MoviePilotRouteInventory{
+		BridgeInstanceID: "bridge-manual", Downloader: "qb-requested", QBClientID: "qb-requested", QBHealth: "healthy",
+		DownloadCapacityKnown: true, DownloadFreeBytes: 100, DownloadConcurrency: 2, DownloadLoadKnown: true,
+	})
+	seedMoviePilotAdmissionRoute(t, database, "worker-b", "session-b", protocol.MoviePilotRouteInventory{
+		BridgeInstanceID: "bridge-manual", Downloader: "qb-other", QBClientID: "qb-other", QBHealth: "healthy",
+		DownloadCapacityKnown: true, DownloadFreeBytes: 200, DownloadConcurrency: 2, DownloadLoadKnown: true,
+	})
+	service := New(database, "")
+	service.SetMoviePilotDownloaderPolicyMode(moviepilotbridge.DownloaderPolicyCoordinatorPreferred)
+
+	policy, err := service.SelectMoviePilotDownloaderPolicyForDownloader(context.Background(), "bridge-manual", "request-manual", "qb-requested", 10)
+	if err != nil {
+		t.Fatalf("select requested downloader: %v", err)
+	}
+	if policy.Mode != moviepilotbridge.DownloaderPolicyCoordinatorSelect || policy.Downloader != "qb-requested" || policy.RouteID == "" || policy.ReservationID == "" {
+		t.Fatalf("policy = %#v", policy)
+	}
+	var reservation model.MoviePilotDownloaderReservation
+	if err := database.First(&reservation, "request_id = ?", "request-manual").Error; err != nil {
+		t.Fatal(err)
+	}
+	if reservation.Downloader != "qb-requested" || reservation.PolicyMode != moviepilotbridge.DownloaderPolicyCoordinatorSelect {
+		t.Fatalf("reservation = %#v", reservation)
+	}
+}
+
+func TestListMoviePilotDownloaderBridgeInstanceIDsScopesManualBinding(t *testing.T) {
+	database := openTorrentTransferTestDB(t)
+	seedMoviePilotAdmissionRoute(t, database, "worker-a", "session-a", protocol.MoviePilotRouteInventory{
+		BridgeInstanceID: "bridge-a", Downloader: "qb-manual", QBClientID: "qb-a",
+	})
+	seedMoviePilotAdmissionRoute(t, database, "worker-b", "session-b", protocol.MoviePilotRouteInventory{
+		BridgeInstanceID: "bridge-b", Downloader: "qb-other", QBClientID: "qb-b",
+	})
+	seedMoviePilotAdmissionRoute(t, database, "worker-c", "session-c", protocol.MoviePilotRouteInventory{
+		BridgeInstanceID: "bridge-c", Downloader: "QB-MANUAL", QBClientID: "qb-c",
+	})
+
+	service := New(database, "")
+	bridgeIDs, err := service.ListMoviePilotDownloaderBridgeInstanceIDs(context.Background(), "qb-manual")
+	if err != nil {
+		t.Fatalf("list downloader Bridges: %v", err)
+	}
+	if strings.Join(bridgeIDs, ",") != "bridge-a,bridge-c" {
+		t.Fatalf("downloader Bridges = %#v, want bridge-a and bridge-c", bridgeIDs)
 	}
 }
 

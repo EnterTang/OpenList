@@ -371,6 +371,35 @@ func TestGetFreshUploadedObjectUsesFreshProviderLookup(t *testing.T) {
 	require.Equal(t, "remote-file", object.GetID())
 }
 
+func TestGetFreshUploadedObjectRetriesEventuallyConsistentListing(t *testing.T) {
+	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/139"}}
+	originalStorage := getCleanupStorageAndActualPath
+	originalGet := getCleanupObject
+	originalDelay := cleanupLookupDelay
+	cleanupLookupDelay = 0
+	lookups := 0
+	getCleanupStorageAndActualPath = func(string) (driver.Driver, string, error) {
+		return d, "/upload/Episode.mkv", nil
+	}
+	getCleanupObject = func(context.Context, driver.Driver, string, ...bool) (model.Obj, error) {
+		lookups++
+		if lookups < 3 {
+			return nil, errs.ObjectNotFound
+		}
+		return &model.Object{ID: "remote-file", Name: "Episode.mkv"}, nil
+	}
+	t.Cleanup(func() {
+		getCleanupStorageAndActualPath = originalStorage
+		getCleanupObject = originalGet
+		cleanupLookupDelay = originalDelay
+	})
+
+	object, err := getFreshUploadedObjectWithRetry(context.Background(), "/139/upload/Episode.mkv")
+	require.NoError(t, err)
+	require.Equal(t, "remote-file", object.GetID())
+	require.Equal(t, 3, lookups)
+}
+
 func TestNewSourceCleanupTargetRequiresExactRemoteID(t *testing.T) {
 	d := &cleanupTestDriver{storage: model.Storage{MountPath: "/123"}}
 	originalStorage := getCleanupStorageAndActualPath

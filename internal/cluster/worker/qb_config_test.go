@@ -47,6 +47,20 @@ func TestResolveQBPathAcceptsNativeWindowsQBPath(t *testing.T) {
 	}
 }
 
+func TestResolveQBPathForWorkerPathUsesTheInverseMapping(t *testing.T) {
+	client := protocol.QBClientConfig{PathMappings: []protocol.QBPathMapping{{
+		QBPath: `F:\downloads`, WorkerPath: `/srv/downloads`,
+	}}}
+
+	got, err := ResolveQBPathForWorkerPath(client, `/srv/downloads/.openlist-staging`)
+	if err != nil {
+		t.Fatalf("resolve qB path from Worker path: %v", err)
+	}
+	if got != `F:/downloads/.openlist-staging` {
+		t.Fatalf("qB staging path = %q, want %q", got, `F:/downloads/.openlist-staging`)
+	}
+}
+
 func TestResolveQBPathRejectsUnmappedPath(t *testing.T) {
 	_, err := ResolveQBPath(protocol.QBClientConfig{
 		PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
@@ -122,6 +136,62 @@ func TestMoviePilotRouteInventoryReportsDownloadDiskCapacity(t *testing.T) {
 	routes := service.moviePilotRouteInventory()
 	if len(routes) != 1 || !routes[0].DownloadCapacityKnown || routes[0].DownloadFreeBytes != 30*1024*1024*1024 || routes[0].DownloadLowWatermarkBytes != 10*1024*1024*1024 {
 		t.Fatalf("download capacity route inventory = %#v", routes)
+	}
+}
+
+func TestMoviePilotRouteInventoryPrefersQBPathCapacity(t *testing.T) {
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients: []protocol.QBClientConfig{{
+			ID: "qb-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+		}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+	}
+	service.downloadFreeSpace = func(context.Context, string) (uint64, error) { return 99 << 30, nil }
+	client := &fakeQBFreeSpaceClient{freeSpace: 42 << 30}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
+
+	routes := service.moviePilotRouteInventory()
+	if len(routes) != 1 || routes[0].DownloadFreeBytes != 42<<30 || !routes[0].DownloadCapacityKnown {
+		t.Fatalf("qB route capacity = %#v, want 42 GiB from qB API", routes)
+	}
+	if client.freeSpacePath != "/downloads" {
+		t.Fatalf("qB capacity path = %q, want /downloads", client.freeSpacePath)
+	}
+}
+
+func TestMoviePilotRouteInventoryUsesQBGlobalCapacityForOlderQB(t *testing.T) {
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients: []protocol.QBClientConfig{{
+			ID: "qb-a", PathMappings: []protocol.QBPathMapping{{QBPath: "/downloads", WorkerPath: "/srv/downloads"}},
+		}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+	}
+	service.downloadFreeSpace = func(context.Context, string) (uint64, error) { return 99 << 30, nil }
+	client := &fakeQBFreeSpaceClient{
+		freeSpaceErr:    qbittorrent.ErrFreeSpaceAtPathUnsupported,
+		globalFreeSpace: 42 << 30,
+	}
+	service.qbClientFactory = func(protocol.QBClientConfig) (qbittorrent.Client, error) { return client, nil }
+
+	routes := service.moviePilotRouteInventory()
+	if len(routes) != 1 || routes[0].DownloadFreeBytes != 42<<30 || !routes[0].DownloadCapacityKnown {
+		t.Fatalf("qB global route capacity = %#v, want 42 GiB", routes)
+	}
+}
+
+func TestMoviePilotRouteInventoryUsesEffectiveDownloadConcurrencyWhenUnset(t *testing.T) {
+	service := New(nil, nil)
+	service.desiredConfig = protocol.WorkerDesiredConfig{
+		QBClients:        []protocol.QBClientConfig{{ID: "qb-a"}},
+		MoviePilotRoutes: []protocol.MoviePilotRoute{{BridgeInstanceID: "mp-main", Downloader: "qb-a", QBClientID: "qb-a"}},
+	}
+	service.downloadFreeSpace = func(context.Context, string) (uint64, error) { return 50 << 30, nil }
+
+	routes := service.moviePilotRouteInventory()
+	if len(routes) != 1 || routes[0].DownloadConcurrency != effectiveConcurrency(0) || routes[0].DownloadConcurrency <= 0 {
+		t.Fatalf("download concurrency = %#v, want effective default", routes)
 	}
 }
 

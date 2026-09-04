@@ -33,6 +33,10 @@ type QBStagingAdmission struct {
 	DownloadRoot       string
 	MaxFileBytes       int64
 	ExtensionWhitelist []string
+	// FreeSpace optionally reports free bytes from the system that owns the
+	// staging volume. It is used when qBittorrent can answer a path-aware
+	// capacity query; the local filesystem probe remains the fallback.
+	FreeSpace func(context.Context, string) (uint64, error)
 }
 
 // CopyQBFileToStaging copies a completed qB file into a unique Worker-local
@@ -89,12 +93,21 @@ func CopyQBFileToStaging(ctx context.Context, source QBSource, admission QBStagi
 	if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
 		return "", fmt.Errorf("create qB staging root: %w", err)
 	}
-	usage, err := disk.UsageWithContext(ctx, stagingRoot)
+	var free uint64
+	if admission.FreeSpace != nil {
+		free, err = admission.FreeSpace(ctx, stagingRoot)
+	} else {
+		usage, usageErr := disk.UsageWithContext(ctx, stagingRoot)
+		err = usageErr
+		if usageErr == nil {
+			free = usage.Free
+		}
+	}
 	if err != nil {
 		return "", fmt.Errorf("inspect qB staging free space: %w", err)
 	}
-	if usage.Free < uint64(info.Size()) {
-		return "", fmt.Errorf("%w: free=%d required=%d", ErrQBStagingInsufficientSpace, usage.Free, info.Size())
+	if free < uint64(info.Size()) {
+		return "", fmt.Errorf("%w: free=%d required=%d", ErrQBStagingInsufficientSpace, free, info.Size())
 	}
 	if source.Size > 0 && info.Size() != source.Size {
 		return "", fmt.Errorf("qB source size changed: qB=%d local=%d", source.Size, info.Size())

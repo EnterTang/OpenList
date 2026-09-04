@@ -85,7 +85,7 @@ func TestCreateIntentTxRefreshesSchedulingProjectionOnRetry(t *testing.T) {
 		TorrentFingerprint: "fingerprint-a", RetentionPolicyJSON: "{}",
 		DownloaderPolicyJSON: `{"mode":"coordinator_select"}`, DownloaderPolicyMode: "coordinator_select",
 		SelectedDownloader: "qb-a", SelectedRouteID: "route-a", ReservationID: "reservation-a",
-		Status: model.MoviePilotIntentStatusWaitingCapacity,
+		Status: model.MoviePilotIntentStatusWaitingCapacity, LastErrorCode: "downloader_capacity_unavailable", LastError: "route is full",
 	}
 	if err := CreateIntentTx(context.Background(), database, first); err != nil {
 		t.Fatal(err)
@@ -96,6 +96,7 @@ func TestCreateIntentTxRefreshesSchedulingProjectionOnRetry(t *testing.T) {
 	retry.DownloaderPolicyMode = "moviepilot_select"
 	retry.SelectedDownloader, retry.SelectedRouteID, retry.ReservationID = "", "", ""
 	retry.Status = model.MoviePilotIntentStatusPending
+	retry.LastErrorCode, retry.LastError = "", ""
 	if err := CreateIntentTx(context.Background(), database, &retry); err != nil {
 		t.Fatalf("refresh scheduling projection: %v", err)
 	}
@@ -103,7 +104,7 @@ func TestCreateIntentTxRefreshesSchedulingProjectionOnRetry(t *testing.T) {
 	if err := database.First(&stored, "request_id = ?", first.RequestID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status != model.MoviePilotIntentStatusPending || stored.DownloaderPolicyMode != "moviepilot_select" || stored.SelectedDownloader != "" || stored.SelectedRouteID != "" || stored.ReservationID != "" {
+	if stored.Status != model.MoviePilotIntentStatusPending || stored.DownloaderPolicyMode != "moviepilot_select" || stored.SelectedDownloader != "" || stored.SelectedRouteID != "" || stored.ReservationID != "" || stored.LastErrorCode != "" || stored.LastError != "" {
 		t.Fatalf("stale scheduling projection = %#v", stored)
 	}
 }

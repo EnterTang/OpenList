@@ -23,6 +23,20 @@ type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+// HTTPError preserves the Bridge response status and body so callers can
+// distinguish a recoverable state transition from a transport failure.
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	if e == nil {
+		return "moviepilot bridge HTTP request failed"
+	}
+	return fmt.Sprintf("moviepilot bridge returned HTTP %d: %s", e.StatusCode, e.Body)
+}
+
 type Client struct {
 	HTTPClient HTTPDoer
 	Resolve    SecretResolver
@@ -127,7 +141,7 @@ func (c *Client) postJSON(ctx context.Context, bridge model.MoviePilotBridgeInst
 		return readErr
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("moviepilot bridge returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(bodyResponse)))
+		return &HTTPError{StatusCode: response.StatusCode, Body: strings.TrimSpace(string(bodyResponse))}
 	}
 	if responsePayload != nil && len(bodyResponse) > 0 {
 		if err := json.Unmarshal(bodyResponse, responsePayload); err != nil {

@@ -191,10 +191,10 @@ func (s *Service) DiscoverTorrentFiles(ctx context.Context, torrent *protocol.To
 	if err != nil {
 		return nil, fmt.Errorf("resolve qB content path: %w", err)
 	}
-	selectedRelative := cleanTorrentRelativePath(torrent.RelativePath)
+	selectedRelative := normalizeTorrentFileRelativePath(contentPath, cleanTorrentRelativePath(torrent.RelativePath), len(files) == 1)
 	result := make([]QBFile, 0, len(files))
 	for _, file := range files {
-		relative := cleanTorrentRelativePath(file.Name)
+		relative := normalizeTorrentFileRelativePath(contentPath, cleanTorrentRelativePath(file.Name), len(files) == 1)
 		if relative == "" {
 			continue
 		}
@@ -234,15 +234,39 @@ func (s *Service) DiscoverTorrentFiles(ctx context.Context, torrent *protocol.To
 }
 
 func cleanTorrentRelativePath(raw string) string {
-	raw = strings.TrimSpace(raw)
+	raw = strings.ReplaceAll(strings.TrimSpace(raw), `\`, "/")
 	if raw == "" {
 		return ""
 	}
 	clean := path.Clean(raw)
-	if clean == "." || path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") || strings.Contains(clean, `\`) {
+	if clean == "." || isAbsoluteQBPath(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 		return ""
 	}
 	return clean
+}
+
+// normalizeTorrentFileRelativePath compensates for qB variants that return a
+// file name prefixed by the torrent content directory. qB's file API defines
+// names relative to content_path, so joining that prefix again would produce
+// paths such as <root>/<folder>/<folder>/episode.mkv. A single-file torrent
+// remains special because qB reports its file name equal to content_path's
+// basename.
+func normalizeTorrentFileRelativePath(contentPath, relative string, singleFile bool) string {
+	if relative == "" {
+		return ""
+	}
+	if singleFile && path.Base(contentPath) == path.Base(relative) {
+		return relative
+	}
+	base := path.Base(contentPath)
+	if base == "." || base == "/" || base == "" {
+		return relative
+	}
+	prefix := base + "/"
+	if strings.HasPrefix(relative, prefix) {
+		return strings.TrimPrefix(relative, prefix)
+	}
+	return relative
 }
 
 func torrentExtensionAllowed(name string, whitelist []string) bool {

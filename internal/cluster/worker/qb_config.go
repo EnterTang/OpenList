@@ -62,9 +62,35 @@ func (s *Service) ResolveMoviePilotRoute(bridgeInstanceID, downloader string) (p
 // The most specific mapping wins, which allows a general download root plus a
 // narrower override for one qB category.
 func ResolveQBPath(client protocol.QBClientConfig, rawQBPath string) (string, error) {
+	qbPath, selected, err := resolveQBPathMapping(client, rawQBPath)
+	if err != nil {
+		return "", err
+	}
+	workerRoot := filepath.Clean(strings.TrimSpace(selected.WorkerPath))
+	if workerRoot == "." || !filepath.IsAbs(workerRoot) {
+		return "", errors.New("qB worker path mapping must be absolute")
+	}
+	source := normalizeQBPath(selected.QBPath)
+	suffix := strings.TrimPrefix(qbPath, source)
+	suffix = strings.TrimLeft(suffix, "/")
+	resolved := workerRoot
+	if suffix != "" {
+		resolved = filepath.Join(workerRoot, filepath.FromSlash(suffix))
+	}
+	if !pathWithin(workerRoot, resolved) {
+		return "", fmt.Errorf("qB path %q escapes worker mapping", qbPath)
+	}
+	return resolved, nil
+}
+
+// resolveQBPathMapping selects the most specific configured mapping for a qB
+// path and returns the normalized qB path alongside it. Keeping this lookup
+// separate lets capacity checks query qB using its own path while path
+// resolution still returns the Worker-local path.
+func resolveQBPathMapping(client protocol.QBClientConfig, rawQBPath string) (string, protocol.QBPathMapping, error) {
 	qbPath := normalizeQBPath(rawQBPath)
 	if qbPath == "." || !isAbsoluteQBPath(qbPath) {
-		return "", errors.New("qB content path must be absolute")
+		return "", protocol.QBPathMapping{}, errors.New("qB content path must be absolute")
 	}
 	best := -1
 	var selected protocol.QBPathMapping
@@ -82,23 +108,44 @@ func ResolveQBPath(client protocol.QBClientConfig, rawQBPath string) (string, er
 		}
 	}
 	if best < 0 {
-		return "", fmt.Errorf("qB path %q does not match any configured path mapping", qbPath)
+		return "", protocol.QBPathMapping{}, fmt.Errorf("qB path %q does not match any configured path mapping", qbPath)
 	}
-	workerRoot := filepath.Clean(strings.TrimSpace(selected.WorkerPath))
-	if workerRoot == "." || !filepath.IsAbs(workerRoot) {
-		return "", errors.New("qB worker path mapping must be absolute")
+	selected.QBPath = normalizeQBPath(selected.QBPath)
+	return qbPath, selected, nil
+}
+
+// ResolveQBPathForWorkerPath performs the inverse of ResolveQBPath. It is
+// intentionally only successful when the Worker path is inside a declared
+// mapping; a qB path must never be guessed for a Worker-only staging volume.
+func ResolveQBPathForWorkerPath(client protocol.QBClientConfig, rawWorkerPath string) (string, error) {
+	workerPath := filepath.Clean(strings.TrimSpace(rawWorkerPath))
+	if workerPath == "." || !filepath.IsAbs(workerPath) {
+		return "", errors.New("Worker path must be absolute")
 	}
-	source := normalizeQBPath(selected.QBPath)
-	suffix := strings.TrimPrefix(qbPath, source)
-	suffix = strings.TrimLeft(suffix, "/")
-	resolved := workerRoot
-	if suffix != "" {
-		resolved = filepath.Join(workerRoot, filepath.FromSlash(suffix))
+	best := -1
+	var selected protocol.QBPathMapping
+	for _, mapping := range client.PathMappings {
+		workerRoot := filepath.Clean(strings.TrimSpace(mapping.WorkerPath))
+		if workerRoot == "." || !filepath.IsAbs(workerRoot) || !pathWithin(workerRoot, workerPath) {
+			continue
+		}
+		if len(workerRoot) > best {
+			best = len(workerRoot)
+			selected = mapping
+		}
 	}
-	if !pathWithin(workerRoot, resolved) {
-		return "", fmt.Errorf("qB path %q escapes worker mapping", qbPath)
+	if best < 0 {
+		return "", fmt.Errorf("Worker path %q does not match any configured qB path mapping", workerPath)
 	}
-	return resolved, nil
+	relative, err := filepath.Rel(filepath.Clean(selected.WorkerPath), workerPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve Worker path relative to qB mapping: %w", err)
+	}
+	qbRoot := normalizeQBPath(selected.QBPath)
+	if relative == "." {
+		return qbRoot, nil
+	}
+	return path.Join(qbRoot, filepath.ToSlash(relative)), nil
 }
 
 // normalizeQBPath canonicalizes paths reported by qB without applying the
@@ -184,6 +231,7 @@ func (s *Service) moviePilotDownloadTelemetry(ctx context.Context, config protoc
 func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory {
 	s.mu.Lock()
 	config := cloneDesiredConfig(s.desiredConfig)
+	downloadConcurrency := effectiveConcurrency(config.DownloadConcurrency)
 	active := make(map[string]int)
 	activeBytes := make(map[string]int64)
 	for _, task := range s.active {
@@ -256,7 +304,7 @@ func (s *Service) moviePilotRouteInventory() []protocol.MoviePilotRouteInventory
 			DownloadLowWatermarkBytes:  downloadWatermarkLowBytes(config.Staging),
 			DownloadCapacityKnown:      capacity.known,
 			DownloadSafetyReserveBytes: nonNegativeInt64(stagingSafetyReserveBytes(config.Staging)),
-			DownloadConcurrency:        config.DownloadConcurrency,
+			DownloadConcurrency:        downloadConcurrency,
 			DownloadActiveCount:        telemetry.activeCount,
 			DownloadRemainingBytes:     telemetry.remainingBytes,
 			DownloadRateBytesPerSecond: telemetry.rateBytes,

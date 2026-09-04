@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -141,6 +142,15 @@ func (s *Service) ReconcileSentIntentBindings(ctx context.Context, limit int) (i
 		reconcileErr := client.ReconcileIntent(ctx, bridge, intent.RequestID)
 		processed++
 		if reconcileErr != nil {
+			if isCancelledIntentReconcileError(reconcileErr) {
+				// Bridge cancellation means there is no binding to replay. The
+				// local intent is still pending, so put the durable delivery back
+				// through POST /intent on the next processor tick.
+				if updateErr := s.requeueSentIntent(ctx, row.ID, now); updateErr != nil {
+					return processed, updateErr
+				}
+				continue
+			}
 			if firstErr == nil {
 				firstErr = reconcileErr
 			}
@@ -363,34 +373,11 @@ func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *mod
 	}
 	var outbox model.MoviePilotBridgeOutbox
 	lookup := s.database.WithContext(ctx).Where("bridge_id = ? AND request_id = ?", bridge.ID, intent.RequestID).Order("created_at DESC").First(&outbox).Error
-	if lookup == nil {
-		if outbox.PayloadJSON != string(raw) {
-			return fmt.Errorf("request id %q already belongs to a different payload", intent.RequestID)
-		}
-		if outbox.Status == "sending" {
-			return nil
-		}
-		if outbox.Status == "sent" {
-			var binding model.MoviePilotTorrentBinding
-			bindingErr := s.database.WithContext(ctx).Where("intent_id = ?", intent.ID).First(&binding).Error
-			if bindingErr == nil {
-				return nil
-			}
-			if !errors.Is(bindingErr, gorm.ErrRecordNotFound) {
-				return bindingErr
-			}
-			// The Bridge may have accepted the download while Coordinator's
-			// bound-event handler was unavailable. Ask it to replay the exact
-			// persisted binding instead of creating another qB download.
-			client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
-			return client.ReconcileIntent(ctx, bridge, intent.RequestID)
-		}
-	}
 	if lookup != nil && !errors.Is(lookup, gorm.ErrRecordNotFound) {
 		return lookup
 	}
-	now := s.nowUTC()
 	if errors.Is(lookup, gorm.ErrRecordNotFound) {
+		now := s.nowUTC()
 		candidate := model.MoviePilotBridgeOutbox{
 			ID: uuid.NewString(), CreatedAt: now, BridgeID: bridge.ID, RequestID: intent.RequestID, EventID: uuid.NewString(),
 			UpdatedAt: now, PayloadJSON: string(raw), Status: "pending", AvailableAt: now,
@@ -404,27 +391,60 @@ func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *mod
 		if err := s.database.WithContext(ctx).Where("bridge_id = ? AND request_id = ?", bridge.ID, intent.RequestID).First(&outbox).Error; err != nil {
 			return err
 		}
+	}
+	payloadChanged := false
+	if outbox.Status == "sending" {
 		if outbox.PayloadJSON != string(raw) {
 			return fmt.Errorf("request id %q already belongs to a different payload", intent.RequestID)
 		}
-		if outbox.Status == "sending" {
+		return nil
+	}
+	if outbox.PayloadJSON != string(raw) {
+		compatible, err := bridgeIntentPayloadIdentityCompatible([]byte(outbox.PayloadJSON), raw)
+		if err != nil {
+			return err
+		}
+		if !compatible {
+			return fmt.Errorf("request id %q already belongs to a different payload", intent.RequestID)
+		}
+		var binding model.MoviePilotTorrentBinding
+		bindingErr := s.database.WithContext(ctx).Where("intent_id = ?", intent.ID).First(&binding).Error
+		if bindingErr == nil {
+			return fmt.Errorf("request id %q already has a bound torrent", intent.RequestID)
+		}
+		if !errors.Is(bindingErr, gorm.ErrRecordNotFound) {
+			return bindingErr
+		}
+		// Downloader policy is scheduling metadata. Before a torrent binding
+		// exists, a retry may legitimately replace an old moviepilot_select
+		// projection with the current coordinator-selected route.
+		payloadChanged = true
+	}
+	if outbox.Status == "sent" && !payloadChanged {
+		var binding model.MoviePilotTorrentBinding
+		bindingErr := s.database.WithContext(ctx).Where("intent_id = ?", intent.ID).First(&binding).Error
+		if bindingErr == nil {
 			return nil
 		}
-		if outbox.Status == "sent" {
-			var binding model.MoviePilotTorrentBinding
-			bindingErr := s.database.WithContext(ctx).Where("intent_id = ?", intent.ID).First(&binding).Error
-			if bindingErr == nil {
-				return nil
-			}
-			if !errors.Is(bindingErr, gorm.ErrRecordNotFound) {
-				return bindingErr
-			}
-			client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
-			return client.ReconcileIntent(ctx, bridge, intent.RequestID)
+		if !errors.Is(bindingErr, gorm.ErrRecordNotFound) {
+			return bindingErr
 		}
+		// The Bridge may have accepted the download while Coordinator's
+		// bound-event handler was unavailable. Ask it to replay the exact
+		// persisted binding instead of creating another qB download.
+		client := &Client{HTTPClient: s.httpClient, Resolve: s.resolve, Now: s.now}
+		if err := client.ReconcileIntent(ctx, bridge, intent.RequestID); err == nil {
+			return nil
+		} else if !isCancelledIntentReconcileError(err) {
+			return err
+		}
+		// A cancelled Bridge intent cannot be reconciled because it has no
+		// binding. Treat this as a new delivery attempt using the persisted
+		// payload. The Bridge accepts that explicit POST as the retry signal.
 	}
-	outbox.UpdatedAt = now
+	now := s.nowUTC()
 	outbox.PayloadJSON = string(raw)
+	outbox.UpdatedAt = now
 	outbox.Status = "pending"
 	outbox.AvailableAt = now
 	outbox.LastError = ""
@@ -442,6 +462,33 @@ func (s *Service) SubmitIntent(ctx context.Context, bridgeID string, intent *mod
 		return err
 	}
 	return s.markOutboxSent(ctx, outbox)
+}
+
+func isCancelledIntentReconcileError(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusConflict && strings.Contains(httpErr.Body, "failed or cancelled intent cannot be reconciled")
+}
+
+func (s *Service) requeueSentIntent(ctx context.Context, outboxID string, now time.Time) error {
+	return s.database.WithContext(ctx).Model(&model.MoviePilotBridgeOutbox{}).
+		Where("id = ? AND status = ?", outboxID, "sent").Updates(map[string]any{
+		"status": "pending", "available_at": now, "last_error": "", "updated_at": now,
+	}).Error
+}
+
+func bridgeIntentPayloadIdentityCompatible(existingRaw, nextRaw []byte) (bool, error) {
+	var existing, next DownloadIntentRequest
+	if err := json.Unmarshal(existingRaw, &existing); err != nil {
+		return false, fmt.Errorf("decode existing bridge intent payload: %w", err)
+	}
+	if err := json.Unmarshal(nextRaw, &next); err != nil {
+		return false, fmt.Errorf("decode next bridge intent payload: %w", err)
+	}
+	existing.DownloaderPolicy = DownloaderPolicy{}
+	next.DownloaderPolicy = DownloaderPolicy{}
+	existing.SubscriptionItemID = ""
+	next.SubscriptionItemID = ""
+	return reflect.DeepEqual(existing, next), nil
 }
 
 // ProcessPendingOutbox retries durable download intents in creation order.

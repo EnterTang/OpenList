@@ -757,6 +757,46 @@ func TestValidateSubscriptionPreferredWorkerNodeIDLength(t *testing.T) {
 	}
 }
 
+func TestNormalizeSubscriptionMoviePilotDownloader(t *testing.T) {
+	item := &model.Subscription{
+		SourceType:               model.SubscriptionSourceMoviePilot,
+		MoviePilotDownloaderMode: " MANUAL ",
+		MoviePilotDownloader:     " qb-main ",
+	}
+
+	normalizeSubscription(item)
+
+	if item.MoviePilotDownloaderMode != model.SubscriptionMoviePilotDownloaderModeManual || item.MoviePilotDownloader != "qb-main" {
+		t.Fatalf("MoviePilot downloader config = %#v", item)
+	}
+	if err := validateSubscriptionMoviePilotDownloader(item); err != nil {
+		t.Fatalf("valid manual downloader rejected: %v", err)
+	}
+}
+
+func TestValidateSubscriptionMoviePilotDownloader(t *testing.T) {
+	tests := []struct {
+		name    string
+		item    model.Subscription
+		wantErr bool
+	}{
+		{name: "legacy empty mode", item: model.Subscription{SourceType: model.SubscriptionSourceMoviePilot}},
+		{name: "automatic", item: model.Subscription{SourceType: model.SubscriptionSourceAuto, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeAuto}},
+		{name: "manual", item: model.Subscription{SourceType: model.SubscriptionSourceMoviePilot, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeManual, MoviePilotDownloader: "qb-main"}},
+		{name: "manual requires downloader", item: model.Subscription{SourceType: model.SubscriptionSourceMoviePilot, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeManual}, wantErr: true},
+		{name: "unsupported mode", item: model.Subscription{SourceType: model.SubscriptionSourceMoviePilot, MoviePilotDownloaderMode: "random"}, wantErr: true},
+		{name: "too long", item: model.Subscription{SourceType: model.SubscriptionSourceMoviePilot, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeManual, MoviePilotDownloader: strings.Repeat("q", 129)}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSubscriptionMoviePilotDownloader(&tt.item)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateSubscriptionEpisodeRange(t *testing.T) {
 	tests := []struct {
 		name    string

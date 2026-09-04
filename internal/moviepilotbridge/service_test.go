@@ -21,6 +21,23 @@ type retryBridgeHTTPClient struct {
 	nonces []string
 }
 
+type cancelledIntentBridgeHTTPClient struct {
+	paths []string
+}
+
+func (c *cancelledIntentBridgeHTTPClient) Do(request *http.Request) (*http.Response, error) {
+	c.paths = append(c.paths, request.URL.Path)
+	_, _ = io.Copy(io.Discard, request.Body)
+	if strings.HasSuffix(request.URL.Path, "/reconcile") {
+		return &http.Response{
+			StatusCode: http.StatusConflict,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"failed or cancelled intent cannot be reconciled"}`)),
+			Header:     make(http.Header),
+		}, nil
+	}
+	return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+}
+
 func (c *retryBridgeHTTPClient) Do(request *http.Request) (*http.Response, error) {
 	c.calls++
 	c.nonces = append(c.nonces, request.Header.Get(HeaderNonce))
@@ -124,6 +141,113 @@ func TestReconcileSentIntentBindingsRepairsOrphanWithoutSubscriptionRerun(t *tes
 	}
 	if !outbox.AvailableAt.After(now) || outbox.LastError != "" {
 		t.Fatalf("outbox after successful reconcile = %#v", outbox)
+	}
+}
+
+func TestSubmitIntentRetriesBridgeCancelledIntent(t *testing.T) {
+	database := newBridgeClientDatabase(t)
+	bridge := model.MoviePilotBridgeInstance{ID: "mp-cancelled", Name: "cancelled", BaseURL: "https://moviepilot.example", SecretRef: "secret", Enabled: true}
+	if err := database.Create(&bridge).Error; err != nil {
+		t.Fatalf("create bridge: %v", err)
+	}
+	now := time.Unix(1700000000, 0).UTC()
+	intent := &model.MoviePilotDownloadIntent{
+		ID: "intent-cancelled", RequestID: "request-cancelled", BridgeInstanceID: bridge.ID,
+		MediaSource: "tmdb", MediaID: "123", ResourceRef: "resource-cancelled", TorrentFingerprint: "fingerprint-cancelled",
+		Status: model.MoviePilotIntentStatusPending,
+	}
+	payload := DownloadIntentRequest{
+		RequestID:        intent.RequestID,
+		Media:            MediaIdentity{MediaSource: "tmdb", MediaID: "123"},
+		Torrent:          TorrentResource{ResourceRef: intent.ResourceRef, SelectedFingerprint: intent.TorrentFingerprint},
+		DownloaderPolicy: DownloaderPolicy{Mode: DownloaderPolicyMoviePilotSelect},
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := database.Create(intent).Error; err != nil {
+		t.Fatalf("create intent: %v", err)
+	}
+	if err := database.Create(&model.MoviePilotBridgeOutbox{
+		ID: "outbox-cancelled", BridgeID: bridge.ID, RequestID: intent.RequestID, EventID: "event-cancelled",
+		PayloadJSON: string(payloadJSON), Status: "sent", CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), AvailableAt: now.Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatalf("create outbox: %v", err)
+	}
+	httpClient := &cancelledIntentBridgeHTTPClient{}
+	service := NewService(database, func(context.Context, string) ([]byte, error) {
+		return []byte("cancelled-intent-signing-key"), nil
+	}, httpClient)
+	service.now = func() time.Time { return now }
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, payload); err != nil {
+		t.Fatalf("retry cancelled intent: %v", err)
+	}
+	if len(httpClient.paths) != 2 || !strings.HasSuffix(httpClient.paths[0], "/reconcile") || httpClient.paths[1] != BridgeIntentPath {
+		t.Fatalf("bridge retry paths = %#v", httpClient.paths)
+	}
+	var outbox model.MoviePilotBridgeOutbox
+	if err := database.First(&outbox, "id = ?", "outbox-cancelled").Error; err != nil {
+		t.Fatalf("reload outbox: %v", err)
+	}
+	if outbox.Status != "sent" || outbox.LastError != "" {
+		t.Fatalf("outbox after cancelled retry = %#v", outbox)
+	}
+}
+
+func TestReconcileSentIntentBindingsRequeuesBridgeCancelledIntent(t *testing.T) {
+	database := newBridgeClientDatabase(t)
+	bridge := model.MoviePilotBridgeInstance{ID: "mp-cancelled-reconcile", Name: "cancelled-reconcile", BaseURL: "https://moviepilot.example", SecretRef: "secret", Enabled: true}
+	if err := database.Create(&bridge).Error; err != nil {
+		t.Fatalf("create bridge: %v", err)
+	}
+	now := time.Unix(1700000000, 0).UTC()
+	intent := model.MoviePilotDownloadIntent{
+		ID: "intent-cancelled-reconcile", RequestID: "request-cancelled-reconcile", BridgeInstanceID: bridge.ID,
+		MediaSource: "tmdb", MediaID: "123", ResourceRef: "resource-cancelled-reconcile", TorrentFingerprint: "fingerprint-cancelled-reconcile",
+		Status: model.MoviePilotIntentStatusAccepted,
+	}
+	payload := DownloadIntentRequest{
+		RequestID:        intent.RequestID,
+		Media:            MediaIdentity{MediaSource: "tmdb", MediaID: "123"},
+		Torrent:          TorrentResource{ResourceRef: intent.ResourceRef, SelectedFingerprint: intent.TorrentFingerprint},
+		DownloaderPolicy: DownloaderPolicy{Mode: DownloaderPolicyMoviePilotSelect},
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := database.Create(&intent).Error; err != nil {
+		t.Fatalf("create intent: %v", err)
+	}
+	if err := database.Create(&model.MoviePilotBridgeOutbox{
+		ID: "outbox-cancelled-reconcile", BridgeID: bridge.ID, RequestID: intent.RequestID, EventID: "event-cancelled-reconcile",
+		PayloadJSON: string(payloadJSON), Status: "sent", CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), AvailableAt: now.Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatalf("create outbox: %v", err)
+	}
+	httpClient := &cancelledIntentBridgeHTTPClient{}
+	service := NewService(database, func(context.Context, string) ([]byte, error) {
+		return []byte("cancelled-reconcile-signing-key"), nil
+	}, httpClient)
+	service.now = func() time.Time { return now }
+	processed, err := service.ReconcileSentIntentBindings(context.Background(), 10)
+	if err != nil || processed != 1 {
+		t.Fatalf("reconcile cancelled intent = processed %d err %v", processed, err)
+	}
+	var outbox model.MoviePilotBridgeOutbox
+	if err := database.First(&outbox, "id = ?", "outbox-cancelled-reconcile").Error; err != nil {
+		t.Fatalf("reload outbox: %v", err)
+	}
+	if outbox.Status != "pending" || !outbox.AvailableAt.Equal(now) {
+		t.Fatalf("requeued outbox = %#v", outbox)
+	}
+	processed, err = service.ProcessPendingOutbox(context.Background(), 10)
+	if err != nil || processed != 1 {
+		t.Fatalf("process requeued intent = processed %d err %v", processed, err)
+	}
+	if len(httpClient.paths) != 2 || httpClient.paths[1] != BridgeIntentPath {
+		t.Fatalf("bridge retry paths = %#v", httpClient.paths)
 	}
 }
 

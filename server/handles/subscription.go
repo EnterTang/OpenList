@@ -290,6 +290,10 @@ func CreateSubscription(c *gin.Context) {
 		return
 	}
 	normalizeSubscription(&req)
+	if err := validateSubscriptionMoviePilotDownloader(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
 	if err := validateSubscriptionPreferredWorkerNodeID(&req); err != nil {
 		common.ErrorResp(c, err, 400)
 		return
@@ -334,6 +338,10 @@ func UpdateSubscription(c *gin.Context) {
 		return
 	}
 	normalizeSubscription(&req)
+	if err := validateSubscriptionMoviePilotDownloader(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
 	if req.Name == "" {
 		common.ErrorStrResp(c, "name is required", 400)
 		return
@@ -831,6 +839,14 @@ func normalizeSubscription(item *model.Subscription) {
 	}
 	item.TargetRoot = strings.TrimSpace(item.TargetRoot)
 	item.PreferredWorkerNodeID = strings.TrimSpace(item.PreferredWorkerNodeID)
+	item.MoviePilotDownloaderMode = strings.ToLower(strings.TrimSpace(item.MoviePilotDownloaderMode))
+	item.MoviePilotDownloader = strings.TrimSpace(item.MoviePilotDownloader)
+	if item.SourceType != model.SubscriptionSourceMoviePilot && item.SourceType != model.SubscriptionSourceAuto {
+		item.MoviePilotDownloaderMode = ""
+		item.MoviePilotDownloader = ""
+	} else if item.MoviePilotDownloaderMode != model.SubscriptionMoviePilotDownloaderModeManual {
+		item.MoviePilotDownloader = ""
+	}
 	if item.TargetRoot != "" {
 		item.TargetRoot = utils.FixAndCleanPath(item.TargetRoot)
 	}
@@ -862,6 +878,26 @@ func normalizeSubscription(item *model.Subscription) {
 func validateSubscriptionPreferredWorkerNodeID(item *model.Subscription) error {
 	if item != nil && len(item.PreferredWorkerNodeID) > 64 {
 		return errors.New("preferred_worker_node_id cannot exceed 64 bytes")
+	}
+	return nil
+}
+
+func validateSubscriptionMoviePilotDownloader(item *model.Subscription) error {
+	if item == nil || (item.SourceType != model.SubscriptionSourceMoviePilot && item.SourceType != model.SubscriptionSourceAuto) {
+		return nil
+	}
+	mode := strings.TrimSpace(item.MoviePilotDownloaderMode)
+	if mode == "" || mode == model.SubscriptionMoviePilotDownloaderModeAuto {
+		return nil
+	}
+	if mode != model.SubscriptionMoviePilotDownloaderModeManual {
+		return errors.New("moviepilot_downloader_mode must be auto or manual")
+	}
+	if item.MoviePilotDownloader == "" {
+		return errors.New("moviepilot_downloader is required when moviepilot_downloader_mode is manual")
+	}
+	if len(item.MoviePilotDownloader) > 128 {
+		return errors.New("moviepilot_downloader cannot exceed 128 bytes")
 	}
 	return nil
 }

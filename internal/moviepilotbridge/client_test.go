@@ -2,8 +2,10 @@ package moviepilotbridge
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +138,69 @@ func TestSubmitIntentReconcilesSentOrphanIntent(t *testing.T) {
 	}
 	if got, want := string(httpClient.body), "{}"; got != want {
 		t.Fatalf("reconcile body = %q, want %q", got, want)
+	}
+}
+
+func TestSubmitIntentResendsChangedPolicyBeforeBinding(t *testing.T) {
+	database := newBridgeClientDatabase(t)
+	bridge := model.MoviePilotBridgeInstance{
+		ID: "mp-policy-change", Name: "policy-change", BaseURL: "https://moviepilot.example",
+		SecretRef: "secret", Enabled: true,
+	}
+	if err := database.Create(&bridge).Error; err != nil {
+		t.Fatal(err)
+	}
+	httpClient := &captureBridgeHTTPClient{}
+	service := NewService(database, func(context.Context, string) ([]byte, error) {
+		return []byte("client-signing-key-that-is-long-enough"), nil
+	}, httpClient)
+	intent := &model.MoviePilotDownloadIntent{
+		ID: "intent-policy-change", RequestID: "request-policy-change", BridgeInstanceID: bridge.ID,
+		MediaSource: "tmdb", MediaID: "123", ResourceRef: "resource-policy", TorrentFingerprint: "fingerprint-policy",
+	}
+	base := DownloadIntentRequest{
+		RequestID: intent.RequestID,
+		Media:     MediaIdentity{MediaSource: "tmdb", MediaID: "123"},
+		Torrent:   TorrentResource{ResourceRef: intent.ResourceRef, SelectedFingerprint: intent.TorrentFingerprint, Title: "same title"},
+	}
+	first := base
+	first.DownloaderPolicy = DownloaderPolicy{Mode: DownloaderPolicyMoviePilotSelect}
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, first); err != nil {
+		t.Fatalf("submit first policy: %v", err)
+	}
+	second := base
+	second.DownloaderPolicy = DownloaderPolicy{
+		Mode: DownloaderPolicyCoordinatorSelect, Downloader: "qb-cld139",
+		RouteID: "route-cld2", ReservationID: "reservation-policy-change",
+	}
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, second); err != nil {
+		t.Fatalf("resubmit changed policy: %v", err)
+	}
+	var sent DownloadIntentRequest
+	if err := json.Unmarshal(httpClient.body, &sent); err != nil {
+		t.Fatalf("decode resent payload: %v", err)
+	}
+	if !reflect.DeepEqual(sent.DownloaderPolicy, second.DownloaderPolicy) {
+		t.Fatalf("resent policy = %#v, want %#v", sent.DownloaderPolicy, second.DownloaderPolicy)
+	}
+	var outbox model.MoviePilotBridgeOutbox
+	if err := database.Where("request_id = ?", intent.RequestID).First(&outbox).Error; err != nil {
+		t.Fatalf("load changed-policy outbox: %v", err)
+	}
+	if outbox.PayloadJSON == "" || outbox.Status != "sent" {
+		t.Fatalf("changed-policy outbox = %#v", outbox)
+	}
+	if err := database.Create(&model.MoviePilotTorrentBinding{
+		ID: "binding-policy-change", IntentID: intent.ID, BridgeInstanceID: bridge.ID,
+		DownloaderAlias: "qb-cld139", WorkerNodeID: "worker-cld2", QBClientID: "qb-cld139",
+		TorrentHash: strings.Repeat("a", 40), ContentPath: "/downloads/Policy", Status: model.MoviePilotTorrentStatusBound,
+	}).Error; err != nil {
+		t.Fatalf("create policy binding: %v", err)
+	}
+	third := base
+	third.DownloaderPolicy = DownloaderPolicy{Mode: DownloaderPolicyMoviePilotSelect}
+	if err := service.SubmitIntent(context.Background(), bridge.ID, intent, third); err == nil || !strings.Contains(err.Error(), "bound torrent") {
+		t.Fatalf("bound policy change error = %v", err)
 	}
 }
 

@@ -31,12 +31,24 @@ type MoviePilotDownloaderPolicyScheduler interface {
 	ReleaseMoviePilotDownloaderReservation(context.Context, string) error
 }
 
+type moviePilotDownloaderPolicySelector interface {
+	SelectMoviePilotDownloaderPolicyForDownloader(context.Context, string, string, string, int64) (moviepilotbridge.DownloaderPolicy, error)
+}
+
+type moviePilotDownloaderPolicyAutomaticSelector interface {
+	SelectMoviePilotDownloaderPolicyAutomatically(context.Context, string, string, int64) (moviepilotbridge.DownloaderPolicy, error)
+}
+
 type moviePilotDownloaderPolicyModeProvider interface {
 	MoviePilotDownloaderPolicyMode() string
 }
 
 type moviePilotBridgeCatalog interface {
 	ListEnabledInstanceIDs(context.Context) ([]string, error)
+}
+
+type moviePilotDownloaderBridgeCatalog interface {
+	ListMoviePilotDownloaderBridgeInstanceIDs(context.Context, string) ([]string, error)
 }
 
 var moviePilotBridgeRegistry struct {
@@ -161,6 +173,30 @@ func ensureMoviePilotResourceBound(ctx context.Context, sub *model.Subscription)
 	}
 	if len(bridgeIDs) == 0 {
 		return errors.New("no enabled MoviePilot Bridge is configured")
+	}
+	if strings.EqualFold(strings.TrimSpace(sub.MoviePilotDownloaderMode), model.SubscriptionMoviePilotDownloaderModeManual) {
+		if scheduler := currentMoviePilotDownloaderPolicyScheduler(); scheduler != nil {
+			if routeCatalog, ok := scheduler.(moviePilotDownloaderBridgeCatalog); ok {
+				routedBridgeIDs, lookupErr := routeCatalog.ListMoviePilotDownloaderBridgeInstanceIDs(ctx, sub.MoviePilotDownloader)
+				if lookupErr != nil {
+					return fmt.Errorf("list MoviePilot Bridges for downloader %q: %w", sub.MoviePilotDownloader, lookupErr)
+				}
+				allowed := make(map[string]struct{}, len(routedBridgeIDs))
+				for _, bridgeID := range routedBridgeIDs {
+					allowed[strings.ToLower(strings.TrimSpace(bridgeID))] = struct{}{}
+				}
+				filteredBridgeIDs := make([]string, 0, len(bridgeIDs))
+				for _, bridgeID := range bridgeIDs {
+					if _, exists := allowed[strings.ToLower(strings.TrimSpace(bridgeID))]; exists {
+						filteredBridgeIDs = append(filteredBridgeIDs, bridgeID)
+					}
+				}
+				if len(filteredBridgeIDs) == 0 {
+					return fmt.Errorf("no enabled MoviePilot Bridge advertises downloader %q", strings.TrimSpace(sub.MoviePilotDownloader))
+				}
+				bridgeIDs = filteredBridgeIDs
+			}
+		}
 	}
 
 	var searchErrors []string
@@ -403,35 +439,71 @@ func submitMoviePilotIntent(ctx context.Context, sub *model.Subscription, subscr
 	}
 	requestPolicy := moviepilotbridge.DownloaderPolicy{Mode: moviepilotbridge.DownloaderPolicyMoviePilotSelect}
 	scheduler := currentMoviePilotDownloaderPolicyScheduler()
-	if scheduler != nil {
-		selected, selectErr := scheduler.SelectMoviePilotDownloaderPolicy(ctx, bound.BridgeInstanceID, requestID, bound.Size)
-		if selectErr != nil {
-			if !errors.Is(selectErr, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
-				return selectErr
-			}
-			waitingPolicyMode := moviepilotbridge.DownloaderPolicyCoordinatorSelect
+	mode := strings.ToLower(strings.TrimSpace(sub.MoviePilotDownloaderMode))
+	var selected moviepilotbridge.DownloaderPolicy
+	var selectErr error
+	selectedByCoordinator := false
+	switch mode {
+	case model.SubscriptionMoviePilotDownloaderModeAuto:
+		if scheduler == nil {
+			return errors.New("automatic MoviePilot downloader selection requires the Coordinator")
+		}
+		selector, ok := scheduler.(moviePilotDownloaderPolicyAutomaticSelector)
+		if !ok {
+			return errors.New("automatic MoviePilot downloader selection is not supported by the Coordinator")
+		}
+		selected, selectErr = selector.SelectMoviePilotDownloaderPolicyAutomatically(ctx, bound.BridgeInstanceID, requestID, bound.Size)
+		selectedByCoordinator = true
+	case model.SubscriptionMoviePilotDownloaderModeManual:
+		if scheduler == nil {
+			return errors.New("manual MoviePilot downloader selection requires the Coordinator")
+		}
+		selector, ok := scheduler.(moviePilotDownloaderPolicySelector)
+		if !ok {
+			return errors.New("manual MoviePilot downloader selection is not supported by the Coordinator")
+		}
+		selected, selectErr = selector.SelectMoviePilotDownloaderPolicyForDownloader(ctx, bound.BridgeInstanceID, requestID, sub.MoviePilotDownloader, bound.Size)
+		selectedByCoordinator = true
+	case "":
+		// Empty mode is the legacy setting. Keep its global Coordinator policy
+		// behavior for subscriptions created before per-subscription selection.
+		if scheduler != nil {
+			selected, selectErr = scheduler.SelectMoviePilotDownloaderPolicy(ctx, bound.BridgeInstanceID, requestID, bound.Size)
+			selectedByCoordinator = true
+		}
+	default:
+		return fmt.Errorf("unsupported MoviePilot downloader mode %q", sub.MoviePilotDownloaderMode)
+	}
+	if selectErr != nil {
+		if !errors.Is(selectErr, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
+			return selectErr
+		}
+		waitingPolicyMode := moviepilotbridge.DownloaderPolicyCoordinatorSelect
+		if mode == "" {
 			if provider, ok := scheduler.(moviePilotDownloaderPolicyModeProvider); ok {
 				candidateMode := strings.ToLower(strings.TrimSpace(provider.MoviePilotDownloaderPolicyMode()))
 				if candidateMode == moviepilotbridge.DownloaderPolicyCoordinatorPreferred || candidateMode == moviepilotbridge.DownloaderPolicyCoordinatorSelect {
 					waitingPolicyMode = candidateMode
 				}
 			}
-			waitingPolicyJSON, marshalErr := json.Marshal(moviepilotbridge.DownloaderPolicy{Mode: waitingPolicyMode})
-			if marshalErr != nil {
-				return marshalErr
-			}
-			intent := &model.MoviePilotDownloadIntent{
-				ID: uuid.NewString(), RequestID: requestID, BridgeInstanceID: bound.BridgeInstanceID,
-				SubscriptionID: sub.ID, SubscriptionItemID: subscriptionItemID, MediaSource: bound.MediaSource, MediaID: bound.MediaID,
-				TorrentFingerprint: bound.SelectedFingerprint, ResourceRef: bound.ResourceRef, RetentionPolicyJSON: string(policyRaw),
-				DownloaderPolicyJSON: string(waitingPolicyJSON), DownloaderPolicyMode: waitingPolicyMode,
-				Status: model.MoviePilotIntentStatusWaitingCapacity, LastErrorCode: "downloader_capacity_unavailable", LastError: selectErr.Error(),
-			}
-			if persistErr := db.CreateIntentTx(ctx, db.GetDb(), intent); persistErr != nil {
-				return fmt.Errorf("select MoviePilot downloader: %v; persist waiting intent: %w", selectErr, persistErr)
-			}
-			return fmt.Errorf("select MoviePilot downloader: %w", selectErr)
 		}
+		waitingPolicyJSON, marshalErr := json.Marshal(moviepilotbridge.DownloaderPolicy{Mode: waitingPolicyMode})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		intent := &model.MoviePilotDownloadIntent{
+			ID: uuid.NewString(), RequestID: requestID, BridgeInstanceID: bound.BridgeInstanceID,
+			SubscriptionID: sub.ID, SubscriptionItemID: subscriptionItemID, MediaSource: bound.MediaSource, MediaID: bound.MediaID,
+			TorrentFingerprint: bound.SelectedFingerprint, ResourceRef: bound.ResourceRef, RetentionPolicyJSON: string(policyRaw),
+			DownloaderPolicyJSON: string(waitingPolicyJSON), DownloaderPolicyMode: waitingPolicyMode,
+			Status: model.MoviePilotIntentStatusWaitingCapacity, LastErrorCode: "downloader_capacity_unavailable", LastError: selectErr.Error(),
+		}
+		if persistErr := db.CreateIntentTx(ctx, db.GetDb(), intent); persistErr != nil {
+			return fmt.Errorf("select MoviePilot downloader: %v; persist waiting intent: %w", selectErr, persistErr)
+		}
+		return fmt.Errorf("select MoviePilot downloader: %w", selectErr)
+	}
+	if selectedByCoordinator {
 		requestPolicy = selected
 	}
 	policyJSON, err := json.Marshal(requestPolicy)

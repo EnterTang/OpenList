@@ -133,11 +133,64 @@ func (s *Service) downloadSpaceUsage(ctx context.Context, root string) (uint64, 
 	return value.Free, nil
 }
 
+// downloadSpaceUsageForQB prefers qBittorrent's path-aware capacity API. That
+// keeps the capacity decision on the machine that owns the qB files and avoids
+// treating a container/host path mapping as if it were a local filesystem.
+// Older qBittorrent versions do not expose this endpoint. When there is only
+// one mapped qB path, their global default-save-path capacity is a bounded
+// compatibility fallback; otherwise the Worker-local fallback avoids
+// attributing one qB volume's capacity to another.
+func (s *Service) downloadSpaceUsageForQB(ctx context.Context, client qbittorrent.Client, qbPath, workerPath string, allowGlobal bool) (uint64, error) {
+	if strings.TrimSpace(qbPath) != "" && normalizeQBPath(qbPath) != "." {
+		freeSpaceClient, ok := client.(qbittorrent.FreeSpaceClient)
+		if !ok {
+			return s.downloadSpaceUsage(ctx, workerPath)
+		}
+		free, err := freeSpaceClient.GetFreeSpaceAtPath(ctx, qbPath)
+		if err == nil {
+			return free, nil
+		}
+		if !errors.Is(err, qbittorrent.ErrFreeSpaceAtPathUnsupported) {
+			return 0, fmt.Errorf("query qB free space at path %q: %w", qbPath, err)
+		}
+		if allowGlobal {
+			if globalFreeSpaceClient, ok := client.(qbittorrent.GlobalFreeSpaceClient); ok {
+				free, globalErr := globalFreeSpaceClient.GetFreeSpace(ctx)
+				if globalErr != nil {
+					return 0, fmt.Errorf("query qB global free space: %w", globalErr)
+				}
+				return free, nil
+			}
+		}
+	}
+	return s.downloadSpaceUsage(ctx, workerPath)
+}
+
+func qBGlobalFreeSpaceAllowed(config protocol.QBClientConfig) bool {
+	var mappedPath string
+	for _, mapping := range config.PathMappings {
+		path := normalizeQBPath(mapping.QBPath)
+		if path == "." {
+			continue
+		}
+		if mappedPath == "" {
+			mappedPath = path
+			continue
+		}
+		if path != mappedPath {
+			return false
+		}
+	}
+	return mappedPath != ""
+}
+
 // downloadRootCapacity returns the least free space among the configured qB
 // path mappings. The minimum is intentional: one qB client may span several
 // volumes, and a route must not advertise more capacity than its tightest
 // mapped volume can provide.
 func (s *Service) downloadRootCapacity(ctx context.Context, config protocol.QBClientConfig) (int64, bool) {
+	client, clientErr := s.qbClientForCapacity(config)
+	allowGlobal := qBGlobalFreeSpaceAllowed(config)
 	seen := make(map[string]struct{}, len(config.PathMappings))
 	var free uint64
 	known := false
@@ -151,6 +204,9 @@ func (s *Service) downloadRootCapacity(ctx context.Context, config protocol.QBCl
 		}
 		seen[root] = struct{}{}
 		value, err := s.downloadSpaceUsage(ctx, root)
+		if clientErr == nil {
+			value, err = s.downloadSpaceUsageForQB(ctx, client, normalizeQBPath(mapping.QBPath), root, allowGlobal)
+		}
 		if err != nil {
 			continue
 		}
@@ -255,15 +311,23 @@ func (s *Service) ReconcileQBDiskCapacity(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			if _, ok := state.roots[root]; !ok {
-				free, usageErr := s.downloadSpaceUsage(ctx, root)
+			qbPath, _, mappingErr := resolveQBPathMapping(state.config, info.SavePath)
+			if mappingErr != nil {
+				qbPath = normalizeQBPath(info.ContentPath)
+			}
+			capacityKey := qbPath
+			if capacityKey == "." {
+				capacityKey = root
+			}
+			if _, ok := state.roots[capacityKey]; !ok {
+				free, usageErr := s.downloadSpaceUsageForQB(ctx, state.client, qbPath, root, qBGlobalFreeSpaceAllowed(state.config))
 				if usageErr != nil {
-					log.Warnf("inspect qB download volume %s: %v", root, usageErr)
+					log.Warnf("inspect qB download volume %s: %v", qbPath, usageErr)
 					continue
 				}
-				state.roots[root] = free
+				state.roots[capacityKey] = free
 			}
-			if state.roots[root] > low || !isIncompleteTorrent(info) || isPausedDownload(info) {
+			if state.roots[capacityKey] > low || !isIncompleteTorrent(info) || isPausedDownload(info) {
 				continue
 			}
 			if err := state.client.StopByHash(ctx, info.Hash); err != nil {
@@ -274,7 +338,7 @@ func (s *Service) ReconcileQBDiskCapacity(ctx context.Context) {
 				log.Warnf("persist qB capacity pause %s: %v", info.Hash, err)
 			}
 			s.syncMoviePilotCapacityPause(ctx, clientID, info.Hash, true)
-			log.Warnf("paused qB torrent %s on %s: free disk space is %d bytes, low watermark is %d bytes", info.Hash, clientID, state.roots[root], low)
+			log.Warnf("paused qB torrent %s on %s: free disk space is %d bytes, low watermark is %d bytes", info.Hash, clientID, state.roots[capacityKey], low)
 		}
 	}
 
@@ -307,7 +371,11 @@ func (s *Service) ReconcileQBDiskCapacity(ctx context.Context) {
 		if err != nil {
 			root = entry.DownloadRoot
 		}
-		free, err := s.downloadSpaceUsage(ctx, root)
+		qbPath, _, mappingErr := resolveQBPathMapping(state.config, info.SavePath)
+		if mappingErr != nil {
+			qbPath = normalizeQBPath(info.ContentPath)
+		}
+		free, err := s.downloadSpaceUsageForQB(ctx, state.client, qbPath, root, qBGlobalFreeSpaceAllowed(state.config))
 		if err != nil || free < high {
 			continue
 		}

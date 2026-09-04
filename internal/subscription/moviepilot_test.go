@@ -14,11 +14,12 @@ import (
 )
 
 type fakeMoviePilotBridgeClient struct {
-	searches     []moviepilotbridge.ResourceSearchRequest
-	intents      []moviepilotbridge.DownloadIntentRequest
-	intentModels []model.MoviePilotDownloadIntent
-	results      []moviepilotbridge.ResourceSearchResult
-	bridges      []string
+	searches      []moviepilotbridge.ResourceSearchRequest
+	searchBridges []string
+	intents       []moviepilotbridge.DownloadIntentRequest
+	intentModels  []model.MoviePilotDownloadIntent
+	results       []moviepilotbridge.ResourceSearchResult
+	bridges       []string
 }
 
 type fakeMoviePilotDownloaderPolicyScheduler struct {
@@ -29,7 +30,23 @@ type fakeMoviePilotDownloaderPolicyScheduler struct {
 		requestID    string
 		expectedSize int64
 	}
-	released []string
+	selectedDownloaderCalls []struct {
+		bridgeID     string
+		requestID    string
+		downloader   string
+		expectedSize int64
+	}
+	selectedAutomaticallyCalls []struct {
+		bridgeID     string
+		requestID    string
+		expectedSize int64
+	}
+	specificPolicy      moviepilotbridge.DownloaderPolicy
+	specificErr         error
+	automaticPolicy     moviepilotbridge.DownloaderPolicy
+	automaticErr        error
+	downloaderBridgeIDs []string
+	released            []string
 }
 
 func (f *fakeMoviePilotDownloaderPolicyScheduler) SelectMoviePilotDownloaderPolicy(_ context.Context, bridgeID, requestID string, expectedSize int64) (moviepilotbridge.DownloaderPolicy, error) {
@@ -41,13 +58,43 @@ func (f *fakeMoviePilotDownloaderPolicyScheduler) SelectMoviePilotDownloaderPoli
 	return f.policy, f.selectionErr
 }
 
+func (f *fakeMoviePilotDownloaderPolicyScheduler) SelectMoviePilotDownloaderPolicyForDownloader(_ context.Context, bridgeID, requestID, downloader string, expectedSize int64) (moviepilotbridge.DownloaderPolicy, error) {
+	f.selectedDownloaderCalls = append(f.selectedDownloaderCalls, struct {
+		bridgeID     string
+		requestID    string
+		downloader   string
+		expectedSize int64
+	}{bridgeID: bridgeID, requestID: requestID, downloader: downloader, expectedSize: expectedSize})
+	if f.specificPolicy.Mode != "" || f.specificErr != nil {
+		return f.specificPolicy, f.specificErr
+	}
+	return f.policy, f.selectionErr
+}
+
+func (f *fakeMoviePilotDownloaderPolicyScheduler) SelectMoviePilotDownloaderPolicyAutomatically(_ context.Context, bridgeID, requestID string, expectedSize int64) (moviepilotbridge.DownloaderPolicy, error) {
+	f.selectedAutomaticallyCalls = append(f.selectedAutomaticallyCalls, struct {
+		bridgeID     string
+		requestID    string
+		expectedSize int64
+	}{bridgeID: bridgeID, requestID: requestID, expectedSize: expectedSize})
+	if f.automaticPolicy.Mode != "" || f.automaticErr != nil {
+		return f.automaticPolicy, f.automaticErr
+	}
+	return f.policy, f.selectionErr
+}
+
 func (f *fakeMoviePilotDownloaderPolicyScheduler) ReleaseMoviePilotDownloaderReservation(_ context.Context, requestID string) error {
 	f.released = append(f.released, requestID)
 	return nil
 }
 
-func (f *fakeMoviePilotBridgeClient) SearchResources(_ context.Context, _ string, request moviepilotbridge.ResourceSearchRequest) ([]moviepilotbridge.ResourceSearchResult, error) {
+func (f *fakeMoviePilotDownloaderPolicyScheduler) ListMoviePilotDownloaderBridgeInstanceIDs(_ context.Context, _ string) ([]string, error) {
+	return append([]string(nil), f.downloaderBridgeIDs...), nil
+}
+
+func (f *fakeMoviePilotBridgeClient) SearchResources(_ context.Context, bridgeID string, request moviepilotbridge.ResourceSearchRequest) ([]moviepilotbridge.ResourceSearchResult, error) {
 	f.searches = append(f.searches, request)
+	f.searchBridges = append(f.searchBridges, bridgeID)
 	return append([]moviepilotbridge.ResourceSearchResult(nil), f.results...), nil
 }
 
@@ -166,6 +213,48 @@ func TestRunMoviePilotAutomaticallyBindsFirstBridgeResult(t *testing.T) {
 	}
 	if reloaded.BoundTorrent == nil || reloaded.BoundTorrent.SelectedFingerprint != "fingerprint-1" {
 		t.Fatalf("persisted binding = %#v", reloaded.BoundTorrent)
+	}
+}
+
+func TestRunMoviePilotManualDownloaderBindsBridgeWithMatchingRoute(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	client := &fakeMoviePilotBridgeClient{
+		bridges: []string{"bridge-without-route", "bridge-with-route"},
+		results: []moviepilotbridge.ResourceSearchResult{{
+			ResourceRef: "resource-manual-bridge", Title: "Manual bridge movie", Site: "tracker-a", Size: 1024,
+			SelectedFingerprint: "fingerprint-manual-bridge",
+		}},
+	}
+	scheduler := &fakeMoviePilotDownloaderPolicyScheduler{
+		downloaderBridgeIDs: []string{"bridge-with-route"},
+		specificPolicy: moviepilotbridge.DownloaderPolicy{
+			Mode: moviepilotbridge.DownloaderPolicyCoordinatorSelect, Downloader: "qb-manual",
+			RouteID: "route-manual-bridge", ReservationID: "reservation-manual-bridge",
+		},
+	}
+	SetMoviePilotBridgeClient(client)
+	SetMoviePilotDownloaderPolicyScheduler(scheduler)
+	t.Cleanup(func() {
+		SetMoviePilotBridgeClient(nil)
+		SetMoviePilotDownloaderPolicyScheduler(nil)
+	})
+	sub := &model.Subscription{
+		ID: 47, Name: "Manual bridge movie", TMDBName: "Manual bridge movie", TMDBID: 47, MediaType: "movie",
+		SourceType: model.SubscriptionSourceMoviePilot, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeManual,
+		MoviePilotDownloader: "qb-manual",
+	}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	if _, _, _, _, _, err := runMoviePilot(context.Background(), sub, true); err != nil {
+		t.Fatalf("run manual MoviePilot subscription: %v", err)
+	}
+	if len(client.searchBridges) != 1 || client.searchBridges[0] != "bridge-with-route" {
+		t.Fatalf("searched Bridge IDs = %#v, want bridge-with-route only", client.searchBridges)
+	}
+	if sub.BoundTorrent == nil || sub.BoundTorrent.BridgeInstanceID != "bridge-with-route" {
+		t.Fatalf("bound subscription = %#v", sub.BoundTorrent)
 	}
 }
 
@@ -311,6 +400,93 @@ func TestSubmitMoviePilotIntentUsesCoordinatorDownloaderPolicy(t *testing.T) {
 	}
 	if len(client.intentModels) != 1 || client.intentModels[0].DownloaderPolicyMode != moviepilotbridge.DownloaderPolicyCoordinatorSelect || client.intentModels[0].SelectedDownloader != "qb-win" || client.intentModels[0].SelectedRouteID != "route-win" || client.intentModels[0].ReservationID != "reservation-win" {
 		t.Fatalf("submitted scheduling metadata = %#v", client.intentModels)
+	}
+}
+
+func TestSubmitMoviePilotIntentUsesAutomaticCoordinatorDownloaderPolicy(t *testing.T) {
+	client := &fakeMoviePilotBridgeClient{}
+	scheduler := &fakeMoviePilotDownloaderPolicyScheduler{automaticPolicy: moviepilotbridge.DownloaderPolicy{
+		Mode: moviepilotbridge.DownloaderPolicyCoordinatorSelect, Downloader: "qb-auto",
+		RouteID: "route-auto", ReservationID: "reservation-auto",
+	}}
+	SetMoviePilotBridgeClient(client)
+	SetMoviePilotDownloaderPolicyScheduler(scheduler)
+	t.Cleanup(func() {
+		SetMoviePilotBridgeClient(nil)
+		SetMoviePilotDownloaderPolicyScheduler(nil)
+	})
+	sub := &model.Subscription{ID: 44, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeAuto, BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-auto", SelectedFingerprint: "fingerprint-auto",
+		MediaSource: "tmdb", MediaID: "44", MediaType: "movie",
+	}}
+	if err := SubmitMoviePilotIntent(context.Background(), sub); err != nil {
+		t.Fatalf("submit automatic intent: %v", err)
+	}
+	if len(scheduler.selectedAutomaticallyCalls) != 1 || scheduler.selectedAutomaticallyCalls[0].bridgeID != "mp-main" || scheduler.selectedAutomaticallyCalls[0].expectedSize != 0 {
+		t.Fatalf("automatic scheduler calls = %#v", scheduler.selectedAutomaticallyCalls)
+	}
+	if len(scheduler.selectedCalls) != 0 || len(scheduler.selectedDownloaderCalls) != 0 || len(client.intents) != 1 || client.intents[0].DownloaderPolicy.Mode != moviepilotbridge.DownloaderPolicyCoordinatorSelect || client.intents[0].DownloaderPolicy.Downloader != "qb-auto" {
+		t.Fatalf("automatic policy = %#v", client.intents)
+	}
+}
+
+func TestSubmitMoviePilotIntentUsesManuallySelectedDownloaderPolicy(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	client := &fakeMoviePilotBridgeClient{}
+	scheduler := &fakeMoviePilotDownloaderPolicyScheduler{
+		specificPolicy: moviepilotbridge.DownloaderPolicy{
+			Mode: moviepilotbridge.DownloaderPolicyCoordinatorSelect, Downloader: "qb-manual",
+			RouteID: "route-manual", ReservationID: "reservation-manual",
+		},
+	}
+	SetMoviePilotBridgeClient(client)
+	SetMoviePilotDownloaderPolicyScheduler(scheduler)
+	t.Cleanup(func() {
+		SetMoviePilotBridgeClient(nil)
+		SetMoviePilotDownloaderPolicyScheduler(nil)
+	})
+	sub := &model.Subscription{ID: 45, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeManual, MoviePilotDownloader: "qb-manual", BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-manual", SelectedFingerprint: "fingerprint-manual",
+		MediaSource: "tmdb", MediaID: "45", MediaType: "movie", Size: 99,
+	}}
+	if err := SubmitMoviePilotIntent(context.Background(), sub); err != nil {
+		t.Fatalf("submit manual intent: %v", err)
+	}
+	if len(scheduler.selectedDownloaderCalls) != 1 || scheduler.selectedDownloaderCalls[0].downloader != "qb-manual" || scheduler.selectedDownloaderCalls[0].expectedSize != 99 {
+		t.Fatalf("manual scheduler calls = %#v", scheduler.selectedDownloaderCalls)
+	}
+	if len(scheduler.selectedCalls) != 0 || len(client.intents) != 1 || client.intents[0].DownloaderPolicy.Mode != moviepilotbridge.DownloaderPolicyCoordinatorSelect || client.intents[0].DownloaderPolicy.Downloader != "qb-manual" {
+		t.Fatalf("manual policy = %#v", client.intents)
+	}
+}
+
+func TestRunMoviePilotManualDownloaderWaitsWithStrictPolicy(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	client := &fakeMoviePilotBridgeClient{}
+	scheduler := &fakeMoviePilotDownloaderPolicyScheduler{
+		specificErr: moviepilotbridge.ErrDownloaderCapacityUnavailable,
+	}
+	SetMoviePilotBridgeClient(client)
+	SetMoviePilotDownloaderPolicyScheduler(scheduler)
+	t.Cleanup(func() {
+		SetMoviePilotBridgeClient(nil)
+		SetMoviePilotDownloaderPolicyScheduler(nil)
+	})
+	sub := &model.Subscription{ID: 46, Name: "Manual capacity wait", SourceType: model.SubscriptionSourceMoviePilot, MoviePilotDownloaderMode: model.SubscriptionMoviePilotDownloaderModeManual, MoviePilotDownloader: "qb-manual", TMDBID: 46, MediaType: "movie", BoundTorrent: &model.SubscriptionBoundTorrent{
+		BridgeInstanceID: "mp-main", ResourceRef: "resource-manual-capacity", SelectedFingerprint: "fingerprint-manual-capacity", MediaSource: "tmdb", MediaID: "46", MediaType: "movie", Size: 10,
+	}}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, _, err := runMoviePilot(context.Background(), sub, true); !errors.Is(err, moviepilotbridge.ErrDownloaderCapacityUnavailable) {
+		t.Fatalf("run error = %v, want retryable capacity error", err)
+	}
+	var intent model.MoviePilotDownloadIntent
+	if err := db.GetDb().Where("request_id = ?", moviePilotIntentRequestID(sub.ID, sub.BoundTorrent.ResourceRef, sub.BoundTorrent.SelectedFingerprint)).First(&intent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if intent.DownloaderPolicyMode != moviepilotbridge.DownloaderPolicyCoordinatorSelect {
+		t.Fatalf("waiting intent policy mode = %q, want coordinator_select", intent.DownloaderPolicyMode)
 	}
 }
 

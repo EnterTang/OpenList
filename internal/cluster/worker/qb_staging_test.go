@@ -49,6 +49,31 @@ func TestCopyQBFileToStagingKeepsSourceUnchangedAndCleansByCaller(t *testing.T) 
 	}
 }
 
+func TestCopyQBFileToStagingUsesInjectedCapacityProbe(t *testing.T) {
+	downloadRoot := t.TempDir()
+	stagingRoot := t.TempDir()
+	sourcePath := filepath.Join(downloadRoot, "episode.mkv")
+	if err := os.WriteFile(sourcePath, []byte("episode"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	_, err := CopyQBFileToStaging(context.Background(), QBSource{
+		WorkerPath: sourcePath, DownloadRoot: downloadRoot, Name: "episode.mkv", Size: 7,
+	}, QBStagingAdmission{
+		StagingRoot: stagingRoot, DownloadRoot: downloadRoot, ExtensionWhitelist: []string{".mkv"},
+		FreeSpace: func(context.Context, string) (uint64, error) {
+			called = true
+			return 0, nil
+		},
+	})
+	if !called {
+		t.Fatal("injected staging capacity probe was not called")
+	}
+	if err == nil || !strings.Contains(err.Error(), "qB staging free space is insufficient") {
+		t.Fatalf("capacity error = %v, want injected qB capacity rejection", err)
+	}
+}
+
 func TestCopyQBFileToStagingRejectsPathEscape(t *testing.T) {
 	_, err := CopyQBFileToStaging(context.Background(), QBSource{WorkerPath: "/mnt/downloads/../../etc/passwd", Name: "passwd"}, QBStagingAdmission{StagingRoot: "/mnt/staging", DownloadRoot: "/mnt/downloads"})
 	if err == nil || err.Error() != "qB source path escapes declared download root" {

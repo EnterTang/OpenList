@@ -182,6 +182,60 @@ func TestSubscriptionNeedsExecutionFollowupDoesNotSpinOnBlockedWorker(t *testing
 	}
 }
 
+func TestSubscriptionExecutionFollowupUsesNormalRunForMoviePilotCapacityWait(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "MoviePilot capacity", TMDBName: "MoviePilot capacity", Active: true, TransferEnabled: true}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	retryAt := time.Now().UTC().Add(-time.Minute)
+	item := &model.SubscriptionItem{
+		SubscriptionID: sub.ID, SourceKey: "moviepilot:capacity", Status: model.SubscriptionItemStatusRetryWait,
+		LastErrorCode: "downloader_capacity_unavailable", LastError: "all qB routes are below the configured download safety margin or concurrency limit",
+		RetryAt: &retryAt,
+	}
+	if err := db.GetDb().Create(item).Error; err != nil {
+		t.Fatal(err)
+	}
+	action, err := subscriptionExecutionFollowupActionFor(context.Background(), sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != subscriptionFollowupNormalRun {
+		t.Fatalf("follow-up action = %q, want %q", action, subscriptionFollowupNormalRun)
+	}
+	followup, err := SubscriptionNeedsExecutionFollowup(context.Background(), sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !followup {
+		t.Fatal("MoviePilot capacity wait should trigger a follow-up")
+	}
+}
+
+func TestSubscriptionExecutionFollowupKeepsDurableClusterJobReplay(t *testing.T) {
+	setupSubscriptionRuntimeDB(t)
+	sub := &model.Subscription{Name: "Cluster capacity", TMDBName: "Cluster capacity", Active: true, TransferEnabled: true}
+	if err := db.CreateSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+	retryAt := time.Now().UTC().Add(-time.Minute)
+	item := &model.SubscriptionItem{
+		SubscriptionID: sub.ID, SourceKey: "cluster:capacity", ClusterJobID: "cluster-job-1", Status: model.SubscriptionItemStatusRetryWait,
+		LastErrorCode: "worker_capacity_unavailable", LastError: "worker capacity unavailable", RetryAt: &retryAt,
+	}
+	if err := db.GetDb().Create(item).Error; err != nil {
+		t.Fatal(err)
+	}
+	action, err := subscriptionExecutionFollowupActionFor(context.Background(), sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != subscriptionFollowupClusterJob {
+		t.Fatalf("follow-up action = %q, want %q", action, subscriptionFollowupClusterJob)
+	}
+}
+
 func TestReconcileSubscriptionExecutionClassifiesRecoverableFailures(t *testing.T) {
 	setupSubscriptionRuntimeDB(t)
 	sub := &model.Subscription{Name: "classify", TMDBName: "classify", LastStatus: model.SubscriptionStatusRunning}

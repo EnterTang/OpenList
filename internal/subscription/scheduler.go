@@ -100,7 +100,7 @@ func (s *scheduler) tick() {
 			log.Errorf("subscription %d execution reconciliation failed: %+v", item.ID, err)
 			continue
 		}
-		followup, err := SubscriptionNeedsExecutionFollowup(context.Background(), item.ID)
+		followupAction, err := subscriptionExecutionFollowupActionFor(context.Background(), item.ID)
 		if err != nil {
 			log.Errorf("subscription %d follow-up check failed: %+v", item.ID, err)
 			continue
@@ -109,19 +109,19 @@ func (s *scheduler) tick() {
 		if interval <= 0 {
 			interval = 60
 		}
-		if !followup && item.LastCheckedAt != nil && now.Sub(*item.LastCheckedAt) < time.Duration(interval)*time.Minute {
+		if followupAction == subscriptionFollowupNone && item.LastCheckedAt != nil && now.Sub(*item.LastCheckedAt) < time.Duration(interval)*time.Minute {
 			continue
 		}
 		if !s.markRunning(item.ID) {
 			log.Debugf("subscription %d skipped: scheduler concurrency limit reached", item.ID)
 			continue
 		}
-		go func(id uint, compensate bool) {
+		go func(id uint, action subscriptionExecutionFollowupAction) {
 			defer s.markDone(id)
 			runCtx, cancel := context.WithTimeout(context.Background(), defaultSubscriptionRunTimeout)
 			defer cancel()
 			var err error
-			if compensate {
+			if action == subscriptionFollowupClusterJob {
 				_, err = RetryFailedForRole(runCtx, id, conf.Conf.Cluster.Role)
 			} else {
 				_, err = RunForRole(runCtx, id, true, conf.Conf.Cluster.Role)
@@ -129,7 +129,7 @@ func (s *scheduler) tick() {
 			if err != nil {
 				log.Errorf("subscription %d run failed: %+v", id, err)
 			}
-		}(item.ID, followup)
+		}(item.ID, followupAction)
 	}
 }
 

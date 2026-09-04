@@ -131,6 +131,28 @@ func getFreshUploadedObject(ctx context.Context, expectedPath string) (model.Obj
 	return getCleanupObject(ctx, storage, actualPath)
 }
 
+func getFreshUploadedObjectWithRetry(ctx context.Context, expectedPath string) (model.Obj, error) {
+	var lastErr error
+	for attempt := 0; attempt < sourceCleanupLookupAttempts; attempt++ {
+		obj, err := getFreshUploadedObject(ctx, expectedPath)
+		if err == nil {
+			return obj, nil
+		}
+		lastErr = err
+		// A path/mount/authentication error will not be fixed by waiting. Only
+		// retry the provider's eventually-consistent "not found" response.
+		if !errs.IsObjectNotFound(err) || attempt+1 == sourceCleanupLookupAttempts {
+			return nil, err
+		}
+		select {
+		case <-time.After(cleanupLookupDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
+}
+
 type activeTask struct {
 	attempt         protocol.AttemptRef
 	offer           protocol.JobOffer
@@ -263,6 +285,10 @@ func New(queue resultQueue, sender Sender) *Service {
 // usage. Keeping the reservation while copying closes the race between two
 // upload workers that both observe the same free-space value.
 func (s *Service) reserveMoviePilotStaging(ctx context.Context, stagingRoot string, bytes int64) (func(), error) {
+	return s.reserveMoviePilotStagingWithUsage(ctx, stagingRoot, bytes, nil)
+}
+
+func (s *Service) reserveMoviePilotStagingWithUsage(ctx context.Context, stagingRoot string, bytes int64, usage func(context.Context, string) (uint64, error)) (func(), error) {
 	if bytes <= 0 {
 		return func() {}, nil
 	}
@@ -273,7 +299,9 @@ func (s *Service) reserveMoviePilotStaging(ctx context.Context, stagingRoot stri
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create qB staging root: %w", err)
 	}
-	usage := s.stagingFreeSpace
+	if usage == nil {
+		usage = s.stagingFreeSpace
+	}
 	s.mu.Lock()
 	safetyReserve := stagingSafetyReserveBytes(s.desiredConfig.Staging)
 	s.mu.Unlock()
@@ -310,6 +338,51 @@ func (s *Service) reserveMoviePilotStaging(ctx context.Context, stagingRoot stri
 			}
 		})
 	}, nil
+}
+
+// moviePilotQBStagingFreeSpace returns a Worker-local capacity probe unless
+// the staging directory is covered by an explicit qB path mapping and the qB
+// client supports a suitable capacity API. The global qB fallback is limited
+// to one mapped qB root; an unmapped staging directory remains Worker-local
+// so qB's download-volume capacity cannot mask a full temporary volume.
+func (s *Service) moviePilotQBStagingFreeSpace(clientConfig protocol.QBClientConfig, client qbittorrent.Client, stagingRoot string) func(context.Context, string) (uint64, error) {
+	fallback := s.stagingFreeSpace
+	if fallback == nil {
+		fallback = func(ctx context.Context, root string) (uint64, error) {
+			usage, err := disk.UsageWithContext(ctx, root)
+			if err != nil {
+				return 0, err
+			}
+			return usage.Free, nil
+		}
+	}
+	freeSpaceClient, ok := client.(qbittorrent.FreeSpaceClient)
+	if !ok {
+		return fallback
+	}
+	qbPath, err := ResolveQBPathForWorkerPath(clientConfig, stagingRoot)
+	if err != nil {
+		return fallback
+	}
+	return func(ctx context.Context, _ string) (uint64, error) {
+		free, queryErr := freeSpaceClient.GetFreeSpaceAtPath(ctx, qbPath)
+		if queryErr == nil {
+			return free, nil
+		}
+		if errors.Is(queryErr, qbittorrent.ErrFreeSpaceAtPathUnsupported) {
+			if qBGlobalFreeSpaceAllowed(clientConfig) {
+				if globalFreeSpaceClient, ok := client.(qbittorrent.GlobalFreeSpaceClient); ok {
+					free, globalErr := globalFreeSpaceClient.GetFreeSpace(ctx)
+					if globalErr != nil {
+						return 0, fmt.Errorf("query qB global staging free space: %w", globalErr)
+					}
+					return free, nil
+				}
+			}
+			return fallback(ctx, stagingRoot)
+		}
+		return 0, fmt.Errorf("query qB staging free space at path %q: %w", qbPath, queryErr)
+	}
 }
 
 func effectiveMediaConcurrency() int {
@@ -1710,6 +1783,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 	var reused bool
 	var stagingTempRoot string
 	var qbStagingConfig protocol.StagingConfig
+	var qbClientConfig protocol.QBClientConfig
 	var qbClient qbittorrent.Client
 	if isQBTransfer {
 		s.reportStageStatus(ctx, offer, model.ClusterStageQBObserving, model.ClusterStageStatusRunning, "")
@@ -1737,11 +1811,12 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		if stagingTempRoot == "" {
 			return errors.New("MoviePilot qB staging root is not configured")
 		}
-		_, qbClient, _, err = s.discoverTorrentClient(offer.TaskContext.Torrent)
+		qbClientConfig, qbClient, _, err = s.discoverTorrentClient(offer.TaskContext.Torrent)
 		if err != nil {
 			return fmt.Errorf("resolve qB control client: %w", err)
 		}
-		releaseStagingReservation, admissionErr := s.reserveMoviePilotStaging(ctx, stagingTempRoot, file.Size)
+		stagingFreeSpace := s.moviePilotQBStagingFreeSpace(qbClientConfig, qbClient, stagingTempRoot)
+		releaseStagingReservation, admissionErr := s.reserveMoviePilotStagingWithUsage(ctx, stagingTempRoot, file.Size, stagingFreeSpace)
 		if admissionErr != nil {
 			if errors.Is(admissionErr, ErrQBStagingInsufficientSpace) && qbClient != nil {
 				if pauseErr := qbClient.StopByHash(ctx, offer.TaskContext.Torrent.TorrentHash); pauseErr != nil {
@@ -1760,6 +1835,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		}, QBStagingAdmission{
 			StagingRoot: stagingTempRoot, DownloadRoot: file.DownloadRoot,
 			MaxFileBytes: stagingMaxFileBytes(stagingConfig), ExtensionWhitelist: stagingConfig.ExtensionWhitelist,
+			FreeSpace: stagingFreeSpace,
 		})
 		releaseStagingReservation()
 		if err != nil {
@@ -2010,7 +2086,7 @@ func (s *Service) executeMediaTransfer(ctx context.Context, offer protocol.JobOf
 		// fs.PutDirectly may leave a temporary cache object without a remote ID.
 		// Refresh the target directory so cleanup receives the provider's exact
 		// file ID instead of the cache placeholder.
-		remote, getRemoteErr := getFreshUploadedObject(ctx, expectedPath)
+		remote, getRemoteErr := getFreshUploadedObjectWithRetry(ctx, expectedPath)
 		if getRemoteErr != nil || remote == nil || remote.IsDir() {
 			if getRemoteErr == nil {
 				getRemoteErr = errors.New("uploaded qB object is missing or is a directory")

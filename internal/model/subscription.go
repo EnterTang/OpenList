@@ -10,6 +10,9 @@ const (
 	SubscriptionSourceMoviePilot = "moviepilot"
 	SubscriptionSourceAuto       = "auto"
 
+	SubscriptionMoviePilotDownloaderModeAuto   = "auto"
+	SubscriptionMoviePilotDownloaderModeManual = "manual"
+
 	SubscriptionStatusIdle    = "idle"
 	SubscriptionStatusRunning = "running"
 	SubscriptionStatusSuccess = "success"
@@ -61,6 +64,8 @@ type Subscription struct {
 	TempTarget               SubscriptionStorageTarget  `json:"temp_target,omitempty" gorm:"serializer:json"`
 	DeliveryTarget           SubscriptionStorageTarget  `json:"delivery_target,omitempty" gorm:"serializer:json"`
 	PreferredWorkerNodeID    string                     `json:"preferred_worker_node_id,omitempty" gorm:"size:64"`
+	MoviePilotDownloaderMode string                     `json:"moviepilot_downloader_mode,omitempty" gorm:"size:16;index"`
+	MoviePilotDownloader     string                     `json:"moviepilot_downloader,omitempty" gorm:"size:128"`
 	TransferEnabled          bool                       `json:"transfer_enabled"`
 	TMDBID                   int64                      `json:"tmdb_id" gorm:"index"`
 	TMDBName                 string                     `json:"tmdb_name"`
